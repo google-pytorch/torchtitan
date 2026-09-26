@@ -22,6 +22,16 @@ from torch.distributed.tensor import Shard
 from torchtitan.config import FSDPSymmMemScope
 from torchtitan.distributed.parallel_dims import ParallelDims
 
+__all__ = [
+    "apply_fsdp_to_decoder",
+    "disable_fsdp_gradient_division",
+    "enable_fsdp_symm_mem",
+    "get_fsdp_reshard_after_forward_policy",
+    "linear_param_shard_placements",
+    "resolve_fsdp_mesh",
+    "resolve_sparse_fsdp_mesh",
+]
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,7 +43,7 @@ _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
 _SPARSE_STORAGE_AXES = ["dp_replicate", "efsdp", "ep"]
 
 
-def _linear_param_shard_placements(module: nn.Module) -> dict[nn.Parameter, Shard]:
+def linear_param_shard_placements(module: nn.Module) -> dict[nn.Parameter, Shard]:
     """Shard stacked Linear parameters along their matrix-row dimension.
 
     A stacked Linear stores weight as ``[N, F, D]`` and bias as ``[N, F]``.
@@ -45,10 +55,15 @@ def _linear_param_shard_placements(module: nn.Module) -> dict[nn.Parameter, Shar
     for child in module.modules():
         if not isinstance(child, nn.Linear) or getattr(child, "num_linears", 1) == 1:
             continue
-        weight = cast(nn.Parameter, child.weight)
+        # Fork divergence from upstream pytorch/torchtitan: read `_parameters`
+        # rather than `child.weight`. The TPU layer stacks leave Linear shells
+        # without parameters, and attribute access on a SimpleFSDP-wrapped
+        # module would all-gather the weight.
+        weight = cast(nn.Parameter | None, child._parameters.get("weight"))
+        if weight is None:
+            continue
         placements[weight] = Shard(1)
-        if child.bias is not None:
-            bias = child.bias
+        if (bias := child._parameters.get("bias")) is not None:
             placements[bias] = Shard(1)
     return placements
 
@@ -307,7 +322,7 @@ def apply_fsdp_to_decoder(
     for layer_id, transformer_block in model.layers.items():
         # A stacked Linear keeps W1/W3 separate from the matrix-row dimension.
         # Shard matrix rows so every rank retains both projections.
-        stacked_param_placements = _linear_param_shard_placements(transformer_block)
+        stacked_param_placements = linear_param_shard_placements(transformer_block)
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
         # - When EP > 1: routed experts use edp_mesh, other params use dp_mesh

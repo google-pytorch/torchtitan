@@ -32,6 +32,7 @@ from torch.distributed.tensor._utils import (
 from torch.distributed.tensor.placement_types import _StridedShard, Placement
 from torch.fx.traceback import annotate
 
+from torchtitan.distributed.fsdp import linear_param_shard_placements
 from torchtitan.protocols.module import Module
 
 from torchtitan.quantization._fsdp_tensor import (
@@ -444,19 +445,23 @@ def data_parallel(
     # through -- `ReplicateComputation`'s EP/TP path -- is refused outright.
     template_dim = 0 if isinstance(shard_dim, dict) else shard_dim
 
-    param_sharding: tuple[Placement, ...]
-    if mode == "replicate":
-        param_sharding = (Replicate(),)
-    elif mode == "fully_shard":
-        param_sharding = (Shard(template_dim),)
-    elif mode == "hybrid_shard":
+    if mode == "hybrid_shard":
         # replicate inter-host, fully shard intra-host
-        param_sharding = (Replicate(), Shard(template_dim))
         assert (
             device_mesh.ndim == 2
         ), "hybrid sharded data parallel requires 2D DeviceMesh"
-    else:
+    elif mode not in ("replicate", "fully_shard"):
         raise ValueError(f"Unsupported mode {mode}")
+
+    param_shard_placements = linear_param_shard_placements(model)
+
+    def get_param_sharding(param: nn.Parameter) -> tuple[Placement, ...]:
+        if mode == "replicate":
+            return (Replicate(),)
+        placement = param_shard_placements.get(param, Shard(template_dim))
+        if mode == "fully_shard":
+            return (placement,)
+        return (Replicate(), placement)
 
     for module_fqn, mod in model.named_modules():
         params_dict = dict(mod.named_parameters(recurse=False))
@@ -476,37 +481,24 @@ def data_parallel(
                 continue
 
         param_non_dp_mesh_types = {}
-        # Fork divergence from upstream pytorch/torchtitan: a stacked Linear
-        # stores weight as [N, F, D] and bias as [N, F] (FeedForward.w13 has
-        # N=2, pytorch/torchtitan#4808). Sharding dim 0 would hit the
-        # replicate-if-narrower-than-the-mesh rule below and keep the whole
-        # weight, its gradient and its optimizer state on every rank, so shard
-        # the matrix rows (dim 1), as core FSDP's
-        # `_linear_param_shard_placements` does. Remove when the upstream merge
-        # reaches pytorch/torchtitan#4867 (d0f3bbfd6), which does this here.
-        is_stacked_linear = (
-            isinstance(mod, nn.Linear) and getattr(mod, "num_linears", 1) > 1
-        )
         param_shardings: dict[str, tuple[Placement, ...]] = {}
 
         for p_name, p in params_dict.items():
+            if p is not None:
+                param_sharding = param_shardings[p_name] = get_param_sharding(p)
             if p is not None and p.numel() > 0:
                 dim = shard_dim[p_name] if isinstance(shard_dim, dict) else shard_dim
-                if isinstance(p, DTensor) and dim != template_dim:
+                if p in param_shard_placements:
+                    # A stacked Linear keeps the axis `get_param_sharding` gave
+                    # it, which `ReplicateComputation` was handed too.
+                    dim = param_shard_placements[p].dim
+                elif isinstance(p, DTensor) and dim != template_dim:
                     # Under EP/TP, `ReplicateComputation` re-wraps the parameter
                     # with `param_sharding`, which carries `template_dim` and so
                     # would drop this axis.
                     raise NotImplementedError(
                         f"{p_name} is already a DTensor, so sharding it on dim "
                         f"{dim} would be dropped on the EP/TP path"
-                    )
-                if is_stacked_linear:
-                    dim = 1
-                    # `ReplicateComputation`'s EP/TP path re-wraps the parameter
-                    # with the sharding it is given, so hand it this axis.
-                    param_shardings[p_name] = tuple(
-                        Shard(dim) if isinstance(pl, Shard) else pl
-                        for pl in param_sharding
                     )
                 p, non_dp_mesh_types = _prepare_spmd_parameter_for_fsdp(
                     p,
@@ -534,7 +526,6 @@ def data_parallel(
                         requires_grad=p.requires_grad,
                     ),
                 )
-
                 # to be compatible with DCP, we use a customized _register_parametrization
                 # instead of nn.utils.parametrize.register_parametrization here
                 # nn.utils.parametrize.register_parametrization(
@@ -555,7 +546,7 @@ def data_parallel(
             lambda param_name: ReplicateComputation(
                 param_fqn=(f"{module_fqn}.{param_name}" if module_fqn else param_name),
                 device_mesh=device_mesh,
-                param_sharding=param_shardings.get(param_name, param_sharding),
+                param_sharding=param_shardings[param_name],
                 mode=mode,
                 mp_policy=mp_policy,
                 non_dp_mesh_types=param_non_dp_mesh_types.get(param_name, {}),

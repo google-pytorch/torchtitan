@@ -27,6 +27,7 @@ import os
 from typing import Any, Optional
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer.optimizer import (
@@ -42,7 +43,11 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
+from torchtitan.experiments.tpu.grad_norm import (
+    CompiledGradNorm,
+    _mesh_groups,
+    clip_grad_norm_ as grad_norm_clip_grad_norm_,
+)
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     GraphSplitter,
 )
@@ -417,9 +422,15 @@ class TpuGraphTrainer(GraphTrainer):
         return loss
 
     def _clip_grad_norm(self) -> torch.Tensor:
-        if self._compiled_grad_norm is None:
-            return super()._clip_grad_norm()
         parameters = [p for m in self.model_parts for p in m.parameters()]
+        if self._compiled_grad_norm is None:
+            return grad_norm_clip_grad_norm_(
+                parameters,
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=self.parallel_dims.ep_enabled,
+            )
         return self._compiled_grad_norm.clip_grad_norm_(
             parameters,
             self.config.training.max_norm,
@@ -536,6 +547,29 @@ _GRAD_CLIP_EPS = 1e-6
 _GRAD_CLIP_MAX_SCALE = 1.0
 
 
+def _in_graph_clip_grads(
+    grads: tuple[torch.Tensor, ...], max_norm: float
+) -> tuple[torch.Tensor, ...]:
+    groups = _mesh_groups(list(grads))
+    norms = []
+    for group in groups:
+        norm = torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(grads[i]) for i in group]),
+            2.0,
+        )
+        if len(groups) > 1 and isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        norms.append(norm)
+    total_norm = (
+        norms[0]
+        if len(norms) == 1
+        else torch.linalg.vector_norm(torch.stack(norms), 2.0)
+    )
+    clip_coef = max_norm / (total_norm + _GRAD_CLIP_EPS)
+    clip_coef_clamped = torch.clamp(clip_coef, max=_GRAD_CLIP_MAX_SCALE)
+    return tuple(g * clip_coef_clamped for g in grads)
+
+
 def _make_fwd_bwd_adamw_fn(
     model: nn.Module,
     *,
@@ -583,13 +617,7 @@ def _make_fwd_bwd_adamw_fn(
         )
 
         if max_norm is not None and max_norm > 0.0:
-            total_norm = torch.linalg.vector_norm(
-                torch.stack([torch.linalg.vector_norm(g) for g in grads]),
-                2.0,
-            )
-            clip_coef = max_norm / (total_norm + _GRAD_CLIP_EPS)
-            clip_coef_clamped = torch.clamp(clip_coef, max=_GRAD_CLIP_MAX_SCALE)
-            grads = tuple(g * clip_coef_clamped for g in grads)
+            grads = _in_graph_clip_grads(grads, max_norm)
 
         exp_avgs = [
             _get_optstate_buffer(model, fqn, "exp_avg") for fqn in param_fqns

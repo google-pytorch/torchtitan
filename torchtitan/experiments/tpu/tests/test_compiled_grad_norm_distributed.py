@@ -13,7 +13,7 @@ from unittest import mock
 import torch
 import torch.multiprocessing as mp
 from absl.testing import absltest
-from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import utils as dist_utils
@@ -89,7 +89,6 @@ def _run_clip_parity(
     rank: int,
     world_size: int,
 ) -> None:
-  del rank
   mesh = torch.distributed.DeviceMesh(
       device.type,
       torch.arange(world_size).reshape(2, world_size // 2),
@@ -172,6 +171,130 @@ def _run_clip_parity(
     assert "gradient metadata changed" in str(error)
   else:
     raise AssertionError("changed DTensor placements were not rejected")
+
+  # In the same workers, since spawning them is most of the test's time.
+  _run_mixed_mesh_clip_parity(device, rank, world_size)
+
+
+def _run_mixed_mesh_clip_parity(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+  """Gradients on two meshes: norm and clip must match a whole-tensor reference.
+
+  Stacks stored on a split mesh (graph_trainer/layer_stack.py) put some
+  gradients on an ``(E, ranks // E)`` split of the FSDP mesh and the rest on
+  the FSDP mesh itself. ``get_total_norm`` and the foreach clip both refuse to
+  mix meshes, so the norm is taken per mesh and combined.
+  """
+  del rank
+  mesh = torch.distributed.init_device_mesh(
+      device.type, (world_size,), mesh_dim_names=("fsdp",)
+  )
+  # pylint: disable-next=protected-access
+  split = mesh._unflatten(0, (2, world_size // 2), ("fsdp_outer", "fsdp_inner"))
+
+  def make_parameters() -> list[torch.Tensor]:
+    parameters = []
+    for shape, scale, target_mesh, placements in (
+        ((2 * world_size,), 1.0, mesh, [Shard(0)]),
+        ((3,), 2.0, mesh, [Replicate()]),
+        ((2, world_size, 3), 0.5, split, [Shard(0), Shard(1)]),
+        ((2, world_size), -3.0, split, [Shard(0), Shard(1)]),
+    ):
+      numel = torch.Size(shape).numel()
+      whole = scale * torch.arange(1, numel + 1, device=device).view(shape)
+      parameter = torch.nn.Parameter(
+          distribute_tensor(torch.zeros_like(whole), target_mesh, placements)
+      )
+      parameter.grad = distribute_tensor(whole, target_mesh, placements)
+      parameters.append(parameter)
+    # A plain tensor too, as a parameter no parallelism touched would be.
+    plain = torch.nn.Parameter(torch.zeros(5, device=device))
+    plain.grad = torch.arange(1.0, 6.0, device=device)
+    parameters.append(plain)
+    return parameters
+
+  def whole(t: torch.Tensor) -> torch.Tensor:
+    return t.full_tensor() if isinstance(t, DTensor) else t
+
+  for norm_type in (2.0, 1.0, 3.0, float("inf")):
+    parameters = make_parameters()
+    grads = [p.grad for p in parameters]
+    assert len(grad_norm._mesh_groups(grads)) == 3  # pylint: disable=protected-access
+    want = torch.linalg.vector_norm(
+        torch.cat([whole(g).flatten() for g in grads]), norm_type
+    )
+    got = grad_norm.global_grad_norm(grads, norm_type)
+    assert not isinstance(got, DTensor), type(got)
+    torch.testing.assert_close(got, want, msg=f"norm_type={norm_type}")
+
+  max_norm = 5.0
+  reference = make_parameters()
+  want_norm = torch.linalg.vector_norm(
+      torch.cat([whole(p.grad).flatten() for p in reference])
+  )
+  coef = torch.clamp(max_norm / (want_norm + 1e-6), max=1.0)
+  assert coef < 1.0, "nothing is clipped, so this checks nothing"
+  want_grads = [whole(p.grad) * coef for p in reference]
+
+  candidate = make_parameters()
+  compile_pass = (
+      mock.patch.object(
+          grad_norm,
+          "tpu_backend_compile_pass",
+          side_effect=lambda gm, _example_inputs, *, is_fwd: gm,
+      )
+      if device.type == "cpu"
+      else contextlib.nullcontext()
+  )
+  with compile_pass:
+    got_norm = grad_norm.CompiledGradNorm().clip_grad_norm_(candidate, max_norm)
+  torch.testing.assert_close(got_norm, want_norm)
+  for i, (parameter, want_grad) in enumerate(
+      zip(candidate, want_grads, strict=True)
+  ):
+    got_grad = parameter.grad
+    if isinstance(got_grad, DTensor):
+      # Clipping scales in place; it must not move the gradient.
+      assert got_grad.device_mesh == reference[i].grad.device_mesh
+      assert got_grad.placements == reference[i].grad.placements
+    torch.testing.assert_close(whole(got_grad), want_grad, msg=f"grad {i}")
+
+  # Non-compiled grad_norm.clip_grad_norm_ (used when compile_grad_norm=False)
+  # must also handle gradients across multiple meshes.
+  eager_candidate = make_parameters()
+  eager_norm = grad_norm.clip_grad_norm_(
+      eager_candidate, max_norm, foreach=True
+  )
+  torch.testing.assert_close(eager_norm, want_norm)
+  for i, (parameter, want_grad) in enumerate(
+      zip(eager_candidate, want_grads, strict=True)
+  ):
+    got_grad = parameter.grad
+    if isinstance(got_grad, DTensor):
+      assert got_grad.device_mesh == reference[i].grad.device_mesh
+      assert got_grad.placements == reference[i].grad.placements
+    torch.testing.assert_close(
+        whole(got_grad), want_grad, msg=f"eager grad {i}"
+    )
+
+  # optimizer_in_graph clipping (_in_graph_clip_grads) must also handle
+  # gradients across multiple meshes.
+  in_graph_grads = tuple(p.grad for p in make_parameters())
+  clipped_in_graph = tpu_graph_trainer._in_graph_clip_grads(  # pylint: disable=protected-access
+      in_graph_grads, max_norm
+  )
+  for i, (got_grad, want_grad) in enumerate(
+      zip(clipped_in_graph, want_grads, strict=True)
+  ):
+    if isinstance(got_grad, DTensor):
+      assert got_grad.device_mesh == reference[i].grad.device_mesh
+      assert got_grad.placements == reference[i].grad.placements
+    torch.testing.assert_close(
+        whole(got_grad), want_grad, msg=f"in_graph grad {i}"
+    )
 
 
 class CompiledGradNormDistributedTest(

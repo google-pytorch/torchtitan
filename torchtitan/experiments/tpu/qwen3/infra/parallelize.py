@@ -15,7 +15,9 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    configure_simple_fsdp_shard_dims,
+)
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
@@ -157,8 +159,8 @@ def parallelize_qwen3(
     )
     # Creates process groups, so every rank runs it here, right after sharding.
     for holder in model.modules():
-      if hasattr(holder, "build_split_meshes"):
-        holder.build_split_meshes()
+      if hasattr(holder, "shard_split_stacks"):
+        holder.shard_split_stacks()
     install_tpu_replicate_computation(model)
   else:
     dtensor_parallelize.parallelize_qwen3(

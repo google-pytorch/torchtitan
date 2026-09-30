@@ -112,13 +112,8 @@ class SimpleFSDPShardingTest(absltest.TestCase):
 
     configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
-    # 2 experts can't split over 4 ranks, so the stack is flattened to
-    # [2, 2*8, 8] and shards on dim 1 instead of the hidden dim.
     self.assertEqual(
-        model.layer_stacks._fsdp_shard_dim, {"moe__experts__w1_EDF": 1}
-    )
-    self.assertEqual(
-        tuple(model.layer_stacks.moe__experts__w1_EDF.shape), (2, 16, 8)
+        model.layer_stacks._fsdp_shard_dim, {"moe__experts__w1_EDF": 2}
     )
 
   def test_rejects_an_empty_expert_module_when_nothing_is_stacked(self) -> None:

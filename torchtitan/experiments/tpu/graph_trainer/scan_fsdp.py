@@ -25,6 +25,7 @@ from typing import Any
 import torch
 import torch.distributed._functional_collectives as funcol
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan.tools.logging import logger
@@ -35,6 +36,7 @@ __all__ = [
     "configure_simple_fsdp_shard_dims",
     "gather_slice",
     "plan_stacked_gathers",
+    "split_stack_spec",
 ]
 
 
@@ -57,6 +59,10 @@ class ScanFSDPSpec:
             the gradient is ``Partial`` on it and has to be summed.
         gather_dim: which axis of the per-layer slice to gather on -- the
             stack's shard axis minus the scan axis, so dim 1 becomes 0.
+        split_shape: set for a split stack (see
+            ``LayerStackHolder.shard_split_stacks``), whose shard is
+            ``Shard(gather_dim)`` and ``Shard(gather_dim + 1)``. Those two axes
+            are merged, gathered as one, and the result viewed to this shape.
     """
 
     group_name: str
@@ -65,6 +71,7 @@ class ScanFSDPSpec:
     sharded: bool
     replicate_group_name: str | None = None
     gather_dim: int = 0
+    split_shape: torch.Size | None = None
 
 
 _orig_all_gather_single = funcol.all_gather_single
@@ -303,13 +310,42 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
             spec.param_dtype,
             spec.reduce_dtype,
         )
-    return _AllGatherReduceScatter.apply(
+    if spec.split_shape is not None:
+        shard = shard.flatten(spec.gather_dim, spec.gather_dim + 1)
+    whole = _AllGatherReduceScatter.apply(
         shard,
         spec.group_name,
         spec.param_dtype,
         spec.reduce_dtype,
         spec.replicate_group_name,
         spec.gather_dim,
+    )
+    if spec.split_shape is None:
+        return whole
+    return whole.unflatten(
+        spec.gather_dim,
+        spec.split_shape[spec.gather_dim : spec.gather_dim + 2],
+    )
+
+
+def split_stack_spec(
+    unsplit: DeviceMesh,
+    param_dtype: torch.dtype | None,
+    reduce_dtype: torch.dtype | None,
+    gather_dim: int,
+    split_shape: torch.Size,
+) -> ScanFSDPSpec:
+    """How to gather a split stack: flat, over the unsplit FSDP mesh."""
+    return ScanFSDPSpec(
+        group_name=unsplit.get_group(unsplit.ndim - 1).group_name,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        sharded=True,
+        replicate_group_name=(
+            unsplit.get_group(0).group_name if unsplit.ndim == 2 else None
+        ),
+        gather_dim=gather_dim,
+        split_shape=split_shape,
     )
 
 
@@ -334,6 +370,8 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
     computation = getattr(holder, "_simple_fsdp_parametrization_list", [None])[0]
     param_dtype = computation.param_dtype if computation else None
     reduce_dtype = computation.reduce_dtype if computation else None
+    # Split mesh -> the FSDP mesh it was split from; see `shard_split_stacks`.
+    unsplit = getattr(holder, "split_meshes", {})
 
     plan: dict[str, ScanFSDPSpec] = {}
     n_sharded = 0
@@ -347,6 +385,13 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
             continue
 
         mesh = param.device_mesh
+        if mesh in unsplit:
+            # Even by construction, and gathered one layer at a time.
+            plan[name] = split_stack_spec(
+                unsplit[mesh], param_dtype, reduce_dtype, 0, param.shape[1:]
+            )
+            n_sharded += 1
+            continue
         # 1-D: `fully_shard`, one Shard placement. 2-D: `hybrid_shard`, which
         # SimpleFSDP builds as exactly (Replicate(), Shard(dim)) over
         # ("dp_replicate", "fsdp") -- so the shard axis is the last one, and the
@@ -420,9 +465,9 @@ def configure_simple_fsdp_shard_dims(
 ) -> list[str]:
     """Picks SimpleFSDP shard axes that divide evenly, for any decoder model.
 
-    Plans an axis per layer stack (calling ``flatten_for`` first if present) and
-    moves ``tok_embeddings`` / ``lm_head`` to their hidden axis (dim 1) when the
-    vocabulary does not divide the FSDP degree (e.g. Llama 3's 128,256 over 512+ ranks).
+    Plans an axis per layer stack and moves ``tok_embeddings`` / ``lm_head`` to
+    their hidden axis (dim 1) when the vocabulary does not divide the FSDP
+    degree (e.g. Llama 3's 128,256 over 512+ ranks).
 
     Args:
         model: The model to configure, before ``apply_simple_fsdp``.
@@ -431,53 +476,9 @@ def configure_simple_fsdp_shard_dims(
     Returns:
         FQNs of the modules moved to dim 1.
     """
-    if parallel_dims is None:
-        return []
-    fsdp_degree = getattr(parallel_dims, "dp_shard", 1) * getattr(
-        parallel_dims, "cp", 1
+    from torchtitan.experiments.tpu.graph_trainer.tpu_sharding import (  # pylint: disable=g-import-not-at-top
+        configure_tpu_fsdp_shard_dims,
     )
-    if fsdp_degree <= 1:
-        return []
 
-    # Layer stacking moves the layer weights into a holder, which plans an axis
-    # per stack -- dim 1 of a stack is one axis further in than dim 1 of a layer.
-    for holder in model.modules():
-        if hasattr(holder, "plan_shard_dims"):
-            if hasattr(holder, "flatten_for"):
-                holder.flatten_for(fsdp_degree)
-            holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
+    return configure_tpu_fsdp_shard_dims(model, parallel_dims)
 
-    hidden_axis_modules: list[str] = []
-    for module_fqn in ("tok_embeddings", "lm_head"):
-        module = getattr(model, module_fqn, None)
-        if module is None or not hasattr(module, "weight"):
-            continue
-        weight = module.weight
-        if weight.shape[0] % fsdp_degree == 0:
-            continue
-        if weight.ndim != 2 or (
-            weight.shape[1] % fsdp_degree != 0 and weight.shape[1] >= fsdp_degree
-        ):
-            raise ValueError(
-                f"Cannot FSDP-shard {module_fqn}.weight with shape "
-                f"{tuple(weight.shape)} over {fsdp_degree} ranks"
-            )
-        # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
-        # also used by LayerStackHolder for stacked layer weights. When
-        # `weight.shape[1] < fsdp_degree` (e.g. Llama 3 8B at 8192 ranks),
-        # `data_parallel` downgrades `Shard(1)` to `Replicate()`.
-        if weight.shape[1] < fsdp_degree:
-            replicated_mib = weight.numel() * weight.element_size() / (1024**2)
-            logger.warning(
-                "%s.weight with shape %s has hidden dim %d < fsdp_degree %d; "
-                "SimpleFSDP will replicate it (%.1f MiB parameter) instead of "
-                "sharding.",
-                module_fqn,
-                tuple(weight.shape),
-                weight.shape[1],
-                fsdp_degree,
-                replicated_mib,
-            )
-        setattr(module, "_fsdp_shard_dim", 1)
-        hidden_axis_modules.append(module_fqn)
-    return hidden_axis_modules

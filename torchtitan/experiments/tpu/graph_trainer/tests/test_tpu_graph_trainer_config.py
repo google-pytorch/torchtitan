@@ -1482,18 +1482,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     class DummyHolder(nn.Module):
       def __init__(self):
         super().__init__()
-        self.flattened_for = None
-        self.split_meshes_built = False
+        self.split_stacks_sharded = False
 
-      def flatten_for(self, degree: int) -> list[str]:
-        self.flattened_for = degree
-        return []
-
-      def plan_shard_dims(self, degree: int) -> dict[str, int]:
-        return {"w": 1}
-
-      def build_split_meshes(self) -> None:
-        self.split_meshes_built = True
+      def shard_split_stacks(self) -> None:
+        self.split_stacks_sharded = True
 
     class DummyModel(nn.Module):
       def __init__(self):
@@ -1509,10 +1501,49 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(called_with, [m])
     self.assertEqual(getattr(m.tok_embeddings, "_fsdp_shard_dim", None), 1)
     self.assertEqual(getattr(m.lm_head, "_fsdp_shard_dim", None), 1)
-    self.assertEqual(m.layer_stacks.flattened_for, 512)
-    self.assertEqual(getattr(m.layer_stacks, "_fsdp_shard_dim", None), {"w": 1})
-    self.assertTrue(m.layer_stacks.split_meshes_built)
+    self.assertTrue(m.layer_stacks.split_stacks_sharded)
+
+  def test_to_tpu_graph_trainer_config_configures_shard_dims_without_scan(
+      self,
+  ) -> None:
+    config = llama3_8b()
+    config.tpu_config.use_graph_trainer = True
+    config.tpu_config.use_scan_layers = False
+    config.parallelism.use_simple_fsdp = True
+    config.parallelism.data_parallel_shard_degree = 512
+    called_with: list[nn.Module] = []
+
+    def stub_registry(flavor: str):
+      spec = llama3_gt.model_registry(flavor)
+      return dataclasses.replace(
+          spec,
+          parallelize_fn=lambda model, **kwargs: (
+              called_with.append(model) or model
+          ),
+      )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        stub_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    wrapped_fn = graph_config.model_spec.parallelize_fn
+
+    class DummyModel(nn.Module):
+      def __init__(self):
+        super().__init__()
+        self.tok_embeddings = nn.Embedding(128256, 4096, device="meta")
+        self.lm_head = nn.Linear(4096, 128256, bias=False, device="meta")
+
+    m = DummyModel()
+    pdims = SimpleNamespace(dp_shard=512, cp=1, ep_enabled=False)
+    out = wrapped_fn(m, parallel_dims=pdims)
+    self.assertIs(out, m)
+    self.assertEqual(called_with, [m])
+    self.assertEqual(getattr(m.tok_embeddings, "_fsdp_shard_dim", None), 1)
+    self.assertEqual(getattr(m.lm_head, "_fsdp_shard_dim", None), 1)
 
 
 if __name__ == "__main__":
   absltest.main()
+

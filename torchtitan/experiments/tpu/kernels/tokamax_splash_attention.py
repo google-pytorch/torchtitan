@@ -1,7 +1,7 @@
 """Splash Attention integration for torch_tpu via Pallas and Tokamax.
 
 Wraps Tokamax's splash_attention_kernel for use with PyTorch tensors on TPU.
-Uses torch_tpu._internal.pallas.pallas.jax_op to bridge JAX -> PyTorch.
+Uses torch.tpu.pallas.jax_op to bridge JAX -> PyTorch.
 """
 
 import functools
@@ -47,8 +47,9 @@ except ImportError:
 jaxtyping.jaxtyped = _real_jaxtyped
 
 import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
+import torch_tpu  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order,unused-import
 # torch_tpu Pallas bridge
-from torch_tpu._internal import pallas
+from torch.tpu import pallas  # noqa: E402  pyrefly: ignore[missing-import]  pylint: disable=g-import-not-at-top,g-bad-import-order
 
 
 # Taken from tokamax._src.ops.splash_attention.base.DEFAULT_MASK_VALUE.

@@ -9,7 +9,8 @@
 import jax
 import jax.numpy as jnp
 import torch
-from torch_tpu._internal import pallas
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 
 @pallas.jax_op("tt_moe::route_score_grad")

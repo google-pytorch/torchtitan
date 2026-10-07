@@ -37,12 +37,13 @@ def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
     # the env.
     tpu_distributed_utils.maybe_init_distributed()
   if is_tpu and config.tpu_config.eager_mode:
-    from torch_tpu._internal import execution_mode  # pylint: disable=g-import-not-at-top
+    import torch  # pylint: disable=g-import-not-at-top
+    import torch_tpu  # pylint: disable=g-import-not-at-top,unused-import
 
     eager_mode_enum = getattr(
-        execution_mode.EagerMode, config.tpu_config.eager_mode
+        torch.tpu.EagerMode, config.tpu_config.eager_mode  # pyrefly: ignore[missing-attribute]
     )
-    with execution_mode.set_eager_mode(eager_mode_enum):
+    with torch.tpu.set_eager_mode(eager_mode_enum):  # pyrefly: ignore[missing-attribute]
       global_start_trainer_func(config)
   else:
     global_start_trainer_func(config)

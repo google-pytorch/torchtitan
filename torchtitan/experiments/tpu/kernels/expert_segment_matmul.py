@@ -49,9 +49,13 @@ def _grouped_mm_fwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
     tgmm_tile_n: int,
+    transpose_rhs: bool,
 ) -> jax.Array:
     del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n
-    _, k_dim, n_dim = rhs.shape
+    if transpose_rhs:
+        _, n_dim, k_dim = rhs.shape
+    else:
+        _, k_dim, n_dim = rhs.shape
     return call_named(
         megablox_gmm,
         "moe_gmm_fwd",
@@ -60,6 +64,7 @@ def _grouped_mm_fwd(
         group_sizes=group_sizes,
         preferred_element_type=lhs.dtype,
         tiling=_tiling(tile_m, tile_k, tile_n, k_dim, n_dim),
+        transpose_rhs=transpose_rhs,
     )
 
 
@@ -75,46 +80,69 @@ def _grouped_mm_bwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
     tgmm_tile_n: int,
+    transpose_rhs: bool,
 ) -> tuple[jax.Array, jax.Array]:
-    _, k_dim, n_dim = rhs.shape
-    grad_lhs = call_named(
-        megablox_gmm,
-        "moe_gmm_dgrad",
-        dout,
-        rhs,
-        group_sizes=group_sizes,
-        preferred_element_type=dout.dtype,
-        tiling=_tiling(
-            tile_m,
-            tile_n,
-            tile_k,
-            n_dim,
-            k_dim,
-        ),
-        transpose_rhs=True,
-    )
-    grad_rhs = call_named(
-        megablox_tgmm,
-        "moe_tgmm_wgrad",
-        jnp.swapaxes(lhs, 0, 1),
-        dout,
-        group_sizes=group_sizes,
-        # Store the dWeight in the weight's own dtype. Autograd casts a
-        # gradient to the dtype of the input it belongs to, so a wider store
-        # would be rounded to this dtype right after the kernel and only add
-        # an HBM write and a cast round trip. MegaBlox still accumulates each
-        # tile with an FP32 dot into FP32 VMEM; only the final store rounds,
-        # so the values equal an FP32 store cast to this dtype.
-        preferred_element_type=rhs.dtype,
-        tiling=_tiling(
-            tgmm_tile_m,
-            tgmm_tile_k,
-            tgmm_tile_n,
-            lhs.shape[1],
-            dout.shape[1],
-        ),
-        interpret=False,
-    )
+    # Store the dWeight in the weight's own dtype. Autograd casts a gradient to
+    # the dtype of the input it belongs to, so a wider store would be rounded
+    # to this dtype right after the kernel and only add an HBM write and a cast
+    # round trip. MegaBlox still accumulates each tile with an FP32 dot into
+    # FP32 VMEM; only the final store rounds, so the values equal an FP32 store
+    # cast to this dtype.
+    if transpose_rhs:
+        _, n_dim, k_dim = rhs.shape
+        grad_lhs = call_named(
+            megablox_gmm,
+            "moe_gmm_dgrad",
+            dout,
+            rhs,
+            group_sizes=group_sizes,
+            preferred_element_type=dout.dtype,
+            tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
+        )
+        grad_rhs = call_named(
+            megablox_tgmm,
+            "moe_tgmm_wgrad",
+            jnp.swapaxes(dout, 0, 1),
+            lhs,
+            group_sizes=group_sizes,
+            preferred_element_type=rhs.dtype,
+            tiling=_tiling(
+                tgmm_tile_m,
+                tgmm_tile_n,
+                tgmm_tile_k,
+                dout.shape[1],
+                lhs.shape[1],
+            ),
+            interpret=False,
+        )
+    else:
+        _, k_dim, n_dim = rhs.shape
+        grad_lhs = call_named(
+            megablox_gmm,
+            "moe_gmm_dgrad",
+            dout,
+            rhs,
+            group_sizes=group_sizes,
+            preferred_element_type=dout.dtype,
+            tiling=_tiling(tile_m, tile_n, tile_k, n_dim, k_dim),
+            transpose_rhs=True,
+        )
+        grad_rhs = call_named(
+            megablox_tgmm,
+            "moe_tgmm_wgrad",
+            jnp.swapaxes(lhs, 0, 1),
+            dout,
+            group_sizes=group_sizes,
+            preferred_element_type=rhs.dtype,
+            tiling=_tiling(
+                tgmm_tile_m,
+                tgmm_tile_k,
+                tgmm_tile_n,
+                lhs.shape[1],
+                dout.shape[1],
+            ),
+            interpret=False,
+        )
     return grad_lhs, grad_rhs
 
 
@@ -130,7 +158,7 @@ def _backward(ctx, grad_output):
     grad_lhs, grad_rhs = _grouped_mm_bwd(
         grad_output, lhs, rhs, group_sizes, *ctx.static_args
     )
-    return grad_lhs, grad_rhs, None, None, None, None, None, None, None
+    return grad_lhs, grad_rhs, None, None, None, None, None, None, None, None
 
 
 _grouped_mm_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -145,13 +173,15 @@ def segment_matmul_pallas_2d(
     tile_k: int = 0,
     tile_n: int = 0,
     tgmm_tiling: tuple[int, int, int] = (128, 128, 128),
+    transpose_rhs: bool = False,
 ) -> torch.Tensor:
     """Compute per-expert matmuls without moving group sizes to the host.
 
     Zero-valued K/N tile dimensions select the corresponding full matrix
     dimension. Distinct tiling values produce distinct compiled
     specializations. dWeight accumulation is FP32 and its final store is in
-    the dtype of ``rhs``.
+    the dtype of ``rhs``. ``transpose_rhs`` accepts weights
+    in ``(E, N, K)`` order without materializing a transpose.
     """
     if group_sizes.dtype != torch.int32:
         group_sizes = group_sizes.to(torch.int32)
@@ -163,6 +193,7 @@ def segment_matmul_pallas_2d(
         tile_k,
         tile_n,
         *tgmm_tiling,
+        transpose_rhs,
     )
 
 

@@ -18,6 +18,9 @@ from torchtitan.experiments.graph_trainer.qwen3.parallelize import (
     parallelize_qwen3 as graph_trainer_parallelize_qwen3,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
+    install_tpu_replicate_computation,
+)
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
@@ -75,6 +78,7 @@ def parallelize_qwen3(
     for holder in model.modules():
         if hasattr(holder, "build_split_meshes"):
             holder.build_split_meshes()
+    install_tpu_replicate_computation(model)
     return model
 
 

@@ -35,6 +35,9 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     gather_slice,
     plan_stacked_gathers,
 )
+from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
+    install_tpu_replicate_computation,
+)
 from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
     _moe_config,
@@ -228,6 +231,87 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(
     torch.testing.assert_close(got_shard.grad, want_shard.grad, rtol=0, atol=0)
 
 
+def simple_fsdp_nonleading_shard_matches_dtensor(device, rank, world_size):
+    """The TPU-local override gathers and reduces a non-leading shard natively."""
+    if world_size == 1:
+        logging.warning("skipped: one rank, both collectives are the identity")
+        return
+    mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
+    module = nn.Linear(2 * world_size, 4, bias=False, device=device)
+    data_parallel(
+        module,
+        mesh,
+        "fully_shard",
+        shard_dim=1,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        ),
+    )
+    install_tpu_replicate_computation(module)
+    param = module._parameters["weight"]
+    assert param.placements == (Shard(1),), param.placements
+
+    want_shard = param.to_local().detach().clone().requires_grad_(True)
+    want = (
+        DTensor.from_local(want_shard, mesh, (Shard(1),))
+        .redistribute(
+            placements=[Replicate()],
+            forward_dtype=torch.bfloat16,
+            backward_dtype=torch.float32,
+        )
+        .to_local(grad_placements=[Partial()])
+    )
+    got = module.weight
+
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    for gathered in (want, got):
+        (gathered.float().sum() * (rank + 1)).backward()
+    torch.testing.assert_close(param.grad.to_local(), want_shard.grad, rtol=0, atol=0)
+
+
+def simple_hsdp_nonleading_shard_matches_dtensor(device, rank, world_size):
+    """The TPU-local override also preserves HSDP's replicate-axis sum."""
+    if world_size < 4 or world_size % 2:
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
+    shard_degree = world_size // 2
+    mesh = init_device_mesh(
+        device.type,
+        (2, shard_degree),
+        mesh_dim_names=("dp_replicate", "dp_shard"),
+    )
+    module = nn.Linear(2 * shard_degree, 4, bias=False, device=device)
+    data_parallel(
+        module,
+        mesh,
+        "hybrid_shard",
+        shard_dim=1,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        ),
+    )
+    install_tpu_replicate_computation(module)
+    param = module._parameters["weight"]
+    assert param.placements == (Replicate(), Shard(1)), param.placements
+
+    want_shard = param.to_local().detach().clone().requires_grad_(True)
+    want = (
+        DTensor.from_local(want_shard, mesh, (Replicate(), Shard(1)))
+        .redistribute(
+            placements=[Replicate(), Replicate()],
+            forward_dtype=torch.bfloat16,
+            backward_dtype=torch.float32,
+        )
+        .to_local(grad_placements=[Partial(), Partial()])
+    )
+    got = module.weight
+
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    for gathered in (want, got):
+        (gathered.float().sum() * (rank + 1)).backward()
+    torch.testing.assert_close(param.grad.to_local(), want_shard.grad, rtol=0, atol=0)
+
+
 def a_doubly_replicated_stack_sums_on_both_axes(device, rank, world_size):
     """A stack too narrow to shard is `Partial` on both axes, not one.
 
@@ -390,6 +474,7 @@ def an_unevenly_sharded_hybrid_stack_is_refused(device, rank, world_size):
     else:
         raise AssertionError("an unevenly sharded hybrid stack was planned")
 
+
 class TestLayerStackDistributed(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
@@ -426,6 +511,12 @@ class TestLayerStackDistributed(
                 a_sharded_stack_gathers_and_reduces_like_unrolled, shard_dim=2
             )
         )
+
+    def test_simple_fsdp_nonleading_shard_matches_dtensor(self):
+        self._on_devices(simple_fsdp_nonleading_shard_matches_dtensor)
+
+    def test_simple_hsdp_nonleading_shard_matches_dtensor(self):
+        self._on_devices(simple_hsdp_nonleading_shard_matches_dtensor)
 
     def test_an_unevenly_sharded_stack_is_refused(self):
         self._on_devices(an_unevenly_sharded_stack_is_refused)

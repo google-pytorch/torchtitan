@@ -54,6 +54,56 @@ class ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertEqual(grad_rhs.dtype, torch.bfloat16)
         torch.testing.assert_close(grad_rhs.cpu(), want, rtol=0, atol=0)
 
+    def test_transpose_rhs_forward_and_backward_parity(self):
+        device = self.accelerator_device
+        group_sizes = torch.tensor([64, 64], dtype=torch.int32, device=device)
+        lhs_ref = torch.randn(
+            128, 128, dtype=torch.bfloat16, device=device
+        ).requires_grad_()
+        rhs_ref = torch.randn(
+            2, 128, 256, dtype=torch.bfloat16, device=device
+        ).requires_grad_()
+        grad_output = torch.randn(128, 256, dtype=torch.bfloat16, device=device)
+
+        out_ref = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs_ref,
+            rhs_ref,
+            group_sizes,
+            tile_m=128,
+            tgmm_tiling=(128, 0, 0),
+        )
+        grads_ref = torch.autograd.grad(out_ref, (lhs_ref, rhs_ref), grad_output)
+
+        lhs = lhs_ref.detach().clone().requires_grad_()
+        rhs = rhs_ref.detach().transpose(-2, -1).contiguous().requires_grad_()
+        out = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs,
+            rhs,
+            group_sizes,
+            tile_m=128,
+            tgmm_tiling=(128, 0, 0),
+            transpose_rhs=True,
+        )
+        grads = torch.autograd.grad(out, (lhs, rhs), grad_output)
+
+        out = out.cpu()
+        out_ref = out_ref.cpu()
+        grad_lhs, grad_rhs = (grad.cpu() for grad in grads)
+        grad_lhs_ref, grad_rhs_ref = (grad.cpu() for grad in grads_ref)
+
+        torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+        # The transposed contraction can round BF16 partial sums in a different
+        # order. Keep the tolerance to roughly one BF16 ULP at unit scale.
+        torch.testing.assert_close(
+            grad_lhs, grad_lhs_ref, rtol=8e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            grad_rhs.transpose(-2, -1),
+            grad_rhs_ref,
+            rtol=8e-3,
+            atol=1e-3,
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

@@ -408,9 +408,13 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
       (
           "muse_glimmer_30b_full_logits",
           "tpu_selective",
-          ("attention.inner_attention",),
+          ("attention.inner_attention", "feed_forward.w2"),
       ),
-      ("muse_glimmer_30b_fused_ce", "full", ()),
+      (
+          "muse_glimmer_30b_fused_ce",
+          "tpu_selective",
+          ("attention.inner_attention", "feed_forward.w2"),
+      ),
   )
   def test_30b_graph_trainer_recipes_use_zero3_and_remat_policy(
       self, name, memory_policy, save_regions

@@ -18,9 +18,9 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Model**: upstream `muse_glimmer_30b` settings (sequence 16384, local batch
   1, AdamW lr 3e-4, 200 warmup steps).
 - **Parallelism**: GraphTrainer with SimpleFSDP Zero-3, the `prefetch` FSDP
-  schedule, full rematerialization except each layer's Splash output (see
-  [Memory policy](#memory-policy)), and the optimizer compiled into the
-  graph.
+  schedule, full rematerialization except each layer's Splash output and FFN
+  down-projection (`w2`) output (see [Memory policy](#memory-policy)), and the
+  optimizer compiled into the graph.
 - **Precision**: fp32 weights and optimizer state, bf16 compute.
 - **Kernels**: JAX Pallas Splash attention (1024 tiles) with a local mask for
   the sliding-window layers, and plain cross entropy over the full logits.

@@ -33,6 +33,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
 from torchtitan.experiments.tpu.remat_regions import (
     ATTENTION_INNER_ATTENTION,
+    FEED_FORWARD_W2,
     MOE_ROUTING,
     REMAT_REGION,
 )
@@ -241,11 +242,47 @@ SPLASH_ATTENTION_REGION = SaveRegion(
     select=select_splash_attention,
 )
 
+_FFN_W2_FQN_PATTERN = "layers.*.feed_forward.w2"
+_MATMUL_OPS = (
+    torch.ops.aten.linear.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.addmm.default,
+    torch.ops.aten.bmm.default,
+)
+
+
+def select_ffn_down_projection(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return each layer's FFN down-projection (``w2``) matmul.
+
+    Raises unless every ``layers.*.feed_forward.w2`` module traced exactly one
+    matmul in the forward, so a layout change fails loudly instead of saving
+    the wrong value.
+    """
+    by_fqn: dict[str, list[torch.fx.Node]] = {}
+    for node in _forward_call_nodes(gm):
+        fqn = _get_module_fqn(node)
+        if node.target in _MATMUL_OPS and matches_module_fqn_pattern(
+            _FFN_W2_FQN_PATTERN, fqn
+        ):
+            by_fqn.setdefault(fqn, []).append(node)
+    bad = {fqn: len(nodes) for fqn, nodes in by_fqn.items() if len(nodes) != 1}
+    if bad:
+        raise ValueError(
+            f"FFN w2 modules without exactly one forward matmul: {bad}; update "
+            "select_ffn_down_projection for this model."
+        )
+    chosen = {nodes[0] for nodes in by_fqn.values()}
+    return [node for node in _forward_call_nodes(gm) if node in chosen]
+
+
+FFN_W2_REGION = SaveRegion(name=FEED_FORWARD_W2, select=select_ffn_down_projection)
+
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
         ROUTING_REGION,
         SPLASH_ATTENTION_REGION,
+        FFN_W2_REGION,
     )
 }
 

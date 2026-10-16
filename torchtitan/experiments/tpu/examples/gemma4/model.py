@@ -17,6 +17,7 @@ from torchtitan.models.common.attention import (
     GQAttention,
     QKVLinear,
     ScaledDotProductInnerAttention,
+    segment_ids_from_positions,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
@@ -125,14 +126,16 @@ class QKVLinearKeqV(QKVLinear):
 
 
 class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
-    """``ScaledDotProductInnerAttention`` that honors ``sliding_window_size``.
+    """``ScaledDotProductInnerAttention`` that honors ``sliding_window_size`` and packed documents.
 
     Upstream SDPA only supports plain causal attention. When
     ``sliding_window_size`` is set, each query attends to itself and the
-    ``sliding_window_size`` previous keys, via an explicit band mask. This is
-    the same attribute and convention the TPU splash patches read, and the
-    class name keeps matching their ``"ScaledDotProduct"`` lookup, so
-    enabling a splash kernel still replaces this module.
+    ``sliding_window_size`` previous keys, via an explicit band mask. When
+    ``positions`` or ``segment_ids`` are provided, queries also only attend to
+    keys from the same packed document. This matches the attribute and
+    packed-document convention the TPU splash and tokamax patches use, and the
+    class name keeps matching their ``"ScaledDotProduct"`` lookup, so enabling
+    a splash kernel still replaces this module.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -153,9 +156,18 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
         scale: float | None = None,
         enable_gqa: bool = False,
         is_causal: bool = True,
+        positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        if self.sliding_window_size is None:
+        if segment_ids is None and positions is not None:
+            positions_local = (
+                positions.to_local()
+                if hasattr(positions, "to_local")
+                else positions
+            )
+            segment_ids = segment_ids_from_positions(positions_local)
+        if self.sliding_window_size is None and segment_ids is None:
             return super().forward(
                 q_BLHK,
                 k_BLHK,
@@ -194,16 +206,31 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
             q_BLHK = q_BLHK.reshape(batch_size, seq_len, *q_BLHK.shape[1:])
             k_BLHK = k_BLHK.reshape(batch_size, seq_len, *k_BLHK.shape[1:])
             v_BLHV = v_BLHV.reshape(batch_size, seq_len, *v_BLHV.shape[1:])
-        seq_len = q_BLHK.shape[1]
+        batch_size, seq_len = q_BLHK.shape[:2]
         pos = torch.arange(seq_len, device=q_BLHK.device)
         dist = pos[:, None] - pos[None, :]
-        mask_LL = (dist >= 0) & (dist <= self.sliding_window_size)
+        mask: torch.Tensor = (
+            dist >= 0
+            if is_causal
+            else torch.ones_like(dist, dtype=torch.bool)
+        )
+        if self.sliding_window_size is not None:
+            mask = mask & (dist <= self.sliding_window_size)
+        if segment_ids is not None:
+            seg_local = (
+                segment_ids.to_local()
+                if hasattr(segment_ids, "to_local")
+                else segment_ids
+            )
+            seg_BL = seg_local.reshape(batch_size, seq_len)
+            same_doc_BLL = seg_BL.unsqueeze(2) == seg_BL.unsqueeze(1)
+            mask = (mask.unsqueeze(0) & same_doc_BLL).unsqueeze(1)
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             out_BHLV = F.scaled_dot_product_attention(
                 q_BLHK.transpose(1, 2),
                 k_BLHK.transpose(1, 2),
                 v_BLHV.transpose(1, 2),
-                attn_mask=mask_LL,
+                attn_mask=mask,
                 scale=scale,
                 enable_gqa=enable_gqa,
             )
@@ -224,12 +251,12 @@ class Gemma4Attention(GQAttention):
 
     def __init__(self, config: Config) -> None:
         if (
-            config.is_sliding
-            and config.sliding_window_size is not None
-            and type(config.inner_attention)
+            type(config.inner_attention)
             is ScaledDotProductInnerAttention.Config
         ):
-            # Plain SDPA is causal-only and would silently drop the window.
+            # Plain SDPA is causal-only and would silently drop both the
+            # sliding window and packed-document boundaries (positions /
+            # segment_ids).
             config = dataclasses.replace(
                 config,
                 inner_attention=SlidingWindowScaledDotProductAttention.Config(

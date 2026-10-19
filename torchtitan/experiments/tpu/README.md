@@ -47,7 +47,7 @@ gcloud compute tpus tpu-vm create $TPU_NAME \
 
 ```
 
-Consult the **Quotas** page in the Google Cloud console to identify zones where Cloud TPUs are available and where your project has sufficient quota: [https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas](https://www.google.com/search?q=https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas)
+Consult the **Quotas** page in the Google Cloud console to identify zones where Cloud TPUs are available and where your project has sufficient quota: [https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas](https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas)
 
 **Flags:**
 
@@ -68,11 +68,8 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ### Install TorchTPU
 
-TorchTPU offers a pre-built wheel file, that you can install as:
-
-```
-pip install torch_tpu
-```
+TorchTPU offers a pre-built wheel file. Install it after the dependencies, as shown in
+[Install TorchTitan + TorchTPU and its dependencies](#install-torchtitan--torchtpu-and-its-dependencies).
 
 
 ### Build TorchTPU wheel from source
@@ -110,12 +107,12 @@ python3.12 -m venv venv; source venv/bin/activate
     ```
 
     Note that this command will install the CUDA version of `torch`; to get the
-    CPU-only build, use the `--index-url` parameter from the section on installing
-    nightlies, or install the CPU build separately.
+    CPU-only build, pass `--extra-index-url` as shown below or install the CPU build
+    separately.
 
 ### Install TorchTitan + TorchTPU and its dependencies
 
-Cone the torchtitan repository:
+Clone the torchtitan repository:
 
 ```bash
 git clone https://github.com/google-pytorch/torchtitan
@@ -132,10 +129,16 @@ pip install -r .ci/docker/requirements-flux.txt
 ```
 
 
-Install TorchTPU wheel via:
+Install the pre-built TorchTPU wheel:
 
 ```
-pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
+pip install --pre torch_tpu==0.2.0 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
+```
+
+Or, if you built TorchTPU from source, install that wheel instead:
+
+```
+pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### Run a TorchTitan training job
@@ -218,7 +221,7 @@ Replace the following placeholders:
 4. **Optional: Create a Cloud Storage bucket:**
 
 ```bash
-gcloud storage buckets create ${REPOSITORY} \
+gcloud storage buckets create ${BUCKET_NAME} \
     --project=${PROJECT_ID} \
     --location=US \
     --default-storage-class=STANDARD \
@@ -282,13 +285,13 @@ python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets 
 Upload the tokenizer to the GCS bucket
 
 ```bash
-gcloud storage cp --recursive ./assets/hf gs://${BUCKET_NAME}/assets/hf
-gcloud storage cp --recursive ./tests gs://${BUCKET_NAME}/tests
+gcloud storage cp --recursive ./assets/hf ${BUCKET_NAME}/assets/hf
+gcloud storage cp --recursive ./tests ${BUCKET_NAME}/tests
 ```
 
 #### Build the Docker image
 
-First, copy the `torch_tpu` wheel built in [Build and install TorchTPU wheel from source](#build-and-install-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
+First, copy the `torch_tpu` wheel built in [Build TorchTPU wheel from source](#build-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
 ```bash
 cp ../torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl ./
 ```
@@ -393,8 +396,7 @@ Values are whitespace-separated `flag=value` entries.
 
 #### Usage
 
-Taking [`qwen3_8b_tpu7x`](qwen3/config_registry.py#L534), which declares five flags including
-`xla_tpu_dvfs_p_state=7`:
+Taking [`qwen3_32b`](qwen3/config_registry.py), whose flags include `xla_tpu_dvfs_p_state=7`:
 
 ```bash
 # 1. Add a flag the config does not set. xla_dump_to is an XLA flag, not a
@@ -450,7 +452,7 @@ This also enables the `--debug.print-config` option to print the full configurat
 
 ### Profile workloads using TensorBoard
 
-TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiling.enable-profiling` flag to enable profiling and the `--profiling...` flags for configuration.
+TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiler.enable_profiling` flag to enable profiling and the `--profiler...` flags for configuration.
 
 Profiling data is exported to the directory specified by `--dump_folder` + `profile_trace` for each process. In the example above, this is mapped to an external Cloud Storage bucket via Cloud Storage FUSE and can be loaded directly into TensorBoard.
 
@@ -467,7 +469,7 @@ pip install xprof
 To view the profile captured for your TorchTitan training job, run:
 
 ```bash
-tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b/rank_0
+tensorboard --logdir=${BUCKET_NAME}/torchtitan-llama3-8b/rank_0
 
 ```
 

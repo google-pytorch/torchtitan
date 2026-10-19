@@ -313,6 +313,8 @@ class TPUHFTransformerModel(HFTransformerModel):
       for key, value in vars(hf_config).items():
         if key.startswith("_") and key not in skip and not hasattr(self, key):
           setattr(self, key, value)
+      if getattr(self, "is_heterogeneous", False):
+        self.allow_global_per_layer_attribute_access = True
 
       # A text tower with no causal-LM class: build the bare text model. The
       # AutoModel mapping knows some (Qwen2-VL's Qwen2VLTextModel); the rest

@@ -41,8 +41,12 @@ def _dummy_jaxtyped(*args, **kwargs):
 
 # 3. Swap the dummy in, import tokamax, and swap the real one back
 jaxtyping.jaxtyped = _dummy_jaxtyped
-import tokamax  # pylint: disable=g-import-not-at-top
-jaxtyping.jaxtyped = _real_jaxtyped
+try:
+  import tokamax  # pylint: disable=g-import-not-at-top
+except ImportError:
+  tokamax = None
+finally:
+  jaxtyping.jaxtyped = _real_jaxtyped
 
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
 import torch
@@ -50,7 +54,7 @@ from torch_tpu._internal.pallas import pallas
 
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:
-  return soft_cap is not None or output_multiplier != 1.0
+  return tokamax is None or soft_cap is not None or output_multiplier != 1.0
 
 
 def _my_fwd(

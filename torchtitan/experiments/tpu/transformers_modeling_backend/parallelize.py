@@ -41,6 +41,43 @@ from .model import substitute_tpu_experts
 
 
 
+def _make_contiguous_args(fn):
+  """Materialize non-contiguous tensor inputs (e.g. sliced views) before compile.
+
+  Passing a non-contiguous slice view (such as Gemma 4's
+  ``per_layer_inputs[:, :, i, :]`` of shape ``[B, S, 256]`` backed by a
+  ``[B*S, 35*256]`` storage buffer) into a per-layer ``torch.compile`` region
+  causes ``torch_tpu``'s backward graph lowering to expect the full underlying
+  storage buffer while AOTAutograd passes the cloned contiguous saved tensor,
+  triggering an XLA ``RuntimeProgramInputMismatch``.
+
+  Args:
+    fn: Compiled layer callable to wrap.
+
+  Returns:
+    Wrapped callable that normalizes tensor arguments to contiguous layout.
+  """
+
+  def _wrapped(*args, **kwargs):
+    args = tuple(
+        a.contiguous()
+        if isinstance(a, torch.Tensor) and not a.is_contiguous()
+        else a
+        for a in args
+    )
+    kwargs = {
+        k: (
+            v.contiguous()
+            if isinstance(v, torch.Tensor) and not v.is_contiguous()
+            else v
+        )
+        for k, v in kwargs.items()
+    }
+    return fn(*args, **kwargs)
+
+  return _wrapped
+
+
 def _defer_parametrization_during_init(model: nn.Module) -> None:
   """Let the HF backend tie its weights after SimpleFSDP has wrapped it.
 
@@ -98,6 +135,7 @@ def parallelize_hf_transformers_tpu(
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
   if effective_compile_config.enable:
+    torch._dynamo.config.automatic_dynamic_shapes = False  # pylint: disable=protected-access
     for layer in model.layers.values():
       apply_spmd_safe(layer)
 
@@ -119,6 +157,13 @@ def parallelize_hf_transformers_tpu(
       # call -- Module.parallelize() may run only once per instance.
       skip_dp=parallelism.use_simple_fsdp,
   )
+
+  if effective_compile_config.enable:
+    for layer in model.layers.values():
+      if getattr(layer, "_compiled_call_impl", None) is not None:
+        layer._compiled_call_impl = _make_contiguous_args(  # pylint: disable=protected-access
+            layer._compiled_call_impl  # pylint: disable=protected-access
+        )
 
   if parallelism.use_simple_fsdp:
     # The shard axis is named "fsdp" on some bases and "dp_shard" on others

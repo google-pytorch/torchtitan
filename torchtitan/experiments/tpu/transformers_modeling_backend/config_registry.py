@@ -12,6 +12,11 @@ lane's existing ones.
 """
 
 
+import json
+import os
+import struct
+from typing import Any
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -35,9 +40,28 @@ from torchtitan.experiments.transformers_modeling_backend import (
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
-from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
-from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.components.data import (  # pylint: disable=g-multiple-import
+    ConcatThenSplitPackingConfig,
+    FirstFitPackingConfig,
+    GrainDataLoader,
+    HuggingFaceRandomAccessSource,
+    HuggingFaceStreamingSource,
+    SingleDatasetConfig,
+)
+from torchtitan.experiments.transformers_modeling_backend.state_dict_adapter import (
+    HFTransformerStateDictAdapter,
+)
+from torchtitan.experiments.transformers_modeling_backend.tokenizer import (
+    HFBackendTokenizer,
+)
+from torchtitan.hf_datasets.text_datasets import (  # pylint: disable=g-multiple-import
+    ChatProcessor,
+    DATASETS,
+    TextProcessor,
+)
+from torchtitan.tools.profiler import Profiler
 
 from .job_config import TPUTransformersBackendConfig
 from .model import as_tpu_model_config
@@ -180,6 +204,75 @@ def _c4_test_loader() -> GrainDataLoader.Config:
   )
 
 
+class _SingleFileHFStateDictAdapter(HFTransformerStateDictAdapter):
+  """HF state-dict adapter that consolidates exports into one model.safetensors.
+
+  HuggingFaceStorageReader loads multi-shard or single-shard safetensors
+  without needing ``fqn_to_index_mapping``. Setting ``fqn_to_index_mapping`` to
+  ``None`` ensures ``last_save_in_hf=True`` writes a single consolidated
+  ``model.safetensors`` via ``HuggingFaceStorageWriter`` with consolidation
+  enabled, ready for direct consumption by ``vllm-torchtpu``.
+
+  Also transparently bridges composite multimodal HF checkpoints (such as
+  ``google/gemma-4-E2B`` and ``google/gemma-4-E2B-it``) whose language-tower
+  weights are stored under ``model.language_model.*`` in ``model.safetensors``
+  when ``TPUHFTransformerModel`` extracts ``text_config`` to build
+  ``Gemma4ForCausalLM``.
+  """
+
+  def __init__(self, model_config, hf_assets_path: str | None):
+    super().__init__(model_config, hf_assets_path)
+    self.fqn_to_index_mapping = None
+    self._use_language_model_prefix = self._detect_language_model_prefix(
+        hf_assets_path
+    )
+
+  @staticmethod
+  def _detect_language_model_prefix(hf_assets_path: str | None) -> bool:
+    if not hf_assets_path:
+      return False
+
+    index_file = os.path.join(hf_assets_path, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+      try:
+        with open(index_file, "r", encoding="utf-8") as f:
+          weight_map = json.load(f).get("weight_map", {})
+        return any(k.startswith("model.language_model.") for k in weight_map)
+      except (OSError, ValueError):
+        return False
+    st_file = os.path.join(hf_assets_path, "model.safetensors")
+    if os.path.exists(st_file):
+      try:
+        with open(st_file, "rb") as f:
+          n = struct.unpack("<Q", f.read(8))[0]
+          hdr = json.loads(f.read(n))
+        return any(k.startswith("model.language_model.") for k in hdr)
+      except (OSError, ValueError, struct.error):
+        return False
+    return False
+
+  def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    hf_sd = super().to_hf(state_dict)
+    if self._use_language_model_prefix:
+      remapped = {}
+      for k, v in hf_sd.items():
+        if k.startswith("model.") and not k.startswith("model.language_model."):
+          remapped["model.language_model." + k[len("model.") :]] = v
+        else:
+          remapped[k] = v
+      return remapped
+    return hf_sd
+
+  def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    normalized = {}
+    for k, v in hf_state_dict.items():
+      if k.startswith("model.language_model."):
+        normalized["model." + k[len("model.language_model.") :]] = v
+      else:
+        normalized[k] = v
+    return super().from_hf(normalized)
+
+
 def _tpu_hf_config(
     flavor: str,
     hf_model: str,
@@ -201,6 +294,7 @@ def _tpu_hf_config(
   # return, ...); the shared backend only has the hooks. Re-classing a copy
   # also leaves the shared flavors table untouched.
   model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
+  model_spec.state_dict_adapter = _SingleFileHFStateDictAdapter
   # Sets TpuGroupedExperts.Config.use_pallas_grouped_mm on the swapped MoE
   # experts instead of upstream's torch._grouped_mm (see
   # model._use_pallas_grouped_mm).
@@ -373,3 +467,179 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
     config.loss = CrossEntropyLoss.Config()
   config.compile.enable = False
   return config
+
+
+# ---- Post-Training Workshop Configs (Gemma 4 E2B CPT & SFT) ----------------
+
+
+def _codeparrot_cpt_loader() -> GrainDataLoader.Config:
+  """Continuous pre-training (CPT) loader on codeparrot/codeparrot-clean-valid."""
+  return GrainDataLoader.Config(
+      dataset=ConcatThenSplitPackingConfig(
+          dataset=SingleDatasetConfig(
+              source=HuggingFaceStreamingSource.Config(
+                  path="codeparrot/codeparrot-clean-valid",
+                  split="train",
+              ),
+              processor=TextProcessor.Config(
+                  text_fn=lambda sample: sample["content"],
+              ),
+              post_filters=(lambda sample: sample is not None,),
+          )
+      ),
+  )
+
+
+def _format_alpaca_sample(sample: dict[str, Any]) -> list[dict[str, str]]:
+  """Convert an Alpaca instruction/input/output row into user/assistant turns."""
+  instruction = (sample.get("instruction") or "").strip()
+  inp = (sample.get("input") or "").strip()
+  output = (sample.get("output") or "").strip()
+  user_content = (
+      f"{instruction}\n\n### Input:\n{inp}"
+      if inp and inp.lower() != "not applicable"
+      else instruction
+  )
+  return [
+      {"role": "user", "content": user_content},
+      {"role": "assistant", "content": output},
+  ]
+
+
+def _alpaca_python_sft_loader() -> GrainDataLoader.Config:
+  """Supervised fine-tuning (SFT) loader on iamtarun/python_code_instructions_18k_alpaca."""
+  return GrainDataLoader.Config(
+      dataset=FirstFitPackingConfig(
+          dataset=SingleDatasetConfig(
+              source=HuggingFaceRandomAccessSource.Config(
+                  path="iamtarun/python_code_instructions_18k_alpaca",
+                  split="train",
+              ),
+              processor=ChatProcessor.Config(messages_fn=_format_alpaca_sample),
+              post_filters=(lambda sample: sample is not None,),
+          ),
+      ),
+  )
+
+
+def _gemma4_e2b_cpt_config(*, fused_loss: bool) -> TPUTransformersBackendConfig:
+  """Build Gemma 4 E2B Continuous Pre-Training config on codeparrot."""
+  cfg = _tpu_hf_config(
+      "full",
+      "google/gemma-4-E2B",
+      local_batch_size=2,
+      seq_len=2048,
+      steps=200,
+      compile=True,
+      attn="splash_tpu",
+      fused_loss=fused_loss,
+      attn_mask_type="block_causal",
+      save_attention=True,
+  )
+  cfg.model_spec.state_dict_adapter = _SingleFileHFStateDictAdapter
+  cfg.hf_config_overrides = '{"allow_global_per_layer_attribute_access": true}'
+  cfg.extra_libtpu_init_flags = tpu_flags.parse_flags(
+      "xla_tpu_enable_bitcast_reduce_fusion_graduation=false "
+      "xla_tpu_enable_sublane_major_scaling_bitcast_fusion=false"
+  )
+  cfg.hf_assets_path = "./assets/hf/gemma-4-E2B"
+  cfg.dump_folder = "./outputs/gemma4_e2b_cpt"
+  cfg.optimizer = default_adamw(lr=5e-5, implementation="foreach")
+  cfg.lr_scheduler = LRSchedulersContainer.Config(
+      warmup_steps=20,
+      decay_ratio=0.8,
+      decay_type="cosine",
+      min_lr_factor=0.1,
+  )
+  cfg.dataloader = _codeparrot_cpt_loader()
+  cfg.metrics = MetricsProcessor.Config(
+      log_freq=5,
+      enable_tensorboard=True,
+  )
+  cfg.profiler = Profiler.Config(
+      enable_profiling=False,
+      save_traces_folder="profile_trace",
+      profile_freq=50,
+  )
+  cfg.checkpoint = CheckpointManager.Config(
+      enable=True,
+      initial_load_in_hf=True,
+      initial_load_model_only=True,
+      interval=100,
+      last_save_model_only=True,
+      last_save_in_hf=True,
+      export_dtype="bfloat16",
+  )
+  return cfg
+
+
+def gemma4_e2b_cpt_codeparrot() -> TPUTransformersBackendConfig:
+  """Lab 2: Gemma 4 E2B Continuous Pre-Training (CPT) on codeparrot with splash_tpu + Pallas CE."""
+  return _gemma4_e2b_cpt_config(fused_loss=True)
+
+
+def gemma4_e2b_cpt_codeparrot_plain_ce() -> TPUTransformersBackendConfig:
+  """Lab 2 (portable CE): Gemma 4 E2B CPT on codeparrot with splash_tpu + standard CrossEntropyLoss."""
+  return _gemma4_e2b_cpt_config(fused_loss=False)
+
+
+def _gemma4_e2b_sft_config(*, fused_loss: bool) -> TPUTransformersBackendConfig:
+  """Build Gemma 4 E2B Supervised Fine-Tuning config on Python Alpaca."""
+  cfg = _tpu_hf_config(
+      "sft_full",
+      "google/gemma-4-E2B-it",
+      local_batch_size=2,
+      seq_len=2048,
+      steps=200,
+      compile=True,
+      attn="splash_tpu",
+      fused_loss=fused_loss,
+      attn_mask_type="block_causal",
+      save_attention=True,
+  )
+  cfg.model_spec.state_dict_adapter = _SingleFileHFStateDictAdapter
+  cfg.hf_config_overrides = '{"allow_global_per_layer_attribute_access": true}'
+  cfg.extra_libtpu_init_flags = tpu_flags.parse_flags(
+      "xla_tpu_enable_bitcast_reduce_fusion_graduation=false "
+      "xla_tpu_enable_sublane_major_scaling_bitcast_fusion=false"
+  )
+  cfg.hf_assets_path = "./assets/hf/gemma-4-E2B-it"
+  cfg.dump_folder = "./outputs/gemma4_e2b_sft"
+  cfg.tokenizer = HFBackendTokenizer.Config()
+  cfg.optimizer = default_adamw(lr=2e-5, implementation="foreach")
+  cfg.lr_scheduler = LRSchedulersContainer.Config(
+      warmup_steps=20,
+      decay_ratio=0.8,
+      decay_type="cosine",
+      min_lr_factor=0.1,
+  )
+  cfg.dataloader = _alpaca_python_sft_loader()
+  cfg.metrics = MetricsProcessor.Config(
+      log_freq=5,
+      enable_tensorboard=True,
+  )
+  cfg.profiler = Profiler.Config(
+      enable_profiling=False,
+      save_traces_folder="profile_trace",
+      profile_freq=50,
+  )
+  cfg.checkpoint = CheckpointManager.Config(
+      enable=True,
+      initial_load_in_hf=True,
+      initial_load_model_only=True,
+      interval=100,
+      last_save_model_only=True,
+      last_save_in_hf=True,
+      export_dtype="bfloat16",
+  )
+  return cfg
+
+
+def gemma4_e2b_sft_alpaca() -> TPUTransformersBackendConfig:
+  """Lab 3: Gemma 4 E2B Supervised Fine-Tuning (SFT) on Python Alpaca with splash_tpu + Pallas CE."""
+  return _gemma4_e2b_sft_config(fused_loss=True)
+
+
+def gemma4_e2b_sft_alpaca_plain_ce() -> TPUTransformersBackendConfig:
+  """Lab 3 (portable CE): Gemma 4 E2B SFT on Python Alpaca with splash_tpu + standard CrossEntropyLoss."""
+  return _gemma4_e2b_sft_config(fused_loss=False)

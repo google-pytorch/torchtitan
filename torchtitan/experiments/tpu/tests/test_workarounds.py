@@ -583,6 +583,40 @@ class WorkaroundsTest(parameterized.TestCase):
     ):
       tpu_cp_inner_attention(FlexInnerAttention, "all_gather")
 
+  def test_splash_attention_auto_block_size_and_fallback(self):
+    """auto_block_size picks a dividing block; the fallback forwards CP kwargs."""
+    from torchtitan.experiments.tpu.kernels.splash_attention import (
+        SplashAttention,
+        splash_block_size_for,
+    )
+
+    self.assertEqual(splash_block_size_for(512), 512)
+    self.assertEqual(splash_block_size_for(1024), 512)
+    self.assertEqual(splash_block_size_for(768), 256)
+    self.assertEqual(splash_block_size_for(384), 128)
+    self.assertEqual(splash_block_size_for(64), 0)
+
+    seen = {}
+
+    def fallback(q, k, v, **kwargs):
+      seen.update(kwargs)
+      return q + k + v
+
+    attn = SplashAttention(original_module=fallback, auto_block_size=True)
+    q = torch.ones(256, 2, 4)  # Folded (T, H, D) token stream.
+    cp_rank = torch.tensor([1], dtype=torch.int32)
+    out = attn(q, q, q, cp_rank=cp_rank, load_balanced=True)
+    torch.testing.assert_close(out, q * 3)
+    self.assertIs(seen["cp_rank"], cp_rank)
+    self.assertTrue(seen["load_balanced"])
+    self.assertTrue(seen["is_causal"])
+
+    # The Pallas kernel has no LSE epilogue: out_transform is rejected rather
+    # than silently dropped (meta tensors take the kernel path, not fallback).
+    meta_q = torch.empty(256, 2, 4, device="meta")
+    with self.assertRaisesRegex(NotImplementedError, "out_transform"):
+      attn(meta_q, meta_q, meta_q, out_transform=lambda out, lse: out)
+
   def test_cp_without_cp_recipe_is_rejected(self):
     """As on GPU, cp > 1 on a recipe without a CP transform fails core validation."""
     from torchtitan.experiments.tpu.qwen3 import config_registry

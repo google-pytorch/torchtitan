@@ -779,20 +779,57 @@ def splash_sdpa(
   return result
 
 
+def splash_block_size_for(
+    seq_len: int, max_block_size: int = 512, min_block_size: int = 128
+) -> int:
+  """Largest power-of-two block size <= ``max_block_size`` dividing ``seq_len``.
+
+  The splash kernel needs every block size to divide the sequence length, so a
+  fixed 512 block fails for lengths like 768 that bucketed or packed inputs
+  produce. Returns 0 if no block >= ``min_block_size`` divides ``seq_len``.
+  """
+  block = max_block_size
+  while block >= min_block_size:
+    if seq_len % block == 0:
+      return block
+    block //= 2
+  return 0
+
+
+_SPLASH_BLOCK_KWARGS = (
+    "block_q",
+    "block_kv",
+    "block_dkv",
+    "block_kv_compute",
+    "block_q_dkv",
+    "block_kv_dkv",
+    "block_kv_dkv_compute",
+)
+
+
 class SplashAttention(nn.Module):
-  """Inner attention using custom Splash Attention Pallas kernel."""
+  """Inner attention using custom Splash Attention Pallas kernel.
+
+  Accepts (B, S, H, D) inputs, or a folded (T, H, D) token stream treated as
+  B=1. With ``auto_block_size=True`` the block sizes are picked per call from
+  the sequence length (``splash_block_size_for``), for callers whose sequence
+  lengths vary (e.g. bucketed RL batches); if no block size fits, the call
+  falls back to ``original_module``.
+  """
 
   def __init__(
       self,
       is_causal: bool = True,
       local_window_size: Optional[int] = None,
       original_module: Optional[nn.Module] = None,
+      auto_block_size: bool = False,
       **sa_kwargs,
   ) -> None:
     super().__init__()
     self.is_causal = is_causal
     self.local_window_size = local_window_size
     self.original_module = original_module
+    self.auto_block_size = auto_block_size
     self.sa_kwargs = sa_kwargs
 
   def forward(
@@ -811,13 +848,20 @@ class SplashAttention(nn.Module):
       load_balanced: Optional[bool] = None,
       **kwargs,
   ) -> torch.Tensor:
-    # Fallback to original module if on CPU or sequence length is too small
-    # for the Pallas kernel
-    seq_len = q.shape[1]
+    was_3d = q.dim() == 3
+    seq_len = q.shape[0] if was_3d else q.shape[1]
     causal = is_causal if is_causal is not None else self.is_causal
+    block = splash_block_size_for(seq_len) if self.auto_block_size else None
+    # Fall back to the original module on CPU, for sequences too short for the
+    # Pallas kernel, or when no block size divides the sequence length.
     if (
-        q.device.type == "cpu" or seq_len < 128
+        q.device.type == "cpu" or seq_len < 128 or block == 0
     ) and self.original_module is not None:
+      cp_kwargs = {}
+      if cp_rank is not None:
+        cp_kwargs["cp_rank"] = cp_rank
+      if load_balanced is not None:
+        cp_kwargs["load_balanced"] = load_balanced
       return self.original_module(
           q,
           k,
@@ -828,11 +872,14 @@ class SplashAttention(nn.Module):
           attention_masks=attention_masks,
           positions=positions,
           segment_ids=segment_ids,
+          **cp_kwargs,
           **kwargs,
       )
 
-    # Override is_causal if passed explicitly, else use stored value
-    causal = is_causal if is_causal is not None else self.is_causal
+    if kwargs.get("out_transform") is not None:
+      raise NotImplementedError(
+          "SplashAttention does not support `out_transform`."
+      )
 
     q_is_dt = isinstance(q, DTensor)
     q_mesh = q_placements = None
@@ -849,13 +896,6 @@ class SplashAttention(nn.Module):
     if isinstance(segment_ids, DTensor):
       segment_ids = segment_ids.to_local()
 
-    # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa
-    # Pallas kernel expects (B, H, S, D). We transpose them here to match the
-    # kernel's expected layout.
-    q_trans = q.transpose(1, 2).contiguous()
-    k_trans = k.transpose(1, 2).contiguous()
-    v_trans = v.transpose(1, 2).contiguous()
-
     # `segment_ids` is computed once per step in `Decoder.forward` and threaded
     # down. The fallback is for callers that pass only `positions` --
     # correct, but
@@ -863,7 +903,21 @@ class SplashAttention(nn.Module):
     if segment_ids is None and positions is not None:
       segment_ids = segment_ids_from_positions(positions)
 
+    if was_3d:
+      q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+    if segment_ids is not None and segment_ids.dim() == 1:
+      segment_ids = segment_ids.unsqueeze(0)
+
+    # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa
+    # Pallas kernel expects (B, H, S, D). We transpose them here to match the
+    # kernel's expected layout.
+    q_trans = q.transpose(1, 2).contiguous()
+    k_trans = k.transpose(1, 2).contiguous()
+    v_trans = v.transpose(1, 2).contiguous()
+
     extra_sa_kwargs = dict(self.sa_kwargs)
+    if block:
+      extra_sa_kwargs.update({name: block for name in _SPLASH_BLOCK_KWARGS})
     if cp_rank is not None:
       extra_sa_kwargs["cp_rank"] = cp_rank
     if load_balanced is not None:
@@ -883,6 +937,8 @@ class SplashAttention(nn.Module):
 
     # Transpose back to (B, S, H, D)
     out = out.transpose(1, 2)
+    if was_3d:
+      out = out.squeeze(0)
     if q_is_dt:
       out = DTensor.from_local(out, q_mesh, q_placements)
     return out

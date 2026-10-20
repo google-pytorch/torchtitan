@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -33,6 +34,12 @@ def init_device_mesh(
         and hasattr(torch, "tpu")
         and hasattr(torch.tpu, "topology_aware_mesh")
     ):
+        if "preserve_rank_order" not in inspect.signature(DeviceMesh.__init__).parameters:
+            raise ValueError(
+                "enable_tpu_topo_mesh needs DeviceMesh(preserve_rank_order=...), "
+                f"which torch {torch.__version__} lacks (torch>=2.15 has it). "
+                "Upgrade torch, or pass --parallelism.no-enable_tpu_topo_mesh."
+            )
         rank_mesh = torch.tpu.topology_aware_mesh(mesh_shape)
         # ``preserve_rank_order=True`` makes DeviceMesh honour the
         # topology-aware ordering everywhere: it stops the default process

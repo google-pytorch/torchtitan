@@ -66,35 +66,42 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ```
 
+### Optional: Create and activate a Python 3.14 virtual environment
+
+You can alternatively run everything on your local Python 3.14 environment,
+or use conda instead.
+
+```bash
+sudo apt install python3.14 python3.14-venv  # Install Python 3.14 if it is not already installed.
+mkdir wheel; cd wheel
+python3.14 -m venv venv; source venv/bin/activate
+```
+
 ### Install TorchTPU
 
 TorchTPU offers a pre-built wheel file, that you can install as:
 
 ```
-pip install torch_tpu
+pip install torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
+
+Note that this installs the stable TorchTPU release, which requires stable PyTorch
+(torch <= 2.15), while TorchTitan TPU is generally meant to be run with nightly. To
+use the PyTorch nightly, build the wheel from source as described below.
 
 
 ### Build TorchTPU wheel from source
 
 Alternatively, you can build the TorchTPU wheel from source.
 
-1. First, create and activate a Python 3.12 virtual environment:
-
-```bash
-sudo apt install python3.12  # Install Python 3.12 if it is not already installed.
-mkdir wheel; cd wheel
-python3.12 -m venv venv; source venv/bin/activate
-
-```
-
-2. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu)
+1. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu)
 
     ```
     git clone https://github.com/google-pytorch/torch_tpu.git
+    cd torch_tpu
     ```
 
-3. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
+2. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
 
     Wheels can be built via:
 
@@ -109,48 +116,50 @@ python3.12 -m venv venv; source venv/bin/activate
     bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel --config=no_rbe
     ```
 
-    Note that this command will install the CUDA version of `torch`; to get the
-    CPU-only build, use the `--index-url` parameter from the section on installing
-    nightlies, or install the CPU build separately.
+    Optionally install the PyTorch nightly first. The Docker image and CI use it,
+    and configs that enable `parallelism.enable_tpu_topo_mesh` (for example
+    `qwen3_8b`) need torch >= 2.15. Otherwise the next command installs the latest
+    stable PyTorch:
+
+    ```bash
+    pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cpu
+    ```
+
+    Install wheel via:
+
+    ```bash
+    # The extra-index-url provides the CPU version of torch rather than the default CUDA build.
+    pip install bazel-bin/ci/wheel/*.whl --extra-index-url https://download.pytorch.org/whl/cpu
+    cd ..
+    ```
 
 ### Install TorchTitan + TorchTPU and its dependencies
 
-Cone the torchtitan repository:
+Clone the torchtitan repository:
 
 ```bash
 git clone https://github.com/google-pytorch/torchtitan
 cd torchtitan
 ```
 
-Some dependencies have to be installed before TorchTPU.
+Install the remaining dependencies:
 
 ```bash
-pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
 pip install -r torchtitan/experiments/tpu/requirements.txt -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 pip install -r requirements.txt
 pip install -r .ci/docker/requirements-flux.txt
 ```
 
 
-Install TorchTPU wheel via:
-
-```
-pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
-```
-
 ### Run a TorchTitan training job
 
-Only small models can run on a single host. The following example demonstrates Llama 3.2 1B running on a `v6e-4` VM using FSDP:
+Only small models can run on a single host. The following example demonstrates Qwen3 1.7B running on a `v6e-4` VM using FSDP. It uses the tokenizer bundled in `tests/assets/tokenizer` and the `c4_test` sample dataset, so it needs no downloads and no Hugging Face token:
 
 ```bash
 torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
-    --module=torchtitan.experiments.tpu.llama3 \
-    --config=llama3_1b \
-    --hf_assets_path=assets/hf/Llama-3.2-1B/ \
-    --training.max_context_length=128 \
-    --training.steps=10 \
-    --training.dtype=bfloat16 \
-    --training.mixed_precision_param=bfloat16
+    --module=torchtitan.experiments.tpu.qwen3 \
+    --config=qwen3_1_7b \
+    --training.steps=10
 ```
 
 ---
@@ -272,12 +281,13 @@ cd torchtitan
 This step is optional if you are running a dummy model. For more information, see the [TorchTitan README](https://github.com/pytorch/torchtitan/tree/main?tab=readme-ov-file#downloading-a-tokenizer).
 
 ```bash
-# Obtain your Hugging Face token from https://huggingface.co/settings/tokens
-
-# Download the Llama 3.1 tokenizer
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=...
-
+# Download the Qwen3 1.7B and 8B tokenizers (not gated, no Hugging Face token needed)
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-1.7B --assets tokenizer
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-8B --assets tokenizer
 ```
+
+The tokenizers are saved to `assets/hf/<model>` (for example `assets/hf/Qwen3-8B`), which is the
+directory to pass as `--hf_assets_path`.
 
 Upload the tokenizer to the GCS bucket
 
@@ -288,7 +298,7 @@ gcloud storage cp --recursive ./tests gs://${BUCKET_NAME}/tests
 
 #### Build the Docker image
 
-First, copy the `torch_tpu` wheel built in [Build and install TorchTPU wheel from source](#build-and-install-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
+First, copy the `torch_tpu` wheel built in [Build TorchTPU wheel from source](#build-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
 ```bash
 cp ../torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl ./
 ```
@@ -329,15 +339,25 @@ For more information, see [Submit Job with Persistent Storage](https://github.co
 
 #### Deploy the training workload
 
-The following sample demonstrates Llama 8B training on a `v6e-32` using FSDP:
+The following sample demonstrates Qwen3 8B training on a `v6e-32` using FSDP. It uses the
+`qwen3_8b_zero3` config, which reshards parameters after the forward pass; `qwen3_8b` keeps
+them unsharded and does not fit in v6e HBM.
+
+`gcluster job submit` checks for Docker credential helpers for `gcr.io` and for the cluster's
+region, so configure them once:
 
 ```bash
-export WORKLOAD_NAME=torchtitan-llama3-8b
+gcloud auth configure-docker gcr.io --quiet
+gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+```
+
+```bash
+export WORKLOAD_NAME=torchtitan-qwen3-8b
 
 # if using GCSFUSE, set the following parameters:
-# --dump_folder="/data/assets/hf/Llama-3.1-8B"
-# --dataloader.dataset_path="/data/assets/hf/Llama-3.1-8B"
-# --hf_assets_path="/data/assets/hf/Llama-3.1-8B"
+# --dump_folder="/data/assets/hf/Qwen3-8B"
+# --dataloader.dataset_path="/data/assets/hf/Qwen3-8B"
+# --hf_assets_path="/data/assets/hf/Qwen3-8B"
 # if not using GCSFUSE, remove the --service-account and --mount flags.
 gcluster job submit \
     --name $WORKLOAD_NAME \
@@ -359,15 +379,12 @@ gcluster job submit \
         --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
         --node_rank=$TPU_WORKER_ID \
         -m torchtitan.experiments.tpu.train \
-        --module=torchtitan.experiments.tpu.llama3 \
-        --config=llama3_8b \
-        --training.max_context_length=512 \
+        --module=torchtitan.experiments.tpu.qwen3 \
+        --config=qwen3_8b_zero3 \
         --dataloader.dataset=c4_test \
-        --training.mixed_precision_param=bfloat16 \
         --training.steps=10 \
-        --hf_assets_path=assets/hf/Llama-3.1-8B/ \
+        --hf_assets_path=assets/hf/Qwen3-8B/ \
         --dataloader.dataset_path=tests/assets/c4_test \
-        --metrics.log_freq=5 \
         --metrics.enable_tensorboard \
         --profiler.profile_freq=5 \
         --profiler.profiler_warmup=3 \
@@ -467,7 +484,7 @@ pip install xprof
 To view the profile captured for your TorchTitan training job, run:
 
 ```bash
-tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b/rank_0
+tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-qwen3-8b/rank_0
 
 ```
 
@@ -477,7 +494,7 @@ To avoid incurring unnecessary charges, delete your resources when you are finis
 
 ```bash
 # Cancel the workload.
-gcluster job cancel torchtitan-llama3-8b \
+gcluster job cancel torchtitan-qwen3-8b \
     --cluster ${CLUSTER_NAME} \
     --location ${REGION} \
     --project ${PROJECT_ID}

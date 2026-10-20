@@ -86,6 +86,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
@@ -718,6 +719,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for _, dispatcher, _, _ in dispatchers
         )
     )
+    routed = list(config.model_spec.model.traverse(TpuRoutedExperts.Config))
+    self.assertTrue(routed)
+    self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
 
   def test_fsdp_only_recipe_selects_attention_gradients_for_allreduce(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
@@ -821,16 +825,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.override.imports,
     )
     assert config.model_spec is not None
-    dispatchers = list(
-        config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-    )
-    self.assertTrue(dispatchers)
-    self.assertTrue(
-        all(
-            dispatcher.fuse_route_score_backward
-            for _, dispatcher, _, _ in dispatchers
-        )
-    )
+    routed = list(config.model_spec.model.traverse(TpuRoutedExperts.Config))
+    self.assertTrue(routed)
+    self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
 
     graph_config = to_tpu_graph_trainer_config(
         config,

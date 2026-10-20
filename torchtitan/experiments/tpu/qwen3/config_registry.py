@@ -944,7 +944,13 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
 def _qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
   """Add the common Q235 activation-offload execution policy."""
   cfg = _qwen3_moe_235b_fsdp_only()
-  cfg.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+  # Offload the layer boundaries, and keep the Splash output and LSE of the
+  # last 36 layers in HBM so backward skips their forward recompute (~16 ms
+  # each). Split-boundary donation is what frees the HBM for these saves.
+  cfg.tpu_config.graph_trainer_memory_policy = "tpu_selective_and_offload"
+  cfg.tpu_config.graph_trainer_save_last_n_layers = {
+      "attention.inner_attention": 36
+  }
   cfg.tpu_config.graph_split.forward_layers_per_executable = 1
   # Current ``by_layer`` is the direct successor of the ``sequential`` mode
   # used by the measured schedule: one complete backward layer per
@@ -962,9 +968,16 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
   return cfg
 
 
+def _without_splash_saves(cfg: TPUTrainerConfig) -> None:
+  """Fall back to plain offload; the Splash saves were measured only at w512."""
+  cfg.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+  cfg.tpu_config.graph_trainer_save_last_n_layers = {}
+
+
 def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   """MaxText-numerics variant of the Q235 activation-offload recipe."""
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
+  _without_splash_saves(cfg)
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
@@ -1007,6 +1020,7 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
   vocabulary evenly. Keep local batch 16 and use one microbatch per step.
   """
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
+  _without_splash_saves(cfg)
   _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   # This topology's large FSDP reductions benefit from libtpu's hierarchical
   # n-D lowering. Keep the unvalidated HSDP and MaxText-numerics variants on

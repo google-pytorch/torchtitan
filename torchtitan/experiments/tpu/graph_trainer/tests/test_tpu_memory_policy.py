@@ -9,6 +9,7 @@
 import operator
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -18,6 +19,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import CheckpointPolicy
 
+from torchtitan.experiments.graph_trainer import cpu_offload
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
     _is_backward_node,
@@ -638,6 +640,36 @@ class TestTpuSelectivePolicy(unittest.TestCase):
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual([_get_layer_id(node) for node in splash], [2])
+
+    def test_selective_and_offload_keeps_saves_in_hbm(self) -> None:
+        torch.manual_seed(0)
+        traced, _ = _trace_toy(_MoEToy(_splash_cores()))
+        remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
+        config = _selective_config((), {"attention.inner_attention": 1})
+        config.compile = SimpleNamespace(cpu_offload_budget_gb=100.0)
+
+        # The toy's tensors are below the offload size floor.
+        with mock.patch.object(cpu_offload, "_MIN_OFFLOAD_BYTES", 0):
+            MEMORY_POLICY_REGISTRY["tpu_selective_and_offload"](
+                traced.gm, config=config
+            )
+
+        nodes = list(traced.gm.graph.nodes)
+        saved_splash = [
+            node
+            for node in nodes
+            if _is_splash_node(node)
+            and node.meta.get("recompute") is CheckpointPolicy.MUST_SAVE
+        ]
+        self.assertEqual([_get_layer_id(node) for node in saved_splash], [2])
+        offloaded = {
+            node
+            for node in nodes
+            if node.meta.get("recompute") is CheckpointPolicy.MUST_CPU_OFFLOAD
+        }
+        self.assertTrue(offloaded)
+        splash_values = {*saved_splash, *(u for n in saved_splash for u in n.users)}
+        self.assertFalse(splash_values & offloaded)
 
     def test_saved_routing_skips_the_router_topk_recompute(self) -> None:
         # Backward needs each router's expert ids to scatter the gate-score

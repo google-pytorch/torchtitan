@@ -85,6 +85,8 @@ def test_pp_forward_backward_step_returns_sentinel_without_last_stage():
             ),
             ntokens_seen=0,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
             _pp_loss_sentinel_on_non_last_stage=sentinel,
         ),
     )
@@ -141,6 +143,8 @@ def test_pp_forward_backward_step_releases_consumed_loss_graphs() -> None:
             ),
             ntokens_seen=0,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
         ),
     )
     _bind_pp_forward_backward_body(trainer)
@@ -387,6 +391,8 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
             gradient_accumulation_steps=3,
             num_pp_microbatches=1,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
             forward_backward_step=forward_backward_step,
             sdc_replayer=None,
             model_parts=[],
@@ -449,6 +455,8 @@ def test_train_step_replay_checks_only_first_forward_backward():
             gradient_accumulation_steps=2,
             num_pp_microbatches=1,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
             forward_backward_step=forward_backward_step,
             sdc_replayer=replayer,
             model_parts=[],
@@ -500,6 +508,8 @@ def test_replay_failure_happens_before_optimizer():
             gradient_accumulation_steps=1,
             num_pp_microbatches=1,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
             forward_backward_step=MagicMock(),
             sdc_replayer=SimpleNamespace(run_fwd_bwd=MagicMock(side_effect=mismatch)),
             model_parts=[],
@@ -608,6 +618,8 @@ def _run_train_step_recording_all_reduce(
             gradient_accumulation_steps=gradient_accumulation_steps,
             num_pp_microbatches=1,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
             forward_backward_step=MagicMock(return_value=torch.tensor(1.0)),
             sdc_replayer=None,
             model_parts=[part],

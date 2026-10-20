@@ -97,6 +97,19 @@ def _tracing() -> bool:
   )
 
 
+def _wait(x: torch.Tensor) -> torch.Tensor:
+  """Waits on a functional collective's result exactly once.
+
+  While tracing, funcol already applies ``wait_tensor`` to its result, and
+  TorchTPU's split compiler requires every ``wait_tensor`` to consume a
+  collective, so a second wait fails to compile. In eager mode funcol returns
+  an ``AsyncCollectiveTensor`` that still needs its one wait.
+  """
+  if isinstance(x, funcol.AsyncCollectiveTensor):
+    return x.wait()
+  return x
+
+
 def _all_to_all(
     x: torch.Tensor, group: Any, *, src_dim: int, dst_dim: int
 ) -> torch.Tensor:
@@ -112,7 +125,7 @@ def _all_to_all(
   # [.., D, ..] -> [n, .., D / n, ..]: chunk i goes to rank i.
   chunked = shape[:dst_dim] + [n, shape[dst_dim] // n] + shape[dst_dim + 1 :]
   x = x.reshape(chunked).movedim(dst_dim, 0).contiguous()
-  x = funcol.wait_tensor(funcol.all_to_all_single(x, None, None, group))
+  x = _wait(funcol.all_to_all_single(x, None, None, group))
   # [n, ..] -> concatenate the received chunks along src_dim.
   out_shape = list(shape)
   out_shape[dst_dim] //= n
@@ -135,14 +148,12 @@ class _AllGatherKV(torch.autograd.Function):
     ctx.seq_dim = seq_dim
     ctx.reduce_dtype = reduce_dtype
     ctx.orig_dtype = x.dtype
-    return funcol.wait_tensor(funcol.all_gather_tensor(x, seq_dim, group))
+    return _wait(funcol.all_gather_tensor(x, seq_dim, group))
 
   @staticmethod
   def backward(ctx, grad_out: torch.Tensor):
     g = grad_out.to(ctx.reduce_dtype)
-    g = funcol.wait_tensor(
-        funcol.reduce_scatter_tensor(g, "sum", ctx.seq_dim, ctx.group)
-    )
+    g = _wait(funcol.reduce_scatter_tensor(g, "sum", ctx.seq_dim, ctx.group))
     return g.to(ctx.orig_dtype), None, None, None
 
 
@@ -229,9 +240,7 @@ def _full_sequence_segment_ids(
 ) -> torch.Tensor:
   """Packed-document ``segment_ids`` of the whole (unsharded) sequence."""
   if _tracing():
-    positions = funcol.wait_tensor(
-        funcol.all_gather_tensor(positions, _TOKEN_DIM, group)
-    )
+    positions = _wait(funcol.all_gather_tensor(positions, _TOKEN_DIM, group))
   else:
     positions = spmd.redistribute(
         positions, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
@@ -522,9 +531,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
     """All-gather sharded ``positions`` and return contiguous ``(B, S)`` ``segment_ids``."""
     cp = group.size()
     if _tracing():
-      pos_ag = funcol.wait_tensor(
-          funcol.all_gather_tensor(positions, _TOKEN_DIM, group)
-      )
+      pos_ag = _wait(funcol.all_gather_tensor(positions, _TOKEN_DIM, group))
     else:
       pos_ag = spmd.redistribute(
           positions, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
@@ -611,9 +618,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
         seg = kwargs["segment_ids"]
         if seg.numel() == bsz * q_seq_len:
           seg_ag = (
-              funcol.wait_tensor(
-                  funcol.all_gather_tensor(seg, _TOKEN_DIM, group)
-              )
+              _wait(funcol.all_gather_tensor(seg, _TOKEN_DIM, group))
               if _tracing()
               else spmd.redistribute(
                   seg, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R

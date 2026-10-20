@@ -627,6 +627,23 @@ class WorkaroundsTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "CPInnerAttention"):
       config.__post_init__()
 
+  def test_cp_collectives_wait_exactly_once(self):
+    """Traced funcol results are already waited; a second wait_tensor breaks TorchTPU's split compiler."""
+    from unittest import mock
+    import torch.distributed._functional_collectives as funcol
+    from torchtitan.experiments.tpu import cp_attention
+
+    x = torch.ones(4, 2)
+    with mock.patch.object(
+        funcol, "wait_tensor", side_effect=AssertionError("double wait")
+    ):
+      self.assertIs(cp_attention._wait(x), x)
+
+    act = mock.create_autospec(funcol.AsyncCollectiveTensor, instance=True)
+    act.wait.return_value = x
+    self.assertIs(cp_attention._wait(act), x)
+    act.wait.assert_called_once_with()
+
   def test_ulysses_cp_repeats_kv_heads_and_compiled_all_to_all(self):
     """UlyssesCPScaledDotProductInnerAttention repeats KV heads when cp > n_kv_heads."""
     from types import SimpleNamespace

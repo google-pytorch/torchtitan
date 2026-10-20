@@ -705,8 +705,8 @@ def splash_sdpa(
     use_vmap_bwd: Whether to vectorize backward over the batch. When false,
       backward uses a memory-safe sequential scan. When true, batch-native
       masking also permits XLA to lower backward as a batched custom call.
-    use_document_aware_block_skipping: Select document-aware block skipping
-      when true or batch-native masking when false. Both modes retain exact
+    use_document_aware_block_skipping: Select document-aware block skipping when
+      true or batch-native masking when false. Both modes retain exact
       segment-ID masking. This option is independent of ``use_vmap_bwd``:
       batch-native masking still benefits the always-vmapped forward when
       backward uses scan; enabling both makes backward batch-native as well.

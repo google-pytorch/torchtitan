@@ -6,7 +6,7 @@ on:
       torch_tpu_ref:
         description: 'Branch, tag, or commit SHA of torch_tpu to checkout'
         required: false
-        default: 'main'
+        default: 'v0.2.0'
       push_image:
         description: 'Push the image to GAR'
         required: false
@@ -50,7 +50,7 @@ jobs:
           repository: google-pytorch/torch_tpu
           path: torch_tpu
           token: ${{ secrets.TORCH_TPU_PAT }}
-          ref: ${{ github.event.inputs.torch_tpu_ref || 'main' }}
+          ref: ${{ github.event.inputs.torch_tpu_ref || 'v0.2.0' }}
           persist-credentials: false
 
       - name: Get torch_tpu commit SHA
@@ -64,12 +64,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Download PyTorch Nightly CPU Wheel
+      - name: Download PyTorch 2.15.0 CPU Wheel
         run: |
           mkdir -p torch_tpu/dist
           pip install --upgrade pip
-          pip download --no-deps --pre torch \
-            --index-url https://download.pytorch.org/whl/nightly/cpu \
+          pip download --no-deps --pre "torch==2.15.0" \
+            --index-url https://download.pytorch.org/whl/test/cpu \
             --only-binary=:all: \
             --python-version "${PYTHON_VERSION}" \
             --implementation cp \
@@ -208,7 +208,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
         env:
           NEEDS_BUILD_WHEEL_OUTPUTS_TORCH_TPU_SHA: ${{ needs.build-wheel.outputs.torch_tpu_sha }}
-          INPUT_TORCH_TPU_REF: ${{ github.event.inputs.torch_tpu_ref || 'main' }}
+          INPUT_TORCH_TPU_REF: ${{ github.event.inputs.torch_tpu_ref || 'v0.2.0' }}
 
       - name: Download HuggingFace Tokenizers
         env:
@@ -230,6 +230,9 @@ jobs:
           build-args: |
             CACHE_BUSTER=${{ steps.meta.outputs.NIGHTLY_DATE }}
             PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            TORCH_VERSION=2.15.0
+            TORCH_INDEX_URL=https://download.pytorch.org/whl/test/cpu
+            TORCH_TPU_VERSION=0.2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

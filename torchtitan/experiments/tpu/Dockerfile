@@ -11,8 +11,8 @@ ARG CACHE_BUSTER=1
 # To build against a pinned release instead (e.g. torch 2.15.0 for torch_tpu 0.2.0),
 # set TORCH_VERSION and point TORCH_INDEX_URL at the matching CPU index.
 ARG CACHE_BUSTER
-ARG TORCH_VERSION=""
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cpu
+ARG TORCH_VERSION=2.15.0
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/test/cpu
 RUN pip install --pre "torch${TORCH_VERSION:+==${TORCH_VERSION}}" --index-url "${TORCH_INDEX_URL}"
 
 # Install TPU requirements
@@ -22,7 +22,7 @@ RUN pip install -r ./requirements-tpu.txt -f https://storage.googleapis.com/jax-
 # Install torch_tpu: the release from PyPI if TORCH_TPU_VERSION is set (e.g. 0.2.0,
 # with the matching TORCH_VERSION above), otherwise the torch_tpu-*.whl in the build
 # context. requirements.txt is listed so the COPY succeeds when there is no wheel.
-ARG TORCH_TPU_VERSION=""
+ARG TORCH_TPU_VERSION=0.2.0
 COPY requirements.txt torch_tpu-*.whl* ./
 RUN if [ -n "${TORCH_TPU_VERSION}" ]; then \
       pip install "torch_tpu==${TORCH_TPU_VERSION}" --extra-index-url "${TORCH_INDEX_URL}"; \

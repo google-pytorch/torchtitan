@@ -61,16 +61,6 @@ gcluster job submit \
     --training.mixed_precision_reduce=float32 \
     --parallelism.use_simple_fsdp \
     --parallelism.enable_tpu_topo_mesh \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --splash_attention_kernel.sa_block_q=1024 \
-    --splash_attention_kernel.sa_block_kv=1024 \
-    --splash_attention_kernel.sa_block_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dq=1024 \
-    --splash_attention_kernel.sa_block_kv_dq=1024 \
     --tpu_config.use_graph_trainer \
     --tpu_config.compile_mode=aot_fx_trace \
     --tpu_config.compile_optimizer \
@@ -81,13 +71,13 @@ gcluster job submit \
 ## Expected Metrics
 
 With this configuration, you should observe the following metrics around step
-30 (as of 9/28/2026):
+30 (as of 10/21/2026):
 
-- **TPS (Tokens per second)**: ~11,850
-- **TFLOPS**: ~559.58
-- **MFU**: ~48.51%
-- **Step Time (time_end_to_end)**: ~1.037s
-- **Physical peak HBM**: 79.26GiB (82.56%)
+- **TPS (Tokens per second)**: ~12,050
+- **TFLOPS**: ~591
+- **MFU**: ~51.25%
+- **Step Time (time_end_to_end)**: ~1.02s
+- **Physical peak HBM**: 83.33GiB (86.81%)
 
 ## Alternative configurations
 

@@ -1199,6 +1199,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         {
             name: config.libtpu_init_flags[name]
+            for name in tpu_flags.SPARSECORE_ASYNC_ALL_GATHER
+        },
+        tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
             for name in tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER
         },
         tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
@@ -1209,6 +1216,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for name in tpu_flags.CONVOLUTION_UNFUSING
         },
         tpu_flags.CONVOLUTION_UNFUSING,
+    )
+    self.assertEqual(
+        config.libtpu_init_flags["xla_tpu_copy_insertion_use_region_analysis"],
+        "true",
+    )
+    self.assertEqual(
+        config.libtpu_init_flags[
+            "xla_tpu_copy_insertion_use_region_analysis_limit"
+        ],
+        "1000",
     )
 
   @parameterized.parameters(

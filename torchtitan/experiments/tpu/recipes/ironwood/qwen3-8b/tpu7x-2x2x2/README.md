@@ -20,7 +20,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
   SparseCore collective offloading for FSDP, requested through the config's
   `--libtpu-init-flags` and exported before PJRT initialization.
 - **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--compile.optimizer_compile=in_graph`.
-- **Splash Attention**: Splash Attention block sizes are manually tuned to 1024 across the board for optimal tile sizing.
+- **Splash Attention**: Q/K/V layouts and backward tiles are configured in the `qwen3_8b` model config.
 - **Batch shape**: 6 sequences of 2048 tokens per data-parallel rank. Batch size
   is expressed in tokens, so the command passes
   `--training.num_tokens_per_microbatch_per_dp_rank=12288` (6 sequences * 2048
@@ -59,26 +59,16 @@ gcluster job submit \
     --training.mixed_precision_reduce=float32 \
     --parallelism.use_simple_fsdp \
     --parallelism.enable_tpu_topo_mesh \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --splash_attention_kernel.sa_block_q=1024 \
-    --splash_attention_kernel.sa_block_kv=1024 \
-    --splash_attention_kernel.sa_block_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dq=1024 \
-    --splash_attention_kernel.sa_block_kv_dq=1024 \
     --compile.optimizer_compile=in_graph \
     --libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=65472 xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_latency_hiding_layer_scheduler=true xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false'"
 ```
 
 ## Expected Metrics
 
-With this configuration, you should observe the following metrics around step 30 (as of 9/28/2026):
+With this configuration, you should observe the following metrics around step 30 (as of 10/21/2026):
 
-- **TPS (Tokens per second)**: ~11,650
-- **TFLOPS**: ~550.12
-- **MFU**: ~47.69%
-- **Step Time (time_end_to_end)**: ~1.05s
-- **Memory**: 80.48GiB (83.83%)
+- **TPS (Tokens per second)**: ~12,550
+- **TFLOPS**: ~616
+- **MFU**: ~53.45%
+- **Step Time (time_end_to_end)**: ~0.98s
+- **Memory**: 79.61GiB (82.92%)

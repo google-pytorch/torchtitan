@@ -165,6 +165,14 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     # stays a contiguous copy, and it picks the same axis the unrolled path
     # would. Preferring the *widest* divisible axis instead would send w2_EFD to
     # dim 3 while w1_EDF goes to dim 2, which no other lane does.
+    # For 3-D stacks (2-D per-layer weights `[n_layers, rows, cols]`), prefer an
+    # axis whose per-rank shard is a multiple of 8 (the TPU MXU row tile) so
+    # `scan_fsdp` does not need `_fold_rows` reshapes around collectives, unless
+    # `dim 1` has one entry per rank (`num_experts == degree` on a router).
+    if param.ndim == 3 and param.shape[1] != degree:
+        for d in range(1, param.ndim):
+            if param.shape[d] % (degree * 8) == 0:
+                return d
     for d in range(1, param.ndim):
         if param.shape[d] % degree == 0:
             return d
@@ -283,7 +291,7 @@ class LayerStackHolder(Module):
         is a bug, not a default.
         """
         return {
-            name: _shard_dim(param, degree)
+            name: 1 if name in self.layer_shapes else _shard_dim(param, degree)
             for name, param in self._parameters.items()
             if param is not None
         }

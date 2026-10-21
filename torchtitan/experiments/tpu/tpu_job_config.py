@@ -6,6 +6,7 @@ from typing import Literal
 import torchtitan.config
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolicy
 from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
 
 
@@ -282,10 +283,6 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     ):
       # CP recipes apply core ContextParallelTransform with a TPU CP inner
       # attention; core validates the CP backend, this adds the TPU rules.
-      # Imported here because this base config is shared with the jax and
-      # torchax lanes, which must not pull in the torch_tpu/spmd_types CP stack.
-      from torchtitan.experiments.tpu.cp_attention import validate_tpu_context_parallel  # pylint: disable=g-import-not-at-top
-
       validate_tpu_context_parallel(self.model_spec.model, self.parallelism)
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed

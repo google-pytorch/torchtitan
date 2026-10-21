@@ -12,10 +12,9 @@ from torchtitan.experiments.tpu import base_distributed_device_test
 import torchtitan.experiments.tpu.train
 
 
-
-
 class TrainDistributedTest(
-    base_distributed_device_test.BaseDistributedDeviceTest):
+    base_distributed_device_test.BaseDistributedDeviceTest
+):
   """Tests the distributed training setup."""
 
   @parameterized.named_parameters([
@@ -440,6 +439,31 @@ class TrainDistributedTest(
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
+      ),
+      # qwen3_5 (hybrid GatedDeltaNet + Attention, Dense and MoE).
+      dict(
+          testcase_name="qwen3_5_fsdp",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.no-use_simple_fsdp"],
+      ),
+      dict(
+          testcase_name="qwen3_5_simplefsdp",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_simplefsdp",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
       ),
   ])
   def test_train_distributed(

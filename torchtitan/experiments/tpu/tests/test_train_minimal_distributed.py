@@ -151,6 +151,25 @@ class TrainMinimalDistributedTest(
           param_atol=5e-3,
           param_rtol=1e-3,
       ),
+      # qwen3_5
+      dict(
+          testcase_name="qwen3_5_simplefsdp",
+          module="qwen3_5",
+          config="qwen35_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+          skip_devices=[
+              # Parity is checked on TPU; this case was not validated on CPU.
+              device_type.AcceleratorDeviceType.CPU,
+          ],
+          loss_atol=5e-3,
+          loss_rtol=5e-3,
+          grad_atol=1e-2,
+          grad_rtol=5e-3,
+          param_atol=1e-2,
+          param_rtol=5e-3,
+      ),
   ])
   def test_train_minimal_distributed_parity(
       self,

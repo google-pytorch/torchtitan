@@ -30,23 +30,24 @@ def _is_functional_collective(op) -> bool:
 class _SaveOpsKeepingCollectiveWaits(set):
   """The default save set, plus the ``wait_tensor`` of each saved collective.
 
-  Core ``SelectiveAC`` saves the outputs of some functional collectives
-  (``all_to_all_single``, ``reduce_scatter_tensor``) so backward does not
-  communicate again, but recomputes their ``wait_tensor``. The backward graph
-  then has a ``wait_tensor`` whose input is a saved activation (a graph
-  placeholder). torch-tpu's split compiler keeps every ``wait_tensor`` in the
-  same partition as the collective that produced it and rejects that graph
-  ("Expected call_function for wait_tensor producer, got placeholder"), which
-  breaks compiled Ulysses CP under selective AC.
+  Works around a torch-tpu 0.2.0 compiler gap. Core ``SelectiveAC`` saves the
+  outputs of ``all_to_all_single`` / ``reduce_scatter_tensor`` but recomputes
+  their ``wait_tensor``, so backward re-runs ``wait_tensor`` on the saved
+  tensor. On GPU that is a no-op that returns the same, already-filled tensor:
+  ``wait_tensor`` only waits on work still pending at runtime, and the
+  forward's wait already finished it. torch-tpu's split compiler instead pairs
+  each ``wait_tensor`` with its collective at compile time and rejects one
+  whose input is a graph input ("Expected call_function for wait_tensor
+  producer, got placeholder"), e.g. in compiled Ulysses CP under selective AC.
 
-  While tracing, funcol waits on a collective right after issuing it, so the
-  ``wait_tensor`` that immediately follows a saved collective is saved too. It
-  costs no memory: the waited tensor is the collective's output, which is saved
-  anyway. Waits of recomputed collectives (e.g. FSDP parameter all-gathers) are
-  still recomputed.
+  Also saving the ``wait_tensor`` right after a saved collective (funcol waits
+  right after issuing while tracing) leaves backward without such a wait. No
+  extra memory: ``wait_tensor`` returns its input, the buffer saved anyway.
+  Waits of recomputed collectives (e.g. FSDP all-gathers) stay recomputed.
+  TODO: drop once torch-tpu treats such a wait as a no-op.
 
-  ``SelectiveAC``'s policy asks ``func in save_ops`` once per op, in program
-  order, which the state below relies on.
+  Relies on ``SelectiveAC``'s policy asking ``func in save_ops`` once per op,
+  in program order.
   """
 
   def __init__(self, ops=()):

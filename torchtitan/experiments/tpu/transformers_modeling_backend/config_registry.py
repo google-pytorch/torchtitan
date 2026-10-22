@@ -12,6 +12,11 @@ lane's existing ones.
 """
 
 
+import json
+import os
+import struct
+from typing import Any
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -35,6 +40,9 @@ from torchtitan.experiments.transformers_modeling_backend import (
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
+from torchtitan.experiments.transformers_modeling_backend.state_dict_adapter import (
+    HFTransformerStateDictAdapter,
+)
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.hf_datasets.text_datasets import DATASETS
@@ -180,6 +188,75 @@ def _c4_test_loader() -> GrainDataLoader.Config:
   )
 
 
+class _SingleFileHFStateDictAdapter(HFTransformerStateDictAdapter):
+  """HF state-dict adapter that consolidates exports into one model.safetensors.
+
+  HuggingFaceStorageReader loads multi-shard or single-shard safetensors
+  without needing ``fqn_to_index_mapping``. Setting ``fqn_to_index_mapping`` to
+  ``None`` ensures ``last_save_in_hf=True`` writes a single consolidated
+  ``model.safetensors`` via ``HuggingFaceStorageWriter`` with consolidation
+  enabled, ready for direct consumption by ``vllm-torchtpu``.
+
+  Also transparently bridges composite multimodal HF checkpoints (such as
+  ``google/gemma-4-E2B`` and ``google/gemma-4-E2B-it``) whose language-tower
+  weights are stored under ``model.language_model.*`` in ``model.safetensors``
+  when ``TPUHFTransformerModel`` extracts ``text_config`` to build
+  ``Gemma4ForCausalLM``.
+  """
+
+  def __init__(self, model_config, hf_assets_path: str | None):
+    super().__init__(model_config, hf_assets_path)
+    self.fqn_to_index_mapping = None
+    self._use_language_model_prefix = self._detect_language_model_prefix(
+        hf_assets_path
+    )
+
+  @staticmethod
+  def _detect_language_model_prefix(hf_assets_path: str | None) -> bool:
+    if not hf_assets_path:
+      return False
+
+    index_file = os.path.join(hf_assets_path, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+      try:
+        with open(index_file, "r", encoding="utf-8") as f:
+          weight_map = json.load(f).get("weight_map", {})
+        return any(k.startswith("model.language_model.") for k in weight_map)
+      except (OSError, ValueError):
+        return False
+    st_file = os.path.join(hf_assets_path, "model.safetensors")
+    if os.path.exists(st_file):
+      try:
+        with open(st_file, "rb") as f:
+          n = struct.unpack("<Q", f.read(8))[0]
+          hdr = json.loads(f.read(n))
+        return any(k.startswith("model.language_model.") for k in hdr)
+      except (OSError, ValueError, struct.error):
+        return False
+    return False
+
+  def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    hf_sd = super().to_hf(state_dict)
+    if self._use_language_model_prefix:
+      remapped = {}
+      for k, v in hf_sd.items():
+        if k.startswith("model.") and not k.startswith("model.language_model."):
+          remapped["model.language_model." + k[len("model.") :]] = v
+        else:
+          remapped[k] = v
+      return remapped
+    return hf_sd
+
+  def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    normalized = {}
+    for k, v in hf_state_dict.items():
+      if k.startswith("model.language_model."):
+        normalized["model." + k[len("model.language_model.") :]] = v
+      else:
+        normalized[k] = v
+    return super().from_hf(normalized)
+
+
 def _tpu_hf_config(
     flavor: str,
     hf_model: str,
@@ -201,6 +278,7 @@ def _tpu_hf_config(
   # return, ...); the shared backend only has the hooks. Re-classing a copy
   # also leaves the shared flavors table untouched.
   model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
+  model_spec.state_dict_adapter = _SingleFileHFStateDictAdapter
   # Sets TpuGroupedExperts.Config.use_pallas_grouped_mm on the swapped MoE
   # experts instead of upstream's torch._grouped_mm (see
   # model._use_pallas_grouped_mm).

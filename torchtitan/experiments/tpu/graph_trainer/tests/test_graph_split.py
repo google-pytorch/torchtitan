@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.passes.split_module import split_module
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import CheckpointPolicy
 
@@ -543,6 +545,40 @@ class GraphSplitTest(absltest.TestCase):
       self.assertFalse(
           [node.name for node in returned if _is_view(node)], child.code
       )
+
+  def test_child_boundaries_order_inputs_by_last_read_and_outputs_by_depth(
+      self,
+  ):
+    # Shaped like a backward layer: saved (add_1) is read first and last, dy
+    # (add) once in between, dx is computed last, and reload (neg, standing in
+    # for a host-to-device copy) depends only on an input.
+    def fn(x, y, host):
+      dy, saved = x + 1, y + 1
+      scale = saved * 3
+      early = dy * 2
+      dx = saved.sin() * early * scale
+      reload = host.neg()
+      return dx.cos() + reload.exp()
+
+    gm = make_fx(fn)(*(torch.empty(2, 3, device="meta") for _ in range(3)))
+    partition = {"add": 0, "add_1": 0, "cos": 2, "exp": 2, "add_2": 2}
+    gm = split_module(gm, None, lambda node: partition.get(node.name, 1))
+
+    graph_split_lib._order_child_boundaries(gm)
+
+    # XLA pairs donated inputs and equal-size outputs in order, so the input
+    # freed first (dy) must line up with the output written first (reload).
+    child = gm.submod_1
+    self.assertEqual(
+        [node.name for node in child.graph.find_nodes(op="placeholder")],
+        ["add", "add_1", "host_1"],
+    )
+    self.assertEqual(
+        [node.target for node in child.graph.output_node().args[0]],
+        [torch.ops.aten.neg.default, torch.ops.aten.mul.Tensor],
+    )
+    inputs = (torch.randn(2, 3), torch.randn(2, 3), torch.randn(2, 3))
+    torch.testing.assert_close(gm(*inputs), fn(*inputs))
 
   def test_cpu_reload_prefetch_distance_counts_executables(self):
     """Zero uses the consumer child; one uses its immediate predecessor."""

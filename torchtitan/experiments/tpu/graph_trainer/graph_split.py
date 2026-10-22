@@ -538,6 +538,51 @@ def _assign_partition(
   partition_map.update(dict.fromkeys(nodes, partition))
 
 
+def _order_child_boundaries(parent: torch.fx.GraphModule) -> None:
+  """Order each child's inputs by last read and outputs by first availability.
+
+  ``split_module`` numbers a child's inputs and outputs in discovery order, and
+  only ``parent`` calls the child, so the order carries no meaning. It does
+  matter to donation: XLA aliases donated inputs to equal-size outputs pairwise
+  in that order, and an output cannot be written before its donor's last read.
+  Sorting both sides lets the earliest-freed input back the earliest-ready
+  output, e.g. a host-to-device reload that depends on nothing else.
+  """
+  for call in parent.graph.find_nodes(op="call_module"):
+    child = parent.get_submodule(call.target)
+    nodes = list(child.graph.nodes)
+    position = {node: index for index, node in enumerate(nodes)}
+    depth: dict[torch.fx.Node, int] = {}
+    for node in nodes:
+      depth[node] = 1 + max(map(depth.get, node.all_input_nodes), default=-1)
+
+    inputs = [node for node in nodes if node.op == "placeholder"]
+    last_read = {
+        node: max((position[user] for user in node.users), default=-1)
+        for node in inputs
+    }
+    inputs_by_read = sorted(inputs, key=last_read.__getitem__)
+    first_op = nodes[len(inputs)]
+    for node in inputs_by_read:
+      first_op.prepend(node)
+    call.args = tuple(call.args[inputs.index(node)] for node in inputs_by_read)
+
+    output = child.graph.output_node()
+    values = output.args[0]
+    if isinstance(values, (tuple, list)):
+      order = sorted(
+          range(len(values)),
+          key=lambda i: (depth[values[i]], position[values[i]]),
+      )
+      output.args = (tuple(values[i] for i in order),)
+      new_index = {old: new for new, old in enumerate(order)}
+      for user in list(call.users):
+        if _is_getitem(user):
+          user.args = (call, new_index[user.args[1]])
+    child.recompile()
+  parent.recompile()
+
+
 def _materialize_partitioned_graph(
     gm: torch.fx.GraphModule,
     partition_map: dict[torch.fx.Node, int],
@@ -571,6 +616,7 @@ def _materialize_partitioned_graph(
       ).items()
   }
   chunked_gm = split_module(gm, None, lambda node: partition_map[node])
+  _order_child_boundaries(chunked_gm)
   chunked_gm.graph.lint()
   chunked_gm.recompile()
   return PartitionedGraph(

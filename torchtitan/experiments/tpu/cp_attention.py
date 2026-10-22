@@ -12,8 +12,10 @@ strategies are provided:
    Each attention layer keeps ``Q`` sharded (`S / cp` tokens, all ``H``
    heads), all-gathers ``K`` and ``V`` to the full sequence ``S`` (with fp32
    reduce-scatter in backward), reorders ``K`` and ``V`` back to contiguous
-   order, and runs SplashAttention with ``LoadBalancedCausalMask`` /
-   ``LoadBalancedLocalMask`` (`q_seq_shards=cp`).
+   order, and runs SplashAttention with its causal / local mask in head-tail
+   ``Q`` order (`q_seq_shards=cp`). Without a kernel plugged in it falls back
+   to a plain-PyTorch reference and warns off CPU (see
+   ``KVAllGatherCPInnerAttention.forward``).
 2. ``ulysses``: Each attention layer all-to-alls q/k/v from token-sharded to
    head-sharded, runs full-sequence attention on ``H / cp`` heads, then
    all-to-alls the output back. When ``n_kv_heads < cp`` and
@@ -42,6 +44,7 @@ from torchtitan.distributed.context_parallel.api import prepare_context_parallel
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.experiments.tpu.headtail import headtail_chunk_order
 from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common.attention import (
     BaseAttention,
@@ -50,6 +53,7 @@ from torchtitan.models.common.attention import (
     segment_ids_from_positions,
 )
 from torchtitan.models.common.cp_attention import CPInnerAttention
+from torchtitan.tools.logging import logger
 
 __all__ = [
     "UlyssesCPInnerAttention",
@@ -74,15 +78,38 @@ _HEAD_DIM = 1
 # graph input instead of baking a constant rank into the traced graph.
 _CP_RANK_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
 
+_warned_reference_attention = False
 
-def _cache_cp_rank_for_mesh(cp_mesh: Any) -> None:
-  if hasattr(cp_mesh, "get_local_rank") and hasattr(cp_mesh, "device_type"):
-    dev_type = cp_mesh.device_type
-    dev = torch.device(f"{dev_type}:0" if dev_type != "cpu" else "cpu")
-    r = int(cp_mesh.get_local_rank())
-    key = (dev, r)
-    if key not in _CP_RANK_CACHE:
-      _CP_RANK_CACHE[key] = torch.tensor([r], dtype=torch.int32, device=dev)
+
+def _warn_reference_attention(device: torch.device) -> None:
+  """Warns once when KV all-gather CP runs ``local_forward`` off CPU."""
+  global _warned_reference_attention
+  # Dynamo cannot trace logging, so this warns in eager mode only.
+  if (
+      torch.compiler.is_compiling()
+      or _warned_reference_attention
+      or device.type == "cpu"
+  ):
+    return
+  _warned_reference_attention = True
+  logger.warning(
+      "KV all-gather CP has no attention kernel plugged in, so it runs the"
+      " plain-PyTorch reference attention (local_forward) on %s. It builds the"
+      " full (S / cp, S) fp32 score matrix, which is fine for tests and tiny"
+      " models but not for long sequences. Set"
+      " splash_attention_kernel.use_splash_attention_kernel=True to plug in"
+      " the Splash kernel.",
+      device.type,
+  )
+
+
+def _cache_cp_rank_for_mesh(cp_mesh: DeviceMesh) -> None:
+  dev_type = cp_mesh.device_type
+  dev = torch.device(f"{dev_type}:0" if dev_type != "cpu" else "cpu")
+  r = int(cp_mesh.get_local_rank())
+  key = (dev, r)
+  if key not in _CP_RANK_CACHE:
+    _CP_RANK_CACHE[key] = torch.tensor([r], dtype=torch.int32, device=dev)
 
 
 def _type_checking() -> bool:
@@ -205,12 +232,10 @@ def reorder_sequence(
       + orig_shape[seq_dim + 1 :]
   )
   reshaped = tensor.reshape(new_shape)
-  if not to_contiguous:
-    indices = [idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)]
-  else:
-    first_half = [2 * i for i in range(cp_size)]
-    second_half = [2 * (cp_size - 1 - i) + 1 for i in range(cp_size)]
-    indices = first_half + second_half
+  indices = headtail_chunk_order(cp_size)
+  if to_contiguous:
+    # Inverse permutation: the head-tail index of each contiguous chunk.
+    indices = sorted(range(2 * cp_size), key=indices.__getitem__)
   idx_tensor = torch.tensor(indices, dtype=torch.long, device=tensor.device)
   reordered = torch.index_select(reshaped, seq_dim, idx_tensor)
   return reordered.reshape(orig_shape)
@@ -250,6 +275,12 @@ def _full_sequence_segment_ids(
 
 class UlyssesCPInnerAttention(CPInnerAttention):
   """Ulysses (all-to-all) CP mixin for any single-device inner attention."""
+
+  def __init__(self, config: Any) -> None:
+    super().__init__(config)  # pyrefly: ignore[bad-argument-count]
+    # A full-sequence attention kernel, plugged in with set_local_attention;
+    # None runs the wrapped inner attention (local_forward).
+    self.set_local_attention(None)
 
   @classmethod
   def cp_shard(
@@ -307,9 +338,7 @@ class UlyssesCPInnerAttention(CPInnerAttention):
     if positions is not None:
       kwargs["segment_ids"] = _full_sequence_segment_ids(positions, group)
 
-    local_attn = getattr(self, "_local_attn_override", None) or (
-        self.local_forward
-    )
+    local_attn = self._local_attn_override or self.local_forward
     type_check = _type_checking()
     if type_check:
       q_type = spmd.get_local_type(q_THK), spmd.get_partition_spec(q_THK)
@@ -327,9 +356,9 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
 
   def __init__(self, config: Any) -> None:
     super().__init__(config)  # pyrefly: ignore[bad-argument-count]
-    reduce_dtype_name = getattr(config, "reduce_dtype", "float32")
-    self.reduce_dtype = TORCH_DTYPE_MAP[reduce_dtype_name]
-    self.load_balanced = getattr(config, "load_balanced", True)
+    self.reduce_dtype = TORCH_DTYPE_MAP[config.reduce_dtype]
+    # The local attention kernel, plugged in with set_local_attention.
+    self.set_local_attention(None)
 
   def init_weights(self, **kwargs) -> None:
     super().init_weights(**kwargs)  # pyrefly: ignore[missing-attribute]
@@ -348,7 +377,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
   def _get_cp_rank_tensor(
       self, device: torch.device, group: Any
   ) -> torch.Tensor:
-    r = int(group.rank()) if hasattr(group, "rank") else 0
+    r = int(group.rank())
     key = (device, r)
     cached = _CP_RANK_CACHE.get(key)
     if cached is not None:
@@ -370,17 +399,22 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
     # Populate the per-device CP rank tensor in eager mode before tracing.
     _cache_cp_rank_for_mesh(cp_mesh)
 
+    if load_balancer_type != "headtail":
+      raise ValueError(
+          "KV all-gather CP shards inputs in head-tail order, so"
+          " context_parallel_load_balancer must be 'headtail', got"
+          f" {load_balancer_type!r}."
+      )
     attention_masks = input_dict.pop("attention_masks", None)
     seq_len = get_unflatten_seq_len()
-    cp = cp_mesh.size(0) if hasattr(cp_mesh, "size") else 1
+    cp = cp_mesh.size(0)
     inp = input_dict.get("input")
 
     # When multiple sequences (B > 1) are folded into 1D [B * S], head-tail
     # reordering and CP sharding must happen per sequence of length S, not
     # across the folded B * S axis.
     if (
-        load_balancer_type == "headtail"
-        and seq_len is not None
+        seq_len is not None
         and isinstance(inp, torch.Tensor)
         and inp.ndim >= 1
         and inp.shape[0] > seq_len
@@ -410,11 +444,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       )
     else:
       prepare_context_parallel_input(
-          input_dict,
-          input_shardings,
-          cp_mesh,
-          load_balancer_type,
-          ptrr_mask_key,
+          input_dict, input_shardings, cp_mesh, "headtail", ptrr_mask_key
       )
     if attention_masks is not None:
       input_dict["attention_masks"] = attention_masks
@@ -437,15 +467,22 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       is_causal: bool = True,
       segment_ids: torch.Tensor | None = None,
       cp_rank: torch.Tensor | None = None,
-      load_balanced: bool = True,
       **kwargs,
   ) -> torch.Tensor:
-    """Reference attention for CPU / short sequences (`q_seq_len < 128`).
+    """Reference attention for CPU, tests and short sequences.
 
-    Computes explicit masked attention in fp32 (avoiding the torch_tpu compiled
-    SDPA backward NaN issue when ``q_seq_len != kv_seq_len``) using tensor
-    indexing with ``cp_rank`` so it is traceable without graph breaks.
+    Computes explicit masked attention in fp32 over the full (S / cp, S) score
+    matrix (avoiding the torch_tpu compiled SDPA backward NaN issue when
+    ``q_seq_len != kv_seq_len``) using tensor indexing with ``cp_rank`` so it is
+    traceable without graph breaks. It is the Splash wrapper's fallback for CPU
+    and short sequences, and ``forward``'s when no kernel is plugged in (it
+    warns off CPU). Sliding windows are not supported.
     """
+    if self._uses_sliding_window():
+      raise NotImplementedError(
+          "The KV all-gather CP reference attention does not support sliding"
+          " windows; plug in the Splash kernel with set_local_attention."
+      )
     # Unpatched ScaledDotProductInnerAttention on CPU ignores segment_ids
     # (F.scaled_dot_product_attention only masks via is_causal), so match its
     # behavior when called from GQAttention (which passes attention_masks=None).
@@ -474,18 +511,12 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
     sm_scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
     scores = torch.matmul(q_bh, k_bh.transpose(-2, -1)) * sm_scale
 
+    if cp > 1 and cp_rank is None:
+      raise ValueError("cp_rank is required when Q is a CP shard (cp > 1).")
     kv_pos = torch.arange(kv_len, device=q.device, dtype=torch.int32)
     if cp > 1:
-      r = (
-          cp_rank.reshape(())
-          if cp_rank is not None
-          else torch.tensor(0, dtype=torch.int32, device=q.device)
-      )
-      q_pos_full = (
-          reorder_sequence(kv_pos, cp_size=cp, seq_dim=0, to_contiguous=False)
-          if load_balanced
-          else kv_pos
-      )
+      r = cp_rank.reshape(())
+      q_pos_full = reorder_sequence(kv_pos, cp_size=cp, seq_dim=0)
       q_pos = q_pos_full.reshape(cp, q_len)[r]
     else:
       q_pos = kv_pos
@@ -500,16 +531,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
           segment_ids.unsqueeze(0) if segment_ids.ndim == 1 else segment_ids
       )
       if cp > 1:
-        r = (
-            cp_rank.reshape(())
-            if cp_rank is not None
-            else torch.tensor(0, dtype=torch.int32, device=q.device)
-        )
-        q_seg_full = (
-            reorder_sequence(seg_2d, cp_size=cp, seq_dim=1, to_contiguous=False)
-            if load_balanced
-            else seg_2d
-        )
+        q_seg_full = reorder_sequence(seg_2d, cp_size=cp, seq_dim=1)
         q_seg = q_seg_full.reshape(bsz, cp, q_len)[:, r, :]
       else:
         q_seg = seg_2d
@@ -519,6 +541,12 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
     probs = torch.softmax(scores, dim=-1)
     out = torch.matmul(probs, v_bh).to(q.dtype).transpose(1, 2)
     return out.squeeze(0) if was_3d else out
+
+  def _uses_sliding_window(self) -> bool:
+    if isinstance(self, VarlenInnerAttention):
+      return self.window_size[0] >= 0
+    # SDPA-based models set the window on the module, not in its config.
+    return getattr(self, "sliding_window_size", None) is not None
 
   @spmd.no_typecheck()
   def _full_sequence_segment_ids_all_gather(
@@ -541,10 +569,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
         .movedim(0, 1)
         .reshape(bsz, cp * q_seq_len)
     )
-    if self.load_balanced:
-      pos_bs = reorder_sequence(
-          pos_bs, cp_size=cp, seq_dim=1, to_contiguous=True
-      )
+    pos_bs = reorder_sequence(pos_bs, cp_size=cp, seq_dim=1, to_contiguous=True)
     return segment_ids_from_positions(pos_bs)
 
   def forward(
@@ -554,6 +579,10 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       v_THV: torch.Tensor,
       **kwargs,
   ) -> torch.Tensor:
+    local_attn = self._local_attn_override
+    if local_attn is None:
+      _warn_reference_attention(q_THK.device)
+      local_attn = self.local_forward
     group = spmd_mesh_group(MeshAxisName.CP)
     if group is None:
       raise RuntimeError("CP attention requires an active CP mesh axis.")
@@ -602,9 +631,8 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
           .movedim(0, 1)
           .reshape(bsz, kv_seq_len, v_THV.shape[-2], v_THV.shape[-1])
       )
-      if self.load_balanced:
-        k_4d = reorder_sequence(k_4d, cp_size=cp, seq_dim=1, to_contiguous=True)
-        v_4d = reorder_sequence(v_4d, cp_size=cp, seq_dim=1, to_contiguous=True)
+      k_4d = reorder_sequence(k_4d, cp_size=cp, seq_dim=1, to_contiguous=True)
+      v_4d = reorder_sequence(v_4d, cp_size=cp, seq_dim=1, to_contiguous=True)
 
       if "enable_gqa" in kwargs:
         kwargs["enable_gqa"] = q_4d.shape[2] != k_4d.shape[2]
@@ -629,18 +657,11 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
               .movedim(0, 1)
               .reshape(bsz, kv_seq_len)
           )
-          if self.load_balanced:
-            seg_bs = reorder_sequence(
-                seg_bs, cp_size=cp, seq_dim=1, to_contiguous=True
-            )
-          kwargs["segment_ids"] = seg_bs
+          kwargs["segment_ids"] = reorder_sequence(
+              seg_bs, cp_size=cp, seq_dim=1, to_contiguous=True
+          )
 
       kwargs["cp_rank"] = cp_rank
-      kwargs["load_balanced"] = self.load_balanced
-
-      local_attn = getattr(self, "_local_attn_override", None) or (
-          self.local_forward
-      )
       out_4d = local_attn(q_4d, k_4d, v_4d, **kwargs)
       out_THV = (
           out_4d.reshape(bsz * q_seq_len, out_4d.shape[-2], out_4d.shape[-1])
@@ -678,7 +699,6 @@ class KVAllGatherCPScaledDotProductInnerAttention(
   @dataclass(kw_only=True, slots=True)
   class Config(ScaledDotProductInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
-    load_balanced: bool = True
 
 
 class KVAllGatherCPVarlenInnerAttention(
@@ -688,7 +708,6 @@ class KVAllGatherCPVarlenInnerAttention(
   @dataclass(kw_only=True, slots=True)
   class Config(VarlenInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
-    load_balanced: bool = True
 
 
 CPStrategy = Literal["ulysses", "all_gather"]
@@ -732,9 +751,9 @@ def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
 def tpu_cp_load_balancer(strategy: CPStrategy) -> str | None:
   """Returns the ``context_parallel_load_balancer`` that ``strategy`` needs.
 
-  KV All-Gather keeps Q sequence-sharded and expects the head-tail order its
-  ``LoadBalancedCausalMask`` is built for; Ulysses attends over the full
-  sequence, so there is no causal imbalance to balance.
+  KV All-Gather keeps Q sequence-sharded in head-tail order (see
+  ``headtail.py``), which its Splash masks are built for; Ulysses attends over
+  the full sequence, so there is no causal imbalance to balance.
   """
   return "headtail" if strategy == "all_gather" else None
 
@@ -782,13 +801,27 @@ def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
   cp = parallelism.context_parallel_degree
   if cp <= 1:
     return
+  if (
+      not hasattr(FSDPParam, "_resolve_spmd_types_for_storage")
+      and not parallelism.use_simple_fsdp
+      and (
+          parallelism.tensor_parallel_degree > 1
+          or parallelism.expert_parallel_degree > 1
+      )
+  ):
+    raise NotImplementedError(
+        "CP with TP or EP under FSDP2 needs a torch release with"
+        " FSDPParam._resolve_spmd_types_for_storage; this one has none, and"
+        " install_tpu_cp_patches only covers CP with FSDP/HSDP. Use"
+        " parallelism.use_simple_fsdp, or turn off TP/EP."
+    )
   for fqn, attn, _, _ in model.traverse(BaseAttention.Config):
     owner = attn.inner_attention._owner
     if owner is None:
       continue
     if issubclass(owner, KVAllGatherCPInnerAttention):
       strategy = "all_gather"
-      expected_lb = "headtail" if attn.inner_attention.load_balanced else None
+      expected_lb = "headtail"
     elif issubclass(owner, UlyssesCPInnerAttention):
       strategy = "ulysses"
       expected_lb = None
@@ -829,7 +862,9 @@ def install_tpu_cp_patches() -> None:
   Released torch (e.g. 2.13.0) has no ``FSDPParam._resolve_spmd_types_for_
   storage`` and rejects the multi-axis ``DataParallelMeshDims`` that
   ``resolve_fsdp_mesh`` returns when CP is on; give it the flattened
-  ``dp_shard_cp`` mesh instead. No-op on torch versions that have it.
+  ``dp_shard_cp`` mesh instead. No-op on torch versions that have it. It does
+  not cover CP with TP or EP, which ``validate_tpu_context_parallel`` rejects
+  on such torch versions.
 
   TODO: Remove once the TPU stack moves to a torch release with
   ``FSDPParam._resolve_spmd_types_for_storage``.

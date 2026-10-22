@@ -605,10 +605,9 @@ class WorkaroundsTest(parameterized.TestCase):
     attn = SplashAttention(original_module=fallback, auto_block_size=True)
     q = torch.ones(256, 2, 4)  # Folded (T, H, D) token stream.
     cp_rank = torch.tensor([1], dtype=torch.int32)
-    out = attn(q, q, q, cp_rank=cp_rank, load_balanced=True)
+    out = attn(q, q, q, cp_rank=cp_rank)
     torch.testing.assert_close(out, q * 3)
     self.assertIs(seen["cp_rank"], cp_rank)
-    self.assertTrue(seen["load_balanced"])
     self.assertTrue(seen["is_causal"])
 
     # The Pallas kernel has no LSE epilogue: out_transform is rejected rather
@@ -743,6 +742,7 @@ class WorkaroundsTest(parameterized.TestCase):
         revert_tpu_context_parallel,
         validate_tpu_context_parallel,
     )
+    from torchtitan.experiments.tpu.headtail import headtail_positions
     from torchtitan.experiments.tpu.qwen3 import config_registry
     from torchtitan.models.common.attention import ScaledDotProductInnerAttention
 
@@ -780,6 +780,10 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(reord, expected_reord)
     restored = reorder_sequence(reord, cp_size=4, seq_dim=1, to_contiguous=True)
     torch.testing.assert_close(restored, x)
+    # The Splash masks put their Q rows in the same order.
+    self.assertEqual(
+        headtail_positions(16, 4).tolist(), expected_reord.flatten().tolist()
+    )
 
     # 3. Verify forward + backward numerical parity against CP=1 (with packed documents).
     torch.manual_seed(42)
@@ -908,6 +912,132 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(dq_cp, q_full.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(dk_cp, k_full.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(dv_cp, v_full.grad, rtol=1e-5, atol=1e-5)
+
+  def test_all_gather_cp_warns_once_without_a_kernel_off_cpu(self):
+    """Without a kernel, KV all-gather CP warns once off CPU, then runs on."""
+    from unittest import mock
+    from torchtitan.experiments.tpu import cp_attention
+    from torchtitan.experiments.tpu.cp_attention import (
+        KVAllGatherCPScaledDotProductInnerAttention,
+    )
+    from torchtitan.tools.logging import logger
+
+    # Past the kernel check, forward stops at the missing CP mesh.
+    self.enter_context(
+        mock.patch.object(cp_attention, "spmd_mesh_group", return_value=None)
+    )
+    self.enter_context(
+        mock.patch.object(cp_attention, "_warned_reference_attention", False)
+    )
+    attn = KVAllGatherCPScaledDotProductInnerAttention(
+        KVAllGatherCPScaledDotProductInnerAttention.Config()
+    )
+    meta_q = torch.empty(8, 2, 4, device="meta")
+    cpu_q = torch.empty(8, 2, 4)
+
+    # CPU (tests) runs the reference attention silently.
+    with self.assertNoLogs(logger, level="WARNING"):
+      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+        attn(cpu_q, cpu_q, cpu_q)
+    # Off CPU it warns, once per process.
+    with self.assertLogs(logger, level="WARNING") as logs:
+      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+        attn(meta_q, meta_q, meta_q)
+    self.assertIn("no attention kernel plugged in", logs.output[0])
+    with self.assertNoLogs(logger, level="WARNING"):
+      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+        attn(meta_q, meta_q, meta_q)
+
+    # A plugged-in kernel does not warn.
+    self.enter_context(
+        mock.patch.object(cp_attention, "_warned_reference_attention", False)
+    )
+    attn.set_local_attention(lambda *args, **kwargs: None)
+    with self.assertNoLogs(logger, level="WARNING"):
+      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+        attn(meta_q, meta_q, meta_q)
+
+  def test_all_gather_cp_reference_attention_limits(self):
+    """The reference attention needs cp_rank for a CP shard and has no windows."""
+    from torchtitan.experiments.tpu.cp_attention import (
+        KVAllGatherCPScaledDotProductInnerAttention,
+        KVAllGatherCPVarlenInnerAttention,
+    )
+
+    q = torch.randn(4, 2, 8)
+    kv = torch.randn(8, 2, 8)  # Q is one of cp=2 shards of the K/V sequence.
+    sdpa = KVAllGatherCPScaledDotProductInnerAttention(
+        KVAllGatherCPScaledDotProductInnerAttention.Config()
+    )
+    with self.assertRaisesRegex(ValueError, "cp_rank is required"):
+      sdpa.local_forward(q, kv, kv)
+    out = sdpa.local_forward(
+        q, kv, kv, cp_rank=torch.tensor([1], dtype=torch.int32)
+    )
+    self.assertEqual(q.shape, out.shape)
+
+    # SDPA models with a sliding window set it on the inner attention module.
+    sdpa.sliding_window_size = 3
+    with self.assertRaisesRegex(NotImplementedError, "sliding windows"):
+      sdpa.local_forward(q, q, q)
+    varlen = KVAllGatherCPVarlenInnerAttention(
+        KVAllGatherCPVarlenInnerAttention.Config(window_size=(3, 0))
+    )
+    with self.assertRaisesRegex(NotImplementedError, "sliding windows"):
+      varlen.local_forward(q, q, q)
+
+  def test_all_gather_cp_requires_headtail_inputs(self):
+    """cp_shard rejects any load balancer but head-tail, which forward assumes."""
+    from types import SimpleNamespace
+    from torchtitan.experiments.tpu.cp_attention import (
+        KVAllGatherCPInnerAttention,
+    )
+
+    cp_mesh = SimpleNamespace(
+        device_type="cpu", get_local_rank=lambda: 0, size=lambda dim: 2
+    )
+    with self.assertRaisesRegex(ValueError, "must be 'headtail'"):
+      KVAllGatherCPInnerAttention.cp_shard(
+          {"input": torch.arange(8)}, None, cp_mesh, None, None
+      )
+
+  def test_cp_with_tp_or_ep_on_fsdp2_needs_spmd_types_fsdp(self):
+    """CP + TP/EP with FSDP2 on torch without spmd_types FSDP fails clearly."""
+    from types import SimpleNamespace
+    from unittest import mock
+    from torchtitan.experiments.tpu import cp_attention
+    from torchtitan.experiments.tpu.qwen3 import config_registry
+
+    config = config_registry.qwen3_debugmodel_allgather_cp2()
+    model, parallelism = config.model_spec.model, config.parallelism
+    for layer in model.layers:
+      layer.attention.n_heads = 8
+      layer.attention.n_kv_heads = 2
+    without = mock.patch.object(cp_attention, "FSDPParam", SimpleNamespace())
+    with_it = mock.patch.object(
+        cp_attention,
+        "FSDPParam",
+        SimpleNamespace(_resolve_spmd_types_for_storage=None),
+    )
+
+    for tp, ep in ((2, 1), (1, 2)):
+      parallelism.tensor_parallel_degree = tp
+      parallelism.expert_parallel_degree = ep
+      parallelism.use_simple_fsdp = False
+      with without, self.assertRaisesRegex(NotImplementedError, "FSDP2"):
+        cp_attention.validate_tpu_context_parallel(model, parallelism)
+      with with_it:
+        cp_attention.validate_tpu_context_parallel(model, parallelism)
+      # SimpleFSDP does not go through resolve_fsdp_mesh.
+      parallelism.use_simple_fsdp = True
+      with without:
+        cp_attention.validate_tpu_context_parallel(model, parallelism)
+
+    # CP alone is covered by install_tpu_cp_patches.
+    parallelism.tensor_parallel_degree = parallelism.expert_parallel_degree = 1
+    parallelism.use_simple_fsdp = False
+    with without:
+      cp_attention.validate_tpu_context_parallel(model, parallelism)
 
 
 if __name__ == "__main__":

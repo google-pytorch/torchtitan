@@ -10,14 +10,14 @@ from typing import Optional
 # JAX imports
 import jax
 import jax.numpy as jnp
-import numpy as np
-
 # Workaround for https://github.com/openxla/tokamax/issues/240 (same as
 # linear_softmax_cross_entropy_loss.py): tokamax applies @jaxtyping.jaxtyped
 # at import time, and typeguard's AST instrumentation cannot parse jaxtyping
 # shape-string annotations ("*B T H d"). Swap in a pass-through decorator for
 # the duration of the tokamax import.
 import jaxtyping
+import numpy as np
+from torchtitan.experiments.tpu.headtail import headtail_chunk_order, headtail_positions
 
 _real_jaxtyped = jaxtyping.jaxtyped
 
@@ -48,114 +48,40 @@ _DEFAULT_MASK_VALUE = -0.7 * float(
 )
 
 
-class LoadBalancedCausalMask(splash_attention_mask.CausalMask):
-  """Causal mask with head-tail load-balanced Q sequence ordering for CP."""
-
-  cp_size: int
-
-  def __init__(
-      self,
-      shape: tuple[int, int],
-      offset: int = 0,
-      shard_count: int = 1,
-      cp_size: int = 1,
-  ):
-    self.cp_size = cp_size
-    super().__init__(shape=shape, offset=offset, shard_count=shard_count)
-    if cp_size > 1:
-      if shape[0] % (2 * cp_size) != 0:
-        raise ValueError(
-            f"Q sequence length ({shape[0]}) must be divisible by"
-            f" 2 * cp_size ({2 * cp_size})."
-        )
-      q_seq = np.arange(shape[0], dtype=np.int32).reshape(2 * cp_size, -1)
-      # Pair chunk i from the front with chunk (2*cp_size - 1 - i) from the back
-      # so each rank's Q shard has identical causal compute load.
-      indices = [
-          idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)
-      ]
-      self.q_sequence = q_seq[indices, :].reshape(-1)
-
-  def __eq__(self, other: object) -> bool:
-    if not isinstance(other, type(self)):
-      return NotImplemented
-    return (
-        self.shape == other.shape
-        and self.offset == other.offset
-        and self.cp_size == other.cp_size
-        and np.array_equal(self.q_sequence, other.q_sequence)
-    )
-
-  def __hash__(self) -> int:
-    return hash((
-        type(self),
-        self.shape,
-        self.offset,
-        self.cp_size,
-        self.q_sequence.tobytes() if self.q_sequence is not None else None,
-    ))
-
-
-class LoadBalancedLocalMask(splash_attention_mask.LocalMask):
-  """Sliding-window local mask with head-tail load-balanced Q sequence ordering."""
-
-  cp_size: int
-
-  def __init__(
-      self,
-      shape: tuple[int, int],
-      window_size: tuple[int | None, int | None],
-      offset: int,
-      shard_count: int = 1,
-      cp_size: int = 1,
-  ):
-    self.cp_size = cp_size
-    super().__init__(
-        shape=shape,
-        window_size=window_size,
-        offset=offset,
-        shard_count=shard_count,
-    )
-    if cp_size > 1:
-      if shape[0] % (2 * cp_size) != 0:
-        raise ValueError(
-            f"Q sequence length ({shape[0]}) must be divisible by"
-            f" 2 * cp_size ({2 * cp_size})."
-        )
-      q_seq = np.arange(shape[0], dtype=np.int32).reshape(2 * cp_size, -1)
-      indices = [
-          idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)
-      ]
-      self.q_sequence = q_seq[indices, :].reshape(-1)
-
-  def __eq__(self, other: object) -> bool:
-    if not isinstance(other, type(self)):
-      return NotImplemented
-    return (
-        self.shape == other.shape
-        and self.window_size == other.window_size
-        and self.offset == other.offset
-        and self.cp_size == other.cp_size
-        and np.array_equal(self.q_sequence, other.q_sequence)
-    )
-
-  def __hash__(self) -> int:
-    return hash((
-        type(self),
-        self.shape,
-        self.window_size,
-        self.offset,
-        self.cp_size,
-        self.q_sequence.tobytes() if self.q_sequence is not None else None,
-    ))
-
-
 def _reorder_sequence_jax(x: jax.Array, cp_size: int) -> jax.Array:
   """Reorder a 1D sequence array of length S into head-tail load-balanced order."""
   s = x.shape[0]
   chunks = x.reshape(2 * cp_size, s // (2 * cp_size))
-  indices = [idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)]
-  return chunks[np.array(indices, dtype=np.int32), :].reshape(s)
+  order = np.array(headtail_chunk_order(cp_size), dtype=np.int32)
+  return chunks[order, :].reshape(s)
+
+
+def _make_mask(
+    mask_shape: tuple[int, int],
+    is_causal: bool,
+    local_window_size: int | None,
+    cp_size: int,
+):
+  """Single-head Splash mask; with CP, its Q rows are in head-tail order.
+
+  KV all-gather CP shards Q in head-tail order (``headtail.py``), so the stock
+  causal / local mask gets its ``q_sequence`` permuted to match. The stock
+  masks compare and hash ``q_sequence``, so kernel caching still works.
+  """
+  if local_window_size is not None:
+    # Sliding-window causal: each q attends to the previous local_window_size
+    # keys plus itself (window_size=(left, right), right=0 keeps it causal).
+    mask = splash_attention_mask.LocalMask(
+        shape=mask_shape, window_size=(local_window_size, 0), offset=0
+    )
+  elif is_causal:
+    mask = splash_attention_mask.CausalMask(shape=mask_shape)
+  else:
+    # Every key is visible, so the Q order does not matter.
+    return splash_attention_mask.FullMask(mask_shape)
+  if cp_size > 1:
+    mask.q_sequence = headtail_positions(mask_shape[0], cp_size)
+  return mask
 
 
 def _slice_mask_info(mask_info, cp_size: int, cp_rank: jax.Array | None):
@@ -229,7 +155,6 @@ def _make_splash_attention_fn(
     v_layout: str = "HEAD_DIM_MINOR",
     use_vmap_bwd: bool = False,
     kv_seq_len: int | None = None,
-    load_balanced: bool = True,
 ):
   """Create JAX splash attention forward and backward functions using Tokamax.
 
@@ -249,7 +174,6 @@ def _make_splash_attention_fn(
     )
   cp_size = kv_seq_len // q_seq_len
 
-
   def _get_layout(layout_str):
     if layout_str == "HEAD_DIM_MINOR":
       return splash_attention_kernel.QKVLayout.HEAD_DIM_MINOR
@@ -257,7 +181,6 @@ def _make_splash_attention_fn(
       return splash_attention_kernel.QKVLayout.SEQ_MINOR
     else:
       raise ValueError(f"Unknown layout: {layout_str}")
-
 
   config = splash_attention_kernel.SplashConfig(
       block_q=min(block_q, q_seq_len),
@@ -279,27 +202,7 @@ def _make_splash_attention_fn(
   )
 
   mask_shape = (kv_seq_len, kv_seq_len)
-  if local_window_size is not None:
-    if cp_size > 1 and load_balanced:
-      single_mask = LoadBalancedLocalMask(
-          shape=mask_shape,
-          window_size=(local_window_size, 0),
-          offset=0,
-          cp_size=cp_size,
-      )
-    else:
-      single_mask = splash_attention_mask.LocalMask(
-          shape=mask_shape,
-          window_size=(local_window_size, 0),
-          offset=0,
-      )
-  elif is_causal:
-    if cp_size > 1 and load_balanced:
-      single_mask = LoadBalancedCausalMask(shape=mask_shape, cp_size=cp_size)
-    else:
-      single_mask = splash_attention_mask.CausalMask(shape=mask_shape)
-  else:
-    single_mask = splash_attention_mask.FullMask(mask_shape)
+  single_mask = _make_mask(mask_shape, is_causal, local_window_size, cp_size)
 
   is_mqa = n_kv_heads == 1
 
@@ -335,16 +238,11 @@ def _make_splash_attention_fn(
       return None
     if cp_size == 1:
       return splash_attention_kernel.SegmentIds(q=segment_ids_b, kv=segment_ids_b)
-    q_seg = (
-        _reorder_sequence_jax(segment_ids_b, cp_size)
-        if load_balanced
-        else segment_ids_b
-    )
+    q_seg = _reorder_sequence_jax(segment_ids_b, cp_size)
     q_seg = jax.lax.dynamic_slice_in_dim(
         q_seg, cp_rank[0] * q_seq_len, q_seq_len, axis=0
     )
     return splash_attention_kernel.SegmentIds(q=q_seg, kv=segment_ids_b)
-
 
   @jax.jit
   def splash_fn(q, k, v, segment_ids=None, cp_rank=None):
@@ -454,7 +352,6 @@ def jax_attention_fwd(
     cp_rank: jax.Array | None,
     is_causal: bool,
     local_window_size: int,  # Sentinel int: -1 means None
-    load_balanced: bool,
     scale: float,
     block_q: int,
     block_kv: int,
@@ -501,7 +398,6 @@ def jax_attention_fwd(
       n_kv_heads=n_kv_heads,
       is_causal=is_causal,
       local_window_size=local_window_size_opt,
-      load_balanced=load_balanced,
       block_q=block_q,
       block_kv=block_kv,
       block_kv_compute=block_kv_compute,
@@ -540,7 +436,6 @@ def jax_attention_bwd(
     cp_rank: jax.Array | None,
     is_causal: bool,
     local_window_size: int,  # Sentinel int: -1 means None
-    load_balanced: bool,
     scale: float,
     block_q: int,
     block_kv: int,
@@ -583,7 +478,6 @@ def jax_attention_bwd(
       n_kv_heads=n_kv_heads,
       is_causal=is_causal,
       local_window_size=local_window_size_opt,
-      load_balanced=load_balanced,
       block_q=block_q,
       block_kv=block_kv,
       block_kv_compute=block_kv_compute,
@@ -666,7 +560,7 @@ def _kernel_config_args() -> tuple:
 def setup_context(ctx, inputs, output, **kwargs):
   del kwargs
   # inputs: q, k, v, segment_ids, cp_rank, is_causal, local_window_size,
-  # load_balanced, scale, then the _KERNEL_CONFIG_FIELDS values.
+  # scale, then the _KERNEL_CONFIG_FIELDS values.
   (
       q,
       k,
@@ -675,17 +569,15 @@ def setup_context(ctx, inputs, output, **kwargs):
       cp_rank,
       is_causal,
       local_window_size,
-      load_balanced,
       scale,
-  ) = inputs[:9]
+  ) = inputs[:8]
   out, logsumexp = output
   ctx.save_for_backward(q, k, v, out, logsumexp, segment_ids, cp_rank)
 
   ctx.is_causal = is_causal
   ctx.local_window_size = local_window_size
-  ctx.load_balanced = load_balanced
   ctx.scale = scale
-  ctx.kernel_config = inputs[9:]
+  ctx.kernel_config = inputs[8:]
 
 
 def backward(ctx, grad_out, grad_lse):
@@ -704,12 +596,11 @@ def backward(ctx, grad_out, grad_lse):
       cp_rank,
       ctx.is_causal,
       ctx.local_window_size,
-      ctx.load_balanced,
       ctx.scale,
       *ctx.kernel_config,
   )
   # One gradient per forward input; segment_ids, cp_rank, and the scalars get None.
-  return (dq, dk, dv) + (None,) * (6 + len(ctx.kernel_config))
+  return (dq, dk, dv) + (None,) * (5 + len(ctx.kernel_config))
 
 
 # Register the autograd!
@@ -723,7 +614,6 @@ def splash_sdpa(
     *,
     segment_ids: Optional[torch.Tensor] = None,
     cp_rank: Optional[torch.Tensor] = None,
-    load_balanced: bool = True,
     scale: Optional[float] = None,
     is_causal: bool = True,
     local_window_size: Optional[int] = None,
@@ -804,7 +694,6 @@ def splash_sdpa(
       cp_rank,
       is_causal,
       local_window_size_val,
-      load_balanced,
       scale,
       *_kernel_config_args(),
   )

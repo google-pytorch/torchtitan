@@ -6,15 +6,70 @@ from typing import Callable
 
 from absl import logging
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax.numpy as jnp
+import numpy as np
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.headtail import headtail_positions
 from torchtitan.experiments.tpu.kernels.splash_attention import (
+    _make_mask,
     _maybe_document_aware_mask_info,
     splash_sdpa,
 )
+
+
+def _dense_cp_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    local_window_size: int | None,
+) -> tuple[torch.Tensor, ...]:
+  """Full-sequence (B, H, S, D) causal attention and its q/k/v gradients."""
+  pos = torch.arange(q.shape[2])
+  allowed = pos[:, None] >= pos[None, :]
+  if local_window_size is not None:
+    allowed &= pos[:, None] - pos[None, :] <= local_window_size
+  q, k, v = (x.clone().requires_grad_(True) for x in (q, k, v))
+  with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+  out.backward(grad_out)
+  return out.detach(), q.grad, k.grad, v.grad
+
+
+class HeadTailMaskTest(parameterized.TestCase):
+  """KV all-gather CP masks: stock Splash masks with head-tail Q rows."""
+
+  @parameterized.product(cp_size=(1, 2, 4), local_window_size=(None, 5))
+  def test_mask_matches_dense_reference(self, cp_size, local_window_size):
+    seq_len = 32
+    mask = _make_mask((seq_len, seq_len), True, local_window_size, cp_size)
+    # Row i holds the query at original position headtail_positions(...)[i].
+    q_pos = headtail_positions(seq_len, cp_size)[:, None]
+    kv_pos = np.arange(seq_len)[None, :]
+    expected = q_pos >= kv_pos
+    if local_window_size is not None:
+      expected &= q_pos - kv_pos <= local_window_size
+    np.testing.assert_array_equal(mask[:, :], expected)
+
+  @parameterized.parameters(None, 5)
+  def test_mask_equality_follows_q_order(self, local_window_size):
+    shape = (32, 32)
+    mask = _make_mask(shape, True, local_window_size, cp_size=2)
+    same = _make_mask(shape, True, local_window_size, cp_size=2)
+    self.assertEqual(mask, same)
+    self.assertEqual(hash(mask), hash(same))
+    for cp_size in (1, 4):
+      self.assertNotEqual(
+          mask, _make_mask(shape, True, local_window_size, cp_size)
+      )
+
+  def test_non_causal_mask_is_full(self):
+    mask = _make_mask((32, 32), False, None, cp_size=2)
+    self.assertTrue(np.all(mask[:, :]))
 
 
 class SplashMaskInfoTest(absltest.TestCase):
@@ -386,6 +441,45 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
         v_test.grad.cpu(), v_ref_grad.cpu(), rtol=5e-2, atol=5e-2
     )
     logging.info("MQA/GQA backward test passed.")
+
+  @parameterized.product(cp_size=(2, 4), local_window_size=(None, 200))
+  def test_cp_shard_parity(self, cp_size, local_window_size):
+    """Head-tail CP Q shards against the full K/V match full attention.
+
+    KV all-gather CP gives rank r the r-th slice of the head-tail sequence; the
+    kernel must mask those queries by their original positions, causal or
+    sliding window. dK and dV add up over the ranks.
+    """
+    device = self.accelerator_device
+    b, n_heads, seq_len, head_dim = 1, 2, 512, 128
+    q, k, v, grad_out = (
+        torch.randn(b, n_heads, seq_len, head_dim) for _ in range(4)
+    )
+    out_ref, dq_ref, dk_ref, dv_ref = _dense_cp_reference(
+        q, k, v, grad_out, local_window_size
+    )
+
+    k_test = k.to(device).requires_grad_(True)
+    v_test = v.to(device).requires_grad_(True)
+    shards = torch.from_numpy(headtail_positions(seq_len, cp_size)).long()
+    for r, rows in enumerate(shards.reshape(cp_size, -1)):
+      q_test = q[:, :, rows].to(device).requires_grad_(True)
+      out = splash_sdpa(
+          q_test,
+          k_test,
+          v_test,
+          cp_rank=torch.tensor([r], dtype=torch.int32, device=device),
+          local_window_size=local_window_size,
+      )
+      out.backward(grad_out[:, :, rows].to(device))
+      torch.testing.assert_close(
+          out.cpu(), out_ref[:, :, rows], rtol=5e-2, atol=5e-2
+      )
+      torch.testing.assert_close(
+          q_test.grad.cpu(), dq_ref[:, :, rows], rtol=5e-2, atol=5e-2
+      )
+    torch.testing.assert_close(k_test.grad.cpu(), dk_ref, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(v_test.grad.cpu(), dv_ref, rtol=5e-2, atol=5e-2)
 
 
 if __name__ == "__main__":

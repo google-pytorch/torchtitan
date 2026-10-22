@@ -17,12 +17,12 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import QKVLayout
 import jax.numpy as jnp
 import torch
-from torchtitan.models.common.attention import segment_ids_from_positions
 from torch import nn
 from torch.distributed.tensor import DTensor
-
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.headtail import headtail_chunk_order, headtail_positions
+from torchtitan.models.common.attention import segment_ids_from_positions
 
 custom_jax_kernel = pallas.custom_jax_kernel
 
@@ -107,112 +107,40 @@ def _maybe_document_aware_mask_info(
   )
 
 
-class LoadBalancedCausalMask(splash_attention_mask.CausalMask):
-  """Causal mask with head-tail load-balanced Q sequence ordering for CP."""
-
-  cp_size: int
-
-  def __init__(
-      self,
-      shape: tuple[int, int],
-      offset: int = 0,
-      shard_count: int = 1,
-      cp_size: int = 1,
-  ):
-    self.cp_size = cp_size
-    super().__init__(shape=shape, offset=offset, shard_count=shard_count)
-    if cp_size > 1:
-      if shape[0] % (2 * cp_size) != 0:
-        raise ValueError(
-            f"Q sequence length ({shape[0]}) must be divisible by"
-            f" 2 * cp_size ({2 * cp_size})."
-        )
-      q_seq = self.q_sequence.reshape(2 * cp_size, -1)
-      indices = [
-          idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)
-      ]
-      self.q_sequence = q_seq[indices, :].reshape(-1)
-
-  def __eq__(self, other: object) -> bool:
-    if not isinstance(other, type(self)):
-      return NotImplemented
-    return (
-        self.shape == other.shape
-        and self.offset == other.offset
-        and self.cp_size == other.cp_size
-        and bool((self.q_sequence == other.q_sequence).all())
-    )
-
-  def __hash__(self) -> int:
-    return hash((
-        type(self),
-        self.shape,
-        self.offset,
-        self.cp_size,
-        self.q_sequence.tobytes() if self.q_sequence is not None else None,
-    ))
-
-
-class LoadBalancedLocalMask(splash_attention_mask.LocalMask):
-  """Sliding-window local mask with head-tail load-balanced Q sequence ordering."""
-
-  cp_size: int
-
-  def __init__(
-      self,
-      shape: tuple[int, int],
-      window_size: tuple[int | None, int | None],
-      offset: int,
-      shard_count: int = 1,
-      cp_size: int = 1,
-  ):
-    self.cp_size = cp_size
-    super().__init__(
-        shape=shape,
-        window_size=window_size,
-        offset=offset,
-        shard_count=shard_count,
-    )
-    if cp_size > 1:
-      if shape[0] % (2 * cp_size) != 0:
-        raise ValueError(
-            f"Q sequence length ({shape[0]}) must be divisible by"
-            f" 2 * cp_size ({2 * cp_size})."
-        )
-      q_seq = self.q_sequence.reshape(2 * cp_size, -1)
-      indices = [
-          idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)
-      ]
-      self.q_sequence = q_seq[indices, :].reshape(-1)
-
-  def __eq__(self, other: object) -> bool:
-    if not isinstance(other, type(self)):
-      return NotImplemented
-    return (
-        self.shape == other.shape
-        and self.window_size == other.window_size
-        and self.offset == other.offset
-        and self.cp_size == other.cp_size
-        and bool((self.q_sequence == other.q_sequence).all())
-    )
-
-  def __hash__(self) -> int:
-    return hash((
-        type(self),
-        self.shape,
-        self.window_size,
-        self.offset,
-        self.cp_size,
-        self.q_sequence.tobytes() if self.q_sequence is not None else None,
-    ))
-
-
 def _reorder_sequence_jax(x: jax.Array, cp_size: int) -> jax.Array:
   """Reorder a 1D sequence array of length S into head-tail load-balanced order."""
   s = x.shape[0]
   chunks = x.reshape(2 * cp_size, s // (2 * cp_size))
-  indices = [idx for i in range(cp_size) for idx in (i, 2 * cp_size - 1 - i)]
-  return chunks[jnp.array(indices, dtype=jnp.int32), :].reshape(s)
+  order = jnp.array(headtail_chunk_order(cp_size), dtype=jnp.int32)
+  return chunks[order, :].reshape(s)
+
+
+def _make_mask(
+    mask_shape: tuple[int, int],
+    is_causal: bool,
+    local_window_size: int | None,
+    cp_size: int,
+):
+  """Single-head Splash mask; with CP, its Q rows are in head-tail order.
+
+  KV all-gather CP shards Q in head-tail order (``headtail.py``), so the stock
+  causal / local mask gets its ``q_sequence`` permuted to match. The stock
+  masks compare and hash ``q_sequence``, so kernel caching still works.
+  """
+  if local_window_size is not None:
+    # Sliding-window causal: each q attends to the previous local_window_size
+    # keys plus itself (window_size=(left, right), right=0 keeps it causal).
+    mask = splash_attention_mask.LocalMask(
+        shape=mask_shape, window_size=(local_window_size, 0), offset=0
+    )
+  elif is_causal:
+    mask = splash_attention_mask.CausalMask(shape=mask_shape)
+  else:
+    # Every key is visible, so the Q order does not matter.
+    return splash_attention_mask.FullMask(mask_shape)
+  if cp_size > 1:
+    mask.q_sequence = headtail_positions(mask_shape[0], cp_size)
+  return mask
 
 
 def _slice_mask_info(mask_info, cp_size: int, cp_rank: jax.Array | None):
@@ -266,7 +194,6 @@ def _make_splash_attention_fn(
     use_vmap_bwd: bool = False,
     use_document_aware_block_skipping: bool = True,
     kv_seq_len: int | None = None,
-    load_balanced: bool = True,
 ):
   """Create JAX splash attention forward and backward functions.
 
@@ -313,33 +240,7 @@ def _make_splash_attention_fn(
   )
 
   mask_shape = (kv_seq_len, kv_seq_len)
-  if local_window_size is not None:
-    # Sliding-window causal: each q attends to the previous local_window_size
-    # keys plus itself. window_size=(left, right); right=0 ⇒ no future tokens
-    # (still causal), offset=0 ⇒ q starts at kv start. The LocalMask is more
-    # specific than CausalMask so the splash kernel skips the off-window
-    # blocks entirely. With local_window_size >= seq_len-1, this is
-    # equivalent to a CausalMask (every token attends to every prior token).
-    if cp_size > 1 and load_balanced:
-      single_mask = LoadBalancedLocalMask(
-          shape=mask_shape,
-          window_size=(local_window_size, 0),
-          offset=0,
-          cp_size=cp_size,
-      )
-    else:
-      single_mask = splash_attention_mask.LocalMask(
-          shape=mask_shape,
-          window_size=(local_window_size, 0),
-          offset=0,
-      )
-  elif is_causal:
-    if cp_size > 1 and load_balanced:
-      single_mask = LoadBalancedCausalMask(shape=mask_shape, cp_size=cp_size)
-    else:
-      single_mask = splash_attention_mask.CausalMask(shape=mask_shape)
-  else:
-    single_mask = splash_attention_mask.FullMask(mask_shape)
+  single_mask = _make_mask(mask_shape, is_causal, local_window_size, cp_size)
 
   multi_head_mask = splash_attention_mask.MultiHeadMask(
       masks=(single_mask,) * n_heads
@@ -382,11 +283,7 @@ def _make_splash_attention_fn(
       return splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
-    q_seg = (
-        _reorder_sequence_jax(segment_ids_b, cp_size)
-        if load_balanced
-        else segment_ids_b
-    )
+    q_seg = _reorder_sequence_jax(segment_ids_b, cp_size)
     q_seg = jax.lax.dynamic_slice_in_dim(
         q_seg, cp_rank[0] * q_seq_len, q_seq_len, axis=0
     )
@@ -652,7 +549,6 @@ def splash_sdpa(
     *,
     segment_ids: Optional[torch.Tensor] = None,
     cp_rank: Optional[torch.Tensor] = None,
-    load_balanced: bool = True,
     scale: Optional[float] = None,
     is_causal: bool = True,
     local_window_size: Optional[int] = None,
@@ -686,7 +582,6 @@ def splash_sdpa(
     segment_ids: Optional segment IDs for document packing.
     cp_rank: Optional context-parallel rank tensor of shape (1,) when q is
       sequence-sharded (q_seq_len < kv_seq_len).
-    load_balanced: Whether q is in head-tail load-balanced order when sharded.
     scale: Scale factor for attention logits.
     is_causal: Whether to apply causal mask.
     enable_gqa: Kept for API compatibility.
@@ -754,7 +649,6 @@ def splash_sdpa(
   )
   if kv_seq_len != seq_len:
     splash_args["kv_seq_len"] = kv_seq_len
-    splash_args["load_balanced"] = load_balanced
   torch_fwd_name, torch_bwd_name = _get_splash_op_names(**splash_args)
   torch_fwd_fn = getattr(torch.ops.pallas, torch_fwd_name)
   torch_bwd_fn = getattr(torch.ops.pallas, torch_bwd_name)
@@ -845,7 +739,6 @@ class SplashAttention(nn.Module):
       positions: Optional[torch.Tensor] = None,
       segment_ids: Optional[torch.Tensor] = None,
       cp_rank: Optional[torch.Tensor] = None,
-      load_balanced: Optional[bool] = None,
       **kwargs,
   ) -> torch.Tensor:
     was_3d = q.dim() == 3
@@ -860,8 +753,6 @@ class SplashAttention(nn.Module):
       cp_kwargs = {}
       if cp_rank is not None:
         cp_kwargs["cp_rank"] = cp_rank
-      if load_balanced is not None:
-        cp_kwargs["load_balanced"] = load_balanced
       return self.original_module(
           q,
           k,
@@ -920,8 +811,6 @@ class SplashAttention(nn.Module):
       extra_sa_kwargs.update({name: block for name in _SPLASH_BLOCK_KWARGS})
     if cp_rank is not None:
       extra_sa_kwargs["cp_rank"] = cp_rank
-    if load_balanced is not None:
-      extra_sa_kwargs["load_balanced"] = load_balanced
 
     out = splash_sdpa(
         q_trans,

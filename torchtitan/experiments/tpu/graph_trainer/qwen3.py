@@ -18,6 +18,9 @@ from torchtitan.experiments.graph_trainer.qwen3.parallelize import (
     parallelize_qwen3 as graph_trainer_parallelize_qwen3,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+from torchtitan.experiments.tpu.graph_trainer.tpu_sharding import (
+    shard_split_fsdp_modules,
+)
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
@@ -72,9 +75,7 @@ def parallelize_qwen3(
         **kwargs,
     )
     # Creates process groups, so every rank runs it here, right after sharding.
-    for holder in model.modules():
-        if hasattr(holder, "build_split_meshes"):
-            holder.build_split_meshes()
+    shard_split_fsdp_modules(model)
     return model
 
 

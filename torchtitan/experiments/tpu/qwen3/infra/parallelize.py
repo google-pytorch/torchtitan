@@ -10,8 +10,10 @@ from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.graph_trainer.tpu_sharding import (
+    configure_tpu_fsdp_shard_dims,
+    shard_split_fsdp_modules,
+)
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
@@ -21,49 +23,11 @@ def configure_qwen_simple_fsdp_shard_dims(
     parallel_dims: torchtitan.distributed.ParallelDims,
 ) -> None:
   """Use divisible hidden axes for uneven Qwen parameters under SimpleFSDP."""
-  fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
-  if fsdp_degree <= 1:
-    return
-
-  hidden_axis_modules = configure_simple_fsdp_shard_dims(model, parallel_dims)
-  stacks = any(hasattr(m, "plan_shard_dims") for m in model.modules())
-
-  # With EP, apply_simple_fsdp separately wraps each expert bank on the EDP
-  # mesh and owns its shard-axis selection.
-  if not parallel_dims.ep_enabled:
-    qwen_expert_modules = [
-        (module_fqn, module)
-        for module_fqn, module in model.named_modules()
-        if isinstance(module, TpuGroupedExperts)
-    ]
-    for module_fqn, module in qwen_expert_modules:
-      if module.num_experts % fsdp_degree == 0:
-        continue
-
-      parameters = list(module.named_parameters(recurse=False))
-      if not parameters:
-        if stacks:
-          continue  # Stacking took them; the holder above shards them instead.
-        raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
-      incompatible = [
-          f"{name}{tuple(parameter.shape)}"
-          for name, parameter in parameters
-          if (
-              parameter.ndim != 3
-              or parameter.shape[0] != module.num_experts
-              or parameter.shape[1] % fsdp_degree != 0
-          )
-      ]
-      if incompatible:
-        raise ValueError(
-            f"Cannot FSDP-shard {module_fqn} on Qwen's hidden dimension 1 "
-            f"over {fsdp_degree} ranks; incompatible expert parameters: "
-            f"{incompatible}"
-        )
-      # See the documented apply_simple_fsdp hook above.
-      setattr(module, "_fsdp_shard_dim", 1)
-      hidden_axis_modules.append(module_fqn)
-
+  hidden_axis_modules = configure_tpu_fsdp_shard_dims(
+      model,
+      parallel_dims,
+      include_unstacked_experts=True,
+  )
   if hidden_axis_modules:
     logger.info(
         "Using SimpleFSDP dimension 1 for %d uneven Qwen modules",
@@ -125,9 +89,7 @@ def parallelize_qwen3(
         training=training,
     )
     # Creates process groups, so every rank runs it here, right after sharding.
-    for holder in model.modules():
-      if hasattr(holder, "build_split_meshes"):
-        holder.build_split_meshes()
+    shard_split_fsdp_modules(model)
   else:
     dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]

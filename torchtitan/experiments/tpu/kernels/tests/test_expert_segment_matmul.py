@@ -39,6 +39,7 @@ class ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             128,
             128,
             128,
+            False,
         )
 
         want_fp32 = torch.stack(

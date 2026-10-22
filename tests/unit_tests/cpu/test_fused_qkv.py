@@ -233,5 +233,44 @@ class TestFusedQKVForwardContiguity(unittest.TestCase):
         self.assertTrue(torch.equal(raw_fixed, xk_fixed))
 
 
+class TestQwen3ConfigurableQKVProjection(unittest.TestCase):
+    def test_qwen3_flavors_default_to_fused_and_support_unfused_override(self):
+        """Qwen3 flavors default to FusedQKVLinear (fuse_qkv=True) for backward
+        compatibility while allowing fuse_qkv=False at runtime to build QKVLinear.
+
+        Covers a TPU fork change (google-pytorch/torchtitan) to be upstreamed to
+        pytorch/torchtitan together with the `fuse_qkv` option in
+        torchtitan/models/qwen3/__init__.py.
+        """
+        from torchtitan.models.qwen3 import model_registry
+
+        for flavor in (
+            "debugmodel",
+            "0.6B",
+            "1.7B",
+            "4B",
+            "8B",
+            "14B",
+            "32B",
+            "debugmodel_moe",
+            "30B-A3B",
+            "235B-A22B",
+        ):
+            with self.subTest(flavor=flavor):
+                spec_default = model_registry(flavor, attn_backend="sdpa", seq_len=128)
+                self.assertIsInstance(
+                    spec_default.model.layers[0].attention.qkv_linear,
+                    FusedQKVLinear.Config,
+                )
+
+                spec_unfused = model_registry(
+                    flavor, attn_backend="sdpa", seq_len=128, fuse_qkv=False
+                )
+                self.assertIsInstance(
+                    spec_unfused.model.layers[0].attention.qkv_linear,
+                    QKVLinear.Config,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

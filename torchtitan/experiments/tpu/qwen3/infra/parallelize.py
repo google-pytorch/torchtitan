@@ -48,6 +48,13 @@ def configure_qwen_simple_fsdp_shard_dims(
         if stacks:
           continue  # Stacking took them; the holder above shards them instead.
         raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
+      # W2's dim 1 (F=1536) gives a 3-row stripe at 512 ranks, which no TPU
+      # tile fits. Its trailing D axis gives 8 rows, but the gather then stores
+      # W2 as [E, D, F], so the grouped matmul reads it as a transposed RHS
+      # instead of paying a full relayout copy.
+      # TODO: remove the trailing-W2/transposed-RHS path if GraphSplitter
+      # aligns with Scan's flattened dim-0 expert sharding, or if FlexShard
+      # provides tile-aligned expert shards.
       use_trailing_w2 = (
           module.use_kernel_native_weight_layout
           and any(

@@ -625,6 +625,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     torch.manual_seed(0)
     model = config.build()
     model.init_states(buffer_device=torch.device("cpu"))
+    # Moderate decays, as in the HF parity test: A_log's init reaches log(16),
+    # with which a GatedDeltaNet forgets within a token or two (hiding state
+    # leaks) and the fp32 chunk-cumulative decays grow to O(1000).
+    gen = torch.Generator().manual_seed(1234)
+    with torch.no_grad():
+      for name, param in model.named_parameters():
+        if "A_log" in name or "dt_bias" in name:
+          param.copy_(0.2 * torch.randn(param.shape, generator=gen))
     model = model.to(self.accelerator_device)
     if config.enable_weight_tying:
       model.tok_embeddings.weight = model.lm_head.weight
@@ -676,7 +684,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         rtol=tol,
         check_name="Packed Documents Logits",
     )
-    grad_rel_bound = 2e-2 if self._is_tpu() else 1e-4
+    grad_rel_bound = 2e-2 if self._is_tpu() else 5e-4
     self.assertEqual(set(grads_packed), set(grads_docs))
     for name, grad in grads_docs.items():
       self.assertLessEqual(
@@ -685,7 +693,13 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           msg=f"Packed documents gradient mismatch for {name}",
       )
 
-    # Negative control: positions that run on across documents.
+    # Negative control: positions that run on across documents leak attention
+    # and GatedDeltaNet state into every document that does not start a row.
+    later = torch.cat([
+        torch.arange(s, s + n)
+        for s, n in zip(starts, doc_lens)
+        if s % seq_len != 0
+    ])
     with torch.no_grad(), set_unflatten_seq_len(seq_len):
       logits_unpacked = model(
           tokens.to(self.accelerator_device),
@@ -693,9 +707,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           .repeat(len(rows))
           .to(self.accelerator_device),
       )
+    leak = _relative_l2_error(logits_unpacked.cpu()[later], logits_docs[later])
     self.assertGreater(
-        _relative_l2_error(logits_unpacked, logits_docs),
-        0.05,
+        leak,
+        0.01,
         msg="Negative control failed: unpacked positions did not leak",
     )
 

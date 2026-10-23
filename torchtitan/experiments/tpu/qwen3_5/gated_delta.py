@@ -83,10 +83,10 @@ def chunked_gated_delta(
   """
   out_dtype = q.dtype
   d_k = q.shape[-1]
-  q = _l2norm(q.float()) * (d_k**-0.5)
-  k = _l2norm(k.float())
   q, k, v = [x.transpose(1, 2).float() for x in (q, k, v)]
   g, beta = [x.transpose(1, 2).float() for x in (g, beta)]
+  q = _l2norm(q) * (d_k**-0.5)
+  k = _l2norm(k)
 
   bs, n_heads, seq_len, _ = k.shape
   d_v = v.shape[-1]
@@ -204,10 +204,12 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
       value_head_dim: int,
   ) -> torch.Tensor:
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
+    g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
+    beta_TH = torch.sigmoid(b_TH)
     # TT-UNFLATTEN-SHIM: unflatten [T, ...] to [B, S, ...] once for conv + recurrence.
-    query_BSC, key_BSC, value_BSC, a_BSH, b_BSH = (
+    query_BSC, key_BSC, value_BSC, g_BSH, beta_BSH = (
         unflatten_shim.unflatten_tensor(x, expected_flat_ndim=2)
-        for x in (query_TC, key_TC, value_TC, a_TH, b_TH)
+        for x in (query_TC, key_TC, value_TC, g_TH, beta_TH)
     )
 
     def causal_conv(
@@ -222,9 +224,6 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     xq_BSHK = causal_conv(query_BSC, conv_q_weight_C1W, key_head_dim)
     xk_BSHK = causal_conv(key_BSC, conv_k_weight_C1W, key_head_dim)
     xv_BSHV = causal_conv(value_BSC, conv_v_weight_C1W, value_head_dim)
-    # The rest is upstream `InnerGatedDeltaNet.forward`.
-    g_BSH = -torch.exp(A_log_H.float()) * F.softplus(a_BSH.float() + dt_bias_H)
-    beta_BSH = torch.sigmoid(b_BSH)
     out_BSHV = self.kernel(
         xq_BSHK,
         xk_BSHK,

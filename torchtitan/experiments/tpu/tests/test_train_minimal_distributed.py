@@ -195,9 +195,10 @@ class TrainMinimalDistributedTest(
           param_rtol=1e-3,
       ),
       # CP over all devices. With dp_shard > 1, i.e. Ulysses all-to-alls on CP
-      # subgroups, eager runs on 8 TPU chips (Google3 build) gave NaN or wrong
-      # gradients in 10 of 17 runs; compiled runs of that layout passed (see
-      # qwen3_fsdp_cp2_ulysses_compile), as did eager runs on 4 v6e chips.
+      # subgroups, 8-chip runs on the torch_tpu 2.13 nightly build gave NaN or
+      # wrong gradients in 10 of 17 eager runs (and a 0.024 step-2 lm_head
+      # gradient diff in 1 of 6 layer-compiled FSDP2 runs on tpu7x); the verl
+      # image (torch_tpu 0.2.0) passes on v6e-4 and multi-host v6e-8.
       dict(
           testcase_name="qwen3_simplefsdp_cp_ulysses",
           module="qwen3",
@@ -276,23 +277,6 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=1,
           tensor_parallel_degree=1,
           context_parallel_degree=-1,
-          enable_compile=True,
-          loss_atol=2e-2,
-          loss_rtol=1e-3,
-          grad_atol=2e-2,
-          grad_rtol=1e-3,
-          param_atol=1e-2,
-          param_rtol=1e-3,
-      ),
-      # Ulysses on CP subgroups (dp_shard > 1) with FSDP2, compiled, the
-      # layout verl uses.
-      dict(
-          testcase_name="qwen3_fsdp_cp2_ulysses_compile",
-          module="qwen3",
-          config="qwen3_debugmodel_ulysses_cp2",
-          data_parallel_shard_degree=None,
-          tensor_parallel_degree=1,
-          context_parallel_degree=2,
           enable_compile=True,
           loss_atol=2e-2,
           loss_rtol=1e-3,

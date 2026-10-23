@@ -783,8 +783,9 @@ def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
 
   Complements core ``validate_context_parallel`` (which checks the SPMD
   backend and that every attention is a ``CPInnerAttention``) with the
-  TPU-specific rules: head divisibility per strategy and the load balancer
-  each strategy expects. Does not modify anything.
+  TPU-specific rules: head divisibility per strategy, the load balancer each
+  strategy expects, and no CP + TP/EP under FSDP2 on torch builds that
+  ``install_tpu_cp_patches`` cannot fix. Does not modify anything.
   """
   cp = parallelism.context_parallel_degree
   if cp <= 1:

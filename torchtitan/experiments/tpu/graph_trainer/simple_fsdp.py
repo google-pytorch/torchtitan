@@ -8,10 +8,7 @@ import torch.distributed.distributed_c10d as c10d
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    MixedPrecisionPolicy,
-    ReplicateComputation,
-)
+from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation
 from torchtitan.tools.logging import logger
 
 
@@ -150,8 +147,22 @@ class TpuReplicateComputation(ReplicateComputation):
     return super().replicate_compute(x)
 
 
+def _has_nonleading_shard(param: torch.Tensor) -> bool:
+  return isinstance(param, DTensor) and any(
+      isinstance(placement, Shard) and placement.dim != 0
+      for placement in param.placements
+  )
+
+
 def install_tpu_replicate_computation(model: nn.Module) -> None:
-  """Replace SimpleFSDP's parametrization only on the TPU Qwen model."""
+  """Replace SimpleFSDP's parametrization only on the TPU Qwen model.
+
+  Relies on this fork's SimpleFSDP keeping its per-parameter computations in
+  ``_simple_fsdp_parametrization_list`` (google-pytorch/torchtitan 7e8acc32b).
+  The computations are re-classed in place, so their constructor signature does
+  not matter. Raises if a non-leading shard has no list to patch, so an upstream
+  change cannot silently fall back to the copying path.
+  """
   if any(hasattr(module, "plan_shard_dims") for module in model.modules()):
     # Scan flattens its stacks onto dim 0 so it scales past 512 ranks; keep
     # its collectives on the upstream path.
@@ -160,30 +171,32 @@ def install_tpu_replicate_computation(model: nn.Module) -> None:
   installed = 0
   for module in model.modules():
     # SimpleFSDP's generated parameter properties resolve this private
-    # per-parameter list on every access, so replacing its elements after
+    # per-parameter list on every access, so patching its elements after
     # wrapping changes the gather implementation without modifying the shared
     # SimpleFSDP module.
     parametrizations = getattr(module, "_simple_fsdp_parametrization_list", None)
     if parametrizations is None:
+      unpatched = [
+          name
+          for name, param in module.named_parameters(recurse=False)
+          if _has_nonleading_shard(param)
+      ]
+      if unpatched:
+        raise RuntimeError(
+            f"{type(module).__name__} has non-leading FSDP shards {unpatched} "
+            "but no _simple_fsdp_parametrization_list to patch; SimpleFSDP's "
+            "internals changed, so the TPU native collectives cannot be installed"
+        )
       continue
-    for i, computation in enumerate(parametrizations):
+    for computation in parametrizations:
       if isinstance(computation, TpuReplicateComputation):
         continue
-      if not isinstance(computation, ReplicateComputation):
+      if type(computation) is not ReplicateComputation:
         raise RuntimeError(
             "Unexpected SimpleFSDP parametrization type: "
             f"{type(computation).__name__}"
         )
-      parametrizations[i] = TpuReplicateComputation(
-          computation.device_mesh,
-          computation.param_sharding,
-          computation.mode,
-          mp_policy=MixedPrecisionPolicy(
-              param_dtype=computation.param_dtype,
-              reduce_dtype=computation.reduce_dtype,
-          ),
-          non_dp_mesh_types=computation.non_dp_mesh_types,
-      )
+      computation.__class__ = TpuReplicateComputation
       installed += 1
   logger.info(
       "Installed TPU SimpleFSDP replication on %d parameter(s)", installed

@@ -195,10 +195,12 @@ class TrainMinimalDistributedTest(
           param_rtol=1e-3,
       ),
       # CP over all devices. With dp_shard > 1, i.e. Ulysses all-to-alls on CP
-      # subgroups, 8-chip runs on the torch_tpu 2.13 nightly build gave NaN or
-      # wrong gradients in 10 of 17 eager runs (and a 0.024 step-2 lm_head
-      # gradient diff in 1 of 6 layer-compiled FSDP2 runs on tpu7x); the verl
-      # image (torch_tpu 0.2.0) passes on v6e-4 and multi-host v6e-8.
+      # subgroups interleaved with eager FSDP collectives, 8-chip runs on the
+      # torch_tpu 2.13 nightly build gave NaN or wrong gradients in 10 of 17
+      # eager runs and a 0.024 step-2 lm_head gradient diff in 1 of 6
+      # layer-compiled FSDP2 runs on tpu7x (cf. b/540005818, b/567661022,
+      # b/574966859); the verl image (torch_tpu 0.2.0) passes on v6e-4 and
+      # multi-host v6e-8.
       dict(
           testcase_name="qwen3_simplefsdp_cp_ulysses",
           module="qwen3",

@@ -47,6 +47,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader, TPUGrainDataLoader
+from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
@@ -391,8 +392,16 @@ def _qwen3_cp(
 
 
 def qwen3_debugmodel_allgather_cp2() -> TPUTrainerConfig:
-  """Qwen3 debug model with load-balanced KV all-gather CP degree 2."""
-  return _qwen3_cp(qwen3_debugmodel(), strategy="all_gather", cp_degree=2)
+  """Qwen3 debug model with load-balanced KV all-gather CP degree 2.
+
+  The debug model runs without the Splash kernel, so KV all-gather CP opts in
+  to its plain-PyTorch reference attention, which is fine at this size.
+  """
+  config = _qwen3_cp(qwen3_debugmodel(), strategy="all_gather", cp_degree=2)
+  assert config.model_spec is not None
+  for _, attn, _, _ in config.model_spec.model.traverse(BaseAttention.Config):
+    attn.inner_attention.allow_reference_attention = True
+  return config
 
 
 def qwen3_debugmodel_ulysses_cp2() -> TPUTrainerConfig:

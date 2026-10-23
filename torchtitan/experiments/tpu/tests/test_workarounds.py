@@ -757,6 +757,9 @@ class WorkaroundsTest(parameterized.TestCase):
           layer.attention.inner_attention,
           KVAllGatherCPScaledDotProductInnerAttention.Config,
       )
+      # The debug model runs without Splash, so the recipe opts in to the
+      # reference attention.
+      self.assertTrue(layer.attention.inner_attention.allow_reference_attention)
     # KV All-Gather does not shard heads across CP, so arbitrary n_kv_heads works.
     config.parallelism.context_parallel_degree = 4
     for layer in config.model_spec.model.layers:
@@ -913,49 +916,33 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(dk_cp, k_full.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(dv_cp, v_full.grad, rtol=1e-5, atol=1e-5)
 
-  def test_all_gather_cp_warns_once_without_a_kernel_off_cpu(self):
-    """Without a kernel, KV all-gather CP warns once off CPU, then runs on."""
+  def test_all_gather_cp_needs_a_kernel_off_cpu(self):
+    """Off CPU, KV all-gather CP runs its reference attention only on opt-in."""
     from unittest import mock
     from torchtitan.experiments.tpu import cp_attention
     from torchtitan.experiments.tpu.cp_attention import (
         KVAllGatherCPScaledDotProductInnerAttention,
     )
-    from torchtitan.tools.logging import logger
 
+    config_cls = KVAllGatherCPScaledDotProductInnerAttention.Config
     # Past the kernel check, forward stops at the missing CP mesh.
     self.enter_context(
         mock.patch.object(cp_attention, "spmd_mesh_group", return_value=None)
     )
-    self.enter_context(
-        mock.patch.object(cp_attention, "_warned_reference_attention", False)
-    )
-    attn = KVAllGatherCPScaledDotProductInnerAttention(
-        KVAllGatherCPScaledDotProductInnerAttention.Config()
-    )
-    meta_q = torch.empty(8, 2, 4, device="meta")
-    cpu_q = torch.empty(8, 2, 4)
+    q = torch.empty(8, 2, 4, device="meta")
 
-    # CPU (tests) runs the reference attention silently.
-    with self.assertNoLogs(logger, level="WARNING"):
-      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
-        attn(cpu_q, cpu_q, cpu_q)
-    # Off CPU it warns, once per process.
-    with self.assertLogs(logger, level="WARNING") as logs:
-      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
-        attn(meta_q, meta_q, meta_q)
-    self.assertIn("no attention kernel plugged in", logs.output[0])
-    with self.assertNoLogs(logger, level="WARNING"):
-      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
-        attn(meta_q, meta_q, meta_q)
-
-    # A plugged-in kernel does not warn.
-    self.enter_context(
-        mock.patch.object(cp_attention, "_warned_reference_attention", False)
-    )
+    attn = KVAllGatherCPScaledDotProductInnerAttention(config_cls())
+    with self.assertRaisesRegex(RuntimeError, "no attention kernel"):
+      attn(q, q, q)
     attn.set_local_attention(lambda *args, **kwargs: None)
-    with self.assertNoLogs(logger, level="WARNING"):
-      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
-        attn(meta_q, meta_q, meta_q)
+    with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+      attn(q, q, q)
+
+    attn = KVAllGatherCPScaledDotProductInnerAttention(
+        config_cls(allow_reference_attention=True)
+    )
+    with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+      attn(q, q, q)
 
   def test_all_gather_cp_reference_attention_limits(self):
     """The reference attention needs cp_rank for a CP shard and has no windows."""

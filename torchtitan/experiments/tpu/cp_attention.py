@@ -13,8 +13,7 @@ strategies are provided:
    heads), all-gathers ``K`` and ``V`` to the full sequence ``S`` (with fp32
    reduce-scatter in backward), reorders ``K`` and ``V`` back to contiguous
    order, and runs SplashAttention with its causal / local mask in head-tail
-   ``Q`` order (`q_seq_shards=cp`). Without a kernel plugged in it falls back
-   to a plain-PyTorch reference and warns off CPU (see
+   ``Q`` order (`q_seq_shards=cp`). A kernel must be plugged in on TPU (see
    ``KVAllGatherCPInnerAttention.forward``).
 2. ``ulysses``: Each attention layer all-to-alls q/k/v from token-sharded to
    head-sharded, runs full-sequence attention on ``H / cp`` heads, then
@@ -53,7 +52,6 @@ from torchtitan.models.common.attention import (
     segment_ids_from_positions,
 )
 from torchtitan.models.common.cp_attention import CPInnerAttention
-from torchtitan.tools.logging import logger
 
 __all__ = [
     "UlyssesCPInnerAttention",
@@ -77,30 +75,6 @@ _HEAD_DIM = 1
 # populated during cp_shard / eager setup so torch.compile lifts it as a dynamic
 # graph input instead of baking a constant rank into the traced graph.
 _CP_RANK_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
-
-_warned_reference_attention = False
-
-
-def _warn_reference_attention(device: torch.device) -> None:
-  """Warns once when KV all-gather CP runs ``local_forward`` off CPU."""
-  global _warned_reference_attention
-  # Dynamo cannot trace logging, so this warns in eager mode only.
-  if (
-      torch.compiler.is_compiling()
-      or _warned_reference_attention
-      or device.type == "cpu"
-  ):
-    return
-  _warned_reference_attention = True
-  logger.warning(
-      "KV all-gather CP has no attention kernel plugged in, so it runs the"
-      " plain-PyTorch reference attention (local_forward) on %s. It builds the"
-      " full (S / cp, S) fp32 score matrix, which is fine for tests and tiny"
-      " models but not for long sequences. Set"
-      " splash_attention_kernel.use_splash_attention_kernel=True to plug in"
-      " the Splash kernel.",
-      device.type,
-  )
 
 
 def _cache_cp_rank_for_mesh(cp_mesh: DeviceMesh) -> None:
@@ -357,6 +331,7 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
   def __init__(self, config: Any) -> None:
     super().__init__(config)  # pyrefly: ignore[bad-argument-count]
     self.reduce_dtype = TORCH_DTYPE_MAP[config.reduce_dtype]
+    self.allow_reference_attention = config.allow_reference_attention
     # The local attention kernel, plugged in with set_local_attention.
     self.set_local_attention(None)
 
@@ -475,8 +450,8 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
     matrix (avoiding the torch_tpu compiled SDPA backward NaN issue when
     ``q_seq_len != kv_seq_len``) using tensor indexing with ``cp_rank`` so it is
     traceable without graph breaks. It is the Splash wrapper's fallback for CPU
-    and short sequences, and ``forward``'s when no kernel is plugged in (it
-    warns off CPU). Sliding windows are not supported.
+    and short sequences; ``forward`` refuses it on TPU unless
+    ``allow_reference_attention`` is set. Sliding windows are not supported.
     """
     if self._uses_sliding_window():
       raise NotImplementedError(
@@ -581,7 +556,16 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
   ) -> torch.Tensor:
     local_attn = self._local_attn_override
     if local_attn is None:
-      _warn_reference_attention(q_THK.device)
+      if q_THK.device.type != "cpu" and not self.allow_reference_attention:
+        raise RuntimeError(
+            "KV all-gather CP has no attention kernel. Set"
+            " splash_attention_kernel.use_splash_attention_kernel=True: the"
+            " Splash patch plugs the kernel in via set_local_attention. The"
+            " plain-PyTorch reference (local_forward) builds the full"
+            " (S / cp, S) score matrix and does not support sliding windows;"
+            " set allow_reference_attention=True to run it on TPU anyway"
+            " (tests, tiny models)."
+        )
       local_attn = self.local_forward
     group = spmd_mesh_group(MeshAxisName.CP)
     if group is None:
@@ -699,6 +683,8 @@ class KVAllGatherCPScaledDotProductInnerAttention(
   @dataclass(kw_only=True, slots=True)
   class Config(ScaledDotProductInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
+    allow_reference_attention: bool = False
+    """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""
 
 
 class KVAllGatherCPVarlenInnerAttention(
@@ -708,6 +694,8 @@ class KVAllGatherCPVarlenInnerAttention(
   @dataclass(kw_only=True, slots=True)
   class Config(VarlenInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
+    allow_reference_attention: bool = False
+    """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""
 
 
 CPStrategy = Literal["ulysses", "all_gather"]

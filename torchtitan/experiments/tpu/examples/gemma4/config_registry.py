@@ -30,10 +30,12 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
@@ -71,6 +73,35 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   )
   if _FUSED_LOSS_OVERRIDE not in config.override.imports:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
+
+def _enable_moe_pallas_kernels(config: TPUTrainerConfig) -> None:
+  """Enable Pallas grouped MM, paired W1/W3, native weight layout, and fused route-score bwd."""
+  assert config.model_spec is not None
+  model_config = cast(Gemma4Model.Config, config.model_spec.model)
+  dispatchers = list(
+      model_config.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError(
+        "Gemma4 MoE Pallas configuration requires TpuTokenDispatcherConverter"
+    )
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
+
+  experts_list = list(model_config.traverse(TpuGroupedExperts.Config))
+  if not experts_list:
+    raise ValueError(
+        "Gemma4 MoE Pallas configuration requires TpuGroupedExpertsConverter"
+    )
+  for _, experts, _, _ in experts_list:
+    experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tile_k = 0
+    experts.pallas_grouped_mm_tile_n = 0
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    experts.use_kernel_native_weight_layout = True
 
 
 def gemma4_debugmodel() -> TPUTrainerConfig:
@@ -164,6 +195,13 @@ def gemma4_moe_debug_fused_ce() -> TPUTrainerConfig:
   """Gemma4 MoE debug model with fused Pallas cross-entropy and soft-cap."""
   cfg = gemma4_moe_debug()
   _enable_pallas_cross_entropy(cfg)
+  return cfg
+
+
+def gemma4_moe_debug_pallas() -> TPUTrainerConfig:
+  """Gemma4 MoE debug model with Pallas grouped MM, paired W1/W3, native weights, and fused route-score backward."""
+  cfg = gemma4_moe_debug()
+  _enable_moe_pallas_kernels(cfg)
   return cfg
 
 
@@ -264,6 +302,7 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
       enable_weight_tying=False,
   )
   _enable_pallas_cross_entropy(cfg)
+  _enable_moe_pallas_kernels(cfg)
   return cfg
 
 

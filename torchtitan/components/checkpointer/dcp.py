@@ -13,7 +13,7 @@ import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, cast, Literal, TYPE_CHECKING
+from typing import Any, Callable, cast, Literal, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -32,7 +32,7 @@ from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import filesystem
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.utils import device_type, GarbageCollection
 
 from .base import (
     BaseCheckpointManager,
@@ -59,6 +59,44 @@ class AsyncMode(str, enum.Enum):
     DISABLED = "disabled"
     ASYNC = "async"
     ASYNC_WITH_PINNED_MEM = "async_with_pinned_mem"
+
+
+_DEVICE_BACKEND_AUTOLOAD_ENV = "TORCH_DEVICE_BACKEND_AUTOLOAD"
+
+
+# TODO: b/576703287 - Remove once torch_tpu's isAvailable() no longer
+# initializes the TPU runtime.
+def _disable_device_autoload_for_dcp_daemon() -> Callable[[], None] | None:
+    """Keeps DCP's async checkpoint daemon from loading torch_tpu.
+
+    ``async_with_pinned_mem`` saves run in a CPU-only process spawned by DCP,
+    which calls ``dist.init_process_group("gloo")`` and ``dist.barrier()``.
+    ``barrier()`` queries the accelerator (``torch._C._get_accelerator()``);
+    with torch_tpu autoloaded, that initializes the TPU runtime and tries to
+    open the TPU device nodes already held by the trainer, which fails. With
+    autoload disabled, torch_tpu is never loaded in the child. The trainer has
+    already loaded torch_tpu, so setting the env var here only affects newly
+    spawned processes.
+
+    The variable is process-wide until the save completes, so any other process
+    spawned in that window (e.g. ``spawn`` dataloader workers) also starts
+    without torch_tpu; this is harmless for CPU-only children.
+
+    Returns:
+        A callable restoring the previous env value, or None if not on TPU.
+    """
+    if device_type != "tpu":
+        return None
+    prev = os.environ.get(_DEVICE_BACKEND_AUTOLOAD_ENV)
+    os.environ[_DEVICE_BACKEND_AUTOLOAD_ENV] = "0"
+
+    def restore() -> None:
+        if prev is None:
+            os.environ.pop(_DEVICE_BACKEND_AUTOLOAD_ENV, None)
+        else:
+            os.environ[_DEVICE_BACKEND_AUTOLOAD_ENV] = prev
+
+    return restore
 
 
 class SaveDone:
@@ -459,6 +497,7 @@ class CheckpointManager(BaseCheckpointManager):
                 )
 
             async_save_started_at = time.monotonic()
+            restore_autoload = _disable_device_autoload_for_dcp_daemon()
             result = self.dcp_save(
                 states,
                 checkpoint_id=checkpoint_id,
@@ -469,6 +508,10 @@ class CheckpointManager(BaseCheckpointManager):
             assert isinstance(result, AsyncSaveResponse)
             self.staging_future = result.staging_completion
             self.save_future = result.upload_completion
+            if restore_autoload is not None:
+                # DCP spawns its daemon lazily from a background thread, so only
+                # restore the env var once the save (and thus the spawn) is done.
+                self.save_future.add_done_callback(lambda _: restore_autoload())
 
         elif self.async_mode == AsyncMode.ASYNC:
             GarbageCollection.collect("GC collection invoked by checkpointer.")

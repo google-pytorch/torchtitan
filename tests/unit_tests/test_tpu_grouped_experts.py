@@ -130,6 +130,7 @@ def test_pallas_dweight_is_stored_in_the_weight_dtype(weight_dtype):
         128,
         32,
         64,
+        False,
     )
 
     assert grad_lhs.shape == (128, 32)
@@ -291,14 +292,16 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
     assert unpaired.call_args.kwargs["tgmm_tiling"] == (128, 8, 0)
 
 
+@pytest.mark.parametrize("transposed", [False, True])
 @pytest.mark.parametrize("paired", [True, False])
-def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
+def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired, transposed):
     """``pallas_grouped_mm_w2_tgmm_tiling`` tiles W2 and nothing else.
 
     Its N tile is non-zero here: the full-N rule is the paired kernel's, and W2
-    is never paired.
+    is never paired. The transposed-RHS tiling replaces it only when the W2 RHS
+    is transposed.
     """
-    shared, w2_own = (128, 8, 0), (64, 4, 4)
+    shared, w2_own, w2_transposed = (128, 8, 0), (64, 4, 4), (32, 0, 8)
     experts = TpuGroupedExperts.Config(
         dim=16,
         hidden_dim=24,
@@ -307,14 +310,17 @@ def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
         use_pallas_paired_grouped_mm=paired,
         pallas_grouped_mm_tgmm_tiling=shared,
         pallas_grouped_mm_w2_tgmm_tiling=w2_own,
+        pallas_grouped_mm_w2_transposed_tgmm_tiling=w2_transposed,
     ).build()
+    experts._use_transposed_w2_rhs = transposed
     for param in experts.parameters():
         torch.nn.init.normal_(param, std=0.02)
     x = torch.randn(7, 16)
     counts = torch.tensor([3, 4], dtype=torch.int32)
 
     def grouped_mm(x, weight, counts, **kwargs):
-        del kwargs
+        if kwargs.get("transpose_rhs"):
+            weight = weight.transpose(-2, -1)
         offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
         return torch._grouped_mm(x, weight, offs=offsets)
 
@@ -342,7 +348,9 @@ def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
         assert gate.kwargs["tgmm_tiling"] == shared
         assert up.kwargs["tgmm_tiling"] == shared
     # W2 is always the last unpaired call.
-    assert unpaired.call_args_list[-1].kwargs["tgmm_tiling"] == w2_own
+    w2_call = unpaired.call_args_list[-1].kwargs
+    assert w2_call["transpose_rhs"] is transposed
+    assert w2_call["tgmm_tiling"] == (w2_transposed if transposed else w2_own)
 
 
 def test_kernel_native_layout_preserves_initialization_and_state_dict():

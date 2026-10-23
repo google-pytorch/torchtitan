@@ -23,7 +23,9 @@ from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
 )
 
 
-def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
+def _model(
+    *, hidden_dim: int = 8, vocab_size: int = 8, kernel_native: bool = False
+) -> nn.Module:
   model = nn.Module()
   model.tok_embeddings = nn.Embedding(vocab_size, 8)
   model.lm_head = nn.Linear(8, vocab_size, bias=False)
@@ -33,6 +35,8 @@ def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
       dim=8,
       hidden_dim=hidden_dim,
       num_experts=2,
+      use_pallas_grouped_mm=kernel_native,
+      use_kernel_native_weight_layout=kernel_native,
   ).build()
   model.layers = nn.ModuleDict({"0": layer})
   return model
@@ -73,6 +77,18 @@ class SimpleFSDPShardingTest(absltest.TestCase):
     configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(2))
 
     self.assertFalse(hasattr(model.layers["0"].moe.experts, "_fsdp_shard_dim"))
+
+  def test_native_w2_uses_its_tile_aligned_trailing_axis(self) -> None:
+    model = _model(hidden_dim=6, kernel_native=True)
+
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
+
+    experts = model.layers["0"].moe.experts
+    self.assertEqual(
+        experts._fsdp_shard_dim,
+        {"w1_EDF": 1, "w2_EFD": 2, "w3_EDF": 1},
+    )
+    self.assertTrue(experts._use_transposed_w2_rhs)
 
   def test_finds_experts_beneath_layer_wrappers(self) -> None:
     model = _wrapped_model()
@@ -115,7 +131,7 @@ class SimpleFSDPShardingTest(absltest.TestCase):
   def test_rejects_when_hidden_axis_is_not_divisible(self) -> None:
     model = _model(hidden_dim=6)
 
-    with self.assertRaisesRegex(ValueError, "moe.experts.*hidden dimension 1"):
+    with self.assertRaisesRegex(ValueError, "moe.experts.*incompatible expert"):
       configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
   def test_uses_hidden_axis_when_vocabulary_is_uneven(self) -> None:
@@ -134,11 +150,17 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         SimpleNamespace(mixed_precision_reduce="bfloat16"),
     )
 
-    with mock.patch.object(
-        graph_trainer_qwen3,
-        "graph_trainer_parallelize_qwen3",
-        return_value=model,
-    ) as upstream_parallelize:
+    with (
+        mock.patch.object(
+            graph_trainer_qwen3,
+            "graph_trainer_parallelize_qwen3",
+            return_value=model,
+        ) as upstream_parallelize,
+        mock.patch.object(
+            graph_trainer_qwen3,
+            "install_tpu_replicate_computation",
+        ) as install_tpu_replicate,
+    ):
       result = graph_trainer_qwen3.parallelize_qwen3(
           cast(GraphTrainerQwen3Model, model),
           training=training,
@@ -152,6 +174,7 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         training=training,
         parallel_dims=parallel_dims,
     )
+    install_tpu_replicate.assert_called_once_with(model)
 
 
 if __name__ == "__main__":

@@ -412,6 +412,12 @@ def _tpu_selective_memory_policy_pass(
     return gm
 
 
+def _tag_saved(node: torch.fx.Node, policy: CheckpointPolicy) -> None:
+    """Tag ``node`` and the getitems that unpack it, which share its tag."""
+    for saved in (node, *(u for u in node.users if u.target is operator.getitem)):
+        saved.meta["recompute"] = policy
+
+
 @register_memory_policy("tpu_selective_and_offload")
 def _tpu_selective_and_offload_memory_policy_pass(
     gm: torch.fx.GraphModule,
@@ -428,13 +434,14 @@ def _tpu_selective_and_offload_memory_policy_pass(
     last_n_layers = tpu_config.graph_trainer_save_last_n_layers
     regions = resolve_save_regions(tpu_config.graph_trainer_save_regions, last_n_layers)
     save_nodes = select_saves(gm, regions, last_n_layers)
-    full_remat_with_saves(gm, config, save_nodes)
+    # Tag full remat first, so the layer boundaries are the only saved values
+    # and therefore the only ones the offload tagger can send to host.
+    full_remat_with_saves(gm, config, ())
     tag_all_offloadable_activations(
         gm,
         cpu_budget_gb=config.compile.cpu_offload_budget_gb,
     )
+    # Then save the region values in HBM.
     for node in save_nodes:
-        for saved in (node, *node.users):
-            if saved.meta.get("recompute") is CheckpointPolicy.MUST_CPU_OFFLOAD:
-                saved.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        _tag_saved(node, CheckpointPolicy.MUST_SAVE)
     return gm

@@ -517,9 +517,11 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       raise ValueError("cp_rank is required when Q is a CP shard (cp > 1).")
     kv_pos = torch.arange(kv_len, device=q.device, dtype=torch.int32)
     if cp > 1:
-      r = cp_rank.reshape(())
+      # index_select keeps the rank a tensor: indexing with it would read its
+      # value (a data-dependent graph break under torch.compile).
+      rank = cp_rank.reshape(1)
       q_pos_full = reorder_sequence(kv_pos, cp_size=cp, seq_dim=0)
-      q_pos = q_pos_full.reshape(cp, q_len)[r]
+      q_pos = q_pos_full.reshape(cp, q_len).index_select(0, rank).reshape(q_len)
     else:
       q_pos = kv_pos
 
@@ -534,7 +536,11 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       )
       if cp > 1:
         q_seg_full = reorder_sequence(seg_2d, cp_size=cp, seq_dim=1)
-        q_seg = q_seg_full.reshape(bsz, cp, q_len)[:, r, :]
+        q_seg = (
+            q_seg_full.reshape(bsz, cp, q_len)
+            .index_select(1, rank)
+            .reshape(bsz, q_len)
+        )
       else:
         q_seg = seg_2d
       mask = mask & (q_seg[:, None, :, None] == seg_2d[:, None, None, :])

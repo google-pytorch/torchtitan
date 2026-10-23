@@ -22,10 +22,30 @@ from torchtitan.experiments.tpu.examples.gemma4 import (
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.models.muse_glimmer.model import SoftCappedLinear
+
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss."
+    "fused_loss_soft_capped_lm_head"
+)
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the soft-capped fused Pallas loss and its LM-head override."""
+  assert config.model_spec is not None
+  model_config = cast(Gemma4Model.Config, config.model_spec.model)
+  lm_head = cast(SoftCappedLinear.Config, model_config.lm_head)
+  config.loss = PallasCrossEntropyLoss.Config(
+      soft_cap=lm_head.output_soft_cap_temp,
+      output_multiplier=lm_head.output_multiplier,
+  )
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
 def gemma4_debugmodel() -> TPUTrainerConfig:
@@ -77,6 +97,13 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
   )
 
 
+def gemma4_debugmodel_fused_ce() -> TPUTrainerConfig:
+  """Gemma4 dense debug model with fused Pallas cross-entropy and soft-cap."""
+  cfg = gemma4_debugmodel()
+  _enable_pallas_cross_entropy(cfg)
+  return cfg
+
+
 def gemma4_moe_testmodel() -> TPUTrainerConfig:
   """Gemma4 MoE test model configuration for TPU."""
   cfg = gemma4_debugmodel()
@@ -105,12 +132,19 @@ def gemma4_moe_debug() -> TPUTrainerConfig:
   return cfg
 
 
+def gemma4_moe_debug_fused_ce() -> TPUTrainerConfig:
+  """Gemma4 MoE debug model with fused Pallas cross-entropy and soft-cap."""
+  cfg = gemma4_moe_debug()
+  _enable_pallas_cross_entropy(cfg)
+  return cfg
+
+
 def gemma4_31b() -> TPUTrainerConfig:
   """Gemma4 31B dense model configuration for TPU."""
   model_spec = model_registry(
       "31B", attn_backend="sdpa", enable_weight_tying=False
   )
-  return TPUTrainerConfig(
+  cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
       model_spec=model_spec,
@@ -152,6 +186,8 @@ def gemma4_31b() -> TPUTrainerConfig:
           steps=10,
       ),
   )
+  _enable_pallas_cross_entropy(cfg)
+  return cfg
 
 
 def gemma4_26b_a4b() -> TPUTrainerConfig:
@@ -167,5 +203,5 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
       ],
       enable_weight_tying=False,
   )
+  _enable_pallas_cross_entropy(cfg)
   return cfg
-

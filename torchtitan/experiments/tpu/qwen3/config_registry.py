@@ -139,6 +139,11 @@ _Q235_SCAN_FLAGS = tpu_flags.merge_flags(
         "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass": (
             25000000
         ),
+        # SELECTIVE_ICI_RS_PIPELINING stops at 1024 KiB per shard, which keeps
+        # the 24 MiB expert-gradient shards inside their iteration, waiting at
+        # the end of the body. Pipelining them too: +2.2% at 64 chips, for
+        # +3.2 GiB HBM.
+        "xla_tpu_ici_rs_pipelining_threshold_kib": 32768,
     },
 )
 

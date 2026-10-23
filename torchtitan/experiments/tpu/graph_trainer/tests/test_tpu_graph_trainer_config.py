@@ -1065,13 +1065,21 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
     for group in (
-        tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
         tpu_flags.ICI_AG_PIPELINING,
         tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
     ):
       self.assertEqual(
           {name: config.libtpu_init_flags[name] for name in group}, group
       )
+    self.assertEqual(
+        config.libtpu_init_flags["xla_tpu_enable_ici_rs_pipelining"], "true"
+    )
+    # Raised from SELECTIVE_ICI_RS_PIPELINING's 1024 to cover the expert
+    # gradient reduce-scatters.
+    self.assertEqual(
+        config.libtpu_init_flags["xla_tpu_ici_rs_pipelining_threshold_kib"],
+        "32768",
+    )
     self.assertEqual(
         config.libtpu_init_flags[
             "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass"

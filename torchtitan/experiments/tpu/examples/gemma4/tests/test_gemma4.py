@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torchtitan.components.loss import (
     ChunkedLossWrapper,
     CrossEntropyLoss,
+    IGNORE_INDEX,
     cross_entropy_loss,
 )
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
@@ -26,8 +27,13 @@ from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     gemma4_26b_a4b,
     gemma4_31b,
     gemma4_debugmodel,
+    gemma4_debugmodel_fused_ce,
     gemma4_moe_debug,
+    gemma4_moe_debug_fused_ce,
     gemma4_moe_testmodel,
+)
+from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
+    configure_gemma4_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import (
     Gemma4Attention,
@@ -41,6 +47,13 @@ from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
+)
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.overrides.fused_loss import (
+    FusedLossLinearWrapper,
+)
+from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
@@ -1131,6 +1144,206 @@ class TestGemma4SplashAttentionParity(BaseDeviceTest):
         0.1,
         "Unmasked causal attention is too close to the windowed/packed output;"
         " the 1e-2 check above would not catch a broken mask.",
+    )
+
+
+class TestGemma4FusedCrossEntropyConfig(parameterized.TestCase):
+  """Config-level checks for Gemma 4 soft-capped fused Pallas cross-entropy."""
+
+  @parameterized.parameters(
+      gemma4_debugmodel_fused_ce,
+      gemma4_moe_debug_fused_ce,
+      gemma4_31b,
+      gemma4_26b_a4b,
+  )
+  def test_recipe_wires_soft_capped_pallas_cross_entropy(self, recipe):
+    cfg = recipe()
+    self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(cfg.loss.soft_cap, 30.0)
+    self.assertEqual(cfg.loss.output_multiplier, 1.0)
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.fused_loss."
+        "fused_loss_soft_capped_lm_head",
+        cfg.override.imports,
+    )
+
+  def test_override_replaces_lm_head_with_fused_loss_linear_wrapper(self):
+    from torchtitan.config import apply_overrides
+
+    cfg = gemma4_debugmodel_fused_ce()
+    apply_overrides(cfg.override, cfg)
+    lm_head_cfg = cfg.model_spec.model.lm_head
+    self.assertIsInstance(lm_head_cfg, FusedLossLinearWrapper.Config)
+    self.assertEqual(lm_head_cfg.soft_cap, 30.0)
+    self.assertEqual(lm_head_cfg.output_multiplier, 1.0)
+
+    with torch.device("meta"):
+      model = cfg.model_spec.model.build()
+    self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
+    self.assertTrue(model.lm_head.returns_loss_operands)
+    self.assertEqual(tuple(model.lm_head.weight.shape), (2048, 256))
+
+
+class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
+  """TPU parity of PallasCrossEntropyLoss(soft_cap=30.0) vs SoftCappedLinear + CrossEntropyLoss."""
+
+  def setUp(self):
+    super().setUp()
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous_precision)
+
+  def _check_relative_l2(
+      self,
+      test: torch.Tensor,
+      reference: torch.Tensor,
+      max_rel_error: float,
+      check_name: str,
+  ) -> None:
+    test_f = test.detach().float().cpu()
+    ref_f = reference.detach().float().cpu()
+    rel_error = (
+        torch.linalg.vector_norm(test_f - ref_f)
+        / torch.linalg.vector_norm(ref_f).clamp_min(1e-12)
+    ).item()
+    self.assertLessEqual(
+        rel_error,
+        max_rel_error,
+        f"{check_name}: relative L2 error {rel_error:.3e} >"
+        f" {max_rel_error:.1e}",
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="float32",
+          dtype=torch.float32,
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          # Pallas Mosaic TPU kernel uses MXU 1-pass bf16-input dot products
+          # internally (measured ~2.9e-3 vs CPU IEEE FP32; negative control with
+          # soft_cap=None diverges by >5e-2).
+          grad_rel_l2=5e-3,
+      ),
+      dict(
+          testcase_name="bfloat16",
+          dtype=torch.bfloat16,
+          loss_atol=1.5e-2,
+          loss_rtol=5e-3,
+          grad_rel_l2=1.5e-2,
+      ),
+  )
+  def test_fused_cross_entropy_matches_eager_soft_capped_linear(
+      self,
+      dtype: torch.dtype,
+      loss_atol: float,
+      loss_rtol: float,
+      grad_rel_l2: float,
+  ):
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("PallasCrossEntropyLoss Mosaic kernel only runs on TPU.")
+
+    torch.manual_seed(42)
+    num_tokens, dim, vocab_size = 1024, 256, 2048
+    soft_cap = 30.0
+
+    eager_head_cfg = SoftCappedLinear.Config(
+        in_features=dim,
+        out_features=vocab_size,
+        output_soft_cap_temp=soft_cap,
+        param_init={"weight": partial(nn.init.normal_, mean=0.0, std=1.5)},
+    )
+    fused_head_cfg = FusedLossLinearWrapper.Config(
+        in_features=dim,
+        out_features=vocab_size,
+        soft_cap=soft_cap,
+        output_multiplier=1.0,
+        param_init={"weight": partial(nn.init.normal_, mean=0.0, std=1.5)},
+    )
+
+    eager_head = eager_head_cfg.build().to(dtype=dtype)
+    eager_head.init_states()
+    fused_head = fused_head_cfg.build().to(
+        device=self.accelerator_device, dtype=dtype
+    )
+    fused_head.load_state_dict(eager_head.state_dict())
+
+    # Scale hidden states so pre-cap logits (z = x @ w.T) have std ~24 and
+    # exercise the non-linear saturation region of 30 * tanh(z / 30).
+    x_cpu = torch.randn(num_tokens, dim, dtype=dtype, requires_grad=True)
+    x_tpu = x_cpu.detach().to(self.accelerator_device).requires_grad_(True)
+    labels_cpu = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.long)
+    # Include IGNORE_INDEX (-100) positions to verify masked token handling.
+    labels_cpu[::16] = IGNORE_INDEX
+    labels_tpu = labels_cpu.to(self.accelerator_device)
+    valid_tokens_cpu = (labels_cpu != IGNORE_INDEX).sum()
+    valid_tokens_tpu = valid_tokens_cpu.to(self.accelerator_device)
+
+    eager_loss_fn = CrossEntropyLoss.Config().build()
+    fused_loss_fn = PallasCrossEntropyLoss.Config(
+        b_block_size=1024,
+        h_block_size=256,
+        v_block_size=2048,
+        soft_cap=soft_cap,
+        output_multiplier=1.0,
+    ).build()
+
+    logits_cpu = eager_head(x_cpu)
+    loss_cpu, _ = eager_loss_fn(logits_cpu, labels_cpu, valid_tokens_cpu)
+    loss_cpu.backward()
+
+    operands_tpu = fused_head(x_tpu)
+    loss_tpu, _ = fused_loss_fn(operands_tpu, labels_tpu, valid_tokens_tpu)
+    loss_tpu.backward()
+
+    test_utils.check_equivalence(
+        loss_tpu.detach().float().cpu(),
+        loss_cpu.detach().float().cpu(),
+        atol=loss_atol,
+        rtol=loss_rtol,
+        check_name=f"Fused CE loss ({dtype})",
+    )
+    self._check_relative_l2(
+        x_tpu.grad,
+        x_cpu.grad,
+        max_rel_error=grad_rel_l2,
+        check_name=f"Fused CE hidden grad ({dtype})",
+    )
+    self._check_relative_l2(
+        fused_head.weight.grad,
+        eager_head.weight.grad,
+        max_rel_error=grad_rel_l2,
+        check_name=f"Fused CE lm_head.weight grad ({dtype})",
+    )
+
+    # Negative control: running PallasCrossEntropyLoss without soft_cap (None)
+    # on the same inputs must diverge well beyond the test tolerances.
+    uncapped_loss_fn = PallasCrossEntropyLoss.Config(
+        b_block_size=1024,
+        h_block_size=256,
+        v_block_size=2048,
+        soft_cap=None,
+        output_multiplier=1.0,
+    ).build()
+    x_uncapped = x_cpu.detach().to(self.accelerator_device).requires_grad_(True)
+    fused_head.zero_grad()
+    loss_uncapped, _ = uncapped_loss_fn(
+        fused_head(x_uncapped), labels_tpu, valid_tokens_tpu
+    )
+    loss_uncapped.backward()
+    loss_diff = (loss_uncapped.detach().float().cpu() - loss_cpu.detach().float()).abs().item()
+    self.assertGreater(
+        loss_diff,
+        0.5,
+        f"Uncapped loss differed by only {loss_diff:.3e}; soft-cap check is not sensitive.",
+    )
+    grad_uncapped_rel = (
+        torch.linalg.vector_norm(x_uncapped.grad.detach().float().cpu() - x_cpu.grad.detach().float())
+        / torch.linalg.vector_norm(x_cpu.grad.detach().float())
+    ).item()
+    self.assertGreater(
+        grad_uncapped_rel,
+        0.1,
+        f"Uncapped grad relative L2 was only {grad_uncapped_rel:.3e}; soft-cap check is not sensitive.",
     )
 
 

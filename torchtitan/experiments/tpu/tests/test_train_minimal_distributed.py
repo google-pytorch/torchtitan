@@ -123,7 +123,7 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-             # TODO(jerryx99): Investigate numerical divergence b/540005818
+              # TODO(jerryx99): Investigate numerical divergence b/540005818
               device_type.AcceleratorDeviceType.TPU,
           ],
           loss_atol=1e-3,
@@ -194,6 +194,92 @@ class TrainMinimalDistributedTest(
           param_atol=1e-2,
           param_rtol=1e-3,
       ),
+      dict(
+          testcase_name="qwen3_simplefsdp_cp2_ulysses",
+          module="qwen3",
+          config="qwen3_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.use_simple_fsdp"],
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
+      # FSDP2 over the flattened (dp_shard, cp) mesh, with dp_shard > 1.
+      dict(
+          testcase_name="qwen3_fsdp_cp2_all_gather",
+          module="qwen3",
+          config="qwen3_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          skip_devices=[
+              # 2 devices: dp_shard=1, the same as qwen3_cp_all_gather.
+              device_type.AcceleratorDeviceType.CPU,
+          ],
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
+      # HSDP: FSDP2 over (dp_replicate, dp_shard x cp).
+      dict(
+          testcase_name="qwen3_hsdp_cp2_all_gather",
+          module="qwen3",
+          config="qwen3_debugmodel_allgather_cp2",
+          data_parallel_replicate_degree=2,
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          skip_devices=[
+              # Needs 2 (replicate) x 2 (cp) devices or more.
+              device_type.AcceleratorDeviceType.CPU,
+          ],
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
+      # torch.compile (skipped on CPU) with TPUSelectiveAC, which
+      # parallelize_qwen3 uses for CP in place of the recipe's SelectiveAC.
+      dict(
+          testcase_name="qwen3_cp_all_gather_compile",
+          module="qwen3",
+          config="qwen3_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=1,
+          context_parallel_degree=-1,
+          enable_compile=True,
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
+      dict(
+          testcase_name="qwen3_cp_ulysses_compile",
+          module="qwen3",
+          config="qwen3_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=1,
+          context_parallel_degree=-1,
+          enable_compile=True,
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
       # gemma4
       dict(
           testcase_name="gemma4_tp",
@@ -243,6 +329,7 @@ class TrainMinimalDistributedTest(
       data_parallel_shard_degree,
       tensor_parallel_degree,
       context_parallel_degree=None,
+      data_parallel_replicate_degree=None,
       skip_devices=None,
       loss_atol=5e-3,
       loss_rtol=5e-3,  # Default atol/rtols
@@ -282,10 +369,12 @@ class TrainMinimalDistributedTest(
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
             "--training.num_tokens_per_microbatch_per_dp_rank=256",
-        ] + (args or []),
+        ]
+        + (args or []),
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_shard_degree=data_parallel_shard_degree,
         context_parallel_degree=context_parallel_degree,
+        data_parallel_replicate_degree=data_parallel_replicate_degree,
         skip_devices=skip_devices,
         loss_atol=loss_atol,
         loss_rtol=loss_rtol,

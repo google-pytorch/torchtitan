@@ -25,6 +25,7 @@ from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
+import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
@@ -400,7 +401,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if model_spec.name in ("llama3", "muse_glimmer", "qwen3"):
+      if model_spec.name in ("llama3", "muse_glimmer", "qwen3", "gemma4"):
         if (
             train_config.tpu_config.use_graph_trainer
             or train_config.tpu_config.compile_mode == "aot_fx_trace"

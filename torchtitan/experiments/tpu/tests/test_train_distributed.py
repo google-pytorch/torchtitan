@@ -341,6 +341,44 @@ class TrainDistributedTest(
       #           device_type.AcceleratorDeviceType.CUDA,
       #       ],
       #   ),
+      # gemma4
+      dict(
+          testcase_name="gemma4_tp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+      ),
+      dict(
+          testcase_name="gemma4_fsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="gemma4_simplefsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+      ),
+      dict(
+          testcase_name="gemma4_moe_fsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_moe_testmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="gemma4_fsdp_checkpoint",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          checkpoint_enabled=True,
+      ),
       # muse_glimmer (text-only). TP is capped at 2: the debugmodel has 2 KV
       # heads (see muse_glimmer_fsdp_tp2).
       dict(

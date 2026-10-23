@@ -13,6 +13,7 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import local_tpu_device
+import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
@@ -247,6 +248,25 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
+      ),
+      dict(
+          testcase_name="gemma4_tp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+      ),
+      dict(
+          testcase_name="gemma4_tp_compile",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+          enable_compile=True,
+          # TODO: Same TPU7x-only XLA fusion_emitter.cc CHECK failure
+          # ("Scaled window bound is not a power of 2") as qwen3_tp_compile.
+          # b/568843473
+          skip_on_tpu7x=True,
       ),
   ])
   def test_model_distributed(

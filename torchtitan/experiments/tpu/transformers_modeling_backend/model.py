@@ -31,13 +31,14 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 
 import contextlib
 import copy
+import functools
 import json
 from dataclasses import dataclass
 
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import AttentionInterface, PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface, PreTrainedModel
 
 from torchtitan.experiments.transformers_modeling_backend.model import (
     _ATTN_IMPLEMENTATION as _FLEX_IMPLEMENTATION,
@@ -47,12 +48,10 @@ from torchtitan.experiments.transformers_modeling_backend.model import (
 from torchtitan.tools.logging import logger
 
 from . import _meta_init, _structure
-# Registers ``attn_implementation="splash_tpu"`` with HF's AttentionInterface.
-# Imported here, not only by the config registry: a worker that receives the
-# Config by pickle (the test harness, any custom entry point) imports this
-# module and nothing else from the lane, and an unregistered name would be
-# quietly built as sdpa.
-from . import attention as _attention  # noqa: F401  pylint: disable=unused-import
+# Importing ``attention`` registers ``attn_implementation="splash_tpu"`` with
+# HF's AttentionInterface, also for a worker that receives the Config by pickle
+# and imports nothing else from the lane.
+from . import attention as _attention
 
 
 class _Attrs:
@@ -207,6 +206,7 @@ class TPUHFTransformerModel(HFTransformerModel):
               f"hf_config_overrides: {hf_model_id} config has no field {key!r}"
           )
         setattr(self, key, value)
+
       self._mirror_logit_transform_into_fused_loss(config, hf_model_id)
       return self
 
@@ -476,7 +476,9 @@ class TPUHFTransformerModel(HFTransformerModel):
           )
       except Exception as e:
         logger.warning(f"Could not size the position table: {e}")
-    return self._build_with_supported_attention(model_cls, config)
+    model = self._build_with_supported_attention(model_cls, config)
+    _use_tpu_esmc_attention(model)
+    return model
 
   @staticmethod
   def _set_attn_everywhere(config, attn: str) -> None:
@@ -632,20 +634,27 @@ class TPUHFTransformerModel(HFTransformerModel):
     backbone, _ = _structure.find_backbone(self.model)
     if backbone is not None:
       seen.add(id(backbone))
-    for holder in (backbone, self.model):
-      if holder is None:
-        continue
+
+    def _walk_unseen(holder, prefix=""):
       for child_name, child in holder.named_children():
         if child is None or id(child) in seen:
           continue
-        # Skip a module that *contains* something already yielded. BERT keeps
-        # its head at cls.predictions.decoder and its token table at
-        # embeddings.word_embeddings, so yielding `cls` or `embeddings` here
-        # would hand the caller a second route to a part already given.
+        full_name = f"{prefix}.{child_name}" if prefix else child_name
+        # A container holding an already-yielded part (BERT/ESM keep the
+        # token table at embeddings.word_embeddings, the head at
+        # cls.predictions.decoder) is descended into, not yielded: yielding
+        # it would hand out the seen part twice, skipping it would lose its
+        # siblings (position_embeddings, layer_norm). Its own direct
+        # parameters/buffers are therefore not reachable through children().
         if any(id(d) in seen for d in child.modules()):
+          yield from _walk_unseen(child, full_name)
           continue
         seen.add(id(child))
-        yield child_name, child
+        yield full_name, child
+
+    for holder in (backbone, self.model):
+      if holder is not None:
+        yield from _walk_unseen(holder)
 
   # ---- masks and forward --------------------------------------------------
 
@@ -679,17 +688,39 @@ class TPUHFTransformerModel(HFTransformerModel):
   def forward(self, *args, **kwargs):
     positions = kwargs.pop("positions", None)
     attention_masks = kwargs.pop("attention_masks", None)
-    model_args = (args[0].unsqueeze(0), *args[1:])
+    # The trainer folds the local batch into one token-major stream [T],
+    # T = B * context_length. Run as [1, T], a bidirectional (FullMask)
+    # encoder has no block structure for splash to skip, so cross-sample
+    # tiles are computed and then masked: O((B*S)^2) work for O(B*S^2)
+    # useful. Unfolding to [B, S] cuts that by B (ESMC-6B, 4 x 2048
+    # tokens/rank, TPU v7x: 4,374 -> 7,165 tok/s per core). Positions and
+    # segment ids stay consistent within each row. A document the packer
+    # laid across a row boundary would be attended as two halves, so the
+    # recipe packs rows to the context (``pack_rows_to_context``). The
+    # head and the loss still see the folded [T, ...] stream.
+    stream = args[0]
+    unfold_rows = 1
+    if (
+        positions is not None
+        and stream.dim() == 1
+        and self._context_length
+        and stream.shape[0] > self._context_length
+        and stream.shape[0] % self._context_length == 0
+    ):
+      unfold_rows = stream.shape[0] // self._context_length
+    model_args = (stream.view(unfold_rows, -1), *args[1:])
 
     if positions is not None:
       # Per-document positions (reset at packed-sample boundaries) drive RoPE;
       # the mask handles cross-sample masking (segment ids on splash).
-      kwargs["position_ids"] = positions.unsqueeze(0)
+      kwargs["position_ids"] = positions.view(unfold_rows, -1)
     else:
-      local_seq_len = args[0].shape[0]
-      kwargs["position_ids"] = torch.arange(local_seq_len, device=args[0].device).unsqueeze(0)
+      kwargs["position_ids"] = torch.arange(stream.shape[0], device=stream.device).unsqueeze(0)
 
     if attention_masks is not None:
+      if unfold_rows > 1:
+        assert attention_masks.dim() <= 2, attention_masks.shape
+        attention_masks = attention_masks.reshape(unfold_rows, -1)
       kwargs["attention_mask"] = attention_masks
 
     # Document segment ids for the splash adapter, derived once per forward
@@ -763,8 +794,9 @@ class TPUHFTransformerModel(HFTransformerModel):
             "returns logits rather than hidden states. Use the plain "
             "cross-entropy config (hf_full_max_plain_ce)."
         )
-      return logits.squeeze(0)
-    hidden_states = hidden.squeeze(0)
+      return logits.reshape(-1, logits.shape[-1])
+    # [B, S, H] -> [T, H]: hand back the folded stream the trainer gave us.
+    hidden_states = hidden.reshape(-1, hidden.shape[-1])
 
     if self._fused_loss:
       # Hand the loss the operands instead of the logits. Materializing them
@@ -925,6 +957,95 @@ class TPUHFTransformerModel(HFTransformerModel):
           f"{moved[0]}). This is an upstream initializer that builds a tensor "
           "without a device."
       )
+
+
+def _rotate_half_matrix(head_dim: int) -> torch.Tensor:
+  """``R`` with ``x @ R == rotate_half(x)`` (``cat(-x2, x1)`` as one matmul)."""
+  half = head_dim // 2
+  eye = torch.eye(half)
+  rotation = torch.zeros(head_dim, head_dim)
+  rotation[:half, half:] = eye
+  rotation[half:, :half] = -eye
+  return rotation
+
+
+class _EsmcTPUAttention(nn.Module):
+  """``EsmcAttention.forward`` arranged for TPU layouts; same parameters.
+
+  Stock ESM-C transposes q/k/v to ``(B, H, S, D)`` as strided views and runs
+  ``rotate_half`` by slicing the 64-wide head into two 32-wide halves. On the
+  128-lane TPU vector unit that costs sub-tile relayout copies of q/k (and of
+  their gradients through QK-LayerNorm) in every layer. Here the transposes
+  are contiguous in both directions and ``rotate_half`` is a ``(D, D)``
+  matmul the MXU fuses into the RoPE elementwise work. Measured on ESMC-600M,
+  32 x 2048 tokens/rank, TPU v7x: 47,252 -> 52,538 tok/s per core (+11%).
+
+  Installed by swapping the instance's class, so submodules, parameter names
+  and the state dict are those of ``EsmcAttention``.
+  """
+
+  rotate_half: torch.Tensor
+
+  @classmethod
+  def install(cls, attn: nn.Module) -> None:
+    attn.__class__ = cls._derive(type(attn))
+    attn.register_buffer(
+        "rotate_half", _rotate_half_matrix(attn.head_dim), persistent=False
+    )
+
+  @classmethod
+  @functools.cache
+  def _derive(cls, hf_cls: type) -> type:
+    return type(f"TPU{hf_cls.__name__}", (cls, hf_cls), {})
+
+  def forward(
+      self,
+      hidden_states: torch.Tensor,
+      attention_mask: torch.Tensor | None = None,
+      position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+      **kwargs,
+  ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    def heads_first(x: torch.Tensor) -> torch.Tensor:
+      return _attention.ContiguousTranspose12.apply(x.view(hidden_shape))
+
+    query = heads_first(self.q_norm(self.q_proj(hidden_states)).to(hidden_states.dtype))
+    key = heads_first(self.k_norm(self.k_proj(hidden_states)).to(hidden_states.dtype))
+    value = heads_first(self.v_proj(hidden_states))
+
+    cos, sin = position_embeddings
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    rotation = self.rotate_half.to(query.dtype)
+    query = query * cos + (query @ rotation) * sin
+    key = key * cos + (key @ rotation) * sin
+
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, None  # pylint: disable=protected-access
+    )
+    if attention_interface is None:  # "eager": HF's own module-level fallback
+      return super().forward(
+          hidden_states, attention_mask, position_embeddings, **kwargs
+      )
+    attn_output, attn_weights = attention_interface(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+    return self.o_proj(attn_output.reshape(*input_shape, -1)), attn_weights
+
+
+def _use_tpu_esmc_attention(model: nn.Module) -> None:
+  """Swaps every ``EsmcAttention`` in ``model`` for ``_EsmcTPUAttention``."""
+  for module in model.modules():
+    if type(module).__name__ == "EsmcAttention" and getattr(module, "head_dim", 0) % 2 == 0:
+      _EsmcTPUAttention.install(module)
 
 
 def as_tpu_model_config(

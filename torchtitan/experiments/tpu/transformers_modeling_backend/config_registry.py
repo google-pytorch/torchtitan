@@ -35,6 +35,7 @@ from torchtitan.experiments.transformers_modeling_backend import (
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
+from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.hf_datasets.text_datasets import DATASETS
@@ -317,6 +318,49 @@ def hf_full_max_plain_ce() -> TPUTransformersBackendConfig:
   """``hf_full_max`` with the model's own head and plain cross entropy."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
                         attn="splash_tpu", save_attention=True)
+
+
+def hf_esmc_mlm_uniref50() -> TPUTransformersBackendConfig:
+  """ESM-C masked-LM pretraining on UniRef50 (``--hf_model=biohub/ESMC-600M|6B``).
+
+  ``hf_full_max_plain_ce`` plus the data and optimizer of "Language Modeling
+  Materializes a World Model of Protein Biology": masked-LM rows
+  (``r_mask = 0.15``, see ``MLMProcessor``), 2048-token context, AdamW
+  ``lr=3.1e-4, betas=(0.9, 0.95), eps=1e-8``, linear warmup then cosine decay
+  to 10%. Pass the ESM-C tokenizer directory as ``--hf_assets_path`` and a
+  parquet mirror of ``bloyal/uniref50`` (or nothing, to stream from the Hub)
+  as ``--dataloader.dataset_path``. The per-rank batch defaults to the 6B
+  optimum (8 x 2048 tokens; 16 x 2048 does not fit 96 GiB); pass
+  ``--training.num_tokens_per_microbatch_per_dp_rank=65536`` for 600M.
+  See recipes/ironwood/esmc/README.md for measurements.
+  """
+  cfg = _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
+                       attn="splash_tpu", save_attention=True)
+  # Whole proteins per 2048-token row: the model runs the batch as [B, S]
+  # rows, so a document must not be split across two of them.
+  cfg.dataloader = c4_test_dataloader(
+      dataset="uniref50", shuffle=True, seed=0, pack_rows_to_context=True
+  )
+  cfg.optimizer = default_adamw(lr=3.1e-4, implementation="foreach")
+  cfg.lr_scheduler = LRSchedulersContainer.Config(
+      warmup_steps=100,
+      decay_ratio=None,
+      decay_type="cosine",
+      min_lr_factor=0.1,
+  )
+  # One 2048 kv block per 2048 q block (head_dim 64): no online-softmax rescale
+  # in the forward and no unreduced dq partial in the backward (+3.1% over 1024
+  # blocks on 6B). ``kv_dkv_compute=2048`` runs out of VMEM.
+  cfg.splash_attention_kernel = SplashAttentionKernelConfig(
+      sa_block_q=2048, sa_block_kv=2048, sa_block_kv_compute=1024,
+      sa_block_q_dkv=2048, sa_block_kv_dkv=2048, sa_block_kv_dkv_compute=1024,
+      sa_use_base2_exp=True, sa_use_experimental_scheduler=True,
+  )
+  # 8 x 2048 tokens per rank amortizes the per-layer fp32 gradient
+  # reduce-scatter (20% -> 2% of the step on 6B).
+  cfg.training.max_context_length = 2048
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 8 * 2048
+  return cfg
 
 
 def hf_moe_auto() -> TPUTransformersBackendConfig:

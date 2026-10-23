@@ -220,6 +220,9 @@ class SplashAttentionKernelConfig:
   sa_q_layout: str = "HEAD_DIM_MINOR"
   sa_k_layout: str = "HEAD_DIM_MINOR"
   sa_v_layout: str = "HEAD_DIM_MINOR"
+  # Forwarded to the sbd splash kernel when set; None keeps its defaults.
+  sa_use_base2_exp: bool | None = None
+  sa_use_experimental_scheduler: bool | None = None
 
 
 @dataclasses.dataclass

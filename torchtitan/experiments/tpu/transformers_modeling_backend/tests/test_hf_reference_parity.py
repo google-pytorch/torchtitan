@@ -63,6 +63,25 @@ def _document_mask(positions: torch.Tensor, causal: bool) -> torch.Tensor:
   return mask[None, None]
 
 
+def _drop_4d_mask_for_embeddings(reference) -> None:
+  """ESM's embeddings scale by a 2D padding mask; hide the 4D document mask.
+
+  ``EsmModel.forward`` hands its ``attention_mask`` to ``EsmEmbeddings`` as-is,
+  which sums it along the last axis for token-dropout rescaling. The encoder
+  layers take the dense ``[1, 1, T, T]`` mask of ``_document_mask`` fine.
+  """
+  embeddings = getattr(getattr(reference, "esm", None), "embeddings", None)
+  if embeddings is None:
+    return
+  original_forward = embeddings.forward
+
+  def forward(*args, attention_mask=None, **kwargs):
+    del attention_mask  # 4D here; the embeddings only read a 2D padding mask.
+    return original_forward(*args, **kwargs)
+
+  embeddings.forward = forward
+
+
 def _reference_logits(reference, wrapper, input_ids, kwargs):
   """The logits the raw HF model produces for the wrapper's inputs.
 
@@ -121,6 +140,7 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   missing = [m for m in missing if not any(m.endswith(t) for t in tied)]
   assert not unexpected and not missing, (unexpected[:5], missing[:5])
   reference.float().eval()  # dropout is zero on the device side; eval() is that with no RNG
+  _drop_4d_mask_for_embeddings(reference)
 
   positions = extra.get("positions")
   positions = positions.cpu() if positions is not None else torch.arange(tokens.shape[0])
@@ -206,6 +226,11 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
            hf_model="distilbert/distilgpt2",
            args=["--compile.no-enable",
                  '--hf_config_overrides={"attn_pdrop": 0, "resid_pdrop": 0, "embd_pdrop": 0}']),
+      # ESM-1b encoder: bidirectional splash attention (is_causal=False),
+      # padding-offset learned positions, pre-encoder + post-encoder LayerNorm,
+      # and EsmLMHead (dense + gelu + layer_norm + tied decoder + bias).
+      dict(testcase_name="esm1b", config="hf_debugmodel_kernels_splash",
+           hf_model="facebook/esm1b_t33_650M_UR50S"),
       # MoE checkpoint through splash. The Titan MoE swap happens in
       # parallelize_fn, which TrainerMinimal runs only for world_size > 1, so
       # on one chip HF's own MixtralSparseMoeBlock runs on the device too:

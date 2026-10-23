@@ -98,6 +98,17 @@ class HFBackendDistributedTest(
           skip_devices=[device_type.AcceleratorDeviceType.CPU],  # splash / fused CE are TPU kernels
           **_KERNEL_TOL,
       ),
+      # ESM-1b encoder (bidirectional splash, learned positions, EsmLMHead); see
+      # test_hf_reference_parity. Its 33-token vocabulary is widened to the
+      # test tokenizer's, which TrainerMinimal does by itself but Trainer does not.
+      dict(
+          testcase_name="esm1b_debug_splash",
+          config="hf_debugmodel_kernels_splash",
+          hf_model="facebook/esm1b_t33_650M_UR50S",
+          args=['--hf_config_overrides={"vocab_size": 2020}'],
+          skip_devices=[device_type.AcceleratorDeviceType.CPU],  # splash / fused CE are TPU kernels
+          **_KERNEL_TOL,
+      ),
       # MoE: the Titan MoE is swapped in by parallelize_fn, which TrainerMinimal
       # only runs for world_size > 1 -- so the single-device CPU reference keeps
       # HF's own MoE block and the recorded Titan expert weights (w1_EFD, ...)

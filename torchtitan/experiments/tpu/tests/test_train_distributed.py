@@ -437,6 +437,22 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
+      dict(
+          testcase_name="gemma4_simplefsdp_fused_ce",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel_fused_ce",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       # muse_glimmer (text-only). TP is capped at 2: the debugmodel has 2 KV
       # heads (see muse_glimmer_fsdp_tp2).
       dict(

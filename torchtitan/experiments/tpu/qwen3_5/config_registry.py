@@ -104,7 +104,7 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
           steps=10,
           dtype="bfloat16",
           mixed_precision_param="bfloat16",
-          mixed_precision_reduce="bfloat16",
+          mixed_precision_reduce="float32",
       ),
       dataloader=TPUGrainDataLoader.Config(dataset="c4"),
       parallelism=ParallelismConfig(

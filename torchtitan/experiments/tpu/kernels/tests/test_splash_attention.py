@@ -27,17 +27,82 @@ def _dense_cp_reference(
     v: torch.Tensor,
     grad_out: torch.Tensor,
     local_window_size: int | None,
+    segment_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-  """Full-sequence (B, H, S, D) causal attention and its q/k/v gradients."""
+  """Full-sequence (B, H, S, D) causal attention and its q/k/v gradients.
+
+  K and V may have fewer heads than Q (GQA); ``segment_ids`` (B, S) restricts
+  attention to packed documents.
+  """
   pos = torch.arange(q.shape[2])
   allowed = pos[:, None] >= pos[None, :]
   if local_window_size is not None:
     allowed &= pos[:, None] - pos[None, :] <= local_window_size
+  if segment_ids is not None:
+    same_document = segment_ids[:, :, None] == segment_ids[:, None, :]
+    allowed = (allowed & same_document)[:, None]
   q, k, v = (x.clone().requires_grad_(True) for x in (q, k, v))
+  n_rep = q.shape[1] // k.shape[1]
   with attention.sdpa_kernel([attention.SDPBackend.MATH]):
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
+    out = F.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(n_rep, dim=1),
+        v.repeat_interleave(n_rep, dim=1),
+        attn_mask=allowed,
+    )
   out.backward(grad_out)
   return out.detach(), q.grad, k.grad, v.grad
+
+
+def _packed_segment_ids(document_lengths_per_row) -> torch.Tensor:
+  """(B, S) int32 segment ids of rows packing documents of the given lengths."""
+  return torch.stack([
+      torch.repeat_interleave(
+          torch.arange(len(lengths), dtype=torch.int32), torch.tensor(lengths)
+      )
+      for lengths in document_lengths_per_row
+  ])
+
+
+# Packed rows of 2048 tokens whose document boundaries fall inside head-tail
+# chunks and 128-token blocks.
+_DOCUMENTS = ((300, 517, 77, 1154), (1000, 48, 1000))
+# KV all-gather CP shards: one KV block, then shards spanning several Q and KV
+# blocks with GQA / MQA, packed documents, a window and the unfused backward.
+_CP_SHARD_CASES = (
+    dict(testcase_name="cp2", cp_size=2),
+    dict(testcase_name="cp4", cp_size=4),
+    dict(testcase_name="cp2_window", cp_size=2, local_window_size=200),
+    dict(testcase_name="cp4_window", cp_size=4, local_window_size=200),
+    dict(
+        testcase_name="cp2_blocks_gqa_documents",
+        cp_size=2,
+        seq_len=2048,
+        n_heads=4,
+        n_kv_heads=2,
+        block=128,
+        documents=_DOCUMENTS,
+    ),
+    dict(
+        testcase_name="cp4_blocks_mqa_window_documents",
+        cp_size=4,
+        seq_len=2048,
+        n_heads=4,
+        n_kv_heads=1,
+        block=128,
+        local_window_size=64,
+        documents=_DOCUMENTS,
+    ),
+    dict(
+        testcase_name="cp4_blocks_unfused_bwd",
+        cp_size=4,
+        seq_len=2048,
+        n_heads=4,
+        n_kv_heads=4,
+        block=128,
+        use_fused_bwd_kernel=False,
+    ),
+)
 
 
 class HeadTailMaskTest(parameterized.TestCase):
@@ -442,23 +507,49 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
     logging.info("MQA/GQA backward test passed.")
 
-  @parameterized.product(cp_size=(2, 4), local_window_size=(None, 200))
-  def test_cp_shard_parity(self, cp_size, local_window_size):
+  @parameterized.named_parameters(*_CP_SHARD_CASES)
+  def test_cp_shard_parity(
+      self,
+      cp_size,
+      local_window_size=None,
+      seq_len=512,
+      n_heads=2,
+      n_kv_heads=2,
+      block=None,
+      documents=None,
+      use_fused_bwd_kernel=True,
+  ):
     """Head-tail CP Q shards against the full K/V match full attention.
 
     KV all-gather CP gives rank r the r-th slice of the head-tail sequence; the
-    kernel must mask those queries by their original positions, causal or
-    sliding window. dK and dV add up over the ranks.
+    kernel must mask those queries by their original positions (causal or
+    sliding window, and by document) in every Q and KV block. dK and dV add up
+    over the ranks.
     """
     device = self.accelerator_device
-    b, n_heads, seq_len, head_dim = 1, 2, 512, 128
-    q, k, v, grad_out = (
-        torch.randn(b, n_heads, seq_len, head_dim) for _ in range(4)
-    )
+    torch.manual_seed(0)
+    b, head_dim = (1 if documents is None else len(documents)), 128
+    q, grad_out = (torch.randn(b, n_heads, seq_len, head_dim) for _ in range(2))
+    k, v = (torch.randn(b, n_kv_heads, seq_len, head_dim) for _ in range(2))
+    segment_ids = None if documents is None else _packed_segment_ids(documents)
     out_ref, dq_ref, dk_ref, dv_ref = _dense_cp_reference(
-        q, k, v, grad_out, local_window_size
+        q, k, v, grad_out, local_window_size, segment_ids
     )
 
+    blocks = {}
+    if block is not None:
+      blocks = dict(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+      )
+    if not use_fused_bwd_kernel:
+      blocks.update(
+          use_fused_bwd_kernel=False, block_q_dq=block, block_kv_dq=block
+      )
     k_test = k.to(device).requires_grad_(True)
     v_test = v.to(device).requires_grad_(True)
     shards = torch.from_numpy(headtail_positions(seq_len, cp_size)).long()
@@ -468,16 +559,24 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
           q_test,
           k_test,
           v_test,
+          segment_ids=None if segment_ids is None else segment_ids.to(device),
           cp_rank=torch.tensor([r], dtype=torch.int32, device=device),
           local_window_size=local_window_size,
+          enable_gqa=n_heads != n_kv_heads,
+          **blocks,
       )
       out.backward(grad_out[:, :, rows].to(device))
-      torch.testing.assert_close(
-          out.cpu(), out_ref[:, :, rows], rtol=5e-2, atol=5e-2
-      )
-      torch.testing.assert_close(
-          q_test.grad.cpu(), dq_ref[:, :, rows], rtol=5e-2, atol=5e-2
-      )
+      for name, got, want in (
+          ("out", out, out_ref),
+          ("dq", q_test.grad, dq_ref),
+      ):
+        torch.testing.assert_close(
+            got.cpu(),
+            want[:, :, rows],
+            rtol=5e-2,
+            atol=5e-2,
+            msg=lambda m, name=name, r=r: f"{name} of rank {r}: {m}",
+        )
     torch.testing.assert_close(k_test.grad.cpu(), dk_ref, rtol=5e-2, atol=5e-2)
     torch.testing.assert_close(v_test.grad.cpu(), dv_ref, rtol=5e-2, atol=5e-2)
 

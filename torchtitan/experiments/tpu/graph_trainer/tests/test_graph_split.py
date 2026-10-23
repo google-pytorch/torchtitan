@@ -14,6 +14,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
+    _is_view,
     apply_cpu_offload_pass,
     tag_all_offloadable_activations,
 )
@@ -534,6 +535,14 @@ class GraphSplitTest(absltest.TestCase):
         if node.target is torch.ops.ao.offload.default
     ]
     self.assertLen(offloads, 2)
+
+    forward = split_forward_graph_by_layer(split.forward_graph, 1)
+    for child in forward.module.children():
+      returned: list[torch.fx.Node] = []
+      torch.fx.node.map_arg(child.graph.output_node().args, returned.append)
+      self.assertFalse(
+          [node.name for node in returned if _is_view(node)], child.code
+      )
 
   def test_cpu_reload_prefetch_distance_counts_executables(self):
     """Zero uses the consumer child; one uses its immediate predecessor."""

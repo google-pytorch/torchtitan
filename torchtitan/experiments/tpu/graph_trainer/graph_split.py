@@ -581,6 +581,18 @@ def _materialize_partitioned_graph(
   )
 
 
+def _preserves_numel(view: torch.fx.Node) -> bool:
+  source = view.args[0] if view.args else None
+  if not isinstance(source, torch.fx.Node):
+    return False
+  out, src = view.meta.get("val"), source.meta.get("val")
+  return (
+      isinstance(out, torch.Tensor)
+      and isinstance(src, torch.Tensor)
+      and out.numel() == src.numel()
+  )
+
+
 def split_forward_graph_by_layer(
     gm: torch.fx.GraphModule,
     layers_per_executable: int,
@@ -596,8 +608,9 @@ def split_forward_graph_by_layer(
 
   body_nodes = _body_nodes(gm)
   ao_nodes = {node for node in body_nodes if is_ao_transfer(node)}
+  view_nodes = {node for node in body_nodes if _is_view(node)}
   node_layer_ids, layer_nodes = _group_nodes_by_layer(
-      body_nodes, excluded=ao_nodes
+      body_nodes, excluded=ao_nodes | view_nodes
   )
   layer_ids = sorted(layer_nodes)
   if not layer_ids:
@@ -677,6 +690,27 @@ def split_forward_graph_by_layer(
     )
   if spmd_safe_depth:
     raise ValueError("Unbalanced TPU SPMD safe-region entry")
+
+  # A view left with its producer layer becomes a second executable output
+  # beside its base, which XLA must materialize as a copy. Place each
+  # size-preserving view with its earliest consumer so only the base crosses
+  # the boundary. Slices stay put: moving one would pass its whole base.
+  moved_views: Counter = Counter()
+  for node in reversed(body_nodes):
+    if node not in view_nodes or not _preserves_numel(node):
+      continue
+    user_partitions = [partition_map.get(user) for user in node.users]
+    if user_partitions and None not in user_partitions:
+      target = max(partition_map[node], min(user_partitions))
+      if target != partition_map[node]:
+        partition_map[node] = target
+        moved_views[str(node.target)] += 1
+  if moved_views:
+    logger.info(
+        "Placed %d forward views with their consumers: %s",
+        sum(moved_views.values()),
+        dict(moved_views),
+    )
 
   place_ao_transfer_pairs(gm, partition_map)
 

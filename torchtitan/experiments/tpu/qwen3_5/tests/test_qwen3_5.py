@@ -6,9 +6,11 @@ Covers:
    logits, cross-entropy loss, and every parameter gradient (with negative
    controls), for dense, MoE, and MoE with ``TpuGroupedExpertsConverter``;
    plus the adapter round trip.
-2. ``chunked_gated_delta`` against the exact per-token recurrence.
+2. ``chunked_gated_delta`` against the exact per-token recurrence, also with
+   packed documents.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
-   attention (with negative controls).
+   causal convolution, the GatedDeltaNet, the attention and the whole model
+   (with negative controls).
 4. Flavor, registry and recipe checks.
 """
 
@@ -34,6 +36,7 @@ from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
+from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 from transformers import (
     Qwen3_5ForCausalLM,
@@ -49,8 +52,13 @@ def _recurrent_gated_delta_reference(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    segment_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-  """Per-token reference for the gated delta rule recurrence in fp32."""
+  """Per-token reference for the gated delta rule recurrence in fp32.
+
+  With ``(bs, seq_len)`` ``segment_ids``, the state restarts from zero at the
+  first token of every document.
+  """
   q = gated_delta._l2norm(q.float()) * (q.shape[-1] ** -0.5)  # pylint: disable=protected-access
   k = gated_delta._l2norm(k.float())  # pylint: disable=protected-access
   v, g, beta = v.float(), g.float(), beta.float()
@@ -60,12 +68,24 @@ def _recurrent_gated_delta_reference(
   )
   outs = []
   for t in range(seq_len):
+    if segment_ids is not None and t > 0:
+      new_document = segment_ids[:, t] != segment_ids[:, t - 1]
+      state = torch.where(
+          new_document.to(q.device)[:, None, None, None],
+          torch.zeros_like(state),
+          state,
+      )
     state = state * g[:, t].exp()[..., None, None]
     kv_mem = (state * k[:, t, :, :, None]).sum(-2)
     delta = (v[:, t] - kv_mem) * beta[:, t, :, None]
     state = state + k[:, t, :, :, None] * delta[:, :, None, :]
     outs.append((state * q[:, t, :, :, None]).sum(-2))
   return torch.stack(outs, dim=1)
+
+
+def _packed_positions(doc_lens: tuple[int, ...]) -> torch.Tensor:
+  """Positions of documents of ``doc_lens`` tokens packed into one row."""
+  return torch.cat([torch.arange(n) for n in doc_lens])
 
 
 def _relative_l2_error(test: torch.Tensor, reference: torch.Tensor) -> float:
@@ -364,6 +384,132 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           msg=f"GDN {name} grad mismatch",
       )
 
+  @parameterized.named_parameters(
+      # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token
+      # chunks), one has a single token, some span several chunks, and the
+      # last chunk is padded.
+      dict(testcase_name="_chunk16", chunk_size=16),
+      dict(testcase_name="_chunk64", chunk_size=64),
+  )
+  def test_chunked_gated_delta_resets_at_documents(self, chunk_size: int):
+    """Tests chunked_gated_delta on packed documents against the recurrence."""
+    torch.manual_seed(0)
+    doc_lens = ((5, 11, 1, 31, 22), (70,))
+    bs, seq_len, n_heads, d_k, d_v = len(doc_lens), 70, 2, 16, 16
+    segment_ids = segment_ids_from_positions(
+        torch.stack([_packed_positions(lens) for lens in doc_lens])
+    )
+    q = torch.randn(bs, seq_len, n_heads, d_k)
+    k = torch.randn(bs, seq_len, n_heads, d_k)
+    v = torch.randn(bs, seq_len, n_heads, d_v)
+    g_raw = torch.randn(bs, seq_len, n_heads)
+    beta_raw = torch.randn(bs, seq_len, n_heads)
+    leaves_cpu = tuple(x.requires_grad_() for x in (q, k, v, g_raw, beta_raw))
+    leaves_dev = tuple(
+        x.detach().to(self.accelerator_device).requires_grad_()
+        for x in leaves_cpu
+    )
+
+    def run(fn, q, k, v, g_raw, beta_raw, **kwargs):
+      return fn(q, k, v, -F.softplus(g_raw), torch.sigmoid(beta_raw), **kwargs)
+
+    expected = run(
+        _recurrent_gated_delta_reference, *leaves_cpu, segment_ids=segment_ids
+    )
+    out_dev = run(
+        gated_delta.chunked_gated_delta,
+        *leaves_dev,
+        chunk_size=chunk_size,
+        segment_ids=segment_ids.to(self.accelerator_device),
+    )
+    tol = 5e-3 if self._is_tpu() else 1e-4
+    test_utils.check_equivalence(
+        out_dev.cpu(),
+        expected,
+        atol=tol,
+        rtol=tol,
+        check_name="Packed Chunked vs Recurrent GDN Forward",
+    )
+    grad_out = torch.randn_like(expected)
+    expected.backward(grad_out)
+    out_dev.backward(grad_out.to(self.accelerator_device))
+    grad_tol = 2e-2 if self._is_tpu() else 5e-4
+    for name, x_cpu, x_dev in zip(
+        ("q", "k", "v", "g", "beta"), leaves_cpu, leaves_dev, strict=True
+    ):
+      self.assertLessEqual(
+          _relative_l2_error(x_dev.grad, x_cpu.grad),
+          grad_tol,
+          msg=f"Packed GDN {name} grad mismatch",
+      )
+
+    # Negative control: without segment_ids, the state of each document leaks
+    # into the first tokens of the next one.
+    with torch.no_grad():
+      leaky = run(
+          gated_delta.chunked_gated_delta, *leaves_dev, chunk_size=chunk_size
+      )
+    starts = [5, 16, 17, 48]
+    self.assertGreater(
+        _relative_l2_error(leaky[0, starts], expected[0, starts]),
+        0.1,
+        msg="Negative control failed: no state leak without segment_ids",
+    )
+
+  def test_causal_conv_resets_at_documents(self):
+    """Tests that causal conv1d taps into an earlier document read zeros."""
+    torch.manual_seed(0)
+    # Documents shorter than the 4-tap kernel, including a 1-token document.
+    doc_lens = (3, 1, 6, 2, 8)
+    seq_len, channels = sum(doc_lens), 8
+    segment_ids = segment_ids_from_positions(_packed_positions(doc_lens))
+    segment_ids = segment_ids.expand(2, -1).to(self.accelerator_device)
+    x = torch.randn(
+        2, seq_len, channels, device=self.accelerator_device
+    ).requires_grad_()
+    weight = torch.randn(
+        channels, 1, 4, device=self.accelerator_device
+    ).requires_grad_()
+
+    out = gated_delta._causal_conv(x, weight, segment_ids)  # pylint: disable=protected-access
+    starts = [sum(doc_lens[:i]) for i in range(len(doc_lens))]
+    expected = torch.cat(
+        [
+            gated_delta._causal_conv(x[:, s : s + n], weight)  # pylint: disable=protected-access
+            for s, n in zip(starts, doc_lens)
+        ],
+        dim=1,
+    )
+    tol = 5e-3 if self._is_tpu() else 1e-6
+    test_utils.check_equivalence(
+        out.detach().cpu(),
+        expected.detach().cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="Packed Causal Conv Forward",
+    )
+    grad_out = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (x, weight), grad_out)
+    expected_grads = torch.autograd.grad(expected, (x, weight), grad_out)
+    for name, grad, expected_grad in zip(
+        ("x", "weight"), grads, expected_grads, strict=True
+    ):
+      test_utils.check_equivalence(
+          grad.cpu(),
+          expected_grad.cpu(),
+          atol=tol,
+          rtol=tol,
+          check_name=f"Packed Causal Conv {name} Grad",
+      )
+    # Negative control: without segment_ids, the taps cross documents.
+    with torch.no_grad():
+      leaky = gated_delta._causal_conv(x, weight)  # pylint: disable=protected-access
+    self.assertGreater(
+        _relative_l2_error(leaky, expected),
+        0.1,
+        msg="Negative control failed: conv taps did not cross documents",
+    )
+
   def test_gated_delta_net_isolates_batch_sequences(self):
     """Tests that B=2 packed sequences in GatedDeltaNet equal two B=1 runs."""
     config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
@@ -405,6 +551,152 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         _relative_l2_error(out_bleed[seq_len:], out1),
         0.05,
         msg="Negative control failed: GDN bleed did not change slice 1",
+    )
+
+  def test_gated_delta_net_isolates_packed_documents(self):
+    """Tests that documents packed into GatedDeltaNet rows equal single runs."""
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn = config.layers[0].delta_net.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    gdn = gdn.to(self.accelerator_device)
+
+    # Two rows of 80 tokens. With 64-token chunks, documents start mid-chunk
+    # and at a chunk start (64), and some span two chunks.
+    rows = ((30, 34, 16), (50, 30))
+    seq_len = 80
+    doc_lens = [n for lens in rows for n in lens]
+    starts = [sum(doc_lens[:i]) for i in range(len(doc_lens))]
+    x = torch.randn(
+        len(rows) * seq_len, config.dim, device=self.accelerator_device
+    )
+    positions = torch.cat([_packed_positions(lens) for lens in rows]).to(
+        self.accelerator_device
+    )
+
+    with torch.no_grad():
+      with set_unflatten_seq_len(seq_len):
+        out_packed = gdn(x, positions=positions)
+        out_leaky = gdn(x)
+      # Without set_unflatten_seq_len, the [T] token stream is one row.
+      out_stream = gdn(x, positions=positions)
+      expected = []
+      for s, n in zip(starts, doc_lens):
+        with set_unflatten_seq_len(n):
+          expected.append(gdn(x[s : s + n]))
+      expected = torch.cat(expected)
+
+    tol = 5e-3 if self._is_tpu() else 1e-5
+    test_utils.check_equivalence(
+        out_packed.cpu(),
+        expected.cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Packed Rows",
+    )
+    test_utils.check_equivalence(
+        out_stream.cpu(),
+        expected.cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Packed Stream",
+    )
+    # Negative control: without positions, the convolution and the state leak
+    # into the first tokens of each document that does not start a row.
+    inner_starts = [30, 64, 130]
+    self.assertGreater(
+        _relative_l2_error(out_leaky[inner_starts], expected[inner_starts]),
+        0.1,
+        msg="Negative control failed: no GDN leak without positions",
+    )
+
+  def test_model_isolates_packed_documents(self):
+    """Tests that documents packed into rows equal the documents run alone.
+
+    Covers ``positions`` reaching every layer: the attention masks other
+    documents, and the GatedDeltaNet restarts its convolution and state, in the
+    forward pass and in every parameter gradient.
+    """
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    vocab_size = 512
+    config.vocab_size = vocab_size
+    config.tok_embeddings.num_embeddings = vocab_size
+    config.lm_head.out_features = vocab_size
+    config.layers = config.layers[:4]  # 3 GatedDeltaNet + 1 attention layers.
+    torch.manual_seed(0)
+    model = config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
+    model = model.to(self.accelerator_device)
+    if config.enable_weight_tying:
+      model.tok_embeddings.weight = model.lm_head.weight
+
+    rows = ((30, 34, 16), (50, 30))
+    seq_len = 80
+    doc_lens = [n for lens in rows for n in lens]
+    starts = [sum(doc_lens[:i]) for i in range(len(doc_lens))]
+    gen = torch.Generator().manual_seed(7)
+    tokens = torch.randint(0, vocab_size, (len(rows) * seq_len,), generator=gen)
+    loss_weights = torch.randn(len(rows) * seq_len, vocab_size, generator=gen)
+    positions = torch.cat([_packed_positions(lens) for lens in rows])
+
+    def forward_backward(tokens, positions, loss_weights, row_len):
+      model.zero_grad()
+      with set_unflatten_seq_len(row_len):
+        logits = model(
+            tokens.to(self.accelerator_device),
+            positions=positions.to(self.accelerator_device),
+        )
+      (
+          logits.float() * loss_weights.to(self.accelerator_device)
+      ).sum().backward()
+      grads = {
+          name: param.grad.detach().float().cpu()
+          for name, param in model.named_parameters()
+          if param.grad is not None
+      }
+      return logits.detach().float().cpu(), grads
+
+    logits_packed, grads_packed = forward_backward(
+        tokens, positions, loss_weights, seq_len
+    )
+    logits_docs, grads_docs = [], {}
+    for s, n in zip(starts, doc_lens):
+      logits, grads = forward_backward(
+          tokens[s : s + n], torch.arange(n), loss_weights[s : s + n], n
+      )
+      logits_docs.append(logits)
+      for name, grad in grads.items():
+        grads_docs[name] = grads_docs.get(name, 0) + grad
+    logits_docs = torch.cat(logits_docs)
+
+    tol = 5e-2 if self._is_tpu() else 1e-4
+    test_utils.check_equivalence(
+        logits_packed,
+        logits_docs,
+        atol=tol,
+        rtol=tol,
+        check_name="Packed Documents Logits",
+    )
+    grad_rel_bound = 2e-2 if self._is_tpu() else 1e-4
+    self.assertEqual(set(grads_packed), set(grads_docs))
+    for name, grad in grads_docs.items():
+      self.assertLessEqual(
+          _relative_l2_error(grads_packed[name], grad),
+          grad_rel_bound,
+          msg=f"Packed documents gradient mismatch for {name}",
+      )
+
+    # Negative control: positions that run on across documents.
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      logits_unpacked = model(
+          tokens.to(self.accelerator_device),
+          positions=torch.arange(seq_len)
+          .repeat(len(rows))
+          .to(self.accelerator_device),
+      )
+    self.assertGreater(
+        _relative_l2_error(logits_unpacked, logits_docs),
+        0.05,
+        msg="Negative control failed: unpacked positions did not leak",
     )
 
   def test_attention_isolates_packed_documents(self):
@@ -482,6 +774,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         self.assertIsNone(spec.pipelining_fn)
         self.assertIsNone(spec.model.vision_encoder)
         for layer in spec.model.layers:
+          self.assertIsInstance(
+              layer, tpu_model.TpuQwen35TransformerBlock.Config
+          )
           if layer.attention is not None:
             self.assertIsInstance(
                 layer.attention, tpu_model.TpuQwen35Attention.Config
@@ -491,6 +786,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
                 SlidingWindowScaledDotProductInnerAttention.Config,
             )
           else:
+            self.assertIsInstance(
+                layer.delta_net, gated_delta.TpuGatedDeltaNet.Config
+            )
             self.assertIsInstance(
                 layer.delta_net.inner_gated_delta_net,
                 gated_delta.TpuInnerGatedDeltaNet.Config,

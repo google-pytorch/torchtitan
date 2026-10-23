@@ -1,4 +1,4 @@
-"""Qwen3.5 attention module for TPU."""
+"""Qwen3.5 attention and transformer block modules for TPU."""
 
 from dataclasses import dataclass
 
@@ -7,7 +7,7 @@ import torch
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.qwen3_5.model import Qwen35Attention
+from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35TransformerBlock
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -70,3 +70,39 @@ class TpuQwen35Attention(Qwen35Attention):
     out_THV = out_THV * torch.sigmoid(gate_THV)
     out_TD = out_THV.view(num_tokens, -1)
     return self.wo(out_TD)
+
+
+class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
+  """``Qwen35TransformerBlock`` that also passes ``positions`` to GatedDeltaNet.
+
+  Identical to upstream ``Qwen35TransformerBlock.forward`` except that the
+  GatedDeltaNet (``gated_delta.TpuGatedDeltaNet``) also receives ``positions``,
+  from which it derives packed-document boundaries.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Qwen35TransformerBlock.Config):
+    pass
+
+  def forward(
+      self,
+      x_TD: torch.Tensor,
+      attention_masks: Qwen35AttentionMaskDict | None,
+      positions: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    layer_mask = (
+        attention_masks[self.attn_mask_key]
+        if attention_masks is not None
+        else None
+    )
+    h_TD = self.attention_norm(x_TD)
+    # TPU: both layer types get `positions` (upstream: full attention only).
+    h_TD = self.attn(h_TD, layer_mask, positions)
+    x_TD = x_TD + h_TD
+
+    h_TD = self.ffn_norm(x_TD)
+    if self.moe_enabled:
+      x_TD = x_TD + self.moe(h_TD)
+    else:
+      x_TD = x_TD + self.feed_forward(h_TD)
+    return x_TD

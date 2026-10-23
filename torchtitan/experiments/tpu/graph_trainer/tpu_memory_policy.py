@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
+from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
@@ -408,4 +409,39 @@ def _tpu_selective_memory_policy_pass(
     last_n_layers = tpu_config.graph_trainer_save_last_n_layers
     regions = resolve_save_regions(tpu_config.graph_trainer_save_regions, last_n_layers)
     full_remat_with_saves(gm, config, select_saves(gm, regions, last_n_layers))
+    return gm
+
+
+def _tag_saved(node: torch.fx.Node, policy: CheckpointPolicy) -> None:
+    """Tag ``node`` and the getitems that unpack it, which share its tag."""
+    for saved in (node, *(u for u in node.users if u.target is operator.getitem)):
+        saved.meta["recompute"] = policy
+
+
+@register_memory_policy("tpu_selective_and_offload")
+def _tpu_selective_and_offload_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """``tpu_selective`` saves kept in HBM, plus CPU offload of layer boundaries.
+
+    The layer boundaries are offloaded as in ``full_and_offload``. The chosen
+    save-region values stay on device: backward reads them first, and
+    offloading them too would add their bytes to the host link every layer.
+    """
+    tpu_config = config.tpu_config
+    last_n_layers = tpu_config.graph_trainer_save_last_n_layers
+    regions = resolve_save_regions(tpu_config.graph_trainer_save_regions, last_n_layers)
+    save_nodes = select_saves(gm, regions, last_n_layers)
+    # Tag full remat first, so the layer boundaries are the only saved values
+    # and therefore the only ones the offload tagger can send to host.
+    full_remat_with_saves(gm, config, ())
+    tag_all_offloadable_activations(
+        gm,
+        cpu_budget_gb=config.compile.cpu_offload_budget_gb,
+    )
+    # Then save the region values in HBM.
+    for node in save_nodes:
+        _tag_saved(node, CheckpointPolicy.MUST_SAVE)
     return gm

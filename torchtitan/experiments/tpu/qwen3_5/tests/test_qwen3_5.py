@@ -510,6 +510,38 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         msg="Negative control failed: conv taps did not cross documents",
     )
 
+  def test_causal_conv_adds_bf16_taps_in_fp32(self):
+    """Tests that bf16 causal conv1d rounds an fp32 tap sum once, as F.conv1d."""
+    torch.manual_seed(0)
+    seq_len, channels, kernel_size = 64, 32, 4
+    x = torch.randn(2, seq_len, channels).bfloat16()
+    weight = torch.randn(channels, 1, kernel_size).bfloat16()
+    # The products of bf16 values are exact in fp32; F.conv1d adds them in fp32.
+    expected = F.conv1d(
+        F.pad(x.float().transpose(1, 2), (kernel_size - 1, 0)),
+        weight.float(),
+        groups=channels,
+    ).transpose(1, 2)
+    out = gated_delta._causal_conv(  # pylint: disable=protected-access
+        x.to(self.accelerator_device), weight.to(self.accelerator_device)
+    ).cpu()
+    self.assertEqual(out.dtype, torch.bfloat16)
+    # Rounding once to bf16 is off by at most half an ulp, 2**-8 of the value.
+    bound = expected.abs() * 2**-8 + 1e-5
+    self.assertTrue(
+        bool(((out.float() - expected).abs() <= bound).all()),
+        msg="bf16 causal conv1d taps did not add in fp32",
+    )
+    # Negative control: adding the bf16 products in bf16 exceeds the bound.
+    x_pad = F.pad(x, (0, 0, kernel_size - 1, 0))
+    bf16_sum = sum(
+        x_pad[:, k : k + seq_len] * weight[:, 0, k] for k in range(kernel_size)
+    )
+    self.assertFalse(
+        bool(((bf16_sum.float() - expected).abs() <= bound).all()),
+        msg="Negative control failed: the bf16 sum is within the bound",
+    )
+
   def test_gated_delta_net_isolates_batch_sequences(self):
     """Tests that B=2 packed sequences in GatedDeltaNet equal two B=1 runs."""
     config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model

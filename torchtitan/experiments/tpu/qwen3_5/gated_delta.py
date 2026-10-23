@@ -55,7 +55,8 @@ def _causal_conv(
   ``y[s] = sum_k w[k] * x[s + k - (W - 1)]``, with zeros before the sequence.
   Slices of the front-padded input avoid transposing ``[B, S, C]`` to
   ``[B, C, S]`` and torch_tpu's grouped 1D ``convolution_backward`` shape bug
-  under GraphTrainer.
+  under GraphTrainer. As in ``F.conv1d``, the taps add in fp32 and the sum is
+  rounded once to the input dtype.
 
   Args:
     x_BSC: ``[B, S, C]`` input.
@@ -65,11 +66,14 @@ def _causal_conv(
       read zeros, as they do before the start of the row.
 
   Returns:
-    ``[B, S, C]`` convolution output.
+    ``[B, S, C]`` convolution output in ``x_BSC.dtype``.
   """
   seq_len = x_BSC.shape[1]
   kernel_size = weight_C1W.shape[-1]
   x_pad = F.pad(x_BSC, (0, 0, kernel_size - 1, 0))
+  # fp32 weights promote every product, and so the sum, to fp32, while autograd
+  # still saves the input slices in the input dtype.
+  weight_CW = weight_C1W[:, 0, :].float()
   out_BSC = None
   for k in range(kernel_size):
     x_shifted = x_pad[:, k : k + seq_len, :]
@@ -77,9 +81,9 @@ def _causal_conv(
     if segment_ids_BS is not None and shift > 0:
       same_BS1 = _same_segment(segment_ids_BS, shift).unsqueeze(-1)
       x_shifted = torch.where(same_BS1, x_shifted, 0.0)
-    term = x_shifted * weight_C1W[:, 0, k]
+    term = x_shifted * weight_CW[:, k]
     out_BSC = term if out_BSC is None else out_BSC + term
-  return out_BSC
+  return out_BSC.to(x_BSC.dtype)
 
 
 def chunked_gated_delta(

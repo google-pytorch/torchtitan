@@ -105,6 +105,11 @@ class GraphSplitterConfig:
   # Number of complete backward child executables by which to advance each H2D
   # reload pair relative to its first consumer.
   cpu_offload_prefetch_executables: int = 0
+  # Join each layer's gathered expert weights with its Splash attention output
+  # in an optimization barrier, so the expert FSDP all-gathers finish while
+  # attention runs instead of queueing on the SparseCore behind the
+  # routed-token gathers. Values are unchanged.
+  expert_all_gather_deadline: bool = False
 
 
 @dataclass(kw_only=True, slots=True)

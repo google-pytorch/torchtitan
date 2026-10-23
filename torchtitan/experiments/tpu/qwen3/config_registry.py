@@ -970,6 +970,9 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   # removed 1.31 s of exposed H2D in the measured BF16 arm at a 0.96-GiB HBM
   # cost from carrying the completed activation across one child boundary.
   cfg.compile.graph_split.cpu_offload_prefetch_executables = 1
+  # Finish the expert all-gathers under attention, while the SparseCore that
+  # runs them is otherwise idle.
+  cfg.compile.graph_split.expert_all_gather_deadline = True
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_COMPILED_OFFLOAD_FLAGS,

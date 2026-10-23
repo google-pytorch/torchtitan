@@ -55,6 +55,9 @@ from torchtitan.experiments.graph_trainer.graph_pp.partition import (
 from torchtitan.experiments.graph_trainer.graph_pp.utils import (
     is_mutation_node,
 )
+from torchtitan.experiments.tpu.graph_trainer.passes.expert_all_gather_deadline import (
+    apply_expert_all_gather_deadline,
+)
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
   HostDonorSpec,
   initialize_pinned_host_buffer,
@@ -330,6 +333,8 @@ class GraphSplitter:
     if not self.enabled:
       raise RuntimeError("GraphSplitter is disabled")
 
+    if self.config.expert_all_gather_deadline:
+      apply_expert_all_gather_deadline(traced.gm)
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
     # Host-slot recurrence belongs to the top-level forward signature, whether

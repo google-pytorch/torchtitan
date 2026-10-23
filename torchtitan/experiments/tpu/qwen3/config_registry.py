@@ -1093,6 +1093,12 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  # Contiguous [Q; K; V] rows instead of the fused projection's per-KV-group
+  # interleave, which XLA relayouted on every layer (an f32 q copy for q-norm
+  # and a QKV split copy): ~0.4 s/step at 64 chips.
+  cfg.model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  )
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
   _fuse_route_score_backward(cfg)
@@ -1131,8 +1137,8 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   # The 30B recipe's save regions apply only to tpu_selective.
   cfg.tpu_config.graph_trainer_save_regions = ()
   # The 30B chain coalesces its packed-QKV and `wo` reductions (commit
-  # 186bd3ba8c). This model packs no QKV and scan leaves no per-layer FQN to
-  # match, so the pass would find none of its targets and refuse to run.
+  # 186bd3ba8c). Scan leaves no per-layer FQN to match, so the pass would
+  # find none of its targets and refuse to run.
   cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
   # The routing metrics stash tensors on the module, which a scan body cannot
   # do (https://github.com/google-pytorch/torchtitan/issues/28).

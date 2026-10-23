@@ -937,6 +937,24 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     self.assertIsInstance(spec.model, GraphTrainerQwen3Model.Config)
 
+  def test_235b_scan_recipe_packs_qkv(self) -> None:
+    config = qwen3_moe_235b_scan()
+
+    assert config.model_spec is not None
+    self.assertLen(
+        list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config)), 94
+    )
+    # The scanned graph-trainer model keeps the packed projection.
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    self.assertLen(
+        list(graph_config.model_spec.model.traverse(TpuPackedQKVLinear.Config)),
+        94,
+    )
+
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()
 

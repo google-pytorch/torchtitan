@@ -283,6 +283,16 @@ class UlyssesCPInnerAttention(CPInnerAttention):
 
   def local_forward(self, q_THK, k_THK, v_THV, **kwargs) -> torch.Tensor:
     """The wrapped single-device inner attention."""
+    if isinstance(self, ScaledDotProductInnerAttention) and (
+        getattr(self, "sliding_window_size", None) is not None
+    ):
+      # F.scaled_dot_product_attention only masks causally.
+      raise NotImplementedError(
+          "Ulysses CP over SDPA does not support sliding windows without an"
+          " attention kernel; plug in the Splash kernel with"
+          " set_local_attention (splash_attention_kernel."
+          "use_splash_attention_kernel=True)."
+      )
     return super().forward(  # pyrefly: ignore[missing-attribute]
         q_THK, k_THK, v_THV, **kwargs
     )
@@ -294,6 +304,16 @@ class UlyssesCPInnerAttention(CPInnerAttention):
       v_THV: torch.Tensor,
       **kwargs,
   ) -> torch.Tensor:
+    # Only the plain Varlen attention applies an LSE epilogue: SDPA and the
+    # TPU kernels would drop it.
+    if kwargs.get("out_transform") is not None and (
+        self._local_attn_override is not None
+        or not isinstance(self, VarlenInnerAttention)
+    ):
+      raise NotImplementedError(
+          "Ulysses CP supports out_transform only with VarlenInnerAttention"
+          " and no attention kernel plugged in."
+      )
     group = spmd_mesh_group(MeshAxisName.CP)
     if group is None:
       raise RuntimeError("CP attention requires an active CP mesh axis.")
@@ -330,6 +350,13 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
 
   def __init__(self, config: Any) -> None:
     super().__init__(config)  # pyrefly: ignore[bad-argument-count]
+    if isinstance(self, VarlenInnerAttention) and self.window_size[1] != 0:
+      # The head-tail masks (and the reference attention) are causal.
+      raise NotImplementedError(
+          "KV all-gather CP supports causal attention only, i.e."
+          " window_size=(left, 0); got window_size="
+          f"{tuple(self.window_size)}."
+      )
     self.reduce_dtype = TORCH_DTYPE_MAP[config.reduce_dtype]
     self.allow_reference_attention = config.allow_reference_attention
     # The local attention kernel, plugged in with set_local_attention.
@@ -554,6 +581,29 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       v_THV: torch.Tensor,
       **kwargs,
   ) -> torch.Tensor:
+    if kwargs.get("out_transform") is not None:
+      # Neither the head-tail kernels nor the reference return the LSE.
+      raise NotImplementedError(
+          "KV all-gather CP does not support out_transform."
+      )
+    is_varlen = isinstance(self, VarlenInnerAttention)
+    if not is_varlen and kwargs.get("attention_masks") is not None:
+      raise ValueError(
+          "KV all-gather CP over SDPA does not support attention_masks; it"
+          " masks causally, and by document through positions."
+      )
+    if (
+        is_varlen
+        and kwargs.get("attention_masks") is not None
+        and kwargs.get("positions") is None
+        and kwargs.get("segment_ids") is None
+    ):
+      # cu_seqlens describe the unsharded sequence; document masks are rebuilt
+      # from the all-gathered positions instead.
+      raise ValueError(
+          "KV all-gather CP needs positions (or segment_ids) to mask packed"
+          " documents; it does not use the Varlen cu_seqlens."
+      )
     local_attn = self._local_attn_override
     if local_attn is None:
       if q_THK.device.type != "cpu" and not self.allow_reference_attention:
@@ -778,18 +828,101 @@ def _validate_heads(
     )
 
 
-def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
+def _validate_sequence_lengths(
+    strategy: CPStrategy,
+    cp: int,
+    training: Any,
+    splash_attention_kernel: Any | None,
+) -> None:
+  """Checks the sequence lengths a strategy can shard (and Splash can tile)."""
+  seq_len = training.max_context_length
+  num_tokens = training.num_tokens_per_microbatch_per_dp_rank
+  if strategy == "ulysses":
+    # Ulysses shards the folded token stream into cp contiguous pieces.
+    if num_tokens % cp:
+      raise ValueError(
+          "Ulysses CP shards the tokens of each microbatch over cp ranks, so"
+          f" training.num_tokens_per_microbatch_per_dp_rank ({num_tokens})"
+          f" must be divisible by cp ({cp})."
+      )
+    return
+  # KV all-gather cuts every sequence into 2 * cp head-tail chunks.
+  if seq_len % (2 * cp):
+    raise ValueError(
+        "KV all-gather CP splits each sequence into 2 * cp head-tail chunks,"
+        f" so training.max_context_length ({seq_len}) must be divisible by"
+        f" {2 * cp}."
+    )
+  if num_tokens > seq_len and num_tokens % seq_len:
+    raise ValueError(
+        "KV all-gather CP shards each sequence separately, so"
+        f" training.num_tokens_per_microbatch_per_dp_rank ({num_tokens}) must"
+        f" be a multiple of training.max_context_length ({seq_len})."
+    )
+  if num_tokens < seq_len and num_tokens % (2 * cp):
+    raise ValueError(
+        "KV all-gather CP splits the sequence into 2 * cp head-tail chunks, so"
+        f" training.num_tokens_per_microbatch_per_dp_rank ({num_tokens}) must"
+        f" be divisible by {2 * cp}."
+    )
+  if splash_attention_kernel is None or not (
+      splash_attention_kernel.use_splash_attention_kernel
+      or splash_attention_kernel.use_tokamax_splash_attention_kernel
+  ):
+    return
+  # The kernel sees each rank's S / cp queries against all S keys and values;
+  # every block size (capped at its length) must divide that length.
+  q_len = min(seq_len, num_tokens) // cp
+  kv_len = q_len * cp
+  q_blocks = ["sa_block_q", "sa_block_q_dkv"]
+  kv_blocks = [
+      "sa_block_kv",
+      "sa_block_kv_compute",
+      "sa_block_kv_dkv",
+      "sa_block_kv_dkv_compute",
+  ]
+  if not splash_attention_kernel.sa_use_fused_bwd_kernel:
+    q_blocks.append("sa_block_q_dq")
+    kv_blocks.append("sa_block_kv_dq")
+  for names, length, what in (
+      (q_blocks, q_len, "the per-rank query length S / cp"),
+      (kv_blocks, kv_len, "the key/value length S"),
+  ):
+    for name in names:
+      block = getattr(splash_attention_kernel, name)
+      if block is not None and length % min(block, length):
+        raise ValueError(
+            "KV all-gather CP with Splash attention: splash_attention_kernel."
+            f"{name} ({block}) must divide {what} ({length})."
+        )
+
+
+def validate_tpu_context_parallel(
+    model: Any,
+    parallelism: Any,
+    *,
+    training: Any | None = None,
+    splash_attention_kernel: Any | None = None,
+) -> None:
   """Checks TPU CP attention against the parallelism config.
 
   Complements core ``validate_context_parallel`` (which checks the SPMD
   backend and that every attention is a ``CPInnerAttention``) with the
   TPU-specific rules: head divisibility per strategy, the load balancer each
-  strategy expects, and no CP + TP/EP under FSDP2 on torch builds that
-  ``install_tpu_cp_patches`` cannot fix. Does not modify anything.
+  strategy expects, causal-only KV all-gather, no pipeline parallelism, no
+  CP + TP/EP under FSDP2 on torch builds that ``install_tpu_cp_patches``
+  cannot fix and, given ``training`` (and ``splash_attention_kernel``), the
+  sequence lengths each strategy can shard and the Splash block sizes for
+  them. Does not modify anything.
   """
   cp = parallelism.context_parallel_degree
   if cp <= 1:
     return
+  if parallelism.pipeline_parallel_degree > 1:
+    # Pipeline microbatches would split each rank's head-tail / token shard.
+    raise NotImplementedError(
+        "TPU context parallelism does not support pipeline parallelism."
+    )
   if (
       not hasattr(FSDPParam, "_resolve_spmd_types_for_storage")
       and not parallelism.use_simple_fsdp
@@ -804,6 +937,7 @@ def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
         " install_tpu_cp_patches only covers CP with FSDP/HSDP. Use"
         " parallelism.use_simple_fsdp, or turn off TP/EP."
     )
+  strategies = set()
   for fqn, attn, _, _ in model.traverse(BaseAttention.Config):
     owner = attn.inner_attention._owner
     if owner is None:
@@ -811,6 +945,12 @@ def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
     if issubclass(owner, KVAllGatherCPInnerAttention):
       strategy = "all_gather"
       expected_lb = "headtail"
+      window = getattr(attn.inner_attention, "window_size", (-1, 0))
+      if window[1] != 0:
+        raise NotImplementedError(
+            f"{fqn}.inner_attention: KV all-gather CP supports causal"
+            f" attention only, i.e. window_size=(left, 0); got {window}."
+        )
     elif issubclass(owner, UlyssesCPInnerAttention):
       strategy = "ulysses"
       expected_lb = None
@@ -823,6 +963,12 @@ def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
           f" {parallelism.context_parallel_load_balancer!r}."
       )
     _validate_heads(fqn, attn, parallelism.tensor_parallel_degree, cp, strategy)
+    strategies.add(strategy)
+  if training is not None:
+    for strategy in sorted(strategies):
+      _validate_sequence_lengths(
+          strategy, cp, training, splash_attention_kernel
+      )
 
 
 def revert_tpu_context_parallel(model: Any) -> None:

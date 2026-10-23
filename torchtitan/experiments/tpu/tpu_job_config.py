@@ -283,7 +283,12 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     ):
       # CP recipes apply core ContextParallelTransform with a TPU CP inner
       # attention; core validates the CP backend, this adds the TPU rules.
-      validate_tpu_context_parallel(self.model_spec.model, self.parallelism)
+      validate_tpu_context_parallel(
+          self.model_spec.model,
+          self.parallelism,
+          training=self.training,
+          splash_attention_kernel=self.splash_attention_kernel,
+      )
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed
     # that is crashing when running on TAP.

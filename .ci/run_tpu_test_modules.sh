@@ -29,7 +29,7 @@ for module in "$@"; do
       [ "$attempt" -gt 1 ] && retried+=("$module")
       continue 2
     fi
-    if ! grep -q "$transient_error_pattern" "$log"; then
+    if ! grep -qi "$transient_error_pattern" "$log"; then
       break
     fi
     echo "::warning::$module hit '$transient_error_pattern' on attempt $attempt/$MAX_ATTEMPTS"

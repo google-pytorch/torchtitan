@@ -500,6 +500,8 @@ def test_replay_failure_happens_before_optimizer():
             gradient_accumulation_steps=1,
             num_pp_microbatches=1,
             device=torch.device("cpu"),
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            transfer_stream=None,
             forward_backward_step=MagicMock(),
             sdc_replayer=SimpleNamespace(run_fwd_bwd=MagicMock(side_effect=mismatch)),
             model_parts=[],

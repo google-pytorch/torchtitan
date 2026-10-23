@@ -55,7 +55,8 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=SelectiveAC.Config(preserve_rng_state=False),
+      compile=CompileConfig(enable=False, backend="tpu"),
       validator=Validator.Config(enable=False),
       tpu_config=TPUConfig(enable_amp=False),
   )
@@ -113,8 +114,8 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       comm=CommConfig(train_timeout_seconds=600),
-      activation_checkpoint=FullAC.Config(),
-      compile=CompileConfig(enable=False),
+      activation_checkpoint=FullAC.Config(preserve_rng_state=False),
+      compile=CompileConfig(enable=False, backend="tpu"),
       validator=Validator.Config(enable=False),
       tpu_config=TPUConfig(
           enable_amp=False,

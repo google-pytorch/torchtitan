@@ -230,8 +230,6 @@ jobs:
           build-args: |
             CACHE_BUSTER=${{ steps.meta.outputs.NIGHTLY_DATE }}
             PYTHON_VERSION=${{ env.PYTHON_VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       # Downstream jobs should reference the image by digest. Candidate tags are
       # mutable if this workflow is used to build two runs on the same day, and

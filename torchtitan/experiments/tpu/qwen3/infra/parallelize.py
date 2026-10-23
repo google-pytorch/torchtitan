@@ -10,6 +10,9 @@ from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
+from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
+    install_tpu_replicate_computation,
+)
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
@@ -45,28 +48,51 @@ def configure_qwen_simple_fsdp_shard_dims(
         if stacks:
           continue  # Stacking took them; the holder above shards them instead.
         raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
-      incompatible = [
-          f"{name}{tuple(parameter.shape)}"
-          for name, parameter in parameters
-          if (
-              parameter.ndim != 3
-              or parameter.shape[0] != module.num_experts
-              or parameter.shape[1] % fsdp_degree != 0
+      # W2's dim 1 (F=1536) gives a 3-row stripe at 512 ranks, which no TPU
+      # tile fits. Its trailing D axis gives 8 rows, but the gather then stores
+      # W2 as [E, D, F], so the grouped matmul reads it as a transposed RHS
+      # instead of paying a full relayout copy.
+      # TODO: remove the trailing-W2/transposed-RHS path if GraphSplitter
+      # aligns with Scan's flattened dim-0 expert sharding, or if FlexShard
+      # provides tile-aligned expert shards.
+      use_trailing_w2 = (
+          module.use_kernel_native_weight_layout
+          and any(
+              name == "w2_EFD"
+              and parameter.ndim == 3
+              and parameter.shape[2] % fsdp_degree == 0
+              for name, parameter in parameters
           )
-      ]
+      )
+      shard_dims: dict[str, int] = {}
+      incompatible: list[str] = []
+      for name, parameter in parameters:
+        if parameter.ndim != 3 or parameter.shape[0] != module.num_experts:
+          incompatible.append(f"{name}{tuple(parameter.shape)}")
+          continue
+        if use_trailing_w2 and name == "w2_EFD":
+          shard_dims[name] = 2
+        elif parameter.shape[1] % fsdp_degree == 0:
+          shard_dims[name] = 1
+        else:
+          incompatible.append(f"{name}{tuple(parameter.shape)}")
       if incompatible:
         raise ValueError(
-            f"Cannot FSDP-shard {module_fqn} on Qwen's hidden dimension 1 "
-            f"over {fsdp_degree} ranks; incompatible expert parameters: "
+            f"Cannot FSDP-shard {module_fqn} over {fsdp_degree} ranks; "
+            f"incompatible expert parameters: "
             f"{incompatible}"
         )
       # See the documented apply_simple_fsdp hook above.
-      setattr(module, "_fsdp_shard_dim", 1)
+      if use_trailing_w2:
+        setattr(module, "_fsdp_shard_dim", shard_dims)
+        module._use_transposed_w2_rhs = True
+      else:
+        setattr(module, "_fsdp_shard_dim", 1)
       hidden_axis_modules.append(module_fqn)
 
   if hidden_axis_modules:
     logger.info(
-        "Using SimpleFSDP dimension 1 for %d uneven Qwen modules",
+        "Using non-leading SimpleFSDP dimensions for %d uneven Qwen modules",
         len(hidden_axis_modules),
     )
 
@@ -128,6 +154,7 @@ def parallelize_qwen3(
     for holder in model.modules():
       if hasattr(holder, "build_split_meshes"):
         holder.build_split_meshes()
+    install_tpu_replicate_computation(model)
   else:
     dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]

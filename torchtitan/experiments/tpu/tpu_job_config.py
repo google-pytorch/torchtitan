@@ -120,7 +120,7 @@ class TPUConfig:
   # Model checkpoints are unaffected: they keep the per-layer keys either way.
   # Optimizer checkpoints are not, because the parameter names change, so a run
   # cannot resume across a flip of this flag.
-  # https://github.com/google-pytorch/torchtitan/issues/389
+  # https://github.com/google-pytorch/torchtitan/issues/21
   use_scan_layers: bool = False
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False

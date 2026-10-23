@@ -53,7 +53,7 @@ def _flux_seq_len(img_size: int, max_t5_encoding_len: int) -> int:
 
 
 def flux_debugmodel() -> FluxTrainer.Config:
-    hf_assets_path = "third_party/py/torchtitan/tests/assets/tokenizer"
+    hf_assets_path = "tests/assets/tokenizer"
     img_size = 256
     max_t5_encoding_len = 256
     training_dataset = _flux_dataset("cc12m-test", img_size=img_size)

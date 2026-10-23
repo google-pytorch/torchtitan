@@ -31,7 +31,8 @@ index and flips its gradient stacks once: correct, just not copy-free.
 Assumes one thread per process: the two replacements are module-level globals
 in torch's `scan.py`, so a concurrent `call_backward` would see them.
 
-Delete this file once the fix lands upstream: google-pytorch/torchtitan#396.
+Delete this file once torch's scan backward stops calling `torch.flip`:
+google-pytorch/torchtitan#26.
 """
 
 import contextlib

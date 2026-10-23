@@ -37,33 +37,33 @@ If you need to rebuild the Docker container containing the correct Torch-TPU, Ra
 
 ```bash
 # Build the Docker image
-docker build -t us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:vllm-0612 -f torchtitan/experiments/tpu/rl_nc_ray/scripts/Dockerfile.ray.vllm .
+docker build -t <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/torchtitan-ray:latest -f torchtitan/experiments/tpu/rl_nc_ray/scripts/Dockerfile.ray.vllm .
 
 # Push to your Google Artifact Registry
-docker push us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:vllm-0612
+docker push <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/torchtitan-ray:latest
 ```
 
 > [!TIP]
-> Ensure your KubeRay cluster configuration YAML file (`torchtitan/experiments/tpu/rl_nc_ray/scripts/ray-v6e8-2.yaml`) points to this built image:
+> Ensure your KubeRay cluster configuration YAML file (`torchtitan/experiments/tpu/rl_nc_ray/scripts/ray-v6e8-2.yaml`) points to this built image (replace `YOUR_IMAGE`):
 > ```yaml
-> image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:vllm-0612
+> image: <REGION>-docker.pkg.dev/<PROJECT_ID>/<REPOSITORY>/torchtitan-ray:latest
 > ```
 
 #### B. Configure GCS Bucket Access (Workload Identity)
-The Ray configuration (`ray-v6e8-2.yaml`) automatically mounts the GCS bucket `torchprime` to `/data` in all pods using the GKE GCS Fuse CSI driver.
+The Ray configuration (`ray-v6e8-2.yaml`) automatically mounts your GCS bucket (`bucketName: YOUR_BUCKET`) to `/data` in all pods using the GKE GCS Fuse CSI driver.
 
 To authorize secure bucket access from your GKE nodes:
 1. Ensure the **GCS Fuse CSI driver** is enabled on your GKE cluster.
 2. Bind the Kubernetes Service Account (`ray-ksa` in the `default` namespace) to your Google Service Account (GSA) containing Storage Object Admin permissions via Workload Identity:
 
 ```bash
-gcloud iam service-accounts add-iam-policy-binding ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com \
+gcloud iam service-accounts add-iam-policy-binding <GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com \
     --role="roles/iam.workloadIdentityUser" \
-    --member="serviceAccount:tpu-pytorch.svc.id.goog[default/ray-ksa]"
+    --member="serviceAccount:<PROJECT_ID>.svc.id.goog[default/ray-ksa]"
 ```
 
 > [!IMPORTANT]
-> If you are using a different GSA, update the Workload Identity annotation on the `ray-ksa` ServiceAccount in `ray-v6e8-2.yaml` accordingly:
+> Set `YOUR_GCP_SERVICE_ACCOUNT` in the Workload Identity annotation on the `ray-ksa` ServiceAccount in `ray-v6e8-2.yaml`:
 > ```yaml
 > metadata:
 >   name: ray-ksa

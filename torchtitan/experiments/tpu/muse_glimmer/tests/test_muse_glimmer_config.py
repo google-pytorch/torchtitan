@@ -12,8 +12,10 @@ from absl.testing import parameterized
 import torch
 from torch.nn.attention import flex_attention
 from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.experiments.tpu import workarounds
+from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import resolve_save_regions
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer import attention as tpu_attention
@@ -400,15 +402,66 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     )
 
   @parameterized.parameters(
-      "muse_glimmer_30b_full_logits",
-      "muse_glimmer_30b_fused_ce",
+      (
+          "muse_glimmer_30b_full_logits",
+          "tpu_selective",
+          ("attention.inner_attention",),
+      ),
+      ("muse_glimmer_30b_fused_ce", "full", ()),
   )
-  def test_30b_graph_trainer_recipes_use_zero3_full_remat(self, name):
-    """Tests the GraphTrainer recipes' Zero-3, remat and FSDP schedule."""
+  def test_30b_graph_trainer_recipes_use_zero3_and_remat_policy(
+      self, name, memory_policy, save_regions
+  ):
+    """Tests Zero-3, the remat policy and the FSDP schedule."""
     config = getattr(config_registry, name)()
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, memory_policy
+    )
+    self.assertEqual(config.tpu_config.graph_trainer_save_regions, save_regions)
+    self.assertEqual(config.tpu_config.graph_trainer_save_last_n_layers, {})
     self.assertNotEqual(config.tpu_config.graph_trainer_fsdp_schedule, "none")
+
+  @parameterized.parameters(
+      # Opt out to plain full rematerialization.
+      (
+          (
+              "--tpu_config.graph_trainer_memory_policy=full",
+              "--tpu_config.graph_trainer_save_regions",
+          ),
+          "full",
+          {},
+      ),
+      # Splash saved in the last 26 layers only: no extra peak HBM.
+      (
+          (
+              "--tpu_config.graph_trainer_save_regions",
+              "--tpu_config.graph_trainer_save_last_n_layers",
+              "attention.inner_attention",
+              "26",
+          ),
+          "tpu_selective",
+          {"attention.inner_attention": 26},
+      ),
+  )
+  def test_30b_full_logits_readme_memory_overrides(
+      self, flags, memory_policy, last_n_layers
+  ):
+    """Tests the memory-policy overrides documented in the recipe README."""
+    config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.muse_glimmer",
+        "--config=muse_glimmer_30b_full_logits",
+        *flags,
+    ])
+    tpu_config = config.tpu_config
+    self.assertEqual(tpu_config.graph_trainer_memory_policy, memory_policy)
+    self.assertEqual(tpu_config.graph_trainer_save_regions, ())
+    self.assertEqual(tpu_config.graph_trainer_save_last_n_layers, last_n_layers)
+    if memory_policy == "tpu_selective":
+      # The policy accepts the combination (each region listed once).
+      resolve_save_regions(
+          tpu_config.graph_trainer_save_regions, last_n_layers
+      )
 
   def test_30b_fused_ce_recipe_passes_logit_transform_check(self):
     """Tests that the 30B head and loss agree on cap and 0.196 multiplier."""

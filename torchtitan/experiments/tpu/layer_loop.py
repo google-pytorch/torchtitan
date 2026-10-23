@@ -5,7 +5,7 @@
 owning that loop. :class:`TpuLayerLoop` is ``model.layers`` as a container that
 runs its own layers, and :func:`tpu_model_class` builds the model subclass whose
 ``forward`` calls it. Recipes that skip the rewrite are untouched.
-Design: google-pytorch/torchtitan#380.
+Design: the unmerged ``tpu-layer-loop-converter`` branch (7cde56bca0).
 """
 
 import functools

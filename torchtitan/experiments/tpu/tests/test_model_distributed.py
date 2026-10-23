@@ -13,6 +13,7 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import local_tpu_device
+import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
@@ -196,8 +197,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
-          # TODO(jeremiahhsu): Failing only on TPU7x b/568843473
+          # TODO(jerryx99): Failing only on TPU7x b/568843473
           skip_on_tpu7x=True,
+          skip_devices=[
+              # TODO(jerryx99): Flaky in TAP on Viperlite: rank 0 is aborted
+              # with SLICE_FAILURE_CHIP_DRIVER_ERROR during teardown after
+              # training completes. Re-enable once the flake is resolved.
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
@@ -225,8 +232,8 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       ),
       dict(
           testcase_name="flux_tp_dtensor",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
@@ -234,13 +241,32 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       ),
       dict(
           testcase_name="flux_tp_dtensor_compile",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
+      ),
+      dict(
+          testcase_name="gemma4_tp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+      ),
+      dict(
+          testcase_name="gemma4_tp_compile",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+          enable_compile=True,
+          # TODO: Same TPU7x-only XLA fusion_emitter.cc CHECK failure
+          # ("Scaled window bound is not a power of 2") as qwen3_tp_compile.
+          # b/568843473
+          skip_on_tpu7x=True,
       ),
   ])
   def test_model_distributed(
@@ -272,11 +298,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
         "--training.max_context_length=32",
         "--training.steps=3",
     ]
-    if module == "flux":
-      args.extend([
-          "--encoder.t5_encoder=tests/assets/flux_test_encoders/t5-micro",
-          "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
-      ])
     # Activation checkpoint configuration refactored to use tyro subcommands.
     # This must go last as tyro expects all subsequent flags to be part of the
     # subcommand.

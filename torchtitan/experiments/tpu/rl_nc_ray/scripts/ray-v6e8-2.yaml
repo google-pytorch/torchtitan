@@ -5,7 +5,7 @@ metadata:
   name: ray-ksa 
   namespace: default # Change this if your Ray cluster is in a different namespace
   annotations:
-      iam.gke.io/gcp-service-account: ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com
+      iam.gke.io/gcp-service-account: YOUR_GCP_SERVICE_ACCOUNT
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -35,7 +35,7 @@ spec:
         serviceAccountName: ray-ksa
         containers:
           - name: ray-head
-            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:rebase-0820
+            image: YOUR_IMAGE
             imagePullPolicy: Always
             env:
             - name: RAY_TRAIN_V2_ENABLED
@@ -66,7 +66,7 @@ spec:
           csi:
             driver: gcsfuse.csi.storage.gke.io
             volumeAttributes:
-              bucketName: torchprime
+              bucketName: YOUR_BUCKET
               mountOptions: "implicit-dirs"
   workerGroupSpecs:
     - replicas: 2 # use 2 slices
@@ -81,7 +81,7 @@ spec:
           serviceAccountName: ray-ksa
           containers:
             - name: ray-worker
-              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:rebase-0820
+              image: YOUR_IMAGE
               imagePullPolicy: Always
               resources:
                 limits:
@@ -110,7 +110,7 @@ spec:
             csi:
               driver: gcsfuse.csi.storage.gke.io
               volumeAttributes:
-                bucketName: torchprime
+                bucketName: YOUR_BUCKET
                 mountOptions: "implicit-dirs"
           nodeSelector:
             # Change this according to the TPU slice topology.

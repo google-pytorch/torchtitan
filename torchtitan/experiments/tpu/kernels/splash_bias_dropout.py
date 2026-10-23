@@ -340,13 +340,13 @@ def _document_aware_mask_info(mask_info, seg_b, bq: int, bkv: int, *, is_dkv: bo
 
   Both halves of this were measured against doing nothing, at that op-point
   (Llama-3.2-1B, 4x v6e, tok/s/device): **14,307** with segment ids alone,
-  which is what the tokamax wrapper and PR #492 do; **18,640** if the tiles
-  are merely zeroed, so the kernel skips their arithmetic but still walks all
-  136 grid steps; **20,210** if the list is also compacted to 24 steps. The
-  interval test is 79 % of the win; the compaction is the last 8.4 %, which is
-  also the 8.4 % that buys parity with the stock splash kernel (20,102) and so
-  the right to stop maintaining it. The whole helper costs 0.167 ms per step
-  across its 32 invocations, against ~340 ms saved.
+  which is what the tokamax wrapper and commit a18deacfe9 do; **18,640** if
+  the tiles are merely zeroed, so the kernel skips their arithmetic but still
+  walks all 136 grid steps; **20,210** if the list is also compacted to 24
+  steps. The interval test is 79 % of the win; the compaction is the last
+  8.4 %, which is also the 8.4 % that buys parity with the stock splash kernel
+  (20,102) and so the right to stop maintaining it. The whole helper costs
+  0.167 ms per step across its 32 invocations, against ~340 ms saved.
 
   The two passes carry different metadata and so get different treatment:
 

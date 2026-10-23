@@ -65,6 +65,7 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVLinear
+from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_8b_maxtext_parity,
@@ -854,7 +855,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     assert config.model_spec is not None
     self.assertEqual(config.model_spec.flavor, "235B-A22B")
-    # Bias-based load balancing (#391) and the routing metrics (#399) both keep
+    # Bias-based load balancing (#22) and the routing metrics (#28) both keep
     # per-layer state a scan body cannot hold.
     moes = list(config.model_spec.model.traverse(MoE.Config))
     self.assertLen(moes, 94)
@@ -958,6 +959,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     for group in (
         tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
         tpu_flags.ICI_AG_PIPELINING,
+        tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
     ):
       self.assertEqual(
           {name: config.libtpu_init_flags[name] for name in group}, group
@@ -967,6 +969,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass"
         ],
         "25000000",
+    )
+    self.assertEqual(
+        config.libtpu_init_flags["xla_tpu_copy_insertion_use_region_analysis"],
+        "true",
+    )
+    self.assertEqual(
+        config.libtpu_init_flags[
+            "xla_tpu_copy_insertion_use_region_analysis_limit"
+        ],
+        "1000",
     )
 
   def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:
@@ -1026,8 +1038,101 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_qwen3_30b_fsdp_profile_explicitly_uses_zero2(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
 
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, "tpu_selective"
+    )
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
+
+  def test_qwen3_30b_fsdp_recipe_saves_routing_and_splash(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, "tpu_selective"
+    )
+    self.assertEqual(
+        config.tpu_config.graph_trainer_save_regions,
+        ("moe.routing", "attention.inner_attention"),
+    )
+    self.assertEqual(config.tpu_config.graph_trainer_save_last_n_layers, {})
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    self.assertEqual(graph_config.compile.memory_policy, "tpu_selective")
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_save_regions,
+        ("moe.routing", "attention.inner_attention"),
+    )
+
+  def test_qwen3_30b_fsdp_recipe_opts_out_to_full_from_cli(self) -> None:
+    # The opt-out documented in the recipe README.
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_moe_30b_fsdp_only_full_ac_benchmark",
+            "--tpu_config.graph_trainer_memory_policy=full",
+            "--tpu_config.graph_trainer_save_regions",
+        ]),
+    )
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(graph_config.compile.memory_policy, "full")
+    self.assertEqual(graph_config.tpu_config.graph_trainer_save_regions, ())
+
+  def test_qwen3_30b_fsdp_recipe_limits_splash_to_last_layers_from_cli(
+      self,
+  ) -> None:
+    # The partial save documented in the recipe README.
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_moe_30b_fsdp_only_full_ac_benchmark",
+            "--tpu_config.graph_trainer_save_regions",
+            "moe.routing",
+            "--tpu_config.graph_trainer_save_last_n_layers",
+            "attention.inner_attention",
+            "24",
+        ]),
+    )
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(graph_config.compile.memory_policy, "tpu_selective")
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_save_regions, ("moe.routing",)
+    )
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_save_last_n_layers,
+        {"attention.inner_attention": 24},
+    )
+
+  @parameterized.parameters(
+      name
+      for name in dir(qwen3_config_registry)
+      if name.startswith("qwen3_moe_235b")
+  )
+  def test_qwen3_235b_recipes_keep_their_own_memory_policy(self, name) -> None:
+    # The 235B recipes start from the 30B benchmark recipe, whose
+    # tpu_selective saves were measured only on 30B.
+    config = getattr(qwen3_config_registry, name)()
+
+    self.assertNotEqual(
+        config.tpu_config.graph_trainer_memory_policy, "tpu_selective"
+    )
+    self.assertEqual(config.tpu_config.graph_trainer_save_regions, ())
+    if config.tpu_config.use_graph_trainer:
+      # The conversion validates the memory settings.
+      self._qwen3_graph_config(config)
 
   def test_qwen3_moe_fsdp_uses_pallas_cross_entropy(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
@@ -1094,6 +1199,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         {
             name: config.libtpu_init_flags[name]
+            for name in tpu_flags.SPARSECORE_ASYNC_ALL_GATHER
+        },
+        tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
             for name in tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER
         },
         tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
@@ -1104,6 +1216,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for name in tpu_flags.CONVOLUTION_UNFUSING
         },
         tpu_flags.CONVOLUTION_UNFUSING,
+    )
+    self.assertEqual(
+        config.libtpu_init_flags["xla_tpu_copy_insertion_use_region_analysis"],
+        "true",
+    )
+    self.assertEqual(
+        config.libtpu_init_flags[
+            "xla_tpu_copy_insertion_use_region_analysis_limit"
+        ],
+        "1000",
     )
 
   @parameterized.parameters(

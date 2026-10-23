@@ -72,7 +72,7 @@ class SingleStreamBlock_ref(nn.Module):
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         return x + mod.gate * output
 
-# TODO(jeremiahsu): b/540005818 re-enable once fixed
+# TODO(jerryx99): b/540005818 re-enable once fixed
 @unittest.skip("Skipping Flux QKV split test due to numerical tolerance issues")
 class TestFluxSingleStreamUnbind(unittest.TestCase):
 

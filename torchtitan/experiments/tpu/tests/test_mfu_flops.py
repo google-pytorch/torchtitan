@@ -9,6 +9,7 @@ import inspect
 from absl.testing import absltest
 import torch
 
+from torchtitan.experiments.tpu.examples.gemma4 import gemma4_configs
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
@@ -84,6 +85,25 @@ class FlopsConventionTest(absltest.TestCase):
             isinstance(recipe().model_spec.model, MaxTextQwen3Config),
             "maxtext" in name,
         )
+
+
+class MaxTextGemma4FlopsTest(absltest.TestCase):
+
+  def test_gemma4_31b_matches_maxtext(self) -> None:
+    model_config = gemma4_configs["31B"]
+    nparams, flops = model_config.get_nparams_and_flops(
+        _build(model_config), seq_len=2048
+    )
+    self.assertGreater(nparams, 30_000_000_000)
+    self.assertEqual(flops, 188_705_931_264)
+
+  def test_gemma4_26b_a4b_matches_maxtext(self) -> None:
+    model_config = gemma4_configs["26B-A4B"]
+    nparams, flops = model_config.get_nparams_and_flops(
+        _build(model_config), seq_len=2048
+    )
+    self.assertGreater(nparams, 25_000_000_000)
+    self.assertEqual(flops, 24_063_442_944)
 
 
 if __name__ == "__main__":

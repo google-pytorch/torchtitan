@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.nn import init
 from torch.nn.attention.flex_attention import and_masks
 from transformers import AutoConfig
@@ -438,6 +439,20 @@ class HFTransformerModel(BaseModel):
                     if cls_name:
                         hf_model_config.architectures = [cls_name]
 
+            # Heterogeneous configs (transformers >= 5.19; e.g. Gemma-4's global
+            # layers use head_dim 512 and 2 KV heads) keep per-layer values
+            # out of the public attributes, and reading one from the global
+            # config raises. Read the global values here and carry the
+            # per-layer overrides onto this config below; copying only the
+            # global values would build every layer with one shape.
+            per_layer_overrides = None
+            if getattr(hf_model_config, "is_heterogeneous", False):
+                per_layer_overrides = {
+                    int(i): o
+                    for i, o in hf_model_config.to_dict()["per_layer_config"].items()
+                }
+                hf_model_config.allow_global_per_layer_attribute_access = True
+
             # Explicitly update attributes based on mappings
             for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
                 if hasattr(hf_model_config, hf_name):
@@ -462,6 +477,21 @@ class HFTransformerModel(BaseModel):
                 # (e.g., DeepSeek V3 uses n_routed_experts, GLM uses num_local_experts)
                 if key == "num_experts" and hasattr(self, "n_routed_experts"):
                     self.n_routed_experts = value
+
+            if per_layer_overrides is not None:
+                # Global reads (head_dim, n_kv_heads below and in FLOP
+                # counting) see the default layer; the model reads each
+                # layer's own config. A flavor may have cut the layer count.
+                self.allow_global_per_layer_attribute_access = True
+                # Cut layer_types with the overrides: HF validates every listed
+                # layer type against the per-layer config.
+                layer_types = getattr(self, "layer_types", None)
+                if isinstance(layer_types, list):
+                    self.layer_types = layer_types[: self.num_hidden_layers]
+                self.per_layer_config = {
+                    i: o for i, o in per_layer_overrides.items()
+                    if i < self.num_hidden_layers
+                }
 
             self.max_seq_len = training.max_context_length
 
@@ -609,6 +639,10 @@ class HFTransformerModel(BaseModel):
 
             attention_op_flops = 0
             unsupported_layer_types = set()
+            # Attention-free models (Mamba) have no attention heads and so no
+            # attention term; their matmuls are counted in 6 * active_nparams.
+            if not getattr(self, "n_heads", None):
+                layer_types = []
             for layer_type in layer_types:
                 if layer_type in ("attention", "full_attention"):
                     sliding_window_size = None
@@ -864,6 +898,12 @@ class HFTransformerModel(BaseModel):
                     shared = getattr(self.mlp, shared_name, None)
                     if shared is not None:
                         shared.layer_idx = layer_idx
+            # Some architectures keep the MLP under another name (LFM2 and
+            # Falcon-H1: `feed_forward`; GraniteMoeHybrid: `shared_mlp`).
+            if mlp_cls is not None:
+                for module in self.modules():
+                    if isinstance(module, mlp_cls):
+                        module.layer_idx = layer_idx
 
         def _initialize_weights_patched(self, module, is_remote_code: bool = False):
             # NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
@@ -917,14 +957,14 @@ class HFTransformerModel(BaseModel):
             layer_idx_classes = tuple(layer_idx_classes)
 
             if isinstance(module, layer_idx_classes):
-                if not hasattr(module, "layer_idx"):
+                layer_idx = getattr(module, "layer_idx", None)
+                depth_init = getattr(config, "depth_init", False)
+                if depth_init and layer_idx is None:
                     raise ValueError(
                         f"Module {module} does not have a layer_idx attribute"
                     )
 
-                layer_idx = module.layer_idx
-
-                if hasattr(config, "depth_init") and config.depth_init:
+                if depth_init:
                     init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
                 else:
                     init_std = 0.02 / (2 * config.num_hidden_layers) ** 0.5
@@ -1375,7 +1415,28 @@ class HFTransformerModel(BaseModel):
             else:
                 logger.info("Skipping nn.Identity module during weight initialization.")
 
-        self.model.apply(selective_init)
+        # Some HF inits build a value as a plain tensor and copy it into the
+        # parameter (Mamba / Gated DeltaNet A_log in Qwen3-Next, Qwen3.5,
+        # Nemotron-H, Jamba, Zamba2). Under FSDP / TP the parameter is a
+        # DTensor, so give the value the parameter's placements first.
+        from transformers import initialization as hf_init
+
+        hf_copy = hf_init.copy_
+
+        def copy_into_dtensor(tensor, other):
+            if isinstance(tensor, DTensor) and not isinstance(other, DTensor):
+                other = distribute_tensor(
+                    other.to(tensor.to_local().device),
+                    tensor.device_mesh,
+                    tensor.placements,
+                )
+            return hf_copy(tensor, other)
+
+        hf_init.copy_ = copy_into_dtensor
+        try:
+            self.model.apply(selective_init)
+        finally:
+            hf_init.copy_ = hf_copy
 
         # HF rotary embeddings compute their `inv_freq` buffer in __init__, not in
         # `_init_weights`. With meta-device init + `to_empty()`, that buffer is

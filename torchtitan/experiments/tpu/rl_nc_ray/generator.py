@@ -6,7 +6,7 @@ the Ray worker initializes, preventing the orchestrator from eagerly locking the
 Replaces Monarch/Torchstore weight sync with `load_model_state_dict()`, receiving weights 
 via Ray's object store and manually copying them into the vLLM model's `DTensor` parameters.
 
-TODO (jialei): use the latest torchtpu-vllm, and confirm each of those TPU hacks is still needed. 
+TODO(jialei777): use the latest torchtpu-vllm, and confirm each of those TPU hacks is still needed. 
 """
 
 import asyncio

@@ -227,9 +227,12 @@ def _is_not_none(sample: Any) -> bool:
 
 
 DATASETS: dict[str, SingleDatasetConfig] = {
+    # Locally downloaded cc12m WebDataset shards (*.tar). The default path is a
+    # placeholder; point it at the shards with --dataloader.dataset_path (see
+    # precompute_flux_embeddings.py). Use "cc12m-wds" to stream from Hugging Face.
     "cc12m": SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
-            path="third_party/py/torchtitan/tests/assets/cc12m",
+            path="tests/assets/cc12m",
             split="train",
             load_dataset_kwargs={
                 "data_files": {"train": "*.tar"},
@@ -243,7 +246,7 @@ DATASETS: dict[str, SingleDatasetConfig] = {
     ),
     "cc12m-test": SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
-            path="third_party/py/torchtitan/tests/assets/cc12m_test",
+            path="tests/assets/cc12m_test",
             split="train",
             load_dataset_kwargs={
                 "data_files": {"train": "*.tar"},
@@ -257,7 +260,7 @@ DATASETS: dict[str, SingleDatasetConfig] = {
     ),
     "cc12m-test-validation": SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
-            path="third_party/py/torchtitan/tests/assets/cc12m_test",
+            path="tests/assets/cc12m_test",
             split="train",
             load_dataset_kwargs={
                 "data_files": {"train": "*.tar"},

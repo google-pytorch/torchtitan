@@ -76,58 +76,50 @@ class TrainDistributedTest(
       # flux
       dict(
           testcase_name="flux_tp",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
-          skip_devices=[
-              # b/501467380 - Error during backward pass
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="flux_tp_compile",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
           skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
+              # b/501466433 - Bug with torch.compile (not reproducible on TPU
+              # with flux_testmodel).
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       dict(
           testcase_name="flux_fsdp",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
-          skip_devices=[
-              # b/501467380 - Error during backward pass
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="flux_fsdp_compile",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
           skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
+              # b/501466433 - Bug with torch.compile (not reproducible on TPU
+              # with flux_testmodel).
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
@@ -357,7 +349,7 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
-      # TODO(abrauckmann): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.
+      # TODO(alexanderb14): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.
       #   dict(
       #       testcase_name="qwen3_fsdp_moe_use_gmm_and_fill_indices_kernels",
       #       module="torchtitan.experiments.tpu.qwen3",
@@ -374,6 +366,44 @@ class TrainDistributedTest(
       #           device_type.AcceleratorDeviceType.CUDA,
       #       ],
       #   ),
+      # gemma4
+      dict(
+          testcase_name="gemma4_tp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+      ),
+      dict(
+          testcase_name="gemma4_fsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="gemma4_simplefsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+      ),
+      dict(
+          testcase_name="gemma4_moe_fsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_moe_testmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="gemma4_fsdp_checkpoint",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          checkpoint_enabled=True,
+      ),
       # muse_glimmer (text-only). TP is capped at 2: the debugmodel has 2 KV
       # heads (see muse_glimmer_fsdp_tp2).
       dict(
@@ -507,7 +537,7 @@ class TrainDistributedTest(
         "--training.mixed_precision_reduce=float32",
         (
             "--training.num_tokens_per_microbatch_per_dp_rank="
-            f"{128 if module == 'flux' else 512}"
+            f"{128 if module.endswith('flux') else 512}"
         ),
     ]
     if not args:
@@ -517,11 +547,6 @@ class TrainDistributedTest(
     # This allows test cases to override default arguments.
     combined_args = default_args + args
 
-    if module == "flux":
-      combined_args.extend([
-          "--encoder.t5_encoder=tests/assets/flux_test_encoders/t5-micro",
-          "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
-      ])
     if checkpoint_enabled:
       test_tmp_dir = tempfile.mkdtemp()
       self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)

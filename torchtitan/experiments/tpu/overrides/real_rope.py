@@ -61,12 +61,12 @@ class TpuRealArithmeticComplexRoPE(ComplexRoPE):
     if inverse:
       rope_cache = rope_cache.conj()
     cache = torch.view_as_real(rope_cache)
-    cos, sin = cache[..., 0], cache[..., 1]
+    cos, sin = cache[..., 0:1], cache[..., 1:2]
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
       pairs = x.float().reshape(*x.shape[:-1], -1, 2)
-      real, imag = pairs[..., 0], pairs[..., 1]
-      rotated = torch.stack(
+      real, imag = pairs[..., 0:1], pairs[..., 1:2]
+      rotated = torch.cat(
           [real * cos - imag * sin, real * sin + imag * cos], dim=-1
       )
       return rotated.flatten(-2).type_as(x)

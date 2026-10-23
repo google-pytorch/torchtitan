@@ -206,15 +206,17 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
   """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
 
   SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
-  graph rematerialization, JAX Pallas Splash attention and plain cross entropy
-  over the full logits. The 4x4x4 libtpu flags ride on the config.
+  graph rematerialization except each layer's Splash output and LSE, JAX
+  Pallas Splash attention and plain cross entropy over the full logits. The
+  4x4x4 libtpu flags ride on the config.
 
   Full logits vs fused cross entropy, measured on tpu7x-4x4x4 with fp32
   weights and optimizer state (the default ``training.dtype``) and bf16
   compute:
 
   * Why full logits here: with 16384 tokens per device the logits are not
-    what sets peak HBM (46.18 GiB full vs 46.12 GiB fused), so the fused
+    what sets peak HBM (46.18 GiB full vs 46.12 GiB fused, both measured
+    with plain ``full`` rematerialization), so the fused
     kernel saves nothing, while XLA's plain LM-head matmul + cross entropy
     runs ~2% faster than the vocab-tiled Pallas kernel (2,913 vs 2,851 TPS,
     43.8% vs 42.9% MFU).
@@ -235,7 +237,8 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       compile_optimizer=True,
       optimizer_in_graph=True,
-      graph_trainer_memory_policy="full",
+      graph_trainer_memory_policy="tpu_selective",
+      graph_trainer_save_regions=("attention.inner_attention",),
       enable_graph_trainer_remat_schedule=True,
       graph_trainer_fsdp_schedule="prefetch",
   )
@@ -255,6 +258,10 @@ def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   """
   config = muse_glimmer_30b_full_logits()
   _enable_pallas_cross_entropy(config)
+  # This is the recipe to pick for HBM headroom, and the Splash saves were
+  # measured only with full logits, so it keeps plain full rematerialization.
+  config.tpu_config.graph_trainer_memory_policy = "full"
+  config.tpu_config.graph_trainer_save_regions = ()
   return config
 
 

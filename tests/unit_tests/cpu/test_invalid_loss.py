@@ -30,6 +30,8 @@ class TestInvalidLoss(unittest.TestCase):
         trainer.config.training.max_norm = 1.0
         trainer.sdc_replayer = None
         trainer.device = torch.device("cpu")
+        # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+        trainer.transfer_stream = None
         trainer.gradient_accumulation_steps = 1
         trainer.num_pp_microbatches = 1
         trainer.step = 1

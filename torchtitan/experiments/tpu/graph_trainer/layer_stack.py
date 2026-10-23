@@ -24,9 +24,11 @@ What changes for a reader:
   unstacked run. Everywhere else the views are down, the forward and backward
   included: those read rows out of the stack and never restore the names.
 * Anything keyed off *live* parameter names sees the difference: the optimizer
-  state dict and DCP's ``get_model_state_dict`` both do.
-  https://github.com/google-pytorch/torchtitan/issues/389
-  https://github.com/google-pytorch/torchtitan/issues/392
+  state dict and DCP's ``get_model_state_dict`` both do. Neither is handled
+  yet: optimizer state does not carry across a stacked/unstacked switch, and
+  ``get_model_state_dict`` does not work on a stacked model.
+  https://github.com/google-pytorch/torchtitan/issues/21
+  https://github.com/google-pytorch/torchtitan/issues/23
 * Stacks whose axis 1 does not divide by the FSDP mesh degree (e.g. expert
   stacks ``[n, E, X, ...]`` when the mesh degree exceeds ``E``) can be
   flattened before sharding via ``LayerStackHolder.flatten_for(degree)`` into
@@ -124,8 +126,8 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
             raise ValueError(
                 f"layer {i} holds an MoE with load balancing on, and its "
                 "per-layer buffers cannot be shared across layers. Stacking "
-                "does not support MoE load balancing "
-                "(https://github.com/google-pytorch/torchtitan/issues/391); "
+                "does not support MoE load balancing yet "
+                "(https://github.com/google-pytorch/torchtitan/issues/22); "
                 "drop --tpu-config.use-scan-layers, or set "
                 "load_balance_coeff to None."
             )
@@ -147,7 +149,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
                 f"layer {i} does not match layer 0, so their weights cannot "
                 f"share a stack: {differences}. Stacking needs identical "
                 "layers "
-                "(https://github.com/google-pytorch/torchtitan/issues/393)."
+                "(https://github.com/google-pytorch/torchtitan/issues/24)."
             )
 
 
@@ -163,6 +165,14 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     # stays a contiguous copy, and it picks the same axis the unrolled path
     # would. Preferring the *widest* divisible axis instead would send w2_EFD to
     # dim 3 while w1_EDF goes to dim 2, which no other lane does.
+    # For 3-D stacks (2-D per-layer weights `[n_layers, rows, cols]`), prefer an
+    # axis whose per-rank shard is a multiple of 8 (the TPU MXU row tile) so
+    # `scan_fsdp` does not need `_fold_rows` reshapes around collectives, unless
+    # `dim 1` has one entry per rank (`num_experts == degree` on a router).
+    if param.ndim == 3 and param.shape[1] != degree:
+        for d in range(1, param.ndim):
+            if param.shape[d] % (degree * 8) == 0:
+                return d
     for d in range(1, param.ndim):
         if param.shape[d] % degree == 0:
             return d
@@ -281,7 +291,7 @@ class LayerStackHolder(Module):
         is a bug, not a default.
         """
         return {
-            name: _shard_dim(param, degree)
+            name: 1 if name in self.layer_shapes else _shard_dim(param, degree)
             for name, param in self._parameters.items()
             if param is not None
         }

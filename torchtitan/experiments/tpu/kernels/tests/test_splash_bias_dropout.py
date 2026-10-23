@@ -710,7 +710,7 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
           ga.cpu(), gb.cpu(), rtol=0.0, atol=0.0, msg=f"{name}:{gname}"
       )
 
-  # TODO(jeremiahhsu): Update tokamax pin. This test requires tokamax pin
+  # TODO(jerryx99): Update tokamax pin. This test requires tokamax pin
   # 8eadbf6cfdd9 otherwise fails with ValueError: too many values to unpack
   # (expected 8)
   @unittest.skip("Requires tokamax pin 8eadbf6cfdd9")

@@ -144,7 +144,7 @@ def _common_setup(config):
     AuxLoss.set_step_denominator(
         torch.tensor(num_tokens_per_train_step, dtype=torch.int64, device=device)
     )
-    # TODO(jeremiahhsu): pass local_global_batch_size / global_batch_size here
+    # TODO(jerryx99): pass local_global_batch_size / global_batch_size here
     # (as Trainer does) before precompiling a recipe that uses
     # MoELoadBalanceAuxLoss; Qwen3Model.update_from_config raises without
     # them. No recipe does today. Should not be needed once the aux loss moves

@@ -244,12 +244,10 @@ The following setup commands should be executed on the user's local machine, unl
     gcloud compute ssh <DEPLOYMENT_NAME>-login-001 --tunnel-through-iap --zone <zone> -- -L 6006:localhost:6006
     ```
 
-    **Option 2: Direct SSH from Cloudtop**
+    **Option 2: Direct SSH**
 
     ```bash
-    ssh -i ~/.ssh/google_compute_engine <username>_google_com@nic0.<hostname>-login-001.<zone>.c.<project_id>.internal.gcpnode.com
-    # For example
-    ssh -i ~/.ssh/google_compute_engine erichuan_google_com@nic0.a3mega-login-001.us-east5-a.c.cienet-cmcs.internal.gcpnode.com
+    ssh -i ~/.ssh/google_compute_engine <username>@nic0.<hostname>-login-001.<zone>.c.<project_id>.internal.gcpnode.com
     ```
 
 7.  **[Login node] Run NCCL test for a3mega Slurm cluster ([**Doc link**](https://cloud.google.com/cluster-toolkit/docs/machine-learning/a3-mega-enable-gpudirect-tcpxo))**
@@ -382,15 +380,15 @@ The following setup commands should be executed on the user's Login Node, unless
     tensorboard --logdir ./outputs/tb
     ```
 
-    Note: If you didn’t ssh to the login node with port forwarding, you can’t access TensorBoard directly. You must first copy the data from the outputs directory to your local machine or cloudtop to perform the actions mentioned above.
+    Note: If you didn’t ssh to the login node with port forwarding, you can’t access TensorBoard directly. You must first copy the data from the outputs directory to your local machine to perform the actions mentioned above.
 
     ```bash
     # [Login node] Create a gz archive
     cd ~/torchtitan
     tar czf outputs.tar.gz --directory=outputs .
 
-    # [Local] Copy the archive to your local machine or cloudtop
-    scp -i ~/.ssh/google_compute_engine <username>_google_com@nic0.<hostname>-login-001.<zone>.c.<project_id>.internal.gcpnode.com:~/torchtitan/outputs.tar.gz ~/Downloads/outputs.tar.gz
+    # [Local] Copy the archive to your local machine
+    scp -i ~/.ssh/google_compute_engine <username>@nic0.<hostname>-login-001.<zone>.c.<project_id>.internal.gcpnode.com:~/torchtitan/outputs.tar.gz ~/Downloads/outputs.tar.gz
 
     # [Local] Extract the archive
     cd ~/Downloads

@@ -183,7 +183,7 @@ def run_distributed(
       # Construct the environment before spawning workers.
       distributed_utils.maybe_init_distributed(num_devices)
     try:
-      # TODO(jialeic): Support returning results from gdist workers.
+      # TODO(jialei777): Support returning results from gdist workers.
       gdist.torchrun(
           _run_in_gdist_worker,
           nproc_per_node=num_devices)(

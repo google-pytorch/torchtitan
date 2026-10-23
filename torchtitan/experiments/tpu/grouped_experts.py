@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from torchtitan.config import derive
+from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
@@ -108,6 +110,7 @@ class TpuGroupedExperts(GroupedExperts):
 
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
+        activation: str = "silu"
         use_pallas_grouped_mm: bool = False
         # Share routed-token loads between the equal-shaped W1/W3 projections.
         use_pallas_paired_grouped_mm: bool = False
@@ -122,6 +125,10 @@ class TpuGroupedExperts(GroupedExperts):
         use_kernel_native_weight_layout: bool = False
 
     def __init__(self, config: Config):
+        if config.activation not in ("silu", "gelu_tanh"):
+            raise ValueError(
+                f"Unsupported expert activation: {config.activation!r}"
+            )
         if config.use_kernel_native_weight_layout:
             if not config.use_pallas_grouped_mm:
                 raise ValueError(
@@ -143,6 +150,7 @@ class TpuGroupedExperts(GroupedExperts):
         else:
             super().__init__(config)
 
+        self.activation = config.activation
         self.use_pallas_grouped_mm = config.use_pallas_grouped_mm
         self.use_pallas_paired_grouped_mm = config.use_pallas_paired_grouped_mm
         self.pallas_grouped_mm_tile_m = config.pallas_grouped_mm_tile_m
@@ -225,6 +233,46 @@ class TpuGroupedExperts(GroupedExperts):
                     canonical_key
                 ).transpose(-2, -1).contiguous()
 
+    def _native_experts_forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """``GroupedExperts.forward`` with a configurable activation.
+
+        Mirrors ``GroupedExperts.forward`` in
+        ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
+        silu.
+        """
+        if isinstance(self.w1_EFD, DTensor):
+            w1_EFD = self.w1_EFD.to_local()
+            w2_EDF = self.w2_EDF.to_local()
+            w3_EFD = self.w3_EFD.to_local()
+        else:
+            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
+
+        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+        if (
+            get_spmd_backend() == "spmd_types"
+            and spmd.is_type_checking()
+            and spmd_mesh_size("ep") == 1
+        ):
+            for axis in ("dp", "cp"):
+                spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
+
+        h_RF = self._activation_fn(
+            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
+        )
+        h_RF = h_RF * self._grouped_mm(
+            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
+        )
+        return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
+
+    def _activation_fn(self, gate_RF: torch.Tensor) -> torch.Tensor:
+        if self.activation == "gelu_tanh":
+            return F.gelu(gate_RF, approximate="tanh")
+        return F.silu(gate_RF)
+
     def forward(
         self,
         x_RD: torch.Tensor,
@@ -234,7 +282,9 @@ class TpuGroupedExperts(GroupedExperts):
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
-            return super().forward(x_RD, num_tokens_per_expert_E)
+            if self.activation == "silu":
+                return super().forward(x_RD, num_tokens_per_expert_E)
+            return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
@@ -297,7 +347,7 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
             )
-        hidden_RF = F.silu(gate_RF) * up_RF
+        hidden_RF = self._activation_fn(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),

@@ -18,7 +18,7 @@ def _tpu_device_type_registered() -> bool:
     return True
 
 
-# TODO(jeremiahhsu): We skip running on tpu as this pytest test runs on cpu runner.
+# TODO(jerryx99): We skip running on tpu as this pytest test runs on cpu runner.
 # (This is the only test in tests/unit_tests that parameterizes over cpu and tpu).
 # We cannot move to the single-chip TPU shard as it expects tests in absltest
 # format. Either enable the TPU shards to dispatch both absltest and pytest tests

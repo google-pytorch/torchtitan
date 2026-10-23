@@ -32,6 +32,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     check_layers_are_stackable,
+    LayerStackHolder,
     STACK_ATTR,
     with_tpu_stacked_layers,
 )
@@ -56,8 +57,8 @@ SEED = 1234
 # `scan` re-traces its body through functionalization, which has no derivative
 # for `view_as_complex_copy`. The llama3 TPU recipes request this override for
 # the same reason; here there is no recipe to carry it. qwen3 uses `CosSinRoPE`
-# and needs nothing.
-# https://github.com/google-pytorch/torchtitan/issues/386
+# and needs nothing. Drop it once `view_as_complex_copy` has a derivative.
+# https://github.com/google-pytorch/torchtitan/issues/20
 _REAL_ROPE_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.real_rope"
     ".tpu_real_arithmetic_complex_rope"
@@ -468,6 +469,38 @@ class TestLayerStack(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "assign=True"):
             stacked.load_state_dict(checkpoint, assign=True)
+
+    def test_plan_shard_dims_prefers_8_row_tile_aligned_axis_for_2d_weights(self):
+        """For 3-D stacks (2-D per-layer weights), prefer an axis whose per-rank
+        shard size is a multiple of 8 (TPU MXU row tile) to avoid `_fold_rows`."""
+        holder = LayerStackHolder()
+        with torch.device("meta"):
+            # Llama3-405B at 2048 ranks: w1 [126, 53248, 16384] has 26 rows/rank
+            # on dim 1 (not % 8) vs 8 cols/rank on dim 2 (% 8 == 0) -> Shard(2).
+            holder.register_parameter(
+                "w1", nn.Parameter(torch.empty(2, 53248, 16384))
+            )
+            # wqkv [126, 18432, 16384] has 9 rows/rank on dim 1 vs 8 on dim 2 -> Shard(2).
+            holder.register_parameter(
+                "wqkv", nn.Parameter(torch.empty(2, 18432, 16384))
+            )
+            # w2 [126, 16384, 53248] has 8 rows/rank on dim 1 (% 8 == 0) -> Shard(1).
+            holder.register_parameter(
+                "w2", nn.Parameter(torch.empty(2, 16384, 53248))
+            )
+            # 4-D MoE stack [2, 128, 1536, 4096] at 128 ranks keeps dim 1 (num_experts).
+            holder.register_parameter(
+                "experts_w1", nn.Parameter(torch.empty(2, 128, 1536, 4096))
+            )
+
+        self.assertEqual(
+            holder.plan_shard_dims(2048),
+            {"w1": 2, "wqkv": 2, "w2": 1, "experts_w1": 3},
+        )
+        self.assertEqual(
+            holder.plan_shard_dims(128)["experts_w1"],
+            1,
+        )
 
 
 def _toy_layer(dim=4, extra=None, out=None, cache=None, frozen=False):

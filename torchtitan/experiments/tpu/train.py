@@ -25,6 +25,7 @@ from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
+import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
@@ -218,10 +219,20 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   if rank == 0:
     init_logger()
 
+  from torchtitan.experiments.tpu import cloud_distributed_utils  # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
 
   workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
   profiler_workaround.init(train_config)
+
+  # Reject a replicate degree that would straddle DCN, before ParallelDims is
+  # built from this config. No-op on a single slice.
+  cloud_distributed_utils.maybe_validate_multislice_parallelism(
+      train_config.parallelism
+  )
+  if cloud_distributed_utils.is_multi_slice():
+    # The MegaScale PJRT client cannot serve pinned host memory.
+    workarounds.disable_pinned_host_memory()
 
   trainer: Optional[torchtitan.trainer.Trainer] = None
   model_spec = train_config.model_spec
@@ -390,7 +401,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if model_spec.name in ("llama3", "muse_glimmer", "qwen3"):
+      if model_spec.name in ("llama3", "muse_glimmer", "qwen3", "gemma4"):
         if (
             train_config.tpu_config.use_graph_trainer
             or train_config.tpu_config.compile_mode == "aot_fx_trace"

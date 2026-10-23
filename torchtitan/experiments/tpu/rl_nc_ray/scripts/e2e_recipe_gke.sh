@@ -1,7 +1,6 @@
 #!/bin/bash
 # Submit to GKE with vLLM explicitly enabled
 
-export PATH="/home/wenjung_google_com/uv_venv/bin:$PATH"
 export RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1
 
 MODEL_SIZE=${1:-"0.6b"}

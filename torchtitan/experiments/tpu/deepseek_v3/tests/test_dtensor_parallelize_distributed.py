@@ -125,7 +125,7 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
   )
   # This test is already flaky at head with default tolerances of
   # (atol_loss=1e-3, rtol_loss=1e-3, atol_grad=1e-3, rtol_grad=1e-3).
-  # TODO(jeremiahhsu): b/540005818 to audit tolerances
+  # TODO(jerryx99): b/540005818 to audit tolerances
   runner.run_backward_parity(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
@@ -183,7 +183,7 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
       seq_len=TEST_SEQ_LEN,
-      atol_loss=3,  # TODO(tbajpai): investigate tolerance issues b/495494788
+      atol_loss=3,  # TODO(tanvibajpai): investigate tolerance issues b/495494788
       rtol_loss=3,
       atol_grad=9e-1,
       rtol_grad=9e-1,

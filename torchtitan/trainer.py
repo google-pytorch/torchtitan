@@ -352,6 +352,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.device = utils.get_local_device()
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
+        # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+        self.transfer_stream = (
+            device_module.Stream(device=self.device)
+            if device_type == "tpu"
+            else None
+        )
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
@@ -952,11 +958,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
         for fwd_bwd_index, microbatches in enumerate(microbatch_groups):
             input_dict_mbs = []
-            for input_dict in microbatches:
-                for key, value in input_dict.items():
-                    if isinstance(value, torch.Tensor):
-                        input_dict[key] = value.to(self.device, non_blocking=True)
-                input_dict_mbs.append(input_dict)
+            # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+            # Keep the (pinned) host tensors alive until the transfers are
+            # synchronized, per the PyTorch non_blocking pattern:
+            # https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html#non-blocking-true
+            # Required on torch_tpu, which has no default-stream sync yet.
+            host_tensors: list[torch.Tensor] = []
+            with utils.device_module.stream(self.transfer_stream):
+                for input_dict in microbatches:
+                    for key, value in input_dict.items():
+                        if isinstance(value, torch.Tensor):
+                            # TODO(b/574254920): Remove once cl/1002674322 lands; torch_tpu's
+                            # own .contiguous() temporary is dropped before the async copy completes.
+                            value = value.contiguous()
+                            host_tensors.append(value)
+                            input_dict[key] = value.to(self.device, non_blocking=True)
+                    input_dict_mbs.append(input_dict)
+                # TODO(b/574393053): Remove when torch_tpu handles necessary synchronization on the default stream matching CUDA behavior
+                if self.transfer_stream is not None:
+                    self.transfer_stream.synchronize()
+            del host_tensors
 
             if parallel_dims.pp_enabled:
                 fwd_bwd_input_dict = input_dict_mbs
@@ -1158,7 +1179,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         and self.device.type != "tpu"
                         and self.device.type != "cpu"
                     ):
-                        # TODO(alekseyv): TPU doesn't support set_pg_timeouts yet.
+                        # TODO(vlasenkoalexey): TPU doesn't support set_pg_timeouts yet.
                         dist_utils.set_pg_timeouts(
                             timeout=timedelta(
                                 seconds=config.comm.train_timeout_seconds

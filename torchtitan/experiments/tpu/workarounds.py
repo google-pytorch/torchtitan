@@ -673,6 +673,35 @@ def _check_fused_loss_logit_transform(model: nn.Module, job_config: Any) -> None
     )
 
 
+def disable_pinned_host_memory() -> None:
+  """Makes the data pipeline allocate pageable batches instead of pinned ones.
+
+  Multi-slice jobs run on the MegaScale PJRT client, which implements no
+  ``HostMemoryAllocator`` (see ``PjrtBackend::GetHostAllocator`` in
+  torch_tpu's ``csrc/pjrt/pjrt_state.cc``). The collator's page-locked staging
+  buffers go through torch_tpu's ``TpuPinnedAllocator``, which needs one, and
+  the failure arrives as an absl ``FATAL`` from inside the PJRT C API --
+  ``HostMemoryAllocator not implemented for client`` -- so it aborts the
+  process rather than raising something catchable. The allocation therefore has
+  to be avoided up front.
+
+  ``TextCollator`` reads ``HAS_PIN_MEMORY`` as a module global on every call, so
+  rebinding it before the first batch is built is sufficient. Costs the async
+  host-to-device copy: a copy out of pageable memory is synchronous whatever
+  ``non_blocking`` says.
+  """
+  from torchtitan.components.data import collators  # pylint: disable=g-import-not-at-top
+
+  if not collators.HAS_PIN_MEMORY:
+    return
+  collators.HAS_PIN_MEMORY = False
+  logger.info(
+      "Multi-slice: allocating pageable batches. The MegaScale PJRT client"
+      " implements no host memory allocator, so a pinned allocation would"
+      " abort the process; this gives up the async host-to-device copy."
+  )
+
+
 def apply_patches(model: nn.Module, job_config: Any) -> None:
   """Applies all TPU-specific patches and workarounds to the model."""
   _check_fused_loss_logit_transform(model, job_config)

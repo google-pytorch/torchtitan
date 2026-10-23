@@ -130,9 +130,7 @@ DISABLED_TESTS = {
     "torchtitan.experiments.graph_trainer.tests.test_subgraph_regions",
     # Missing optional dependency autoparallel
     "torchtitan.experiments.graph_trainer.tests.test_autoparallel",
-    # Missing optional dependency torchax
-    "torchtitan.experiments.torchax.conformer.tests.test_conformer_equivalence",
-    "torchtitan.experiments.torchax.tests.test_train_distributed",
+    "torchtitan.experiments.jax.tests.test_distributed",
     # TODO: get_peak_flops() rejects 'cpu', so MFU setup raises; make MFU optional.
     "torchtitan.experiments.jax.tests.test_train_distributed",
 }

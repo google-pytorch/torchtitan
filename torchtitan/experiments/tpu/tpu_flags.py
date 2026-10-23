@@ -187,6 +187,14 @@ ICI_AG_PIPELINING: FlagMap = {
     "xla_tpu_enable_ici_ag_pipelining": "true",
 }
 
+# Offload eligible FSDP all-gathers to SparseCore asynchronously and prefer
+# async all-gather over all-reduce.
+SPARSECORE_ASYNC_ALL_GATHER: FlagMap = {
+    "xla_enable_async_all_gather": "true",
+    "xla_tpu_prefer_async_allgather_to_allreduce": "true",
+    "xla_tpu_enable_sparse_core_collective_offload_all_gather": "true",
+}
+
 # Unfuse elementwise ops from MXU matmuls when fusing degrades tile selection
 # (e.g. restores the 416x8 FFN backward tile on Llama3-405B scan).
 CONVOLUTION_UNFUSING: FlagMap = {

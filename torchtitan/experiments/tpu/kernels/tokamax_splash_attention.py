@@ -32,8 +32,12 @@ def _dummy_jaxtyped(*args, **kwargs):
 
 
 jaxtyping.jaxtyped = _dummy_jaxtyped
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
+try:
+  from tokamax._src.ops.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
+  from tokamax._src.ops.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
+except ImportError:
+  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
+  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
 
 jaxtyping.jaxtyped = _real_jaxtyped
 
@@ -42,7 +46,7 @@ import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-ord
 from torch_tpu._internal import pallas
 
 
-# Taken from tokamax._src.ops.experimental.tpu.splash_attention.base.DEFAULT_MASK_VALUE.
+# Taken from tokamax._src.ops.splash_attention.base.DEFAULT_MASK_VALUE.
 _DEFAULT_MASK_VALUE = -0.7 * float(
     np.finfo(np.dtype("float32")).max
 )

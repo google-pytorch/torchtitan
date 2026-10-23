@@ -136,7 +136,7 @@ def to_tpu_graph_trainer_config(
   ):
     raise ValueError(
         f"generic offload policy {memory_policy!r} is unsupported with scan; "
-        "use the scan-specific 'full_and_scan_offload' policy from PR #374"
+        "use the scan-specific 'full_and_scan_offload' policy"
     )
   if budget < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
@@ -158,7 +158,7 @@ def to_tpu_graph_trainer_config(
       raise ValueError(
           "--tpu-config.use-scan-layers cannot be combined with "
           "--parallelism.expert-parallel-degree > 1 "
-          "(https://github.com/google-pytorch/torchtitan/issues/395)."
+          "(https://github.com/google-pytorch/torchtitan/issues/25)."
       )
     # Scanning is a property of the model, so it is expressed as a config
     # rewrite: the recipe gets put on a model class that stacks its layer

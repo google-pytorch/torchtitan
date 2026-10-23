@@ -646,21 +646,36 @@ def clip_grad_norm_(
     else:
         # prevent generators from being exhausted
         parameters = list(parameters)
-    grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(
-        grads, norm_type, error_if_nonfinite, foreach
+    with_grad = [p for p in parameters if p.grad is not None]
+    groups: dict[DeviceMesh | None, list[torch.Tensor]] = {}
+    for p in with_grad:
+        mesh = p.grad.device_mesh if isinstance(p.grad, DTensor) else None
+        groups.setdefault(mesh, []).append(p)
+    # get_total_norm and foreach clipping refuse to mix DTensors from different
+    # meshes (e.g. split-stack parameters on a split FSDP mesh). Keep one group
+    # when at most one DTensor mesh is present.
+    param_groups = (
+        [with_grad]
+        if len(groups.keys() - {None}) <= 1
+        else list(groups.values())
     )
-
-    # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
-    # We can simply reduce the DTensor to get the total norm in this tensor's process group
-    # and then convert it to a local tensor.
-    # NOTE: It has two purposes:
-    #       1. to make sure the total norm is computed correctly when PP is used (see below)
-    #       2. to return a reduced total_norm tensor whose .item() would return the correct value
-    if isinstance(total_norm, DTensor):
-        # Will reach here if any non-PP parallelism is used.
-        # If only using PP, total_norm will be a local tensor.
-        total_norm = total_norm.full_tensor()
+    norms = []
+    for group in param_groups:
+        norm = torch.nn.utils.get_total_norm(
+            [p.grad for p in group], norm_type, error_if_nonfinite, foreach
+        )
+        # If norm is a DTensor, the placements must be
+        # `torch.distributed._tensor.ops.math_ops._NormPartial`. Reduce it in
+        # its process group to get a local scalar tensor before combining meshes
+        # or reducing across PP stages.
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        norms.append(norm)
+    total_norm = (
+        norms[0]
+        if len(norms) == 1
+        else torch.linalg.vector_norm(torch.stack(norms), norm_type)
+    )
 
     if pp_mesh is not None:
         if math.isinf(norm_type):
@@ -670,7 +685,8 @@ def clip_grad_norm_(
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    for group in param_groups:
+        torch.nn.utils.clip_grads_with_norm_(group, max_norm, total_norm, foreach)
     return total_norm
 
 

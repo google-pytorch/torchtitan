@@ -94,9 +94,10 @@ def _config(registry=model_registry):
 def _moe_config(num_experts: int):
     """A 2-layer qwen3 MoE with ``num_experts`` experts, stackable.
 
-    Few experts, so that a small mesh already exceeds them and ``flatten_for``
-    has something to flatten. Load balancing is off because stacking refuses
-    it, and weight tying is off for the reason ``TestQwen3._build`` gives.
+    Few experts, so that a small mesh already exceeds them and
+    ``shard_split_stacks`` has something to split. Load balancing is off
+    because stacking refuses it, and weight tying is off for the reason
+    ``TestQwen3._build`` gives.
     """
     config = dataclasses.replace(
         _config(qwen3_registry), enable_weight_tying=False
@@ -129,7 +130,7 @@ def _build(
     config=None,
     device: str | torch.device = "cpu",
     world_size: int = 1,
-    flatten: bool = False,
+    split: bool = False,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
@@ -141,8 +142,8 @@ def _build(
     ``device`` and ``world_size`` exist for ``test_layer_stack_distributed``,
     which builds the same two models on a real mesh.
 
-    ``flatten`` runs the stack half of ``configure_qwen_simple_fsdp_shard_dims``
-    before sharding, and the ``build_split_meshes`` both Qwen3 parallelize
+    ``split`` runs the stack half of ``configure_qwen_simple_fsdp_shard_dims``
+    before sharding, and the ``shard_split_stacks`` both Qwen3 parallelize
     paths run right after it.
     """
     parallel_dims = ParallelDims(
@@ -163,21 +164,19 @@ def _build(
         convert = _layer_loop
     with torch.device("meta"):
         model = convert(config or _config()).build()
-    holders = [m for m in model.modules() if hasattr(m, "flatten_for")]
-    if flatten:
+    holders = [m for m in model.modules() if hasattr(m, "shard_split_stacks")]
+    if split:
         for holder in holders:
-            holder.flatten_for(world_size)
             holder._fsdp_shard_dim = holder.plan_shard_dims(world_size)  # pylint: disable=protected-access
     model = apply_simple_fsdp(
         model,
         parallel_dims=parallel_dims,
         training=training,
     )
-    if flatten:
-        # Creates process groups, so every rank runs it, before anything
-        # (here `init_weights`) views a flattened layer.
+    if split:
+        # Creates process groups, so every rank runs it, before `to_empty`.
         for holder in holders:
-            holder.build_split_meshes()
+            holder.shard_split_stacks()
     # `to_empty` leaves garbage, and `init_weights` does not necessarily write
     # every parameter (qwen3's `tok_embeddings`, with tying off). Garbage is
     # sometimes NaN, and NaN fails `assert_close` at any tolerance, so zero

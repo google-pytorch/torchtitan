@@ -73,8 +73,8 @@ def parallelize_qwen3(
     )
     # Creates process groups, so every rank runs it here, right after sharding.
     for holder in model.modules():
-        if hasattr(holder, "build_split_meshes"):
-            holder.build_split_meshes()
+        if hasattr(holder, "shard_split_stacks"):
+            holder.shard_split_stacks()
     return model
 
 

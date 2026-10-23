@@ -176,8 +176,8 @@ def to_tpu_graph_trainer_config(
       configure_simple_fsdp_shard_dims(model, kwargs.get("parallel_dims"))
       model = orig_parallelize_fn(model, **kwargs)
       for holder in model.modules():
-        if hasattr(holder, "build_split_meshes"):
-          holder.build_split_meshes()
+        if hasattr(holder, "shard_split_stacks"):
+          holder.shard_split_stacks()
       return model
 
     graph_config.model_spec = dataclasses.replace(

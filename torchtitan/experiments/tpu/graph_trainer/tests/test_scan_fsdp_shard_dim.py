@@ -49,7 +49,7 @@ Q235_STACKS = {
 }
 
 # Axis 1 is num_experts = 128 in these; everything else divides on axis 1.
-FLATTENED = [
+SPLIT = [
     n for n in Q235_STACKS if n.startswith(("moe__experts__", "moe__router__"))
 ]
 
@@ -80,9 +80,8 @@ def _holder(shapes=Q235_STACKS, device="meta"):
 def _shard(holder, mesh, style="fully_shard"):
     """`configure_qwen_simple_fsdp_shard_dims` + `apply_simple_fsdp`, in order."""
     degree = mesh.size(mesh.ndim - 1)
-    holder.flatten_for(degree)
     data_parallel(holder, mesh, style, shard_dim=holder.plan_shard_dims(degree))
-    holder.build_split_meshes()
+    holder.shard_split_stacks()
     return holder
 
 
@@ -100,7 +99,6 @@ def _sharded_holder(world, shapes=Q235_STACKS, shard_dim=None):
 
 
 class TestShardDimPicker(unittest.TestCase):
-    """Exercises `_shard_dim` directly (the fallback for unflattened stacks)."""
 
     def test_dim_one_is_kept_whenever_it_divides(self):
         # Every published 235B number was taken at 128 ranks on dim 1. Moving a
@@ -140,6 +138,77 @@ class TestShardDimPicker(unittest.TestCase):
         ):
             out = scan_fsdp._gather_on(shard, 2, "group")
         self.assertTrue(torch.equal(out, torch.cat([shard] * ranks, dim=2)))
+
+    def test_subtile_two_d_gather_and_scatter_fold_minor_axis_to_align_tiles(
+        self,
+    ):
+        # For 2-D weight shards `[rows, cols]`, when `rows % 8 != 0` (e.g.
+        # Llama 405B w1/w3 at 26 rows/rank, Qwen3 wqkv at 9 rows/rank, or
+        # Llama 70B wk/wv at 4 cols/rank on gather_dim=1), `_movedim_*` folds
+        # `k = 8 // gcd(rows, 8)` from `cols` into `rows` so XLA sees an
+        # 8-row-aligned collective.
+        ranks = 4
+        with _fake_pg(ranks):
+            mesh = init_device_mesh("cpu", (ranks,), mesh_dim_names=("fsdp",))
+            group_name = mesh.get_group(0).group_name
+            for shape, gather_dim, expected_folded in (
+                ((26, 1024), 0, (104, 256)),
+                ((9, 1024), 0, (72, 128)),
+                ((1024, 4), 1, (8, 512)),
+            ):
+                shard = (
+                    torch.arange(shape[0] * shape[1], dtype=torch.float32)
+                    .reshape(shape)
+                    .requires_grad_(True)
+                )
+                seen_gather_shapes = []
+                seen_scatter_shapes = []
+
+                def fake_all_gather(x, gather_dim, group, tag=""):
+                    self.assertEqual(gather_dim, 0)
+                    seen_gather_shapes.append(tuple(x.shape))
+                    return torch.cat([x] * ranks, dim=0)
+
+                def fake_reduce_scatter(
+                    x, reduceOp, scatter_dim, group, tag=""
+                ):
+                    self.assertEqual(scatter_dim, 0)
+                    seen_scatter_shapes.append(tuple(x.shape))
+                    return x.chunk(ranks, dim=0)[0] * ranks
+
+                spec = scan_fsdp.ScanFSDPSpec(
+                    group_name=group_name,
+                    param_dtype=None,
+                    reduce_dtype=None,
+                    sharded=True,
+                    gather_dim=gather_dim,
+                )
+                with (
+                    unittest.mock.patch.object(
+                        scan_fsdp, "_orig_all_gather_single", fake_all_gather
+                    ),
+                    unittest.mock.patch.object(
+                        scan_fsdp,
+                        "_orig_reduce_scatter_single",
+                        fake_reduce_scatter,
+                    ),
+                ):
+                    whole = scan_fsdp.gather_slice(shard, spec)
+                    expected_whole = torch.cat([shard] * ranks, dim=gather_dim)
+                    self.assertEqual(tuple(whole.shape), tuple(expected_whole.shape))
+                    self.assertTrue(torch.equal(whole, expected_whole))
+                    grad_out = torch.randn_like(whole)
+                    whole.backward(grad_out)
+
+                self.assertEqual(seen_gather_shapes, [expected_folded])
+                self.assertEqual(
+                    seen_scatter_shapes,
+                    [(expected_folded[0] * ranks, expected_folded[1])],
+                )
+                expected_grad = (
+                    grad_out.chunk(ranks, dim=gather_dim)[0] * ranks
+                )
+                self.assertTrue(torch.equal(shard.grad, expected_grad))
 
     def test_fold_survives_strides_that_change_between_trace_and_replay(self):
         # TorchTPU traces against fake strides and replays with its own. The
@@ -238,79 +307,6 @@ class TestShardDimPicker(unittest.TestCase):
                 bad, unittest.mock.MagicMock(dp_shard=4096, cp=1)
             )
 
-    def test_subtile_two_d_gather_and_scatter_fold_minor_axis_to_align_tiles(
-        self,
-    ):
-        # For 2-D weight shards `[rows, cols]`, when `rows % 8 != 0` (e.g.
-        # Llama 405B w1/w3 at 26 rows/rank, Qwen3 wqkv at 9 rows/rank, or
-        # Llama 70B wk/wv at 4 cols/rank on gather_dim=1), `_movedim_*` folds
-        # `k = 8 // gcd(rows, 8)` from `cols` into `rows` so XLA sees an
-        # 8-row-aligned collective.
-        ranks = 4
-        with _fake_pg(ranks):
-            mesh = init_device_mesh("cpu", (ranks,), mesh_dim_names=("fsdp",))
-            group_name = mesh.get_group(0).group_name
-            for shape, gather_dim, expected_folded in (
-                ((26, 1024), 0, (104, 256)),
-                ((9, 1024), 0, (72, 128)),
-                ((1024, 4), 1, (8, 512)),
-            ):
-                shard = (
-                    torch.arange(shape[0] * shape[1], dtype=torch.float32)
-                    .reshape(shape)
-                    .requires_grad_(True)
-                )
-                seen_gather_shapes = []
-                seen_scatter_shapes = []
-
-                def fake_all_gather(x, gather_dim, group, tag=""):
-                    self.assertEqual(gather_dim, 0)
-                    seen_gather_shapes.append(tuple(x.shape))
-                    return torch.cat([x] * ranks, dim=0)
-
-                def fake_reduce_scatter(
-                    x, reduceOp, scatter_dim, group, tag=""
-                ):
-                    self.assertEqual(scatter_dim, 0)
-                    seen_scatter_shapes.append(tuple(x.shape))
-                    return x.chunk(ranks, dim=0)[0] * ranks
-
-                spec = scan_fsdp.ScanFSDPSpec(
-                    group_name=group_name,
-                    param_dtype=None,
-                    reduce_dtype=None,
-                    sharded=True,
-                    gather_dim=gather_dim,
-                )
-                with (
-                    unittest.mock.patch.object(
-                        scan_fsdp, "_orig_all_gather_single", fake_all_gather
-                    ),
-                    unittest.mock.patch.object(
-                        scan_fsdp,
-                        "_orig_reduce_scatter_single",
-                        fake_reduce_scatter,
-                    ),
-                ):
-                    whole = scan_fsdp.gather_slice(shard, spec)
-                    expected_whole = torch.cat([shard] * ranks, dim=gather_dim)
-                    self.assertEqual(
-                        tuple(whole.shape), tuple(expected_whole.shape)
-                    )
-                    self.assertTrue(torch.equal(whole, expected_whole))
-                    grad_out = torch.randn_like(whole)
-                    whole.backward(grad_out)
-
-                self.assertEqual(seen_gather_shapes, [expected_folded])
-                self.assertEqual(
-                    seen_scatter_shapes,
-                    [(expected_folded[0] * ranks, expected_folded[1])],
-                )
-                expected_grad = (
-                    grad_out.chunk(ranks, dim=gather_dim)[0] * ranks
-                )
-                self.assertTrue(torch.equal(shard.grad, expected_grad))
-
 
 class TestQ235Placements(unittest.TestCase):
     """What ``data_parallel`` and the scan body's plan end up with."""
@@ -356,126 +352,108 @@ class TestQ235Placements(unittest.TestCase):
                 self.assertEqual(spec.gather_dim, 0, name)  # dim 1 still divides
 
 
-class TestFlattenedStacks(unittest.TestCase):
-    """Past ``num_experts`` ranks, stacks ``[L, E, X, ...]`` become ``[L, E*X, ...]``."""
+class TestSplitStacks(unittest.TestCase):
+    """Past ``num_experts`` ranks, ``[L, E, X, ...]`` is sharded on axes 1 and 2."""
 
-    def _flattened(self, holder):
-        return sorted(holder.layer_shapes)
-
-    def test_nothing_is_flattened_while_num_experts_divides(self):
+    def test_nothing_is_split_while_num_experts_divides(self):
         with _sharded_holder(128) as holder:
-            self.assertEqual(self._flattened(holder), [])
+            self.assertEqual(holder.split_meshes, {})
             for name, shape in Q235_STACKS.items():
                 self.assertEqual(tuple(holder._parameters[name].shape), shape, name)
 
-    def test_axes_one_and_two_are_flattened(self):
+    def test_split_stacks_keep_their_logical_shape(self):
         for world in (256, 2048):
             with self.subTest(world=world), _sharded_holder(world) as holder:
-                self.assertEqual(self._flattened(holder), sorted(FLATTENED))
+                ranks_per_expert = world // 128
                 plan = plan_stacked_gathers(holder)
-                for name in FLATTENED:
+                for name in SPLIT:
                     layers, a, b, *rest = Q235_STACKS[name]
                     param = holder._parameters[name]
+                    self.assertEqual(tuple(param.shape), Q235_STACKS[name], name)
+                    self.assertEqual(param.placements, (Shard(1), Shard(2)), name)
                     self.assertEqual(
-                        tuple(param.shape), (layers, a * b, *rest), name
+                        tuple(param.to_local().shape),
+                        (layers, 1, b // ranks_per_expert, *rest),
+                        name,
                     )
-                    self.assertEqual(param.placements[-1], Shard(1), name)
-                    self.assertEqual(
-                        tuple(holder.layer_shapes[name]), (a, b, *rest)
-                    )
-                    # The point of flattening: no transpose around the gather.
+                    # One flat gather over the whole FSDP group, no transpose.
                     self.assertEqual(plan[name].gather_dim, 0, name)
-                for name in set(Q235_STACKS) - set(FLATTENED):
-                    self.assertEqual(
-                        tuple(holder._parameters[name].shape), Q235_STACKS[name]
-                    )
+                    self.assertEqual(plan[name].split_shape, (a, b, *rest), name)
+                for name in set(Q235_STACKS) - set(SPLIT):
+                    self.assertEqual(len(holder._parameters[name].placements), 1)
+                self.assertEqual(len(holder.split_meshes), 1)
 
-    def test_a_shard_spanning_two_experts_is_not_flattened(self):
+    def test_replicated_stacks_split_when_no_single_axis_divides(self):
+        # At 8192 ranks no single axis of Q235_STACKS[SPLIT] is >= 8192, so
+        # `data_parallel` downgrades them to `Replicate()`; `shard_split_stacks`
+        # must still split them onto `(128, 64)`.
+        split_shapes = {k: Q235_STACKS[k] for k in SPLIT}
+        with _sharded_holder(8192, shapes=split_shapes) as holder:
+            plan = plan_stacked_gathers(holder)
+            for name, shape in split_shapes.items():
+                layers, a, b, *rest = shape
+                param = holder._parameters[name]
+                self.assertEqual(param.placements, (Shard(1), Shard(2)), name)
+                self.assertEqual(
+                    tuple(param.to_local().shape),
+                    (layers, 1, b // 64, *rest),
+                    name,
+                )
+                self.assertTrue(plan[name].sharded, name)
+                self.assertEqual(plan[name].split_shape, (a, b, *rest), name)
+
+    def test_ddp_replicate_mode_is_not_split(self):
+        with _fake_pg(256):
+            mesh = init_device_mesh("cpu", (256,), mesh_dim_names=("dp_replicate",))
+            holder = _shard(_holder(), mesh, "replicate")
+            self.assertEqual(holder.split_meshes, {})
+            for name in SPLIT:
+                self.assertEqual(
+                    holder._parameters[name].placements, (Replicate(),), name
+                )
+
+    def test_a_shard_spanning_two_experts_is_not_split(self):
         # 192 ranks: neither 128 % 192 nor 192 % 128, so a rank's rows would
         # straddle experts and have no DTensor spelling in [E, X, ...].
         with _sharded_holder(192) as holder:
-            self.assertEqual(self._flattened(holder), [])
+            self.assertEqual(holder.split_meshes, {})
 
-    def test_reflattening(self):
-        # The same degree again is a no-op; fewer ranks is refused.
-        holder = _holder()
-        first = holder.flatten_for(256)
-        params = dict(holder._parameters)
-        self.assertEqual(holder.flatten_for(256), first)
-        self.assertEqual(dict(holder._parameters), params)
-        with self.assertRaises(ValueError):
-            holder.flatten_for(128)
-
-    def test_an_already_sharded_stack_is_left_unflattened(self):
-        # TP/EP distributed it first; flattening would need a redistribute.
-        with _fake_pg(256):
-            mesh = init_device_mesh("cpu", (256,), mesh_dim_names=("fsdp",))
-            holder = LayerStackHolder()
-            stack = distribute_tensor(
-                torch.empty(2, 128, 512, 8, device="meta"), mesh, (Shard(2),)
-            )
-            holder.register_parameter("w1", nn.Parameter(stack))
-            holder.flatten_for(256)
-            self.assertEqual(
-                tuple(holder._parameters["w1"].shape), (2, 128, 512, 8)
-            )
-            self.assertEqual(holder.layer_shapes, {})
-            self.assertEqual(holder.plan_shard_dims(256), {"w1": 2})
-
-    def test_layer_view_hsdp(self):
-        # Under hybrid_shard the replicate axis stays in front, untouched.
+    def test_hsdp_keeps_the_replicate_axis_in_front(self):
         with _fake_pg(512):
             mesh = init_device_mesh(
                 "cpu", (2, 256), mesh_dim_names=("dp_replicate", "fsdp")
             )
             holder = _shard(_holder(), mesh, "hybrid_shard")
-            for name in FLATTENED:
-                shape = holder.layer_shapes[name]
-                view = holder.as_layer_shape(name, holder._parameters[name][0])
-                self.assertEqual(tuple(view.shape), tuple(shape), name)
+            plan = plan_stacked_gathers(holder)
+            for name in SPLIT:
+                param = holder._parameters[name]
                 self.assertEqual(
-                    tuple(view.placements), (Replicate(), Shard(0), Shard(1))
+                    param.placements, (Replicate(), Shard(1), Shard(2)), name
                 )
-                # The same local rows, not a copy: 2 ranks per expert, so
-                # rank 0 holds the first half of expert 0.
+                # A layer, as init and the state dict see it.
                 self.assertEqual(
-                    tuple(view.to_local().shape),
-                    (1, shape[1] // 2, *shape[2:]),
-                    name,
+                    param[0].placements, (Replicate(), Shard(0), Shard(1))
                 )
-            # One split mesh, built eagerly and shared by every view.
-            self.assertEqual(len(holder.split_meshes), 1)
+                self.assertIsNotNone(plan[name].replicate_group_name, name)
 
-    def test_layer_view_writes_land_in_the_stack(self):
-        # Real tensors: what init_states and load_state_dict do to a view has
-        # to show up in the stack. [2 layers, 2 entries, 4, 3] over 4 ranks:
-        # 2 ranks per entry, so rank 0 holds rows 0-1 of entry 0 of each layer.
+    def test_layer_writes_land_in_the_stack(self):
+        # What init_states and load_state_dict do to a layer has to show up in
+        # the stack. [2 layers, 2 entries, 4, 3] over 4 ranks: 2 ranks per
+        # entry, so rank 0 holds rows 0-1 of entry 0 of each layer.
         with _fake_pg(4):
             mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("fsdp",))
-            holder = _shard(_holder({"w1": (2, 2, 4, 3)}, device="cpu"), mesh)
+            holder = _shard(_holder({"w1": (2, 2, 4, 3)}), mesh).to_empty(
+                device="cpu"
+            )
             stack = holder._parameters["w1"]
-            view = holder.as_layer_shape("w1", stack[0])
-            self.assertEqual(tuple(view.shape), (2, 4, 3))
-
+            self.assertEqual(tuple(stack.to_local().shape), (2, 1, 2, 3))
             with torch.no_grad():
-                nn.init.constant_(view, 7.0)  # a DTensor op, like init_states
+                stack.zero_()
+                nn.init.constant_(stack[0], 7.0)  # a DTensor op, like init_states
             torch.testing.assert_close(
-                stack.to_local()[0], torch.full_like(stack.to_local()[0], 7.0)
+                stack.to_local()[0], torch.full((1, 2, 3), 7.0)
             )
             self.assertEqual(stack.to_local()[1].abs().sum().item(), 0.0)
-
-            src = torch.arange(6.0).reshape(1, 2, 3)
-            with torch.no_grad():  # load_state_dict copies DTensor to DTensor
-                view.copy_(
-                    DTensor.from_local(
-                        src,
-                        view.device_mesh,
-                        view.placements,
-                        shape=view.shape,
-                        stride=view.stride(),
-                    )
-                )
-            torch.testing.assert_close(stack.to_local()[0], src.reshape(2, 3))
 
 
 if __name__ == "__main__":

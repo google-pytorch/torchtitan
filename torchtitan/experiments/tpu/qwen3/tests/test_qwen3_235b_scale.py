@@ -12,9 +12,9 @@ replicates the parameter or `Shard._split_tensor` pads it. Both train to a loss.
 A fake process group reproduces all of it in a few seconds, so a 1024-chip
 regression does not need 1024 chips to catch.
 
-This builds the model on `meta` and runs the two calls `parallelize_qwen3` makes
-before handing it to SimpleFSDP, so every placement asserted here is one the
-trainer would install.
+This builds the model on `meta` and runs the calls `parallelize_qwen3` makes
+around SimpleFSDP, including `shard_split_stacks`, so every placement asserted
+here is one the trainer would install.
 """
 
 import contextlib
@@ -66,15 +66,22 @@ def _placed_235b(world: int):
     with torch.device("meta"):
       model = with_tpu_stacked_layers(spec.model, use_scan=True).build()
     configure_qwen_simple_fsdp_shard_dims(model, _FakeParallelDims(mesh, world))
-    yield apply_simple_fsdp(
+    model = apply_simple_fsdp(
         model,
         parallel_dims=_FakeParallelDims(mesh, world),
         training=TrainingConfig(
             mixed_precision_param="bfloat16", mixed_precision_reduce="float32"
         ),
     )
+    for holder in _holders(model):
+      holder.shard_split_stacks()
+    yield model
   finally:
     dist.destroy_process_group()
+
+
+def _holders(model):
+  return [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
 
 
 class Qwen3_235BScaleTest(absltest.TestCase):
@@ -86,9 +93,17 @@ class Qwen3_235BScaleTest(absltest.TestCase):
     with _placed_235b(2048) as model:
       for name, param in model.named_parameters():
         self.assertIsInstance(param, DTensor, name)
-        placement = param.placements[-1]
-        if isinstance(placement, Shard):
-          self.assertEqual(param.shape[placement.dim] % 2048, 0, f"{name} {placement}")
+        for i, placement in enumerate(param.placements):
+          if isinstance(placement, Shard):
+            size = param.device_mesh.size(i)
+            self.assertEqual(
+                param.shape[placement.dim] % size, 0, f"{name} {placement}"
+            )
+
+  def test_expert_stacks_are_split_at_2048_ranks(self) -> None:
+    # 128 experts < 2048 ranks, so expert stacks go on a split mesh.
+    with _placed_235b(2048) as model:
+      self.assertTrue(any(h.split_meshes for h in _holders(model)))
 
   def test_nothing_large_is_replicated_at_2048_ranks(self) -> None:
     # The pre-fix failure mode: an expert stack's dim 1 is `num_experts` = 128,
@@ -96,7 +111,7 @@ class Qwen3_235BScaleTest(absltest.TestCase):
     # silence and per-rank weights go from 3.4 GiB to 423 GiB.
     with _placed_235b(2048) as model:
       for name, param in model.named_parameters():
-        if isinstance(param.placements[-1], Replicate):
+        if all(isinstance(p, Replicate) for p in param.placements):
           # Only the per-layer norms, which are `(n_layers, dim)` at most.
           self.assertLess(param.numel(), 1 << 20, f"{name} {tuple(param.shape)}")
 
@@ -104,20 +119,23 @@ class Qwen3_235BScaleTest(absltest.TestCase):
     # The body sees one layer's row, so its dim 0 is the stack's dim 1. Off by
     # one reassembles the weight wrong and still trains.
     with _placed_235b(2048) as model:
-      holders = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
+      holders = _holders(model)
       self.assertTrue(holders, "layer stacking did not run")
       for holder in holders:
         for name, spec in plan_stacked_gathers(holder).items():
-          placement = holder._parameters[name].placements[-1]
-          self.assertEqual(spec.sharded, isinstance(placement, Shard), name)
+          placements = holder._parameters[name].placements
+          dims = [p.dim for p in placements if isinstance(p, Shard)]
+          self.assertEqual(spec.sharded, bool(dims), name)
           if spec.sharded:
-            self.assertEqual(spec.gather_dim, placement.dim - 1, name)
+            # A split stack gathers both shard axes as one, from the first.
+            self.assertEqual(spec.gather_dim, dims[0] - 1, name)
 
   def test_128_ranks_still_shards_every_stack_on_dim_one(self) -> None:
     # Every published 235B number was taken here. If any stack moves off dim 1
     # at 128 ranks this stops being the same run, measured or not.
     with _placed_235b(128) as model:
-      for holder in [m for m in model.modules() if hasattr(m, "plan_shard_dims")]:
+      for holder in _holders(model):
+        self.assertEqual(holder.split_meshes, {})
         for name, param in holder._parameters.items():
           self.assertEqual(param.placements[-1], Shard(1), name)
 

@@ -30,7 +30,10 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
 )
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
-from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
+from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
+    LayerStackHolder,
+    STACK_ATTR,
+)
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     gather_slice,
     plan_stacked_gathers,
@@ -63,17 +66,17 @@ def forward_matches_unrolled(device, rank, world_size):
     torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
 
 
-def flattened_forward_matches_unrolled(device, rank, world_size):
-    """A flattened stack must compute what the unrolled experts do.
+def split_forward_matches_unrolled(device, rank, world_size):
+    """A split stack must compute what the unrolled experts do.
 
-    With 2 experts and at least 4 ranks, ``flatten_for`` stores the expert and
-    router stacks as ``[L, E*X, ...]`` and the body views each gathered layer
-    back to ``[E, X, ...]``. Getting that view wrong mixes rows across experts
-    and still runs, so compare against the plain model bit for bit.
+    With 2 experts and at least 4 ranks, the expert and router stacks go on a
+    split mesh, and both paths gather each one flat and view it back to
+    ``[E, X, ...]``. Getting that view wrong mixes rows across experts and
+    still runs, so compare against the plain model bit for bit.
     """
     del rank
     if world_size < 4 or world_size % 2:
-        logging.warning("skipped: 2 experts flatten only on an even mesh of >= 4")
+        logging.warning("skipped: 2 experts split only on an even mesh of >= 4")
         return
     import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
 
@@ -86,18 +89,18 @@ def flattened_forward_matches_unrolled(device, rank, world_size):
     )
     stacked = _build(
         stacked=True,
-        flatten=True,
+        split=True,
         config=_moe_config(num_experts=2),
         device=device,
         world_size=world_size,
     )
     holder = getattr(stacked, STACK_ATTR)
-    assert holder.layer_shapes, "nothing was flattened, so this checks nothing"
+    assert holder.split_meshes, "nothing was split, so this checks nothing"
 
     # The two arms initialize on different meshes, so their random weights
     # differ; copy the plain one's. `distribute_tensor` places each whole
-    # tensor on the stacked view's own mesh -- the split mesh, for a flattened
-    # layer -- and `src_data_rank=None` slices locally, since every rank already
+    # tensor on the stacked view's own mesh -- the split mesh, for a split
+    # stack -- and `src_data_rank=None` slices locally, since every rank already
     # holds the whole tensor.
     want = {
         k: v.full_tensor() if isinstance(v, DTensor) else v
@@ -118,6 +121,98 @@ def flattened_forward_matches_unrolled(device, rank, world_size):
     expected = plain(tokens, positions).detach()
     got = stacked(tokens, positions).detach()
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def a_split_stack_gathers_and_reduces_like_a_flat_one(device, rank, world_size):
+    """A split stack must gather and reduce exactly like a flat stack.
+
+    ``shard_split_stacks`` stores ``[L, E, X, F]`` on a split mesh, and both
+    the unrolled parametrization (``_SplitStackReplicateComputation``) and the
+    scan body gather it flat. Compare both against ``redistribute`` on the
+    ``Shard(1)`` flat stack, forward and gradient, with bf16/fp32 mixed
+    precision, and check the gradient lands on the parameter with the 2-D
+    placements the optimizer state then inherits.
+    """
+    if world_size == 1:
+        logging.warning("skipped: one rank, both collectives are the identity")
+        return
+    # 2 entries on an even mesh of >= 4, so both split-mesh axes are real.
+    entries = 2 if world_size >= 4 and world_size % 2 == 0 else 1
+    ranks_per_entry = world_size // entries
+    mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("fsdp",))
+    holder = LayerStackHolder()
+    logical = torch.Size((2, entries, 2 * ranks_per_entry, 3))
+    holder.register_parameter(
+        "stack", nn.Parameter(torch.empty(logical, device="meta"))
+    )
+    data_parallel(
+        holder,
+        mesh,
+        "fully_shard",
+        shard_dim=holder.plan_shard_dims(world_size),
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        ),
+    )
+    holder.shard_split_stacks()
+    holder.to_empty(device=device)
+    param = holder._parameters["stack"]
+    assert param.shape == logical, param.shape
+    assert param.placements == (Shard(1), Shard(2)), param.placements
+    torch.manual_seed(0)
+    with torch.no_grad():
+        param.copy_(
+            distribute_tensor(
+                torch.randn(logical, device=device),
+                param.device_mesh,
+                param.placements,
+                src_data_rank=None,
+            )
+        )
+
+    # Reference: the same weights as a flat `Shard(1)` stack.
+    want_shard = param.to_local().detach().flatten(1, 2).clone()
+    want_shard.requires_grad_(True)
+    want = (
+        DTensor.from_local(want_shard, mesh, (Shard(1),))
+        .redistribute(
+            placements=[Replicate()],
+            forward_dtype=torch.bfloat16,
+            backward_dtype=torch.float32,
+        )
+        .to_local(grad_placements=[Partial()])
+        .view(logical)
+    )
+
+    # Unrolled: reading the stack runs the holder's parametrization.
+    got = funcol.wait_tensor(holder.stack)
+    assert got.dtype == torch.bfloat16, got.dtype
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    # Scanned: what the body computes for layer 0.
+    scan_shard = param.to_local().detach().flatten(1, 2).clone()
+    scan_shard.requires_grad_(True)
+    spec = plan_stacked_gathers(holder)["stack"]
+    assert spec.gather_dim == 0, spec
+    got_row = funcol.wait_tensor(gather_slice(scan_shard[0], spec))
+    torch.testing.assert_close(
+        got_row.view(logical[1:]), want[0], rtol=0, atol=0
+    )
+
+    # Scaling by the rank makes an unsummed gradient visibly this rank's own.
+    for gathered in (want, got):
+        (gathered.float().sum() * (rank + 1)).backward()
+    (got_row.float().sum() * (rank + 1)).backward()
+    grad = param.grad
+    assert isinstance(grad, DTensor), type(grad)
+    assert grad.device_mesh == param.device_mesh, grad.device_mesh
+    assert grad.placements == param.placements, grad.placements
+    torch.testing.assert_close(
+        grad.to_local().flatten(1, 2), want_shard.grad, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        scan_shard.grad[0], want_shard.grad[0], rtol=0, atol=0
+    )
 
 
 def stacks_are_sharded_off_the_layer_axis(device, rank, world_size):
@@ -407,8 +502,11 @@ class TestLayerStackDistributed(
     def test_forward_matches_unrolled(self):
         self._on_devices(forward_matches_unrolled)
 
-    def test_flattened_forward_matches_unrolled(self):
-        self._on_devices(flattened_forward_matches_unrolled)
+    def test_split_forward_matches_unrolled(self):
+        self._on_devices(split_forward_matches_unrolled)
+
+    def test_a_split_stack_gathers_and_reduces_like_a_flat_one(self):
+        self._on_devices(a_split_stack_gathers_and_reduces_like_a_flat_one)
 
     def test_stacks_are_sharded_off_the_layer_axis(self):
         self._on_devices(stacks_are_sharded_off_the_layer_axis)
@@ -420,7 +518,7 @@ class TestLayerStackDistributed(
         self._on_devices(a_sharded_stack_gathers_and_reduces_like_unrolled)
 
     def test_a_stack_sharded_off_dim_one_gathers_the_same_way(self):
-        # What an expert stack falls back to once the mesh outgrows num_experts.
+        # An expert stack's fallback when it can't be split (e.g. 192 ranks).
         self._on_devices(
             functools.partial(
                 a_sharded_stack_gathers_and_reduces_like_unrolled, shard_dim=2

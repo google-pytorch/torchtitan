@@ -22,8 +22,8 @@ from absl.testing import absltest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.api import CheckpointException
 import torch.multiprocessing as mp
+from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.components.optimizer.utils import (
     get_flat_optim_state_dict,
@@ -148,11 +148,12 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _flattened_moe_optim_state(world_size: int) -> dict[str, torch.Tensor]:
+def _split_moe_optim_state(world_size: int) -> dict[str, torch.Tensor]:
     """A 4-expert stacked MoE's flat AdamW state, at ``world_size`` ranks.
 
-    Above 4 ranks the expert and router stacks are stored flattened, and so
-    are their moments; at 4 ranks nothing is flattened.
+    Above 4 ranks the expert and router stacks are sharded on two axes, on a
+    split mesh; at 4 ranks they are sharded on axis 1 alone. Either way they
+    and their moments keep the logical ``[L, E, X, ...]`` shape.
     """
     # ParallelDims reads the accelerator type at import; there is none here.
     import torchtitan.distributed.parallel_dims as parallel_dims_module
@@ -160,7 +161,7 @@ def _flattened_moe_optim_state(world_size: int) -> dict[str, torch.Tensor]:
     parallel_dims_module.device_type = "cpu"
     model = test_layer_stack._build(  # pylint: disable=protected-access
         stacked=True,
-        flatten=True,
+        split=True,
         config=test_layer_stack._moe_config(num_experts=4),  # pylint: disable=protected-access
         world_size=world_size,
     )
@@ -169,23 +170,50 @@ def _flattened_moe_optim_state(world_size: int) -> dict[str, torch.Tensor]:
     return get_flat_optim_state_dict(optim)
 
 
-def _save_flattened_optim_worker(rank: int, world_size: int, port: int, path: str):
+def _pattern(index: int, shape: torch.Size) -> torch.Tensor:
+    """A whole moment whose every entry, and every key, is distinct."""
+    return torch.arange(shape.numel(), dtype=torch.float32).view(shape) + (
+        1000.0 * index
+    )
+
+
+def _moments(state: dict[str, torch.Tensor]) -> list[tuple[int, str, DTensor]]:
+    return [
+        (i, k, v)
+        for i, (k, v) in enumerate(sorted(state.items()))
+        if isinstance(v, DTensor) and v.ndim
+    ]
+
+
+def _save_split_optim_worker(rank: int, world_size: int, port: int, path: str):
     with _process_group(rank, world_size, port):
-        state = _flattened_moe_optim_state(world_size)
+        state = _split_moe_optim_state(world_size)
+        with torch.no_grad():
+            for i, _, v in _moments(state):
+                v.copy_(
+                    distribute_tensor(
+                        _pattern(i, v.shape),
+                        v.device_mesh,
+                        v.placements,
+                        src_data_rank=None,
+                    )
+                )
         dcp.save(state, checkpoint_id=os.path.join(path, "optim"))
 
 
-def _load_flattened_optim_worker(rank: int, world_size: int, port: int, path: str):
+def _load_split_optim_worker(rank: int, world_size: int, port: int, path: str):
     with _process_group(rank, world_size, port):
-        state = _flattened_moe_optim_state(world_size)
-        try:
-            dcp.load(state, checkpoint_id=os.path.join(path, "optim"))
-        except CheckpointException as err:
-            assert "Size mismatch" in str(err), err
-        else:
-            raise AssertionError(
-                f"rank {rank} loaded flattened optimizer state into unflattened "
-                "stacks"
+        state = _split_moe_optim_state(world_size)
+        moments = _moments(state)
+        # Something on this side has to be split, or on the save side, or this
+        # isn't crossing the boundary it claims to.
+        assert any(len(v.placements) == 2 for _, _, v in moments) == (
+            world_size > 4
+        ), [v.placements for _, _, v in moments]
+        dcp.load(state, checkpoint_id=os.path.join(path, "optim"))
+        for i, key, v in moments:
+            torch.testing.assert_close(
+                v.full_tensor(), _pattern(i, v.shape), rtol=0, atol=0, msg=key
             )
 
 
@@ -259,32 +287,36 @@ class OptimizerStateTest(unittest.TestCase):
         self.assertEqual(keys[True], keys[False])
 
 
-class FlattenedOptimizerStateTest(unittest.TestCase):
-    """Optimizer state follows the live shape, and flattening changes it.
+class SplitOptimizerStateTest(unittest.TestCase):
+    """Optimizer state reshards across the split-mesh boundary.
 
-    ``flatten_for`` stores a stack whose axis 1 the mesh outgrows as
-    ``[L, E*X, ...]``, and Adam's moments take that shape. Model checkpoints
-    are unaffected -- ``state_dict`` views each layer back to ``[E, X, ...]`` --
-    but the flat optimizer state is keyed off the live parameters, so a run
-    that crosses the E-rank boundary between save and resume sees different
-    shapes under the same keys. That has to fail at load, not resume on
-    moments reshaped into the wrong rows.
+    Past ``num_experts`` ranks a stack is sharded on two axes of a split mesh,
+    but it keeps its logical ``[L, E, X, ...]`` shape, and so do Adam's
+    moments. A run that crosses the E-rank boundary between save and resume
+    sees the same shapes under the same keys, and DCP reshards them like any
+    other DTensor, row for row.
     """
 
-    def test_loading_across_the_flatten_boundary_raises(self):
+    def _round_trip(self, saved: int, loaded: int):
         with tempfile.TemporaryDirectory() as path:
-            # 8 ranks > 4 experts: flattened. 4 ranks: not.
             mp.spawn(
-                _save_flattened_optim_worker,
-                args=(8, _free_port(), path),
-                nprocs=8,
+                _save_split_optim_worker,
+                args=(saved, _free_port(), path),
+                nprocs=saved,
             )
-            # Every rank asserts it raised, so a rank that loaded fails here.
+            # Every rank checks every moment, so a misplaced row fails here.
             mp.spawn(
-                _load_flattened_optim_worker,
-                args=(4, _free_port(), path),
-                nprocs=4,
+                _load_split_optim_worker,
+                args=(loaded, _free_port(), path),
+                nprocs=loaded,
             )
+
+    def test_split_to_unsplit(self):
+        # 8 ranks > 4 experts: split. 4 ranks: not.
+        self._round_trip(8, 4)
+
+    def test_unsplit_to_split(self):
+        self._round_trip(4, 8)
 
 
 if __name__ == "__main__":

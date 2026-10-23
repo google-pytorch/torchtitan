@@ -487,28 +487,30 @@ class WorkaroundsTest(parameterized.TestCase):
     with self.assertNoLogs(workarounds.logger, level="WARNING"):
       workarounds.use_tokamax_splash_attention_patch(model, sa)
 
-  def test_splash_attention_patch_with_ulysses_cp(self):
-    """Splash attention patch preserves UlyssesCPInnerAttention wrapper."""
+  @parameterized.parameters("ulysses", "all_gather")
+  def test_splash_attention_patch_plugs_into_cp_attention(self, strategy):
+    """The Splash patch keeps the CP wrapper and plugs the kernel in as its local attention."""
     from torchtitan.experiments.tpu import workarounds
     from torchtitan.models.common.attention import GQAttention as Attention
-    from torchtitan.experiments.tpu.cp_attention import (
-        UlyssesCPScaledDotProductInnerAttention,
-    )
+    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention
+    from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention
     from torchtitan.experiments.tpu.qwen3 import qwen3_configs
     import copy
 
+    cp_cls = tpu_cp_inner_attention(ScaledDotProductInnerAttention, strategy)
     config = copy.deepcopy(qwen3_configs["testmodel"])
-    config.layers[0].attention.inner_attention = (
-        UlyssesCPScaledDotProductInnerAttention.Config()
-    )
+    config.layers[0].attention.inner_attention = cp_cls.Config()
     attention_block = Attention(config=config.layers[0].attention).to("cpu")
 
     workarounds.use_splash_attention_patch(attention_block, {"block_q": 128})
-    self.assertIsInstance(
-        attention_block.inner_attention,
-        UlyssesCPScaledDotProductInnerAttention,
-    )
-    self.assertIsNotNone(attention_block.inner_attention._local_attn_override)
+    inner = attention_block.inner_attention
+    self.assertIsInstance(inner, cp_cls)
+    splash = inner._local_attn_override.inner  # Inside the UnflattenShim.
+    self.assertIsInstance(splash, SplashAttention)
+    # On CPU or short sequences the kernel falls back to the CP reference path,
+    # not to the CP module itself (which would recurse).
+    self.assertEqual(splash.original_module, inner.local_forward)
 
   def test_qwen3_ulysses_cp_recipe_and_validation(self):
     """The Ulysses CP recipe applies ContextParallelTransform; TPU rules validate it."""
@@ -626,8 +628,8 @@ class WorkaroundsTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "CPInnerAttention"):
       config.__post_init__()
 
-  def test_cp_collectives_wait_exactly_once(self):
-    """Traced funcol results are already waited; a second wait_tensor breaks TorchTPU's split compiler."""
+  def test_wait_helper_waits_async_tensors_once(self):
+    """`_wait` leaves traced (already waited) funcol results alone and waits eager ones once."""
     from unittest import mock
     import torch.distributed._functional_collectives as funcol
     from torchtitan.experiments.tpu import cp_attention

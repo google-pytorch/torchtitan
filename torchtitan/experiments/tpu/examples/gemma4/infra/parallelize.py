@@ -243,7 +243,7 @@ def parallelize_gemma4(
   if effective_compile_config.enable and hasattr(model, "layers"):
     for layer in model.layers.values():
       has_moe = any(isinstance(m, MoE) for m in layer.modules())
-      if not has_moe:
+      if not (has_moe and parallel_dims.ep_enabled):
         apply_spmd_safe(layer)
 
   if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:

@@ -1,12 +1,19 @@
 """Activation-checkpoint policies for the TPU lane."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from typing import Any
 
 import torch
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
+
 _PALLAS_ATTENTION_FWD_MARKER = "splash_attn_fwd"
-_WAIT_TENSOR = torch.ops._c10d_functional.wait_tensor.default
+
+# The collectives in core SelectiveAC's default save set.
+_SAVED_COLLECTIVES = frozenset({
+    torch.ops._c10d_functional.all_to_all_single.default,
+    torch.ops._c10d_functional.reduce_scatter_tensor.default,
+})
 
 
 def _op_name(op) -> str:
@@ -20,50 +27,54 @@ def _op_name(op) -> str:
   return str(op)
 
 
-def _is_functional_collective(op) -> bool:
-  return (
-      getattr(op, "namespace", None) == "_c10d_functional"
-      and op is not _WAIT_TENSOR
-  )
+class TPUSelectiveAC(SelectiveAC):
+  """``SelectiveAC`` that recomputes collectives instead of saving them.
 
+  Core ``SelectiveAC`` saves the outputs of ``all_to_all_single`` and
+  ``reduce_scatter_tensor`` (e.g. Ulysses CP's all-to-alls) and recomputes
+  everything else, including the ``wait_tensor`` after each collective. On
+  torch-tpu that fails both ways:
 
-class _SaveOpsKeepingCollectiveWaits(set):
-  """The default save set, plus the ``wait_tensor`` of each saved collective.
+  - Compiled, backward runs that ``wait_tensor`` on the saved tensor, a graph
+    input. torch-tpu's split compiler pairs every ``wait_tensor`` with its
+    collective and rejects it ("Expected call_function for wait_tensor
+    producer, got placeholder").
+  - Eager, the saved output is an un-waited ``AsyncCollectiveTensor`` that is
+    kept across forward and backward.
 
-  Works around a torch-tpu 0.2.0 compiler gap. Core ``SelectiveAC`` saves the
-  outputs of ``all_to_all_single`` / ``reduce_scatter_tensor`` but recomputes
-  their ``wait_tensor``, so backward re-runs ``wait_tensor`` on the saved
-  tensor. On GPU that is a no-op that returns the same, already-filled tensor:
-  ``wait_tensor`` only waits on work still pending at runtime, and the
-  forward's wait already finished it. torch-tpu's split compiler instead pairs
-  each ``wait_tensor`` with its collective at compile time and rejects one
-  whose input is a graph input ("Expected call_function for wait_tensor
-  producer, got placeholder"), e.g. in compiled Ulysses CP under selective AC.
+  Recomputing each collective together with its wait avoids both, at the cost
+  of running those collectives again in backward (and saving fewer tensors).
+  The gemma4 recipes use this policy; TPU context parallelism switches plain
+  ``SelectiveAC`` to it (``tpu_selective_ac_config``).
 
-  Also saving the ``wait_tensor`` right after a saved collective (funcol waits
-  right after issuing while tracing) leaves backward without such a wait. No
-  extra memory: ``wait_tensor`` returns its input, the buffer saved anyway.
-  Waits of recomputed collectives (e.g. FSDP all-gathers) stay recomputed.
-  TODO: drop once torch-tpu treats such a wait as a no-op.
-
-  Relies on ``SelectiveAC``'s policy asking ``func in save_ops`` once per op,
-  in program order.
+  TODO: Save the collectives again once torch-tpu accepts a wait on a saved
+  tensor.
   """
 
-  def __init__(self, ops=()):
-    super().__init__(ops)
-    self._last_was_saved_collective = False
+  @dataclass(kw_only=True, slots=True)
+  class Config(SelectiveAC.Config):
+    pass
 
-  def __contains__(self, op) -> bool:
-    follows_saved_collective = self._last_was_saved_collective
-    saved = super().__contains__(op) or (
-        op is _WAIT_TENSOR and follows_saved_collective
-    )
-    self._last_was_saved_collective = saved and _is_functional_collective(op)
-    return saved
+  def get_save_ops(self) -> set:
+    return super().get_save_ops() - _SAVED_COLLECTIVES
 
 
-class _SaveOpsIncludingPallasAttention(_SaveOpsKeepingCollectiveWaits):
+def tpu_selective_ac_config(ac_config: Any) -> Any:
+  """Returns a plain ``SelectiveAC.Config`` as a ``TPUSelectiveAC.Config``.
+
+  Other configs (full AC, ``TPUSelectiveAC`` or another subclass, None) are
+  returned unchanged. Parallelize functions call this rather than recipes
+  setting the config, so CLI parsing, which only knows the core AC configs,
+  cannot undo it.
+  """
+  if type(ac_config) is not SelectiveAC.Config:
+    return ac_config
+  return TPUSelectiveAC.Config(**{
+      f.name: getattr(ac_config, f.name) for f in fields(ac_config) if f.init
+  })
+
+
+class _SaveOpsIncludingPallasAttention(set):
   """The default save set, plus any Pallas splash-attention forward op.
 
   ``SelectiveAC``'s policy asks ``func in save_ops``. The splash forward is a
@@ -79,23 +90,8 @@ class _SaveOpsIncludingPallasAttention(_SaveOpsKeepingCollectiveWaits):
     return _PALLAS_ATTENTION_FWD_MARKER in _op_name(op)
 
 
-class TPUSelectiveAC(SelectiveAC):
-  """``SelectiveAC`` for torch-tpu: saved collectives keep their waits.
-
-  See ``_SaveOpsKeepingCollectiveWaits``. Otherwise identical to core
-  ``SelectiveAC``.
-  """
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(SelectiveAC.Config):
-    pass
-
-  def get_save_ops(self) -> set:
-    return _SaveOpsKeepingCollectiveWaits(super().get_save_ops())
-
-
-class AttentionSavingSelectiveAC(TPUSelectiveAC):
-  """``TPUSelectiveAC`` that also saves the attention output on TPU.
+class AttentionSavingSelectiveAC(SelectiveAC):
+  """``SelectiveAC`` that also saves the attention output on TPU.
 
   Upstream's default save set already holds every attention implementation it
   knows about -- the three ``aten::_scaled_dot_product_*`` variants and the
@@ -111,7 +107,7 @@ class AttentionSavingSelectiveAC(TPUSelectiveAC):
   """
 
   @dataclass(kw_only=True, slots=True)
-  class Config(TPUSelectiveAC.Config):
+  class Config(SelectiveAC.Config):
     pass
 
   def get_save_ops(self) -> set:

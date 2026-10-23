@@ -643,36 +643,36 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertIs(cp_attention._wait(act), x)
     act.wait.assert_called_once_with()
 
-  def test_tpu_selective_ac_keeps_waits_of_saved_collectives(self):
-    """A saved collective's wait is saved with it, so backward has no dangling wait_tensor."""
-    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+  def test_tpu_selective_ac_recomputes_saved_collectives(self):
+    """TPUSelectiveAC is core SelectiveAC minus the collectives core saves."""
+    from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
     from torchtitan.experiments.tpu.activation_checkpoint import (
-        AttentionSavingSelectiveAC,
         TPUSelectiveAC,
+        tpu_selective_ac_config,
     )
 
     c10d = torch.ops._c10d_functional
-    wait = c10d.wait_tensor.default
-    for ac_cls in (TPUSelectiveAC, AttentionSavingSelectiveAC):
-      save_ops = ac_cls.Config().build().get_save_ops()
-      self.assertTrue(
-          set(SelectiveAC.Config().build().get_save_ops()) <= save_ops
-      )
-      # all_to_all_single is saved (core save list), so is its wait.
-      self.assertIn(c10d.all_to_all_single.default, save_ops)
-      self.assertIn(wait, save_ops)
-      # A recomputed collective (e.g. an FSDP all-gather) keeps a recomputed wait.
-      self.assertNotIn(c10d.all_gather_into_tensor.default, save_ops)
-      self.assertNotIn(wait, save_ops)
-      # Only the wait right after the saved collective.
-      self.assertIn(c10d.reduce_scatter_tensor.default, save_ops)
-      self.assertNotIn(torch.ops.aten.add.Tensor, save_ops)
-      self.assertNotIn(wait, save_ops)
-      # Saved compute ops do not arm it.
-      self.assertIn(torch.ops.aten.mm.default, save_ops)
-      self.assertNotIn(wait, save_ops)
+    collectives = {
+        c10d.all_to_all_single.default,
+        c10d.reduce_scatter_tensor.default,
+    }
+    core_ops = SelectiveAC.Config().build().get_save_ops()
+    self.assertLessEqual(collectives, core_ops)
+    self.assertEqual(
+        TPUSelectiveAC.Config().build().get_save_ops(), core_ops - collectives
+    )
 
-  def test_ulysses_cp_repeats_kv_heads_and_compiled_all_to_all(self):
+    # CP parallelize functions switch plain SelectiveAC (keeping its fields)
+    # and leave every other AC config alone.
+    selective = SelectiveAC.Config(preserve_rng_state=True)
+    switched = tpu_selective_ac_config(selective)
+    self.assertIs(type(switched), TPUSelectiveAC.Config)
+    self.assertTrue(switched.preserve_rng_state)
+    self.assertIsInstance(switched.build(), TPUSelectiveAC)
+    for other in (None, FullAC.Config(), switched):
+      self.assertIs(tpu_selective_ac_config(other), other)
+
+  def test_ulysses_cp_repeats_kv_heads(self):
     """UlyssesCPScaledDotProductInnerAttention repeats KV heads when cp > n_kv_heads."""
     from types import SimpleNamespace
     from unittest import mock

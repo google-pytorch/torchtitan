@@ -10,6 +10,7 @@ from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
+from torchtitan.experiments.tpu.activation_checkpoint import tpu_selective_ac_config
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
@@ -92,6 +93,10 @@ def parallelize_qwen3(
   """
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
+  if parallel_dims.cp_enabled:
+    # Ulysses CP's all-to-alls are collectives that core SelectiveAC saves,
+    # which torch-tpu cannot compile; see TPUSelectiveAC.
+    ac_config = tpu_selective_ac_config(ac_config)
   if effective_compile_config.enable and hasattr(model, "layers"):
     from torchtitan.models.common.moe import MoE
 

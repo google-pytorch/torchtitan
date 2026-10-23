@@ -15,6 +15,7 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
+from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import (
@@ -25,23 +26,14 @@ from torchtitan.models.common.moe import (
 from torchtitan.tools.logging import logger
 
 
-class _Gemma4SelectiveAC(SelectiveAC):
-  """SelectiveAC that avoids saving un-waited AsyncCollectiveTensors across forward/backward."""
-
-  def get_save_ops(self) -> set:
-    return super().get_save_ops() - {
-        torch.ops._c10d_functional.reduce_scatter_tensor.default,
-        torch.ops._c10d_functional.all_to_all_single.default,
-    }
-
-
 def _apply_ac_gemma4(
     model: nn.Module,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
     dump_folder: str,
 ) -> None:
   if isinstance(ac_config, SelectiveAC.Config):
-    _Gemma4SelectiveAC(ac_config, dump_folder=dump_folder).apply(model)
+    # Avoids saving un-waited AsyncCollectiveTensors across forward/backward.
+    TPUSelectiveAC(ac_config, dump_folder=dump_folder).apply(model)
   else:
     ac_config.build(dump_folder=dump_folder).apply(model)
 

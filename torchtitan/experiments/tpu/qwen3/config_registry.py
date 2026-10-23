@@ -829,6 +829,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
+          TpuRoutedExpertsConverter.Config(),
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
@@ -837,7 +838,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
-  _fuse_route_score_backward(cfg)
+  _scale_routes_before_down_proj(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):

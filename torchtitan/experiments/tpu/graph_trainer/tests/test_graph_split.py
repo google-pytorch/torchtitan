@@ -782,6 +782,46 @@ class GraphSplitTest(absltest.TestCase):
           chunked.partition_map[cast], chunked.partition_map[wait]
       )
 
+    # Also verify that when `_movedim_reduce_scatter_tensor` inserts a post-RS
+    # view (`reshape` / `movedim`) between `wait_tensor` and the post-RS
+    # `_to_copy` cast, both the view and the cast stay with `wait_tensor`.
+    gm_with_post_rs_view = self._trace_simple_fsdp(
+        n_layers=2,
+        reduce_dtype=torch.bfloat16,
+    ).backward_graph
+    inserted_views = []
+    for node in list(gm_with_post_rs_view.graph.nodes):
+      if (
+          node.op == "call_function"
+          and node.target is torch.ops.aten._to_copy.default
+          and len(node.all_input_nodes) == 1
+          and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+      ):
+        wait = node.all_input_nodes[0]
+        with gm_with_post_rs_view.graph.inserting_before(node):
+          view = gm_with_post_rs_view.graph.call_function(
+              torch.ops.aten.view.default, (wait, list(wait.meta["val"].shape))
+          )
+          view.meta["val"] = wait.meta["val"]
+        node.replace_input_with(wait, view)
+        inserted_views.append((wait, view, node))
+    gm_with_post_rs_view.recompile()
+
+    chunked_view = split_backward_graph_by_layer(
+        gm_with_post_rs_view,
+        n_layers=2,
+        pipeline_collectives=True,
+    )
+    self.assertLen(inserted_views, 2)
+    for wait, view, cast in inserted_views:
+      self.assertEqual(
+          chunked_view.partition_map[view], chunked_view.partition_map[wait]
+      )
+      self.assertEqual(
+          chunked_view.partition_map[cast], chunked_view.partition_map[wait]
+      )
+
+
 
 if __name__ == "__main__":
   absltest.main()

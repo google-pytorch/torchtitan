@@ -460,13 +460,18 @@ def _collect_collective_chains(
       if producer is not None:
         chains[producer].add(node)
         if is_reduce_scatter_tensor(producer):
-          chains[producer].update(
-              user
-              for user in node.users
-              if user.op == "call_function"
-              and user.target is torch.ops.aten._to_copy.default
-              and len(user.all_input_nodes) == 1
-          )
+          pending_users = list(node.users)
+          while pending_users:
+            user = pending_users.pop()
+            if (
+                user in chains[producer]
+                or user.op != "call_function"
+                or len(user.all_input_nodes) != 1
+            ):
+              continue
+            if _is_view(user) or user.target is torch.ops.aten._to_copy.default:
+              chains[producer].add(user)
+              pending_users.extend(user.users)
   for producer, chain in chains.items():
     if not is_all_gather_into_tensor(producer):
       continue

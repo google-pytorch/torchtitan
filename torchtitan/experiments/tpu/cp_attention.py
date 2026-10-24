@@ -39,7 +39,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import fsdp as fsdp_mod
-from torchtitan.distributed.context_parallel.api import prepare_context_parallel_input
+from torchtitan.distributed.context_parallel.api import (
+    _cp_shard_dims,
+    prepare_context_parallel_input,
+)
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.distributed.utils import get_spmd_backend
@@ -436,24 +439,33 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
         and inp.shape[0] % seq_len == 0
     ):
       bsz = inp.shape[0] // seq_len
-      for key in ("input", "labels", "positions"):
+      shard_dims = (
+          _cp_shard_dims(input_shardings)
+          if input_shardings is not None
+          else {"input": 0, "labels": 0, "positions": 0}
+      )
+      for key, seq_dim in shard_dims.items():
         val = input_dict.get(key)
-        if (
-            isinstance(val, torch.Tensor)
-            and val.ndim >= 1
-            and val.shape[0] == bsz * seq_len
-        ):
-          rest = list(val.shape[1:])
-          v_bs = val.reshape([bsz, seq_len] + rest)
-          v_reord = reorder_sequence(
-              v_bs, cp_size=cp, seq_dim=1, to_contiguous=False
+        if not isinstance(val, torch.Tensor):
+          continue
+        if seq_dim != 0 or val.ndim < 1 or val.shape[0] != bsz * seq_len:
+          raise ValueError(
+              f"KV all-gather CP with folded batch (B={bsz}, S={seq_len})"
+              f" expects {key!r} to be sharded on dim 0 with leading size"
+              f" {bsz * seq_len}; got seq_dim={seq_dim}, shape="
+              f"{tuple(val.shape)}."
           )
-          # Place the cp shard axis first so dim-0 chunking gives rank r
-          # its [bsz, seq_len // cp] slice across all batch elements.
-          v_grouped = v_reord.reshape([bsz, cp, seq_len // cp] + rest).movedim(
-              1, 0
-          )
-          input_dict[key] = v_grouped.reshape([bsz * seq_len] + rest)
+        rest = list(val.shape[1:])
+        v_bs = val.reshape([bsz, seq_len] + rest)
+        v_reord = reorder_sequence(
+            v_bs, cp_size=cp, seq_dim=1, to_contiguous=False
+        )
+        # Place the cp shard axis first so dim-0 chunking gives rank r
+        # its [bsz, seq_len // cp] slice across all batch elements.
+        v_grouped = v_reord.reshape([bsz, cp, seq_len // cp] + rest).movedim(
+            1, 0
+        )
+        input_dict[key] = v_grouped.reshape([bsz * seq_len] + rest)
       prepare_context_parallel_input(
           input_dict, input_shardings, cp_mesh, None, ptrr_mask_key
       )

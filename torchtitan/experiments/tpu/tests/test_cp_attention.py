@@ -29,12 +29,14 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 import torch.nn.functional as F
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu import cp_attention
 from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
 from torchtitan.experiments.tpu.cp_attention import (
     KVAllGatherCPInnerAttention,
     KVAllGatherCPScaledDotProductInnerAttention,
     KVAllGatherCPVarlenInnerAttention,
+    UlyssesCPInnerAttention,
     UlyssesCPScaledDotProductInnerAttention,
     UlyssesCPVarlenInnerAttention,
     reorder_sequence,
@@ -406,6 +408,60 @@ class CPShardTest(parameterized.TestCase):
       self.assertEqual(
           cp_attention._CP_RANK_CACHE[(torch.device("cpu"), rank)].tolist(),
           [rank],
+      )
+
+  def test_kv_all_gather_cp_shard_respects_input_shardings(self):
+    """When input_shardings is given with B > 1, every CP-sharded key is head-tail reordered."""
+    cp, bsz, seq_len = 2, 2, 16
+    tokens = torch.arange(bsz * seq_len)
+    shardings = {
+        "input": spmd.SpmdType(local_type={MeshAxisName.CP: spmd.S(0)}),
+        "extra_token_ids": spmd.SpmdType(
+            local_type={MeshAxisName.CP: spmd.S(0)}
+        ),
+        "replicated_aux": spmd.SpmdType(local_type={MeshAxisName.CP: spmd.R}),
+    }
+    for rank in range(cp):
+
+      def prepare(input_dict, input_shardings, cp_mesh, lb_type, ptrr_key):
+        del cp_mesh, lb_type, ptrr_key
+        for key in cp_attention._cp_shard_dims(input_shardings):
+          input_dict[key] = input_dict[key].chunk(cp)[rank]
+        return input_dict
+
+      cp_mesh = SimpleNamespace(
+          device_type="cpu", get_local_rank=lambda: rank, size=lambda dim=0: cp
+      )
+      batch = {
+          "input": tokens.clone(),
+          "extra_token_ids": tokens + 500,
+          "replicated_aux": torch.tensor([1, 2, 3]),
+      }
+      with set_unflatten_seq_len(seq_len), mock.patch.object(
+          cp_attention, "prepare_context_parallel_input", prepare
+      ):
+        out = KVAllGatherCPInnerAttention.cp_shard(
+            batch, shardings, cp_mesh, "headtail", None
+        )
+      want = _shard(tokens, "all_gather", cp, rank, seq_len)
+      torch.testing.assert_close(out["input"], want)
+      torch.testing.assert_close(out["extra_token_ids"], want + 500)
+      torch.testing.assert_close(out["replicated_aux"], torch.tensor([1, 2, 3]))
+
+    # A CP-sharded key whose shape does not match B * S raises clearly.
+    cp_mesh = SimpleNamespace(
+        device_type="cpu", get_local_rank=lambda: 0, size=lambda dim=0: cp
+    )
+    bad_batch = {
+        "input": tokens.clone(),
+        "extra_token_ids": torch.arange(7),
+    }
+    with (
+        set_unflatten_seq_len(seq_len),
+        self.assertRaisesRegex(ValueError, "extra_token_ids"),
+    ):
+      KVAllGatherCPInnerAttention.cp_shard(
+          bad_batch, shardings, cp_mesh, "headtail", None
       )
 
   @parameterized.parameters(

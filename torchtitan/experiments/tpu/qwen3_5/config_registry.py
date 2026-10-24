@@ -41,6 +41,12 @@ _TPU_MOE_CONVERTERS = [
 FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
 )
+# The override is imported only when the recipe is built: the module needs a
+# Tokamax build with the KDA op.
+TOKAMAX_GATED_DELTA_OVERRIDE = (
+    "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta."
+    "tokamax_gated_delta_kernel"
+)
 
 
 def _enable_pallas_cross_entropy(
@@ -84,6 +90,12 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
       TpuAllToAllTokenDispatcher.Config
   ):
     dispatcher.fuse_route_score_backward = True
+
+
+def _use_tokamax_gated_delta(cfg: TPUTrainerConfig) -> None:
+  """Runs every GatedDeltaNet with Tokamax's Mosaic TPU KDA kernels."""
+  if TOKAMAX_GATED_DELTA_OVERRIDE not in cfg.override.imports:
+    cfg.override.imports.append(TOKAMAX_GATED_DELTA_OVERRIDE)
 
 
 def qwen35_debugmodel() -> TPUTrainerConfig:

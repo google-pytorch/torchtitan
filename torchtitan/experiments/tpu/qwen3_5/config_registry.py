@@ -140,6 +140,35 @@ def _use_graph_split(
   cfg.optimizer.implementation = "fused"
 
 
+def _use_expert_parallel(cfg: TPUTrainerConfig, *, ep_degree: int) -> None:
+  """Shards the routed experts over `ep_degree` ranks (Expert Parallelism).
+
+  `TpuQwen35Model.Config.update_from_config` switches the token dispatcher to
+  `TpuQwen35TokenDispatcher` (static-shape all-to-all with a per-rank token
+  capacity) and the expert matmuls to the unpaired Pallas kernels.
+
+  Args:
+    cfg: The recipe to update in place.
+    ep_degree: Expert-parallel degree; it must divide the number of experts.
+  """
+  cfg.parallelism.expert_parallel_degree = ep_degree
+  # `CompiledGradNorm` needs a single mesh; the eager norm reduces over the
+  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes.
+  cfg.tpu_config.compile_grad_norm = False
+  if cfg.tpu_config.use_graph_split:
+    cfg.tpu_config.graph_trainer_memory_policy = "full"
+    cfg.tpu_config.graph_trainer_save_regions = ()
+    # Under `fsdp_pipeline`, backward child `L` holds the all-gather of layer
+    # `L - 1` and the reduce-scatter of layer `L + 1`, so the 3:1
+    # GatedDeltaNet:Attention cycle yields 6 distinct backward children, each
+    # with the EP all-to-alls (~9 min to compile each on 8 CPUs). `by_layer`
+    # children with one layer each are self-contained: 3 distinct backward
+    # children.
+    graph_split = cfg.tpu_config.graph_split
+    graph_split.forward_layers_per_executable = 1
+    graph_split.backward_layers_per_executable = 1
+    graph_split.backward_partition_mode = "by_layer"
+
 
 def qwen35_debugmodel() -> TPUTrainerConfig:
   """Debug config for hybrid Qwen3.5 (dense) on TPU."""
@@ -335,3 +364,9 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
   )
   return cfg
 
+
+def qwen35_moe_35b_split_tokamax_ep_benchmark() -> TPUTrainerConfig:
+  """`qwen35_moe_35b_split_tokamax_benchmark` with Expert Parallelism (EP=4)."""
+  cfg = qwen35_moe_35b_split_tokamax_benchmark()
+  _use_expert_parallel(cfg, ep_degree=4)
+  return cfg

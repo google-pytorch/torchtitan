@@ -345,6 +345,14 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
   _enable_pallas_cross_entropy(
       cfg, b_block_size=1024, h_block_size=2048, v_block_size=640
   )
+  # 512-row expert tiles: at 64K tokens per rank (2K routed rows per expert
+  # on average) the routed-expert MLP's forward + backward takes 23.0 vs
+  # 26.8 ms per layer on one TPU7x core with the Qwen3-30B tiles (256).
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.pallas_grouped_mm_tile_m = 512
+    experts.pallas_grouped_mm_tgmm_tiling = (512, 0, 0)
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       tpu_flags.TPU7X_THROUGHPUT_P_STATE,

@@ -514,6 +514,39 @@ class WorkaroundsTest(parameterized.TestCase):
     # not to the CP module itself (which would recurse).
     self.assertEqual(splash.original_module, inner.local_forward)
 
+  def test_splash_patch_warns_on_cp_block_skipping(self):
+    """KV all-gather CP with stock Splash warns when block skipping is left on."""
+    import copy
+    import types
+    from torchtitan.experiments.tpu import workarounds
+    from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention
+    from torchtitan.experiments.tpu.qwen3 import qwen3_configs
+    from torchtitan.models.common.attention import GQAttention as Attention
+    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+
+    cp_cls = tpu_cp_inner_attention(
+        ScaledDotProductInnerAttention, "all_gather"
+    )
+    config = copy.deepcopy(qwen3_configs["testmodel"])
+    config.layers[0].attention.inner_attention = cp_cls.Config()
+
+    attn_block = Attention(config=config.layers[0].attention).to("cpu")
+    with self.assertLogs(workarounds.logger, level="WARNING") as logs:
+      workarounds.use_splash_attention_patch(
+          attn_block,
+          types.SimpleNamespace(sa_use_document_aware_block_skipping=True),
+      )
+    self.assertTrue(
+        any("use_document_aware_block_skipping" in m for m in logs.output)
+    )
+
+    attn_block = Attention(config=config.layers[0].attention).to("cpu")
+    with self.assertNoLogs(workarounds.logger, level="WARNING"):
+      workarounds.use_splash_attention_patch(
+          attn_block,
+          types.SimpleNamespace(sa_use_document_aware_block_skipping=False),
+      )
+
   def test_qwen3_ulysses_cp_recipe_and_validation(self):
     """The Ulysses CP recipe applies ContextParallelTransform; TPU rules validate it."""
     from torchtitan.experiments.tpu.cp_attention import (

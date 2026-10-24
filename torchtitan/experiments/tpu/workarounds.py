@@ -220,6 +220,15 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         _causal,
         _windowed,
     )
+  if any(
+      "KVAllGatherCP" in type(child).__name__ for _, _, child in replacements
+  ) and sa_kwargs.get("use_document_aware_block_skipping", True):
+    logger.warning(
+        "Splash attention: use_document_aware_block_skipping=True is not"
+        " supported with KV all-gather CP; falling back to batch-native masking"
+        " (packed documents are still masked exactly via segment_ids). Set"
+        " sa_use_document_aware_block_skipping=False to acknowledge."
+    )
 
 
 def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None:

@@ -28,10 +28,12 @@ from torchtitan.experiments.tpu.headtail import (
     slice_cp_mask_info,
 )
 from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.tools.logging import logger
 
 custom_jax_kernel = pallas.custom_jax_kernel
 
 _DEFAULT_MASK_VALUE = splash_attention_kernel.DEFAULT_MASK_VALUE
+_warned_cp_block_skipping = False
 
 
 def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dkv):
@@ -165,6 +167,21 @@ def _make_splash_attention_fn(
         f" ({q_seq_len})."
     )
   cp_size = kv_seq_len // q_seq_len
+  global _warned_cp_block_skipping
+  if (
+      cp_size > 1
+      and use_document_aware_block_skipping
+      and not _warned_cp_block_skipping
+  ):
+    _warned_cp_block_skipping = True
+    logger.warning(
+        "Splash attention: use_document_aware_block_skipping=True is not"
+        " supported with head-tail CP (cp_size=%d); falling back to"
+        " batch-native masking (packed documents are still masked exactly via"
+        " segment_ids). Set sa_use_document_aware_block_skipping=False to"
+        " acknowledge.",
+        cp_size,
+    )
 
   def _get_layout(layout_str):
     if layout_str == "HEAD_DIM_MINOR":
@@ -254,6 +271,8 @@ def _make_splash_attention_fn(
       fwd_mask_info_b = fwd_mask_info_sliced
       if segment_ids_b is not None:
         seg_ids = _segment_ids(segment_ids_b, cp_rank)
+        # TODO: Support document-aware block skipping for cp_size > 1 by slicing
+        # segment_ids into q_seg and kv_seg before computing block bounds.
         if cp_size == 1:
           fwd_mask_info_b = _maybe_document_aware_mask_info(
               fwd_mask_info_sliced,
@@ -327,6 +346,7 @@ def _make_splash_attention_fn(
       dkv_mask_info_b = dkv_mask_info_sliced
       if segment_ids_b is not None:
         seg_ids = _segment_ids(segment_ids_b, cp_rank)
+        # TODO: Support document-aware block skipping for cp_size > 1 in bwd.
         if cp_size == 1:
           dkv_mask_info_b = _maybe_document_aware_mask_info(
               dkv_mask_info_sliced,

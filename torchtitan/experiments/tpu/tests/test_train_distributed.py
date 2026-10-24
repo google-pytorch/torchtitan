@@ -503,6 +503,46 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
       ),
+      dict(
+          testcase_name="qwen3_5_moe_use_gmm_kernel",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--qwen3.use_gmm_kernel"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_use_splash_attention_kernel",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--splash_attention_kernel.use_splash_attention_kernel"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_fused_ce",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_fused_ce",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
   ])
   def test_train_distributed(
       self,

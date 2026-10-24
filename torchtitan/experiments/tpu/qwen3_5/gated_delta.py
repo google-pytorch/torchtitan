@@ -71,9 +71,10 @@ def _causal_conv(
   seq_len = x_BSC.shape[1]
   kernel_size = weight_C1W.shape[-1]
   x_pad = F.pad(x_BSC, (0, 0, kernel_size - 1, 0))
-  # fp32 weights promote every product, and so the sum, to fp32, while autograd
-  # still saves the input slices in the input dtype.
-  weight_CW = weight_C1W[:, 0, :].float()
+  # At-least-fp32 weights promote bf16/fp16 products (and their sum) to fp32
+  # while preserving fp64 and saving the input slices in the input dtype.
+  acc_dtype = torch.promote_types(weight_C1W.dtype, torch.float32)
+  weight_CW = weight_C1W[:, 0, :].to(acc_dtype)
   out_BSC = None
   for k in range(kernel_size):
     x_shifted = x_pad[:, k : k + seq_len, :]

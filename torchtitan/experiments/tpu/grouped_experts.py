@@ -122,6 +122,14 @@ class TpuGroupedExperts(GroupedExperts):
         # ``pallas_grouped_mm_tgmm_tiling``. Set it when W1/W3 want a K tile
         # that W2's shorter K axis cannot hold.
         pallas_grouped_mm_w2_tgmm_tiling: tuple[int, int, int] | None = None
+        # W2 dWeight tiling used instead when the parallelizer selects the
+        # transposed W2 RHS (W2 FSDP-sharded on its trailing axis). The tuple
+        # tiles the same logical dimensions, but the transposed kernel stores
+        # them in the other order, so it wants a different shape. ``None``
+        # follows ``pallas_grouped_mm_w2_tgmm_tiling``.
+        pallas_grouped_mm_w2_transposed_tgmm_tiling: (
+            tuple[int, int, int] | None
+        ) = None
         use_kernel_native_weight_layout: bool = False
 
     def __init__(self, config: Config):
@@ -158,7 +166,11 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
         self.pallas_grouped_mm_tgmm_tiling = config.pallas_grouped_mm_tgmm_tiling
         self.pallas_grouped_mm_w2_tgmm_tiling = config.pallas_grouped_mm_w2_tgmm_tiling
+        self.pallas_grouped_mm_w2_transposed_tgmm_tiling = (
+            config.pallas_grouped_mm_w2_transposed_tgmm_tiling
+        )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
+        self._use_transposed_w2_rhs = False
         self._native_sharding_applied = False
 
         if self.use_pallas_paired_grouped_mm:
@@ -297,6 +309,9 @@ class TpuGroupedExperts(GroupedExperts):
             w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
             w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
 
+        if self._use_transposed_w2_rhs:
+            w2_EKN = w2_EKN.transpose(-2, -1)
+
         # Match GroupedExperts: expert compute is BF16 even when the surrounding
         # model is FP32, and the final result is restored to the caller's dtype.
         x_bf16 = x_RD.bfloat16()
@@ -315,6 +330,10 @@ class TpuGroupedExperts(GroupedExperts):
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
         w2_tgmm_tiling = self.pallas_grouped_mm_w2_tgmm_tiling or tgmm_tiling
+        if self._use_transposed_w2_rhs:
+            w2_tgmm_tiling = (
+                self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
+            )
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16
@@ -356,6 +375,7 @@ class TpuGroupedExperts(GroupedExperts):
             tile_k=tile_k,
             tile_n=tile_n,
             tgmm_tiling=w2_tgmm_tiling,
+            transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
 
 

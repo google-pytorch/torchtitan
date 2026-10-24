@@ -103,6 +103,12 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
     tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
     # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
     tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    {
+        # Preserve eligible all-gathers as asynchronous all-gathers instead of
+        # rewriting them to all-reduce-plus-slice. The native non-leading-axis
+        # FSDP path relies on this to avoid the slower rewrite.
+        "xla_tpu_prefer_async_allgather_to_allreduce": True,
+    },
 )
 
 # What the scan-layers line adds on top.
@@ -910,6 +916,9 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
     experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
     # A K tile that does not divide F leaves a masked remainder tile.
     experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
+    # With W2 sharded on its trailing axis (FSDP wider than the expert count),
+    # the transposed-RHS dWeight is stored [E, D, F]: tile D and keep F whole.
+    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 2048)
     experts.use_kernel_native_weight_layout = True
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.

@@ -508,6 +508,8 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertIsInstance(inner, cp_cls)
     splash = inner._local_attn_override.inner  # Inside the UnflattenShim.
     self.assertIsInstance(splash, SplashAttention)
+    self.assertIn("local_attention=", inner.extra_repr())
+    self.assertIn("SplashAttention", repr(inner))
     # On CPU or short sequences the kernel falls back to the CP reference path,
     # not to the CP module itself (which would recurse).
     self.assertEqual(splash.original_module, inner.local_forward)

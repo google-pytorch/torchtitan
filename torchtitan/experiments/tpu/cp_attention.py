@@ -247,7 +247,26 @@ def _full_sequence_segment_ids(
   return segment_ids_from_positions(positions)
 
 
-class UlyssesCPInnerAttention(CPInnerAttention):
+class _TPUCPInnerAttention(CPInnerAttention):
+  """Shared base for TPU CP inner attentions with pluggable local attention."""
+
+  _local_attn_override: Callable[..., torch.Tensor] | None = None
+
+  # TODO: Replace set_local_attention (runtime kernel injection) with
+  # first-class Splash/Tokamax InnerAttention configs with a CP counterparts
+  # registered via ContextParallelTransform(inner_attention_map=...), once the
+  # fork syncs to the upstream API.
+  def set_local_attention(
+      self, local_attn: Callable[..., torch.Tensor] | None
+  ) -> None:
+    """Replaces the local attention kernel, e.g. with TPU splash attention."""
+    object.__setattr__(self, "_local_attn_override", local_attn)
+
+  def extra_repr(self) -> str:
+    return f"local_attention={self._local_attn_override!r}"
+
+
+class UlyssesCPInnerAttention(_TPUCPInnerAttention):
   """Ulysses (all-to-all) CP mixin for any single-device inner attention."""
 
   def __init__(self, config: Any) -> None:
@@ -274,12 +293,6 @@ class UlyssesCPInnerAttention(CPInnerAttention):
     if attention_masks is not None:
       input_dict["attention_masks"] = attention_masks
     return input_dict
-
-  def set_local_attention(
-      self, local_attn: Callable[..., torch.Tensor] | None
-  ) -> None:
-    """Replaces the full-sequence attention, e.g. with TPU splash attention."""
-    object.__setattr__(self, "_local_attn_override", local_attn)
 
   def local_forward(self, q_THK, k_THK, v_THV, **kwargs) -> torch.Tensor:
     """The wrapped single-device inner attention."""
@@ -345,7 +358,7 @@ class UlyssesCPInnerAttention(CPInnerAttention):
     return _all_to_all(out_THV, group, src_dim=_HEAD_DIM, dst_dim=_TOKEN_DIM)
 
 
-class KVAllGatherCPInnerAttention(CPInnerAttention):
+class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
   """MaxText-style load-balanced KV All-Gather CP mixin for inner attention."""
 
   def __init__(self, config: Any) -> None:
@@ -451,12 +464,6 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
     if attention_masks is not None:
       input_dict["attention_masks"] = attention_masks
     return input_dict
-
-  def set_local_attention(
-      self, local_attn: Callable[..., torch.Tensor] | None
-  ) -> None:
-    """Replaces the local attention kernel, e.g. with TPU splash attention."""
-    object.__setattr__(self, "_local_attn_override", local_attn)
 
   def local_forward(
       self,

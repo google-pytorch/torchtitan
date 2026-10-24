@@ -156,9 +156,14 @@ for scaling beyond what FSDP alone fits.
 
 ## Notes
 
-* `GatedDeltaNet` runs one recurrence per `[B, S]` row: documents packed into
-  a row share the causal convolution and the delta-rule state (there are no
-  varlen `cu_seqlens` on TPU); attention masks documents via `positions`.
+* Packed documents: the attention masks documents via `positions`, and the
+  `GatedDeltaNet` restarts its causal convolution and delta-rule state at every
+  document (`positions == 0`), through static-shape `[B, S]` segment ids
+  instead of upstream's varlen `cu_seqlens`. The XLA kernel masks within
+  chunks; Tokamax's kernels take `segment_ids` and lay every document out from
+  a 64-token chunk boundary, keeping up to `max_num_segments` documents per row
+  apart (default: one per 512 tokens, at most 12% more kernel tokens; later
+  documents of a row share one recurrence).
 * The Tokamax kernels clamp the per-token log decay at -5
   (`TokamaxGatedDeltaKernel.Config.min_log_decay`): the kernel's sub-chunk
   factoring overflows below it, which produced NaN gradients with the model's

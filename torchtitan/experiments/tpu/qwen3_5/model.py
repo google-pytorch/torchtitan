@@ -1,13 +1,17 @@
-"""Qwen3.5 attention and transformer block modules for TPU."""
+"""Qwen3.5 attention, transformer block, and model modules for TPU."""
 
 from dataclasses import dataclass
 
 import torch
+import torchtitan.config
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35TransformerBlock
+from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -106,3 +110,37 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
+
+
+class TpuQwen35Model(Qwen35Model):
+  """``Qwen35Model`` whose config switches to the TPU EP token dispatcher.
+
+  Under expert parallelism, ``Config.update_from_config`` switches the MoE
+  layers to ``TpuQwen35TokenDispatcher``.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Qwen35Model.Config):
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      # Zero-argument super() does not work in slots dataclasses on Python
+      # 3.12 (the class is re-created); call the parent explicitly.
+      Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
+      if config.parallelism.expert_parallel_degree > 1:
+        # `ExpertParallel` shards the expert weights on dim 0, which the
+        # paired (w1 + w3) Pallas kernel's fused weight layout does not allow.
+        for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
+          experts.use_pallas_paired_grouped_mm = False
+        for _, dispatcher, parent, field_name in list(
+            self.traverse(TpuAllToAllTokenDispatcher.Config)
+        ):
+          if type(dispatcher) is TpuAllToAllTokenDispatcher.Config:  # pylint: disable=unidiomatic-typecheck
+            ep_dispatcher = torchtitan.config.derive(
+                dispatcher,
+                token_dispatcher.TpuQwen35TokenDispatcher.Config,
+                capacity_factor=token_dispatcher.EP_CAPACITY_FACTOR,
+            )
+            if isinstance(parent, list):
+              parent[field_name] = ep_dispatcher
+            else:
+              setattr(parent, field_name, ep_dispatcher)

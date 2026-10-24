@@ -12,6 +12,8 @@ axis as one stream. This module provides the TPU replacements:
    ``conv1d`` and the recurrence run on each ``[B, S]`` row independently
    without dynamic-shape ``cu_seqlens`` offsets (upstream ``GatedDeltaNet``
    only passes ``cu_seqlens``, not ``positions`` / ``segment_ids``).
+   ``tokamax_gated_delta.TokamaxGatedDeltaKernel`` swaps the recurrence for
+   Tokamax's Mosaic TPU kernels.
 3. ``TpuGatedDeltaNet``: ``GatedDeltaNet`` that passes ``positions`` down, so
    the causal ``conv1d`` and the recurrence also restart at every document
    packed into a row (``positions == 0``), as upstream's ``cu_seqlens`` kernels
@@ -302,6 +304,39 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
     super().__init__(config)
     self.chunk_size = config.chunk_size
 
+  def recurrence(
+      self,
+      q_BSHK: torch.Tensor,
+      k_BSHK: torch.Tensor,
+      v_BSHV: torch.Tensor,
+      g_BSH: torch.Tensor,
+      beta_BSH: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    """The gated delta rule on ``[B, S]`` rows; subclasses swap the kernel.
+
+    Args:
+      q_BSHK: Queries, one key head per value head.
+      k_BSHK: Keys, one key head per value head.
+      v_BSHV: Values.
+      g_BSH: Log-space decay.
+      beta_BSH: Update gate.
+      segment_ids_BS: Optional ``[B, S]`` document index of each token; the
+        recurrence restarts at every document.
+
+    Returns:
+      ``[B, S, H, V]`` output.
+    """
+    return chunked_gated_delta(
+        q_BSHK,
+        k_BSHK,
+        v_BSHV,
+        g_BSH,
+        beta_BSH,
+        chunk_size=self.chunk_size,
+        segment_ids=segment_ids_BS,
+    )
+
   def forward(
       self,
       xq_BSHK: torch.Tensor,
@@ -324,14 +359,13 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
     if repeats > 1:
       xq_BSHK = xq_BSHK.repeat_interleave(repeats, dim=2)
       xk_BSHK = xk_BSHK.repeat_interleave(repeats, dim=2)
-    return chunked_gated_delta(
+    return self.recurrence(
         xq_BSHK,
         xk_BSHK,
         xv_BSHV,
         g_BSH,
         beta_BSH,
-        chunk_size=self.chunk_size,
-        segment_ids=segment_ids_BS,
+        segment_ids_BS=segment_ids_BS,
     )
 
 

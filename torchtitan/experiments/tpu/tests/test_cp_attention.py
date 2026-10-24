@@ -753,6 +753,16 @@ class CPValidationTest(parameterized.TestCase):
     config.splash_attention_kernel.use_splash_attention_kernel = True
     config.__post_init__()
 
+  def test_rejects_tokamax_diag_skip_with_head_tail_cp(self):
+    for flag in ("sa_qk_diag_skip", "sa_sv_diag_skip"):
+      config = self._config("all_gather", cp=4)
+      config.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
+      setattr(config.splash_attention_kernel, flag, True)
+      with self.assertRaisesRegex(
+          NotImplementedError, "Tokamax \\*_diag_skip assumes natural Q order"
+      ):
+        config.__post_init__()
+
   def test_rejects_non_causal_kv_all_gather(self):
     config = self._config("all_gather")
     for layer in config.model_spec.model.layers:

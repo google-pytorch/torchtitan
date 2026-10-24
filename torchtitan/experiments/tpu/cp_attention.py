@@ -939,6 +939,13 @@ def _validate_sequence_lengths(
       or splash_attention_kernel.use_tokamax_splash_attention_kernel
   ):
     return
+  if getattr(splash_attention_kernel, "sa_qk_diag_skip", False) or getattr(
+      splash_attention_kernel, "sa_sv_diag_skip", False
+  ):
+    raise NotImplementedError(
+        "Tokamax *_diag_skip assumes natural Q order; unsupported with"
+        " head-tail CP."
+    )
   # The kernel sees each rank's S / cp queries against all S keys and values;
   # every block size (capped at its length) must divide that length.
   q_len = min(seq_len, num_tokens) // cp

@@ -162,6 +162,14 @@ def _make_splash_attention_fn(
       k_layout=_get_layout(k_layout),
       v_layout=_get_layout(v_layout),
   )
+  if cp_size > 1 and (
+      getattr(config, "qk_diag_skip", False)
+      or getattr(config, "sv_diag_skip", False)
+  ):
+    raise NotImplementedError(
+        "Tokamax *_diag_skip assumes natural Q order; unsupported with"
+        " head-tail CP."
+    )
 
   mask_shape = (kv_seq_len, kv_seq_len)
   single_mask = _make_mask(mask_shape, is_causal, local_window_size, cp_size)

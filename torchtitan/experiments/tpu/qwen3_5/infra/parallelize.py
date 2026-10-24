@@ -4,9 +4,12 @@ import dataclasses
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 import torchtitan.config
 import torchtitan.distributed
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
@@ -14,6 +17,84 @@ from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3_5 import parallelize as dtensor_parallelize
+
+
+def apply_qwen3_5_simple_fsdp(
+    model: nn.Module,
+    *,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    training: torchtitan.config.TrainingConfig,
+) -> nn.Module:
+  """Applies SimpleFSDP to Qwen3.5, wrapping routed experts on ``edp_mesh`` under EP.
+
+  Upstream ``apply_simple_fsdp`` checks ``isinstance(block, TransformerBlock)``
+  before wrapping ``moe.routed_experts.inner_experts`` on ``edp_mesh``. Since
+  ``Qwen35TransformerBlock`` subclasses ``Module`` (and may be wrapped in a
+  ``CheckpointWrapper``), we wrap every ``MoE`` submodule's ``inner_experts`` on
+  ``edp_mesh`` first and then delegate the remaining parameters to
+  ``apply_simple_fsdp``.
+  """
+  if parallel_dims.ep_enabled:
+    use_spmd_types = get_spmd_backend() == "spmd_types"
+    if parallel_dims.dp_replicate_enabled:
+      dp_mode = (
+          "hybrid_shard"
+          if (parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled)
+          else "replicate"
+      )
+      edp_mesh_names = ["dp_replicate", "efsdp"]
+    else:
+      dp_mode = "fully_shard"
+      edp_mesh_names = ["efsdp"]
+    edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+    assert edp_mesh is not None
+    efsdp_degree = edp_mesh["efsdp"].size()
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+            training.mixed_precision_param
+        ],
+        reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+            training.mixed_precision_reduce
+        ],
+    )
+    non_dp_mesh = (
+        parallel_dims.get_optional_mesh("ep") if use_spmd_types else None
+    )
+
+    for module_fqn, moe in model.named_modules():
+      if not isinstance(moe, MoE):
+        continue
+      inner_experts = moe.routed_experts.inner_experts
+      if inner_experts.num_experts % (efsdp_degree * parallel_dims.ep) == 0:
+        experts_shard_dim = 0
+      else:
+        incompatible = [
+            f"{name}{tuple(parameter.shape)}"
+            for name, parameter in inner_experts.named_parameters(recurse=False)
+            if parameter.ndim != 3 or parameter.shape[1] % efsdp_degree != 0
+        ]
+        if incompatible:
+          raise ValueError(
+              f"Cannot FSDP-shard {module_fqn}.routed_experts.inner_experts on "
+              f"dimension 1 over {efsdp_degree} efsdp ranks; incompatible "
+              f"expert parameters: {incompatible}"
+          )
+        experts_shard_dim = 1
+
+      moe.routed_experts.inner_experts = data_parallel(
+          inner_experts,
+          edp_mesh,
+          dp_mode,
+          mp_policy=mp_policy,
+          shard_dim=experts_shard_dim,
+          non_dp_mesh=non_dp_mesh,
+      )
+
+  return apply_simple_fsdp(
+      model,
+      parallel_dims=parallel_dims,
+      training=training,
+  )
 
 
 def parallelize_qwen3_5(
@@ -80,7 +161,7 @@ def parallelize_qwen3_5(
   if parallelism.use_simple_fsdp:
     # TPU: SimpleFSDP instead of FSDP2, on shard dims that divide the mesh.
     configure_simple_fsdp_shard_dims(model, parallel_dims)
-    model = apply_simple_fsdp(
+    model = apply_qwen3_5_simple_fsdp(
         model,
         parallel_dims=parallel_dims,
         training=training,

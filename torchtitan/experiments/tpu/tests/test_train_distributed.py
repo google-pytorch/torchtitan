@@ -529,6 +529,17 @@ class TrainDistributedTest(
           args=["--parallelism.use_simple_fsdp"],
       ),
       dict(
+          testcase_name="qwen3_5_moe_ep2_simplefsdp",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.expert_parallel_degree=2",
+          ],
+      ),
+      dict(
           testcase_name="qwen3_5_moe_use_gmm_kernel",
           module="torchtitan.experiments.tpu.qwen3_5",
           config="qwen35_moe_debugmodel",

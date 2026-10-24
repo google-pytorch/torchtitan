@@ -13,6 +13,8 @@ Covers:
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls), plus Splash parity on TPU.
 4. Flavor, registry, recipe and MFU-accounting checks.
+5. Expert parallelism: ``TpuQwen35TokenDispatcher`` EP=2 parity with EP=1 and
+   a static-shape FX trace, and per-mesh optimizer param groups.
 """
 
 import copy
@@ -20,6 +22,7 @@ import copy
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import OverrideConfig, apply_overrides
@@ -38,6 +41,7 @@ import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
+from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher as qwen35_token_dispatcher
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
@@ -922,7 +926,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     """Tests Splash Attention patch on TpuQwen35Attention vs CPU SDPA."""
     if not self._is_tpu():
       self.skipTest("Splash Attention is a TPU-only Pallas kernel.")
-    config = qwen3_5_tpu.model_registry("debugmodel").model
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=256).model
     batch, seq_len = 2, 256
     attn_cpu = config.layers[3].attention.build()
     attn_cpu.init_states(buffer_device=torch.device("cpu"))
@@ -987,6 +991,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         spec = qwen3_5_tpu.model_registry(flavor)
         self.assertIs(spec.parallelize_fn, parallelize_qwen3_5)
         self.assertIsNone(spec.pipelining_fn)
+        self.assertIsInstance(spec.model, tpu_model.TpuQwen35Model.Config)
         self.assertIsNone(spec.model.vision_encoder)
         for layer in spec.model.layers:
           self.assertIsInstance(
@@ -1173,6 +1178,358 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
     self.assertEqual(parsed.model_spec.max_context_length, 262144)
+
+    # Expert Parallelism (EP > 1) recipes and model config updates.
+    for ep_recipe in (
+        config_registry.qwen35_moe_35b_split_tokamax_ep_benchmark,
+    ):
+      ep_cfg = ep_recipe()
+      self.assertEqual(ep_cfg.parallelism.expert_parallel_degree, 4)
+      self.assertFalse(ep_cfg.tpu_config.compile_grad_norm)
+      self.assertEqual(
+          ep_cfg.tpu_config.graph_split.backward_partition_mode, "by_layer"
+      )
+      self.assertEqual(
+          ep_cfg.tpu_config.graph_split.forward_layers_per_executable, 1
+      )
+      self.assertEqual(
+          ep_cfg.tpu_config.graph_split.backward_layers_per_executable, 1
+      )
+      ep_cfg.model_spec.model.update_from_config(
+          config=ep_cfg, global_batch_size=8, local_global_batch_size=8
+      )
+      ep_dispatchers = list(
+          ep_cfg.model_spec.model.traverse(
+              qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
+          )
+      )
+      self.assertLen(ep_dispatchers, len(ep_cfg.model_spec.model.layers))
+      self.assertTrue(
+          all(d.fuse_route_score_backward for _, d, _, _ in ep_dispatchers)
+      )
+      self.assertTrue(
+          all(d.capacity_factor == 1.25 for _, d, _, _ in ep_dispatchers)
+      )
+      ep_experts = list(
+          ep_cfg.model_spec.model.traverse(TpuGroupedExperts.Config)
+      )
+      self.assertTrue(
+          all(not e.use_pallas_paired_grouped_mm for _, e, _, _ in ep_experts)
+      )
+
+    parsed_ep = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_ep_benchmark",
+        "--parallelism.expert_parallel_degree=8",
+    ])
+    self.assertEqual(parsed_ep.parallelism.expert_parallel_degree, 8)
+    self.assertFalse(parsed_ep.tpu_config.compile_grad_norm)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_dropless", capacity_factor=None),
+      dict(testcase_name="_capacity_2x", capacity_factor=2.0),
+  )
+  def test_ep_token_dispatcher_parity_and_static_fx_trace(
+      self, capacity_factor: float | None
+  ):
+    """Tests TpuQwen35TokenDispatcher EP=2 fwd/bwd parity vs EP=1 and FX trace."""
+    torch.manual_seed(123)
+    dev = self.accelerator_device
+    ep_size = 2
+    num_experts = 6
+    top_k = 2
+    tokens_per_rank = 6
+    dim = 16
+    hidden_dim = 24
+
+    # Shared expert weights [E, H, D] / [E, D, H] across all 6 experts.
+    w1_full = (
+        0.1 * torch.randn(num_experts, hidden_dim, dim, device=dev)
+    ).requires_grad_()
+    w2_full = (
+        0.1 * torch.randn(num_experts, dim, hidden_dim, device=dev)
+    ).requires_grad_()
+    w3_full = (
+        0.1 * torch.randn(num_experts, hidden_dim, dim, device=dev)
+    ).requires_grad_()
+
+    x0_ref = torch.randn(tokens_per_rank, dim, device=dev, requires_grad=True)
+    x1_ref = torch.randn(tokens_per_rank, dim, device=dev, requires_grad=True)
+    # Include an unrouted expert (expert 2 has 0 tokens on rank 1) to exercise
+    # zero-count segments in segment comparisons and group_sizes.
+    idx0 = torch.tensor(
+        [[0, 3], [1, 4], [2, 5], [0, 4], [1, 5], [3, 4]],
+        dtype=torch.int64,
+        device=dev,
+    )
+    idx1 = torch.tensor(
+        [[0, 1], [3, 5], [4, 5], [0, 3], [1, 4], [3, 5]],
+        dtype=torch.int64,
+        device=dev,
+    )
+    scores0_ref = torch.rand(
+        tokens_per_rank, top_k, device=dev, requires_grad=True
+    )
+    scores1_ref = torch.rand(
+        tokens_per_rank, top_k, device=dev, requires_grad=True
+    )
+
+    def expert_mlp(h, group_sizes, w1, w2, w3):
+      splits = list(h.split(group_sizes.tolist(), dim=0))
+      outs = []
+      for e_idx, chunk in enumerate(splits):
+        if chunk.shape[0] == 0:
+          outs.append(chunk)
+        else:
+          gate = F.silu(chunk @ w1[e_idx].t())
+          up = chunk @ w3[e_idx].t()
+          outs.append((gate * up) @ w2[e_idx].t())
+      return torch.cat(outs, dim=0)
+
+    # Reference: single-rank EP=1 dispatcher on the concatenated batch.
+    ref_disp = TpuAllToAllTokenDispatcher.Config(
+        num_experts=num_experts,
+        top_k=top_k,
+        fuse_route_score_backward=True,
+    ).build()
+
+    def count_tokens(indices_tk):
+      return torch.histc(
+          indices_tk.view(-1).float(),
+          bins=num_experts,
+          min=0,
+          max=num_experts - 1,
+      ).to(torch.int64)
+
+    x_cat = torch.cat([x0_ref, x1_ref], dim=0)
+    idx_cat = torch.cat([idx0, idx1], dim=0)
+    scores_cat = torch.cat([scores0_ref, scores1_ref], dim=0)
+    counts_cat = count_tokens(idx_cat)
+    h_ref, gs_ref, meta_ref = ref_disp.dispatch(
+        x_cat, scores_cat, idx_cat, counts_cat
+    )
+    y_ref = expert_mlp(h_ref, gs_ref, w1_full, w2_full, w3_full)
+    out_ref = ref_disp.combine(y_ref, meta_ref, x_cat)
+    out0_ref, out1_ref = out_ref.split(tokens_per_rank, dim=0)
+    grad_out0 = torch.randn_like(out0_ref)
+    grad_out1 = torch.randn_like(out1_ref)
+    (out0_ref * grad_out0 + out1_ref * grad_out1).sum().backward()
+
+    # EP=2 simulation using two TpuQwen35TokenDispatcher instances whose
+    # _token_count_exchange, _dispatch_token_exchange and _combine_token_exchange
+    # methods exchange directly between rank 0 and rank 1.
+    x0 = x0_ref.detach().clone().requires_grad_()
+    x1 = x1_ref.detach().clone().requires_grad_()
+    scores0 = scores0_ref.detach().clone().requires_grad_()
+    scores1 = scores1_ref.detach().clone().requires_grad_()
+    w1_ep = [
+        t.detach().clone().requires_grad_()
+        for t in w1_full.chunk(ep_size, dim=0)
+    ]
+    w2_ep = [
+        t.detach().clone().requires_grad_()
+        for t in w2_full.chunk(ep_size, dim=0)
+    ]
+    w3_ep = [
+        t.detach().clone().requires_grad_()
+        for t in w3_full.chunk(ep_size, dim=0)
+    ]
+
+    fake_ep_mesh = type(
+        "FakeEpMesh",
+        (),
+        {"size": lambda self: ep_size, "get_group": lambda self: None},
+    )()
+    disp = [
+        qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            fuse_route_score_backward=True,
+            capacity_factor=capacity_factor,
+        ).build()
+        for _ in range(ep_size)
+    ]
+    for r in range(ep_size):
+      disp[r].ep_mesh = fake_ep_mesh
+
+    def simulate_two_ranks(xs, idxs, scoress):
+      counts = [count_tokens(idxs[r]) for r in range(ep_size)]
+      sent_counts = [None, None]
+      sent_tokens = [None, None]
+      for r in range(ep_size):
+
+        def record_counts(t, pg, sz, rank=r):
+          del pg
+          sent_counts[rank] = t.view(sz, -1)
+          return sent_counts[rank]
+
+        def record_tokens(t, pg, output_splits, input_splits, rank=r):
+          del pg, output_splits, input_splits
+          sent_tokens[rank] = t
+          return t
+
+        disp[r]._token_count_exchange = record_counts
+        disp[r]._dispatch_token_exchange = record_tokens
+        disp[r].dispatch(xs[r], scoress[r], idxs[r], counts[r])
+
+      stacked_counts = torch.stack(sent_counts, dim=0)  # [2, 2, e]
+      recv_counts = [stacked_counts[:, r].contiguous() for r in range(ep_size)]
+      stacked_tokens = torch.stack(
+          [t.view(ep_size, -1, dim) for t in sent_tokens], dim=0
+      )
+      recv_tokens = [
+          stacked_tokens[:, r].contiguous().view(-1, dim)
+          for r in range(ep_size)
+      ]
+
+      hs = []
+      gss = []
+      metas = []
+      for r in range(ep_size):
+        disp[r]._token_count_exchange = lambda t, pg, sz, rc=recv_counts[r]: rc
+        disp[r]._dispatch_token_exchange = (
+            lambda t, pg, out_splits, in_splits, rt=recv_tokens[r]: rt
+        )
+        h_r, gs_r, meta_r = disp[r].dispatch(
+            xs[r], scoress[r], idxs[r], counts[r]
+        )
+        hs.append(h_r)
+        gss.append(gs_r)
+        metas.append(meta_r)
+
+      ys = [
+          expert_mlp(hs[r], gss[r], w1_ep[r], w2_ep[r], w3_ep[r])
+          for r in range(ep_size)
+      ]
+
+      sent_back = [None, None]
+      for r in range(ep_size):
+
+        def record_back(t, pg, input_splits, output_splits, rank=r):
+          del pg, input_splits, output_splits
+          sent_back[rank] = t
+          return t
+
+        disp[r]._combine_token_exchange = record_back
+        disp[r].combine(ys[r], metas[r], xs[r])
+
+      stacked_back = torch.stack(
+          [t.view(ep_size, -1, dim) for t in sent_back], dim=0
+      )
+      recv_back = [
+          stacked_back[:, r].contiguous().view(-1, dim) for r in range(ep_size)
+      ]
+      combined_outs = []
+      for r in range(ep_size):
+        disp[r]._combine_token_exchange = (
+            lambda t, pg, in_splits, out_splits, rb=recv_back[r]: rb
+        )
+        combined_outs.append(disp[r].combine(ys[r], metas[r], xs[r]))
+      return combined_outs
+
+    out0_ep, out1_ep = simulate_two_ranks(
+        [x0, x1], [idx0, idx1], [scores0, scores1]
+    )
+    tol = 2e-2 if self._is_tpu() else 1e-5
+    test_utils.check_equivalence(
+        out0_ep.cpu(), out0_ref.cpu(), atol=tol, rtol=tol, check_name="EP2 out0"
+    )
+    test_utils.check_equivalence(
+        out1_ep.cpu(), out1_ref.cpu(), atol=tol, rtol=tol, check_name="EP2 out1"
+    )
+
+    (out0_ep * grad_out0 + out1_ep * grad_out1).sum().backward()
+    for name, actual, expected in (
+        ("dx0", x0.grad, x0_ref.grad),
+        ("dx1", x1.grad, x1_ref.grad),
+        ("dscores0", scores0.grad, scores0_ref.grad),
+        ("dscores1", scores1.grad, scores1_ref.grad),
+        ("dw1", torch.cat([t.grad for t in w1_ep], dim=0), w1_full.grad),
+        ("dw2", torch.cat([t.grad for t in w2_ep], dim=0), w2_full.grad),
+        ("dw3", torch.cat([t.grad for t in w3_ep], dim=0), w3_full.grad),
+    ):
+      self.assertLessEqual(
+          _relative_l2_error(actual, expected),
+          tol,
+          msg=f"EP2 backward mismatch on {name}",
+      )
+
+    # Also verify that TpuQwen35TokenDispatcher.dispatch + combine traces
+    # cleanly under make_fx with static shapes and zero host syncs
+    # (_local_scalar_dense) or dynamic repeat_interleave ops.
+
+    trace_disp = disp[0]
+    trace_disp._token_count_exchange = lambda t, pg, sz: t.view(sz, -1).clone()
+    trace_disp._dispatch_token_exchange = lambda t, pg, a, b: t.clone()
+    trace_disp._combine_token_exchange = lambda t, pg, a, b: t.clone()
+    counts0 = count_tokens(idx0)
+
+    def trace_step(x_in, idx_in, scores_in, counts_in):
+      h_disp, gs_disp, meta = trace_disp.dispatch(
+          x_in, scores_in, idx_in, counts_in
+      )
+      out_disp = trace_disp.combine(h_disp * 2.0, meta, x_in)
+      loss = out_disp.sum()
+      dx, dscores = torch.autograd.grad(loss, (x_in, scores_in))
+      return h_disp, gs_disp, out_disp, dx, dscores
+
+    gm = make_fx(trace_step)(
+        x0.detach().requires_grad_(True),
+        idx0,
+        scores0.detach().requires_grad_(True),
+        counts0,
+    )
+    op_names = [
+        str(n.target) for n in gm.graph.nodes if n.op == "call_function"
+    ]
+    self.assertFalse(
+        any("local_scalar_dense" in name for name in op_names),
+        msg=f"Unexpected host scalar sync in traced graph: {op_names}",
+    )
+    self.assertFalse(
+        any("repeat_interleave" in name for name in op_names),
+        msg=f"Unexpected dynamic repeat_interleave in traced graph: {op_names}",
+    )
+    h_traced, gs_traced, out_traced, dx_traced, ds_traced = gm(
+        x0.detach(), idx0, scores0.detach(), counts0
+    )
+    num_routed = tokens_per_rank * top_k
+    expected_cap = (
+        num_routed
+        if capacity_factor is None
+        else min(num_routed, int(capacity_factor * num_routed // ep_size))
+    )
+    self.assertEqual(tuple(h_traced.shape), (ep_size * expected_cap, dim))
+    self.assertEqual(int(gs_traced.sum().item()), ep_size * expected_cap)
+    self.assertEqual(tuple(out_traced.shape), (tokens_per_rank, dim))
+    self.assertEqual(tuple(dx_traced.shape), (tokens_per_rank, dim))
+    self.assertEqual(tuple(ds_traced.shape), (tokens_per_rank, top_k))
+
+  def test_split_optimizer_groups_by_mesh(self):
+    """Tests that _split_optimizer_groups_by_mesh splits multi-mesh groups."""
+    p_dense = torch.nn.Parameter(torch.ones(4))
+    p_expert = torch.nn.Parameter(torch.ones(4))
+    p_dense._spec = type("Spec", (), {"mesh": object()})()
+    p_expert._spec = type("Spec", (), {"mesh": object()})()
+
+    opt = torch.optim.AdamW([{
+        "params": [p_dense, p_expert],
+        "param_names": [
+            "layers.0.attention.wq.weight",
+            "layers.0.moe.experts.w1",
+        ],
+    }])
+    container = type("Container", (), {"optimizers": [opt]})()
+    qwen3_5_tpu._split_optimizer_groups_by_mesh(container)  # pylint: disable=protected-access
+    self.assertLen(opt.param_groups, 2)
+    self.assertIs(opt.param_groups[0]["params"][0], p_dense)
+    self.assertEqual(
+        opt.param_groups[0]["param_names"], ["layers.0.attention.wq.weight"]
+    )
+    self.assertIs(opt.param_groups[1]["params"][0], p_expert)
+    self.assertEqual(
+        opt.param_groups[1]["param_names"], ["layers.0.moe.experts.w1"]
+    )
 
 
 if __name__ == "__main__":

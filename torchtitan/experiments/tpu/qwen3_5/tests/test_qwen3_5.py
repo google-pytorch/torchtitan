@@ -7,7 +7,8 @@ Covers:
    controls), for dense, MoE, and MoE with ``TpuGroupedExpertsConverter``;
    plus the adapter round trip.
 2. ``chunked_gated_delta`` against the exact per-token recurrence, also with
-   packed documents.
+   packed documents, and the slice-based causal convolution's backward against
+   autograd of ``conv1d``, also with packed documents.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls).
@@ -384,6 +385,79 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           msg=f"GDN {name} grad mismatch",
       )
 
+  def test_causal_conv_silu_matches_autograd(self):
+    """Tests the slice-based causal conv backward against autograd/conv1d."""
+    torch.manual_seed(0)
+    channels, kernel_size = 8, 4
+    x = torch.randn(3, 37, channels, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(
+        channels, 1, kernel_size, dtype=torch.float64, requires_grad=True
+    )
+    grad = torch.randn(3, 37, channels, dtype=torch.float64)
+    # pylint: disable=protected-access
+    conv = gated_delta._causal_conv(x, weight)
+    expected_conv = F.conv1d(
+        F.pad(x.transpose(1, 2), (kernel_size - 1, 0)),
+        weight,
+        groups=channels,
+    ).transpose(1, 2)
+    # pylint: enable=protected-access
+    torch.testing.assert_close(conv, expected_conv)
+    out = gated_delta.causal_conv_silu(x, weight)
+    expected = F.silu(expected_conv)
+    torch.testing.assert_close(out, expected)
+    grads = torch.autograd.grad(out, (x, weight), grad)
+    expected_grads = torch.autograd.grad(expected, (x, weight), grad)
+    for actual_grad, expected_grad in zip(grads, expected_grads, strict=True):
+      torch.testing.assert_close(actual_grad, expected_grad)
+
+    # On the accelerator in bf16, as the model runs it.
+    dev = self.accelerator_device
+    x_bf16 = x.detach().to(dev, torch.bfloat16).requires_grad_()
+    w_bf16 = weight.detach().to(dev, torch.bfloat16).requires_grad_()
+    out_bf16 = gated_delta.causal_conv_silu(x_bf16, w_bf16)
+    grads_bf16 = torch.autograd.grad(
+        out_bf16, (x_bf16, w_bf16), grad.to(dev, torch.bfloat16)
+    )
+    self.assertLess(_relative_l2_error(out_bf16.double().cpu(), expected), 1e-2)
+    for actual_grad, expected_grad in zip(
+        grads_bf16, expected_grads, strict=True
+    ):
+      self.assertEqual(actual_grad.dtype, torch.bfloat16)
+      self.assertLess(
+          _relative_l2_error(actual_grad.double().cpu(), expected_grad), 2e-2
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_seq1", seq_len=1),
+      dict(testcase_name="_seq2", seq_len=2),
+      dict(testcase_name="_seq3", seq_len=3),
+  )
+  def test_causal_conv_silu_sequences_shorter_than_kernel(self, seq_len: int):
+    """Tests the conv backward when taps reach before the sequence start."""
+    torch.manual_seed(0)
+    channels, kernel_size = 8, 4
+    x = torch.randn(
+        2, seq_len, channels, dtype=torch.float64, requires_grad=True
+    )
+    weight = torch.randn(
+        channels, 1, kernel_size, dtype=torch.float64, requires_grad=True
+    )
+    grad = torch.randn(2, seq_len, channels, dtype=torch.float64)
+    expected = F.silu(
+        F.conv1d(
+            F.pad(x.transpose(1, 2), (kernel_size - 1, 0)),
+            weight,
+            groups=channels,
+        ).transpose(1, 2)
+    )
+    out = gated_delta.causal_conv_silu(x, weight)
+    torch.testing.assert_close(out, expected)
+    grads = torch.autograd.grad(out, (x, weight), grad)
+    expected_grads = torch.autograd.grad(expected, (x, weight), grad)
+    for actual_grad, expected_grad in zip(grads, expected_grads, strict=True):
+      torch.testing.assert_close(actual_grad, expected_grad)
+
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token
       # chunks), one has a single token, some span several chunks, and the
@@ -490,7 +564,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     grad_out = torch.randn_like(out)
     grads = torch.autograd.grad(out, (x, weight), grad_out)
-    expected_grads = torch.autograd.grad(expected, (x, weight), grad_out)
+    expected_grads = torch.autograd.grad(
+        expected, (x, weight), grad_out, retain_graph=True
+    )
     for name, grad, expected_grad in zip(
         ("x", "weight"), grads, expected_grads, strict=True
     ):
@@ -500,6 +576,30 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           atol=tol,
           rtol=tol,
           check_name=f"Packed Causal Conv {name} Grad",
+      )
+    # The slice-based backward of causal_conv_silu restarts at documents too.
+    out_silu = gated_delta.causal_conv_silu(x, weight, segment_ids)
+    expected_silu = F.silu(expected)
+    test_utils.check_equivalence(
+        out_silu.detach().cpu(),
+        expected_silu.detach().cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="Packed Causal Conv SiLU Forward",
+    )
+    grads_silu = torch.autograd.grad(out_silu, (x, weight), grad_out)
+    expected_silu_grads = torch.autograd.grad(
+        expected_silu, (x, weight), grad_out
+    )
+    for name, grad, expected_grad in zip(
+        ("x", "weight"), grads_silu, expected_silu_grads, strict=True
+    ):
+      test_utils.check_equivalence(
+          grad.cpu(),
+          expected_grad.cpu(),
+          atol=tol,
+          rtol=tol,
+          check_name=f"Packed Causal Conv SiLU {name} Grad",
       )
     # Negative control: without segment_ids, the taps cross documents.
     with torch.no_grad():

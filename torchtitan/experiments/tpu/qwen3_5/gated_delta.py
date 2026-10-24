@@ -38,11 +38,15 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def _same_segment(segment_ids_BS: torch.Tensor, shift: int) -> torch.Tensor:
   """``[B, S]``: whether token ``s - shift`` is in the document of token ``s``.
 
-  For ``s < shift`` the result is arbitrary; callers read zero padding there.
+  ``shift`` may be negative (a later token). Where ``s - shift`` is outside the
+  row, the result is arbitrary; callers read zero padding there.
   """
   seq_len = segment_ids_BS.shape[1]
-  earlier_BS = F.pad(segment_ids_BS, (shift, 0), value=-1)[:, :seq_len]
-  return earlier_BS == segment_ids_BS
+  if shift >= 0:
+    other_BS = F.pad(segment_ids_BS, (shift, 0), value=-1)[:, :seq_len]
+  else:
+    other_BS = F.pad(segment_ids_BS, (0, -shift), value=-1)[:, -shift:]
+  return other_BS == segment_ids_BS
 
 
 def _causal_conv(
@@ -71,10 +75,11 @@ def _causal_conv(
   seq_len = x_BSC.shape[1]
   kernel_size = weight_C1W.shape[-1]
   x_pad = F.pad(x_BSC, (0, 0, kernel_size - 1, 0))
-  # At-least-fp32 weights promote bf16/fp16 products (and their sum) to fp32
-  # while preserving fp64 and saving the input slices in the input dtype.
-  acc_dtype = torch.promote_types(weight_C1W.dtype, torch.float32)
-  weight_CW = weight_C1W[:, 0, :].to(acc_dtype)
+  # fp32 weights promote sub-fp32 products, and so the sum, to fp32, while
+  # autograd still saves the input slices in the input dtype.
+  weight_CW = weight_C1W[:, 0, :].to(
+      torch.promote_types(weight_C1W.dtype, torch.float32)
+  )
   out_BSC = None
   for k in range(kernel_size):
     x_shifted = x_pad[:, k : k + seq_len, :]
@@ -85,6 +90,152 @@ def _causal_conv(
     term = x_shifted * weight_CW[:, k]
     out_BSC = term if out_BSC is None else out_BSC + term
   return out_BSC.to(x_BSC.dtype)
+
+
+class _CausalConvSilu(torch.autograd.Function):
+  """``silu(_causal_conv(x, w))`` with a backward built from slices too.
+
+  Autograd of ``_causal_conv`` accumulates the ``W`` shifted input gradients
+  into the padded buffer with in-place adds at sublane-misaligned sequence
+  offsets, which XLA emits as ``dynamic-update-slice`` adds at ~0.19 TB/s on
+  TPU7x. The input gradient of a causal convolution is an anti-causal convolution of the
+  output gradient, ``dx[t] = sum_k w[k] * dy[t + W - 1 - k]``, so it is computed
+  from shifted slices of the end-padded output gradient instead, like the
+  forward. The convolution output is recomputed for ``silu``'s derivative.
+  With ``segment_ids_BS``, ``x[t]`` only reaches outputs of its own document.
+  """
+
+  @staticmethod
+  def forward(
+      ctx,
+      x_BSC: torch.Tensor,
+      weight_C1W: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None,
+  ):
+    ctx.save_for_backward(x_BSC, weight_C1W, segment_ids_BS)
+    return F.silu(_causal_conv(x_BSC, weight_C1W, segment_ids_BS))
+
+  @staticmethod
+  def backward(ctx, grad_BSC: torch.Tensor):
+    x_BSC, weight_C1W, segment_ids_BS = ctx.saved_tensors
+    seq_len = x_BSC.shape[1]
+    kernel_size = weight_C1W.shape[-1]
+    grad_y_BSC = torch.ops.aten.silu_backward(
+        grad_BSC, _causal_conv(x_BSC, weight_C1W, segment_ids_BS)
+    )
+    grad_pad = F.pad(grad_y_BSC, (0, 0, 0, kernel_size - 1))
+    weight_CW = weight_C1W[:, 0, :].to(
+        torch.promote_types(weight_C1W.dtype, torch.float32)
+    )
+    grad_x_BSC = None
+    grad_w = []
+    for k in range(kernel_size):
+      shift = kernel_size - 1 - k
+      # grad_shifted[t] = dy[t + shift], the output that w[k] links to x[t].
+      grad_shifted = grad_pad[:, shift : shift + seq_len, :].contiguous()
+      if segment_ids_BS is not None and shift > 0:
+        same_BS1 = _same_segment(segment_ids_BS, -shift).unsqueeze(-1)
+        grad_shifted = torch.where(same_BS1, grad_shifted, 0.0)
+      term = grad_shifted * weight_CW[:, k]
+      grad_x_BSC = term if grad_x_BSC is None else grad_x_BSC + term
+      if shift == 0:
+        grad_w.append((x_BSC * grad_y_BSC).sum(dim=(0, 1)))
+      elif segment_ids_BS is not None:
+        grad_w.append((x_BSC * grad_shifted).sum(dim=(0, 1)))
+      elif shift < seq_len:
+        grad_w.append(
+            (x_BSC[:, : seq_len - shift, :] * grad_y_BSC[:, shift:, :]).sum(
+                dim=(0, 1)
+            )
+        )
+      else:
+        grad_w.append(grad_y_BSC.new_zeros(weight_C1W.shape[0]))
+    grad_w_C1W = torch.stack(grad_w, dim=-1).unsqueeze(1)
+    return grad_x_BSC.to(x_BSC.dtype), grad_w_C1W.to(weight_C1W.dtype), None
+
+
+def causal_conv_silu(
+    x_BSC: torch.Tensor,
+    weight_C1W: torch.Tensor,
+    segment_ids_BS: torch.Tensor | None = None,
+) -> torch.Tensor:
+  """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
+
+  Args:
+    x_BSC: ``[B, S, C]`` input.
+    weight_C1W: ``[C, 1, W]`` depthwise ``Conv1d`` weight.
+    segment_ids_BS: Optional ``[B, S]`` document index of each token; the
+      convolution restarts at every document, as at the start of the row.
+
+  Returns:
+    ``[B, S, C]`` output.
+  """
+  return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
+
+
+def _matmul_bf16x3(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+  """Matmul of fp32 operands with near-fp32 accuracy from three bf16 passes.
+
+  torch_tpu runs fp32 matmuls at ``Precision.DEFAULT`` (one bf16 MXU pass) by
+  default. Splitting each operand into a bf16-exact high part and a residual
+  keeps ``hi @ hi + hi @ lo + lo @ hi`` accurate to about 2^-16 regardless of
+  the matmul precision setting.
+  """
+  a_hi = a.to(torch.bfloat16).float()
+  b_hi = b.to(torch.bfloat16).float()
+  return a_hi @ b_hi + (a_hi @ (b - b_hi) + (a - a_hi) @ b_hi)
+
+
+def _unit_lower_triangular_inverse(strict_lower: torch.Tensor) -> torch.Tensor:
+  """Returns ``(I + strict_lower)^-1`` for ``[..., C, C]`` with C a power of 2.
+
+  Recursive doubling over diagonal blocks: a unit lower-triangular matrix split
+  as ``[[A, 0], [L, D]]`` has inverse ``[[A^-1, 0], [-D^-1 L A^-1, D^-1]]``.
+  With ``T_s`` the block-diagonal matrix of the inverses of the ``s x s``
+  diagonal blocks and ``L_s`` the lower-left ``s x s`` quadrants of the
+  ``2s x 2s`` diagonal blocks of ``strict_lower``, this reads
+  ``T_2s = T_s - T_s L_s T_s``. Starting from ``T_2 = I - L_1``,
+  ``log2(C) - 1`` levels of two batched (bf16x3) ``C x C`` matmuls build the
+  inverse. Unlike a Neumann series, every intermediate is an entry of the
+  inverse itself, so there is no growth and cancellation.
+
+  Every intermediate stays ``[..., C, C]`` (masked, mostly-zero blocks are
+  multiplied too), so no ``s x s`` block is a trailing dimension that TPU would
+  pad to its ``(8, 128)`` tiles. On TPU7x this measured the same as a blockwise
+  ``[..., C/s, s, s]`` version (49 vs 50 ms forward + backward for 4 x 2048
+  tokens with 32 heads and 128-token chunks): both are bound by HBM traffic of
+  the ``[C, C]`` FP32 intermediates, which is what Tokamax's kernels
+  (``tokamax_gated_delta``) avoid.
+
+  Args:
+    strict_lower: ``[..., C, C]`` strictly lower-triangular matrices (the
+      diagonal and upper triangle must be zero).
+
+  Returns:
+    ``[..., C, C]`` inverses of ``I + strict_lower``.
+  """
+  c = strict_lower.shape[-1]
+  if c == 1:
+    return torch.ones_like(strict_lower)
+  idx = torch.arange(c, device=strict_lower.device)
+  row, col = idx.unsqueeze(-1), idx
+  inv = torch.eye(c, dtype=strict_lower.dtype, device=strict_lower.device)
+  s = 1
+  while s < c:
+    # Lower-left s x s quadrant of each diagonal 2s x 2s block.
+    quadrant = (
+        (row // (2 * s) == col // (2 * s))
+        & (row % (2 * s) >= s)
+        & (col % (2 * s) < s)
+    )
+    lower_left = strict_lower * quadrant
+    if s == 1:
+      # T_1 = I, so T_2 = I - L_1.
+      inv = inv - lower_left
+    else:
+      inv = inv - _matmul_bf16x3(inv, _matmul_bf16x3(lower_left, inv))
+    s *= 2
+  return inv
 
 
 def chunked_gated_delta(
@@ -99,10 +250,11 @@ def chunked_gated_delta(
   """Chunked gated delta rule in PyTorch (FLA ``chunk_gdn`` math).
 
   Work within each chunk is expressed as batched matrix multiplications over
-  all chunks at once, with the UT transform as one batched triangular solve;
-  only the inter-chunk state recurrence is sequential over
-  ``seq_len / chunk_size`` steps, and each step is three matmuls. Applies Q/K
-  L2 normalization and ``1 / sqrt(key_head_dim)`` query scaling in fp32.
+  all chunks at once (including the UT transform's unit lower-triangular
+  inverse, see ``_unit_lower_triangular_inverse``); only the inter-chunk state
+  recurrence is sequential over ``seq_len / chunk_size`` steps, and each step
+  is three matmuls. Applies Q/K L2 normalization and ``1 / sqrt(key_head_dim)``
+  query scaling in fp32.
 
   With ``segment_ids``, the state restarts from zero at the first token of
   every document, as in upstream's ``cu_seqlens`` kernels, through masks of
@@ -179,11 +331,10 @@ def chunked_gated_delta(
   # UT transform for all chunks at once:
   #   [W | U] = T [diag(beta) diag(exp(g)) K | diag(beta) V],
   #   T = (I + tril_{-1}(diag(beta) (K K^T * decay)))^-1.
-  # `unitriangular=True` takes the unit diagonal of `I + a` as given.
   k_beta = k * beta
   a = (k_beta @ k.transpose(-1, -2) * decay).tril(-1)
   rhs = torch.cat([k_beta * state_decay.unsqueeze(-1), v * beta], dim=-1)
-  wu = torch.linalg.solve_triangular(a, rhs, upper=False, unitriangular=True)
+  wu = _unit_lower_triangular_inverse(a) @ rhs
   w, u = wu[..., :d_k], wu[..., d_k:]
 
   # State-independent per-chunk terms, batched over all chunks.
@@ -211,7 +362,10 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
 
   @dataclass(kw_only=True, slots=True)
   class Config(GatedDeltaKernel.Config):
-    chunk_size: int = 64
+    # On TPU7x (4 x 2048 tokens, 32 heads x 128 dims), compiled forward +
+    # backward took 65 ms with 64-token chunks, 49 ms with 128, and 82 ms with
+    # 256.
+    chunk_size: int = 128
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -313,7 +467,7 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
         weight_C1W: torch.Tensor,
         head_dim: int,
     ) -> torch.Tensor:
-      return F.silu(_causal_conv(x_BSC, weight_C1W, segment_ids_BS)).unflatten(
+      return causal_conv_silu(x_BSC, weight_C1W, segment_ids_BS).unflatten(
           -1, (-1, head_dim)
       )
 

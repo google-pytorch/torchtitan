@@ -123,7 +123,7 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # TODO(jerryx99): Investigate numerical divergence b/540005818
+             # TODO(jerryx99): Investigate numerical divergence b/540005818
               device_type.AcceleratorDeviceType.TPU,
           ],
           loss_atol=1e-3,

@@ -12,7 +12,7 @@ Covers:
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls), plus Splash parity on TPU.
-4. Flavor, registry and recipe checks.
+4. Flavor, registry, recipe and MFU-accounting checks.
 """
 
 import copy
@@ -22,20 +22,24 @@ from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
+from torchtitan.config.override import OverrideConfig, apply_overrides
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import workarounds
+from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
@@ -1029,6 +1033,123 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(
         parsed.training.num_tokens_per_microbatch_per_dp_rank, 8192
     )
+
+  def test_35b_recipes(self):
+    """Tests the 35B-A3B recipes, their TPU kernels and MFU accounting."""
+    gt_spec = gt_qwen3_5.model_registry("35B-A3B")
+    self.assertEqual(gt_spec.name, "qwen3_5")
+    self.assertIs(gt_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5)
+
+    def moe_kernels(cfg):
+      experts = [
+          (
+              e.use_pallas_grouped_mm,
+              e.use_pallas_paired_grouped_mm,
+              e.use_kernel_native_weight_layout,
+          )
+          for _, e, _, _ in cfg.model_spec.model.traverse(
+              TpuGroupedExperts.Config
+          )
+      ]
+      fused = [
+          d.fuse_route_score_backward
+          for _, d, _, _ in cfg.model_spec.model.traverse(
+              TpuAllToAllTokenDispatcher.Config
+          )
+      ]
+      return experts, fused
+
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
+        config_registry.qwen35_moe_35b().override.imports,
+    )
+
+    # The benchmark recipe: ZeRO-3, graph split (2 layers per executable),
+    # fused AdamW outside the graph, Tokamax GatedDeltaNet, Pallas MoE / CE
+    # kernels, and Splash attention.
+    bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+    self.assertEqual(
+        bench_cfg.override.imports,
+        [
+            config_registry.FUSED_LOSS_OVERRIDE,
+            config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
+        ],
+    )
+    self.assertEqual(
+        moe_kernels(bench_cfg), ([(True, True, True)] * 40, [True] * 40)
+    )
+    self.assertEqual(bench_cfg.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertEqual(bench_cfg.parallelism.expert_parallel_degree, 1)
+    self.assertTrue(bench_cfg.parallelism.enable_tpu_topo_mesh)
+    self.assertEqual(
+        bench_cfg.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
+    )
+    self.assertEqual(bench_cfg.training.dtype, "bfloat16")
+    tpu_config = bench_cfg.tpu_config
+    self.assertTrue(tpu_config.use_graph_trainer)
+    self.assertEqual(tpu_config.graph_trainer_memory_policy, "tpu_selective")
+    self.assertEqual(
+        tpu_config.graph_trainer_save_regions,
+        ("moe.routing", "attention.inner_attention"),
+    )
+    self.assertTrue(tpu_config.use_graph_split)
+    self.assertEqual(tpu_config.graph_split.forward_layers_per_executable, 2)
+    self.assertEqual(tpu_config.graph_split.backward_layers_per_executable, 2)
+    self.assertEqual(
+        tpu_config.graph_split.backward_partition_mode, "fsdp_pipeline"
+    )
+    self.assertFalse(tpu_config.optimizer_in_graph)
+    self.assertTrue(tpu_config.compile_grad_norm)
+    self.assertEqual(bench_cfg.optimizer.implementation, "fused")
+    self.assertTrue(
+        bench_cfg.splash_attention_kernel.use_splash_attention_kernel
+    )
+    self.assertIsInstance(bench_cfg.loss, PallasCrossEntropyLoss.Config)
+
+    # The fused loss override only: the Tokamax one needs Tokamax's KDA op.
+    apply_overrides(
+        OverrideConfig(imports=[config_registry.FUSED_LOSS_OVERRIDE]), bench_cfg
+    )
+    with torch.device("meta"):
+      meta_model = bench_cfg.model_spec.model.build()
+    workarounds._check_fused_loss_logit_transform(meta_model, bench_cfg)  # pylint: disable=protected-access
+    inner_experts = meta_model.layers["0"].moe.routed_experts.inner_experts
+    self.assertIsInstance(inner_experts, TpuGroupedExperts)
+
+    # 35B-A3B parameter and MFU accounting. Active params exclude the input
+    # embedding and count the top-8 of 256 routed experts. FLOPs per token are
+    # 6 * active params, plus 10 quadratic attention layers
+    # (6 * 16 heads * (256 + 256) * seq_len each), plus 30 delta-rule layers
+    # (6 * 3 * 32 value heads * 128 * 128 each).
+    seq_len = bench_cfg.training.max_context_length
+    self.assertEqual(seq_len, 2048)
+    total_params, flops_per_token = (
+        bench_cfg.model_spec.model.get_nparams_and_flops(meta_model, seq_len)
+    )
+    self.assertEqual(total_params, 34_660_610_688)
+    self.assertEqual(
+        flops_per_token,
+        6 * 2_946_429_568
+        + 10 * 6 * 16 * (256 + 256) * seq_len
+        + 30 * 6 * 3 * 32 * 128 * 128,
+    )
+
+    # The recipes parse from the command line.
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--training.steps=20",
+        "--training.max_context_length=8192",
+        "--training.num_tokens_per_microbatch_per_dp_rank=65536",
+    ])
+    self.assertEqual(parsed.training.steps, 20)
+    self.assertEqual(parsed.training.max_context_length, 8192)
+    self.assertEqual(
+        parsed.training.num_tokens_per_microbatch_per_dp_rank, 65536
+    )
+    self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
+    self.assertEqual(parsed.model_spec.max_context_length, 262144)
 
 
 if __name__ == "__main__":

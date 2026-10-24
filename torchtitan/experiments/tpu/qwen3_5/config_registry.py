@@ -339,6 +339,12 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
   )
   _use_tokamax_gated_delta(cfg)
   _no_gated_delta_document_resets(cfg)
+  # One hidden block (H=2048) keeps every x tile resident in the fused LCE
+  # backward; v=640 divides the 248320 vocabulary. On one TPU7x core at 64K
+  # tokens: 564 vs 633 ms forward + backward with (1024, 512, 2048).
+  _enable_pallas_cross_entropy(
+      cfg, b_block_size=1024, h_block_size=2048, v_block_size=640
+  )
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       tpu_flags.TPU7X_THROUGHPUT_P_STATE,

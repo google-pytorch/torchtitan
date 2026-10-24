@@ -89,7 +89,7 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
 * **Attention**: Splash attention with segment ids from `positions`; 1024
   blocks keep `head_dim=256` within the scoped VMEM limit.
 * **Loss**: Pallas fused linear cross-entropy (no `[tokens, 248320]` logits in
-  HBM).
+  HBM) with one hidden block (`(b, h, v) = (1024, 2048, 640)`).
 * **Logging** every 5 steps: a per-step `loss.item()` keeps the host from
   dispatching the next step while the current one runs.
 * **libtpu flags**: `xla_tpu_dvfs_p_state=7` (throughput operating point);
@@ -108,7 +108,7 @@ packed-document resets, `mixed_precision_reduce="float32"`,
 
 | Slice (chips, ranks) | Step time | Tokens/s/rank | TFLOPS/rank | MFU | HBM |
 | --- | --- | --- | --- | --- | --- |
-| `2x2x1` (4, 8) | 6.46 s | 10,153 | 223.24 | 19.35% | 37.84 GiB |
+| `2x2x1` (4, 8) | 6.36 s | 10,307 | 226.63 | 19.65% | 37.84 GiB |
 
 ## Expert Parallelism
 

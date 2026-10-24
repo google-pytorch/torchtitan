@@ -24,6 +24,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
@@ -91,6 +92,20 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
       TpuAllToAllTokenDispatcher.Config
   ):
     dispatcher.fuse_route_score_backward = True
+
+
+def _no_gated_delta_document_resets(cfg: TPUTrainerConfig) -> None:
+  """Runs every GatedDeltaNet over whole rows, without packed-document resets.
+
+  Pretraining on packed text does not need the causal convolution and the
+  recurrence to restart at each document (upstream does not without
+  `cu_seqlens`), and the Tokamax kernels' restarts lay every document out
+  from a 64-token chunk boundary. Full attention still masks documents.
+  """
+  for _, delta_net, _, _ in cfg.model_spec.model.traverse(
+      TpuGatedDeltaNet.Config
+  ):
+    delta_net.reset_at_documents = False
 
 
 def _use_tokamax_gated_delta(cfg: TPUTrainerConfig) -> None:
@@ -323,6 +338,7 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
       "attention.inner_attention",
   )
   _use_tokamax_gated_delta(cfg)
+  _no_gated_delta_document_resets(cfg)
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       tpu_flags.TPU7X_THROUGHPUT_P_STATE,

@@ -746,6 +746,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         0.1,
         msg="Negative control failed: no GDN leak without positions",
     )
+    # reset_at_documents=False (pretraining) ignores positions: whole rows.
+    gdn.reset_at_documents = False
+    with torch.no_grad():
+      with set_unflatten_seq_len(seq_len):
+        out_no_reset = gdn(x, positions=positions)
+    test_utils.check_equivalence(
+        out_no_reset.cpu(),
+        out_leaky.cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Without Document Resets",
+    )
 
   def test_model_isolates_packed_documents(self):
     """Tests that documents packed into rows equal the documents run alone.
@@ -1069,6 +1081,17 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     # kernels, and Splash attention.
     bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
     self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+    # Pretraining: no GatedDeltaNet packed-document resets (RL keeps them).
+    def resets(cfg):
+      return [
+          d.reset_at_documents
+          for _, d, _, _ in cfg.model_spec.model.traverse(
+              gated_delta.TpuGatedDeltaNet.Config
+          )
+      ]
+
+    self.assertEqual(resets(bench_cfg), [False] * 30)
+    self.assertEqual(resets(config_registry.qwen35_moe_35b()), [True] * 30)
     self.assertEqual(
         bench_cfg.override.imports,
         [

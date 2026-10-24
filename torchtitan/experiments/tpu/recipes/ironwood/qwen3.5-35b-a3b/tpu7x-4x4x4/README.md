@@ -78,8 +78,12 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   (`optimizer_in_graph=False`, `compile_grad_norm=True`).
 * **`GatedDeltaNet`**: Tokamax's Mosaic TPU KDA kernels
   (`TokamaxGatedDeltaKernel`, through the `tokamax_gated_delta_kernel`
-  override), with the forward returning the backward kernels' residuals; the
-  causal convolution and its input gradient are computed from shifted slices.
+  override), with the forward returning the backward kernels' residuals.
+  Pretraining runs it over whole `[B, S]` rows (`reset_at_documents=False`):
+  restarting at packed documents makes the kernels lay every document out
+  from a 64-token chunk boundary (6.74 vs 9.78 s/step at 64K tokens per rank
+  on `2x2x1`). The causal convolution and its input gradient are
+  computed from shifted slices.
 * **MoE**: Pallas paired grouped matmuls with kernel-native expert weights
   and the fused route-score backward.
 * **Attention**: Splash attention with segment ids from `positions`; 1024
@@ -96,17 +100,15 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
 
 ## Benchmark Results
 
-Full 40-layer model (`qwen35_moe_35b_split_tokamax_benchmark`,
-`mixed_precision_reduce="float32"`, `enable_tpu_topo_mesh=True`), one
-`tpu7x-2x2x1` host (4 chips, 8 ranks), Cloud GKE, step 20 of 20:
+Full 40-layer model (`qwen35_moe_35b_split_tokamax_benchmark`: no GatedDeltaNet
+packed-document resets, `mixed_precision_reduce="float32"`,
+`enable_tpu_topo_mesh=True`), context length 8192
+(`--training.max_context_length=8192`), 65,536 tokens per rank (`8 × 8192`),
+2 layers per executable, Cloud GKE (224-vCPU hosts), step 20 of 20:
 
-| Context | Tokens/rank | Step time | Tokens/s/rank | TFLOPS/rank | MFU | HBM |
-| --- | --- | --- | --- | --- | --- | --- |
-| 2048 | 32,768 (`16 × 2048`) | 4.78 s | 6,849 | 129.91 | 11.26% | 23.96 GiB |
-| 8192 | 65,536 (`8 × 8192`) | 9.78 s | 6,703 | 147.38 | 12.78% | 45.11 GiB |
-
-The GatedDeltaNet restarts at every packed document here, and Tokamax lays
-every document out from a 64-token chunk boundary for that (see Notes).
+| Slice (chips, ranks) | Step time | Tokens/s/rank | TFLOPS/rank | MFU | HBM |
+| --- | --- | --- | --- | --- | --- |
+| `2x2x1` (4, 8) | 6.74 s | 9,727 | 213.89 | 18.54% | 40.12 GiB |
 
 ## Expert Parallelism
 
@@ -143,14 +145,11 @@ for scaling beyond what FSDP alone fits.
 
 ## Notes
 
-* Packed documents: the attention masks documents via `positions`, and the
-  `GatedDeltaNet` restarts its causal convolution and delta-rule state at every
-  document (`positions == 0`), through static-shape `[B, S]` segment ids
-  instead of upstream's varlen `cu_seqlens`. The XLA kernel masks within
-  chunks; Tokamax's kernels take `segment_ids` and lay every document out from
-  a 64-token chunk boundary, keeping up to `max_num_segments` documents per row
-  apart (default: one per 512 tokens, at most 12% more kernel tokens; later
-  documents of a row share one recurrence).
+* With `reset_at_documents=False` (this recipe), `GatedDeltaNet` runs one
+  recurrence per `[B, S]` row: documents packed into a row share the causal
+  convolution and the delta-rule state. The default (`True`, for RL) restarts
+  both at every document (`positions == 0`). Attention always masks documents
+  via `positions`.
 * The Tokamax kernels clamp the per-token log decay at -5
   (`TokamaxGatedDeltaKernel.Config.min_log_decay`): the kernel's sub-chunk
   factoring overflows below it, which produced NaN gradients with the model's

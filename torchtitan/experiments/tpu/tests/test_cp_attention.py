@@ -464,6 +464,37 @@ class CPShardTest(parameterized.TestCase):
           bad_batch, shardings, cp_mesh, "headtail", None
       )
 
+  def test_cp_rank_cache_device_normalization(self):
+    """_CP_RANK_CACHE normalizes device keys across cp_shard, init_weights and forward."""
+    self.assertEqual(
+        cp_attention._normalize_cp_device("cpu"),
+        cp_attention._normalize_cp_device(torch.device("cpu", 0)),
+    )
+    fake_accel_mod = SimpleNamespace(current_device=lambda: 3)
+    with mock.patch.object(torch, "cuda", fake_accel_mod):
+      self.assertEqual(
+          cp_attention._normalize_cp_device("cuda"),
+          torch.device("cuda", 3),
+      )
+      self.assertEqual(
+          cp_attention._normalize_cp_device(torch.device("cuda", 1)),
+          torch.device("cuda", 1),
+      )
+
+    attn = KVAllGatherCPScaledDotProductInnerAttention(
+        KVAllGatherCPScaledDotProductInnerAttention.Config(
+            allow_reference_attention=True
+        )
+    )
+    group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    with mock.patch.object(cp_attention, "spmd_mesh_group", lambda axis: group):
+      attn.init_weights(buffer_device=torch.device("cpu", 0))
+    cached = cp_attention._CP_RANK_CACHE[(torch.device("cpu"), 1)]
+    self.assertIs(
+        attn._get_cp_rank_tensor(torch.device("cpu"), group),
+        cached,
+    )
+
   @parameterized.parameters(
       (16, 2), (16, 4), (16, 8), (48, 3), (64, 4), (64, 8)
   )

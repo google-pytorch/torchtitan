@@ -55,6 +55,7 @@ from torchtitan.models.common.attention import (
     segment_ids_from_positions,
 )
 from torchtitan.models.common.cp_attention import CPInnerAttention
+from torchtitan.tools.logging import logger
 
 __all__ = [
     "UlyssesCPInnerAttention",
@@ -80,9 +81,32 @@ _HEAD_DIM = 1
 _CP_RANK_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
+def _normalize_cp_device(device: torch.device | str) -> torch.device:
+  """Returns a canonical ``torch.device`` for ``_CP_RANK_CACHE`` keys.
+
+  ``_cache_cp_rank_for_mesh``, ``init_weights`` and ``_get_cp_rank_tensor``
+  receive the device from different sources (mesh ``device_type``,
+  ``buffer_device``, ``q_THK.device``). Normalizing ``cpu:0`` -> ``cpu`` and
+  filling in a missing accelerator index from the active device module's
+  ``current_device()`` (or 0) keeps all three on the same cache key.
+  """
+  dev = torch.device(device)
+  if dev.type == "cpu":
+    return torch.device("cpu")
+  if dev.index is not None:
+    return dev
+  dev_mod = getattr(torch, dev.type, None)
+  idx = 0
+  if dev_mod is not None and hasattr(dev_mod, "current_device"):
+    try:
+      idx = int(dev_mod.current_device())
+    except Exception:  # pylint: disable=broad-exception-caught
+      idx = 0
+  return torch.device(dev.type, idx)
+
+
 def _cache_cp_rank_for_mesh(cp_mesh: DeviceMesh) -> None:
-  dev_type = cp_mesh.device_type
-  dev = torch.device(f"{dev_type}:0" if dev_type != "cpu" else "cpu")
+  dev = _normalize_cp_device(cp_mesh.device_type)
   r = int(cp_mesh.get_local_rank())
   key = (dev, r)
   if key not in _CP_RANK_CACHE:
@@ -378,29 +402,49 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
     # The local attention kernel, plugged in with set_local_attention.
     self.set_local_attention(None)
 
+  def _init_self_buffers(
+      self, *, buffer_device: torch.device | None = None
+  ) -> None:
+    if hasattr(super(), "_init_self_buffers"):
+      super()._init_self_buffers(buffer_device=buffer_device)  # pyrefly: ignore[missing-attribute]
+    self._maybe_cache_cp_rank(buffer_device)
+
   def init_weights(self, **kwargs) -> None:
-    super().init_weights(**kwargs)  # pyrefly: ignore[missing-attribute]
+    if hasattr(super(), "init_weights"):
+      super().init_weights(**kwargs)  # pyrefly: ignore[missing-attribute]
+    self._maybe_cache_cp_rank(kwargs.get("buffer_device"))
+
+  def _maybe_cache_cp_rank(
+      self, buffer_device: torch.device | str | None
+  ) -> None:
     group = spmd_mesh_group(MeshAxisName.CP)
-    buffer_device = kwargs.get("buffer_device")
     if (
         group is not None
         and buffer_device is not None
-        and buffer_device.type != "meta"
+        and torch.device(buffer_device).type != "meta"
     ):
+      dev = _normalize_cp_device(buffer_device)
       r = int(group.rank())
-      _CP_RANK_CACHE[(buffer_device, r)] = torch.tensor(
-          [r], dtype=torch.int32, device=buffer_device
+      _CP_RANK_CACHE[(dev, r)] = torch.tensor(
+          [r], dtype=torch.int32, device=dev
       )
 
   def _get_cp_rank_tensor(
       self, device: torch.device, group: Any
   ) -> torch.Tensor:
     r = int(group.rank())
-    key = (device, r)
+    dev = _normalize_cp_device(device)
+    key = (dev, r)
     cached = _CP_RANK_CACHE.get(key)
     if cached is not None:
       return cached
-    t = torch.tensor([r], dtype=torch.int32, device=device)
+    if _tracing():
+      logger.debug(
+          "CP rank cache miss while tracing for key=%s; falling back to inline"
+          " tensor creation.",
+          key,
+      )
+    t = torch.tensor([r], dtype=torch.int32, device=dev)
     if not _tracing():
       _CP_RANK_CACHE[key] = t
     return t

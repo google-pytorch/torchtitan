@@ -30,6 +30,7 @@ from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     gemma4_debugmodel_fused_ce,
     gemma4_moe_debug,
     gemma4_moe_debug_fused_ce,
+    gemma4_moe_debug_pallas,
     gemma4_moe_testmodel,
 )
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
@@ -53,6 +54,7 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
     FusedLossLinearWrapper,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
@@ -1344,6 +1346,280 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
         grad_uncapped_rel,
         0.1,
         f"Uncapped grad relative L2 was only {grad_uncapped_rel:.3e}; soft-cap check is not sensitive.",
+    )
+
+
+class TestGemma4MoEPallasKernels(BaseDeviceTest):
+  """Tests MoE Pallas kernels, kernel-native weights, and route-score fusion for Gemma 4."""
+
+  def setUp(self):
+    super().setUp()
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous_precision)
+
+  def _check_relative_l2(
+      self,
+      test: torch.Tensor,
+      reference: torch.Tensor,
+      max_rel_error: float,
+      check_name: str,
+  ) -> None:
+    test_f = test.detach().float().cpu()
+    ref_f = reference.detach().float().cpu()
+    rel_error = (
+        torch.linalg.vector_norm(test_f - ref_f)
+        / torch.linalg.vector_norm(ref_f).clamp_min(1e-12)
+    ).item()
+    self.assertLessEqual(
+        rel_error,
+        max_rel_error,
+        f"{check_name}: relative L2 error {rel_error:.3e} >"
+        f" {max_rel_error:.1e}",
+    )
+
+  @parameterized.parameters(gemma4_moe_debug_pallas, gemma4_26b_a4b)
+  def test_moe_pallas_config_enables_all_five_levers(self, recipe):
+    cfg = recipe()
+    model_cfg = cfg.model_spec.model
+    dispatchers = list(
+        model_cfg.traverse(TpuAllToAllTokenDispatcher.Config)
+    )
+    self.assertNotEmpty(dispatchers)
+    for _, dispatcher, _, _ in dispatchers:
+      self.assertTrue(dispatcher.fuse_route_score_backward)
+
+    experts_list = list(model_cfg.traverse(TpuGroupedExperts.Config))
+    self.assertNotEmpty(experts_list)
+    for _, experts, _, _ in experts_list:
+      self.assertEqual(experts.activation, "gelu_tanh")
+      self.assertTrue(experts.use_pallas_grouped_mm)
+      self.assertTrue(experts.use_pallas_paired_grouped_mm)
+      self.assertEqual(experts.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(experts.pallas_grouped_mm_tile_k, 0)
+      self.assertEqual(experts.pallas_grouped_mm_tile_n, 0)
+      self.assertEqual(experts.pallas_grouped_mm_tgmm_tiling, (256, 0, 0))
+      self.assertTrue(experts.use_kernel_native_weight_layout)
+
+  def test_kernel_native_weight_layout_state_dict_adapter_round_trip(self):
+    """Kernel-native expert storage (w1_EDF, w2_EFD, w3_EDF) round-trips through HF state_dict."""
+    torch.manual_seed(0)
+    cfg = _build_flavor_config(
+        "testmodel_moe",
+        converters=[
+            TpuTokenDispatcherConverter.Config(),
+            TpuGroupedExpertsConverter.Config(),
+        ],
+        enable_weight_tying=False,
+    )
+    for _, experts, _, _ in cfg.traverse(TpuGroupedExperts.Config):
+      experts.use_pallas_grouped_mm = True
+      experts.use_pallas_paired_grouped_mm = True
+      experts.pallas_grouped_mm_tile_m = 256
+      experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+      experts.use_kernel_native_weight_layout = True
+
+    model = cfg.build()
+    model.init_states()
+
+    inner = model.layers["0"].moe.routed_experts.inner_experts
+    # Native in-memory parameters are transposed: (E=8, D=128, F=128).
+    self.assertTrue(hasattr(inner, "w1_EDF"))
+    self.assertTrue(hasattr(inner, "w2_EFD"))
+    self.assertTrue(hasattr(inner, "w3_EDF"))
+    self.assertFalse(hasattr(inner, "w1_EFD"))
+
+    # Fill w1_EDF with an asymmetric tensor so a missing transpose is caught even when D == F.
+    for layer in model.layers.values():
+      exp = layer.moe.routed_experts.inner_experts
+      with torch.no_grad():
+        exp.w1_EDF.copy_(torch.randn_like(exp.w1_EDF))
+        exp.w2_EFD.copy_(torch.randn_like(exp.w2_EFD))
+        exp.w3_EDF.copy_(torch.randn_like(exp.w3_EDF))
+
+    expected_w1_edf = inner.w1_EDF.detach().clone()
+    expected_w2_efd = inner.w2_EFD.detach().clone()
+    expected_w3_edf = inner.w3_EDF.detach().clone()
+
+    # state_dict() post-hook must expose canonical keys (w1_EFD, w2_EDF, w3_EFD)
+    # with transposed values.
+    tt_sd = model.state_dict()
+    self.assertIn(
+        "layers.0.moe.routed_experts.inner_experts.w1_EFD", tt_sd
+    )
+    self.assertNotIn(
+        "layers.0.moe.routed_experts.inner_experts.w1_EDF", tt_sd
+    )
+    torch.testing.assert_close(
+        tt_sd["layers.0.moe.routed_experts.inner_experts.w1_EFD"],
+        expected_w1_edf.transpose(-2, -1),
+    )
+
+    adapter = Gemma4StateDictAdapter(cfg, hf_assets_path=None)
+    hf_sd = adapter.to_hf(tt_sd)
+    self.assertIn(
+        "model.language_model.layers.0.experts.gate_up_proj", hf_sd
+    )
+    self.assertIn("model.language_model.layers.0.experts.down_proj", hf_sd)
+
+    # Zero out model weights and reload from converted HF state dict.
+    with torch.no_grad():
+      for p in model.parameters():
+        p.zero_()
+    reloaded_tt_sd = adapter.from_hf(hf_sd)
+    missing, unexpected = model.load_state_dict(reloaded_tt_sd, strict=True)
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    torch.testing.assert_close(inner.w1_EDF, expected_w1_edf)
+    torch.testing.assert_close(inner.w2_EFD, expected_w2_efd)
+    torch.testing.assert_close(inner.w3_EDF, expected_w3_edf)
+
+  def test_configure_simple_fsdp_shard_dims_with_kernel_native_weights(self):
+    """configure_gemma4_simple_fsdp_shard_dims shards uneven experts on dim 1 under native layout."""
+    from types import SimpleNamespace
+
+    cfg = gemma4_moe_debug_pallas().model_spec.model
+    # Set E=8 (not divisible by dp_shard=6), D=192 and F=96 (both divisible by 6).
+    cfg.vocab_size = 192
+    cfg.dim = 192
+    cfg.tok_embeddings.num_embeddings = 192
+    cfg.tok_embeddings.embedding_dim = 192
+    cfg.lm_head.in_features = 192
+    cfg.lm_head.out_features = 192
+    for layer in cfg.layers:
+      experts = layer.moe.routed_experts.inner_experts
+      experts.num_experts = 8
+      experts.dim = 192
+      experts.hidden_dim = 96
+
+    with torch.device("meta"):
+      model = cfg.build()
+    pdims = SimpleNamespace(dp_shard=6, ep_enabled=False)
+    configure_gemma4_simple_fsdp_shard_dims(model, pdims)
+    for layer in model.layers.values():
+      inner = layer.moe.routed_experts.inner_experts
+      self.assertEqual(getattr(inner, "_fsdp_shard_dim", None), 1)
+
+  def test_gemma4_moe_pallas_kernels_match_native_reference(self):
+    """Full Gemma4MoE with Pallas grouped MM, paired W1/W3, native weights, and fused route-score bwd."""
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("MoE Pallas grouped matmul kernels only run on TPU.")
+
+    use_cpu_safe_histc_patch()
+    torch.manual_seed(123)
+
+    ref_cfg = copy.deepcopy(gemma4_moe_debug().model_spec.model.layers[0].moe)
+    cand_cfg = copy.deepcopy(
+        gemma4_moe_debug_pallas().model_spec.model.layers[0].moe
+    )
+
+    ref_moe = ref_cfg.build().to(self.accelerator_device)
+    ref_moe.init_states()
+    # Perturb unit-initialized router and norm scales so scaling bugs are caught.
+    with torch.no_grad():
+      ref_moe.pre_feedforward_layernorm_2.weight.copy_(
+          1.0 + 0.1 * torch.randn_like(ref_moe.pre_feedforward_layernorm_2.weight)
+      )
+      ref_moe.router.scale.copy_(
+          1.0 + 0.1 * torch.randn_like(ref_moe.router.scale)
+      )
+      ref_moe.router.per_expert_scale.copy_(
+          1.0 + 0.1 * torch.randn_like(ref_moe.router.per_expert_scale)
+      )
+
+    cand_moe = cand_cfg.build().to(self.accelerator_device)
+    cand_moe.init_states()
+    missing, unexpected = cand_moe.load_state_dict(
+        ref_moe.state_dict(), strict=True
+    )
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    # 512 tokens * top_k=2 = 1024 routed tokens (4 tiles of tile_m=256).
+    num_tokens, dim = 512, 256
+    x_ref = torch.randn(
+        num_tokens, dim, device=self.accelerator_device, requires_grad=True
+    )
+    x_cand = x_ref.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(num_tokens, dim, device=self.accelerator_device)
+
+    y_ref = ref_moe(x_ref)
+    y_cand = cand_moe(x_cand)
+
+    self._check_relative_l2(
+        y_cand,
+        y_ref,
+        max_rel_error=1e-2,
+        check_name="Gemma4MoE Pallas forward",
+    )
+
+    y_ref.backward(grad_out)
+    y_cand.backward(grad_out)
+
+    self._check_relative_l2(
+        x_cand.grad,
+        x_ref.grad,
+        max_rel_error=2e-2,
+        check_name="Gemma4MoE Pallas input grad",
+    )
+
+    ref_grads = {
+        name: p.grad.detach()
+        for name, p in ref_moe.named_parameters()
+        if p.grad is not None
+    }
+    cand_grads_raw = {
+        name: p.grad.detach()
+        for name, p in cand_moe.named_parameters()
+        if p.grad is not None
+    }
+    # Map kernel-native parameter gradient names/shapes back to canonical layout.
+    native_to_canonical = {
+        "routed_experts.inner_experts.w1_EDF": (
+            "routed_experts.inner_experts.w1_EFD"
+        ),
+        "routed_experts.inner_experts.w2_EFD": (
+            "routed_experts.inner_experts.w2_EDF"
+        ),
+        "routed_experts.inner_experts.w3_EDF": (
+            "routed_experts.inner_experts.w3_EFD"
+        ),
+    }
+    cand_grads = {}
+    for name, g in cand_grads_raw.items():
+      if name in native_to_canonical:
+        cand_grads[native_to_canonical[name]] = g.transpose(-2, -1).contiguous()
+      else:
+        cand_grads[name] = g
+
+    self.assertEqual(set(cand_grads.keys()), set(ref_grads.keys()))
+    for name in sorted(ref_grads.keys()):
+      self._check_relative_l2(
+          cand_grads[name],
+          ref_grads[name],
+          max_rel_error=2.5e-2,
+          check_name=f"Gemma4MoE Pallas param grad ({name})",
+      )
+
+    # Negative control: if the Pallas path ran silu instead of gelu_tanh on the
+    # same weights and inputs, the output would shift by >10% relative L2.
+    silu_cfg = copy.deepcopy(cand_cfg)
+    silu_cfg.routed_experts.inner_experts.activation = "silu"
+    silu_moe = silu_cfg.build().to(self.accelerator_device)
+    silu_moe.init_states()
+    silu_moe.load_state_dict(ref_moe.state_dict(), strict=True)
+    with torch.no_grad():
+      y_silu = silu_moe(x_ref.detach())
+    silu_rel_diff = (
+        torch.linalg.vector_norm((y_silu - y_ref).float())
+        / torch.linalg.vector_norm(y_ref.float())
+    ).item()
+    self.assertGreater(
+        silu_rel_diff,
+        0.1,
+        f"SiLU MoE output differed by only {silu_rel_diff:.3e} from GeLU-tanh;"
+        " the 1e-2 check above would not catch a wrong activation.",
     )
 
 

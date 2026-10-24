@@ -255,8 +255,9 @@ class TrainMinimalDistributedTest(
           param_atol=1e-2,
           param_rtol=1e-3,
       ),
-      # torch.compile (skipped on CPU) with TPUSelectiveAC, which
-      # parallelize_qwen3 uses for CP in place of the recipe's SelectiveAC.
+      # torch.compile (skipped on CPU) with TPUSelectiveAC and the Tokamax
+      # Splash kernel, exercising set_local_attention, cp_rank propagation, and
+      # head-tail mask slicing end-to-end against the CPU reference.
       dict(
           testcase_name="qwen3_cp_all_gather_compile",
           module="qwen3",
@@ -265,6 +266,17 @@ class TrainMinimalDistributedTest(
           tensor_parallel_degree=1,
           context_parallel_degree=-1,
           enable_compile=True,
+          args=[
+              "--training.max_context_length=1024",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+              "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+              "--splash_attention_kernel.sa_block_q=128",
+              "--splash_attention_kernel.sa_block_kv=128",
+              "--splash_attention_kernel.sa_block_kv_compute=128",
+              "--splash_attention_kernel.sa_block_q_dkv=128",
+              "--splash_attention_kernel.sa_block_kv_dkv=128",
+              "--splash_attention_kernel.sa_block_kv_dkv_compute=128",
+          ],
           loss_atol=2e-2,
           loss_rtol=1e-3,
           grad_atol=2e-2,
@@ -280,6 +292,17 @@ class TrainMinimalDistributedTest(
           tensor_parallel_degree=1,
           context_parallel_degree=-1,
           enable_compile=True,
+          args=[
+              "--training.max_context_length=1024",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+              "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+              "--splash_attention_kernel.sa_block_q=128",
+              "--splash_attention_kernel.sa_block_kv=128",
+              "--splash_attention_kernel.sa_block_kv_compute=128",
+              "--splash_attention_kernel.sa_block_q_dkv=128",
+              "--splash_attention_kernel.sa_block_kv_dkv=128",
+              "--splash_attention_kernel.sa_block_kv_dkv_compute=128",
+          ],
           loss_atol=2e-2,
           loss_rtol=1e-3,
           grad_atol=2e-2,

@@ -497,6 +497,82 @@ def config_to_input_distribution(
     return InputDistribution.REPLICATE
 
 
+def _apply_cpu_splash_reference_patch(model: nn.Module) -> None:
+  """Makes CPU ScaledDotProductInnerAttention apply segment_ids/window masks like Splash."""
+  from torchtitan.models.common.attention import (  # pylint: disable=g-import-not-at-top
+      ScaledDotProductInnerAttention,
+      segment_ids_from_positions,
+  )
+
+  for module in model.modules():
+    if not isinstance(module, ScaledDotProductInnerAttention):
+      continue
+    window = getattr(module, "sliding_window_size", None)
+
+    def _splash_ref_forward(
+        q,
+        k,
+        v,
+        *,
+        scale=None,
+        enable_gqa=False,
+        is_causal=True,
+        segment_ids=None,
+        positions=None,
+        _orig=module.forward,
+        _window=window,
+        **kwargs,
+    ):
+      if segment_ids is None and positions is not None:
+        segment_ids = segment_ids_from_positions(positions)
+      if segment_ids is None and _window is None:
+        return _orig(
+            q,
+            k,
+            v,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            is_causal=is_causal,
+            **kwargs,
+        )
+      was_3d = q.ndim == 3
+      if was_3d:
+        q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+      bsz, seq_len = q.shape[0], q.shape[1]
+      pos = torch.arange(seq_len, device=q.device)
+      mask = torch.ones(
+          (bsz, 1, seq_len, seq_len), dtype=torch.bool, device=q.device
+      )
+      if is_causal:
+        mask = mask & (pos[None, None, :, None] >= pos[None, None, None, :])
+      if _window is not None:
+        mask = mask & (
+            pos[None, None, :, None] - pos[None, None, None, :] <= _window
+        )
+      if segment_ids is not None:
+        seg = (
+            segment_ids.unsqueeze(0)
+            if segment_ids.ndim == 1
+            else segment_ids.reshape(bsz, seq_len)
+        )
+        mask = mask & (seg[:, None, :, None] == seg[:, None, None, :])
+      q_bh = q.transpose(1, 2)
+      k_bh = k.transpose(1, 2)
+      v_bh = v.transpose(1, 2)
+      out = torch.nn.functional.scaled_dot_product_attention(
+          q_bh,
+          k_bh,
+          v_bh,
+          attn_mask=mask,
+          is_causal=False,
+          scale=scale,
+          enable_gqa=enable_gqa,
+      ).transpose(1, 2)
+      return out.squeeze(0) if was_3d else out
+
+    module.forward = _splash_ref_forward
+
+
 def _run_cpu_verification(
     temp_path: str,
     config_args: list[str],
@@ -553,8 +629,15 @@ def _run_cpu_verification(
     # reference needs the plain one.
     revert_tpu_context_parallel(cpu_config.model_spec.model)
 
-  # Disable splash attention patch on CPU to avoid ValueError
+  # Disable splash attention patch on CPU to avoid ValueError, while recording
+  # whether the device run used Splash/Tokamax so the CPU reference applies the
+  # same causal + segment_ids (+ sliding window) mask.
+  had_splash_kernel = False
   if hasattr(cpu_config, "splash_attention_kernel"):
+    had_splash_kernel = bool(
+        cpu_config.splash_attention_kernel.use_splash_attention_kernel
+        or cpu_config.splash_attention_kernel.use_tokamax_splash_attention_kernel
+    )
     cpu_config.splash_attention_kernel.use_splash_attention_kernel = False
     cpu_config.splash_attention_kernel.use_tokamax_splash_attention_kernel = False
 
@@ -586,6 +669,8 @@ def _run_cpu_verification(
         job_config=cpu_config,
         step_callback=validator.on_step,
     )
+    if had_splash_kernel:
+      _apply_cpu_splash_reference_patch(trainer_cpu.model)
 
     # Load the captured distributed weights into the CPU model
     current_cpu_dict = dict(trainer_cpu.model.named_parameters())

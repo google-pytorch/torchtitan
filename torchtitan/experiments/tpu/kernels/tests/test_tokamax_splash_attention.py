@@ -6,11 +6,98 @@ import logging
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import numpy as np
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.headtail import headtail_positions
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
+
+
+def _packed_segment_ids(document_lengths_per_row) -> torch.Tensor:
+  """(B, S) int32 segment ids of rows packing documents of the given lengths."""
+  return torch.stack([
+      torch.repeat_interleave(
+          torch.arange(len(lengths), dtype=torch.int32), torch.tensor(lengths)
+      )
+      for lengths in document_lengths_per_row
+  ])
+
+
+# Packed rows of 2048 tokens whose document boundaries fall inside head-tail
+# chunks and 128-token blocks.
+_DOCUMENTS = ((300, 517, 77, 1154), (1000, 48, 1000))
+# KV all-gather CP shards: one KV block, then shards spanning several Q and KV
+# blocks with GQA / MQA, packed documents and a window. (Tokamax has only the
+# fused backward: SplashConfig rejects use_fused_bwd_kernel=False.)
+_CP_SHARD_CASES = (
+    dict(testcase_name="cp2", cp_size=2),
+    dict(testcase_name="cp4", cp_size=4),
+    dict(testcase_name="cp2_window", cp_size=2, local_window_size=200),
+    dict(testcase_name="cp4_window", cp_size=4, local_window_size=200),
+    dict(
+        testcase_name="cp2_blocks_gqa_documents",
+        cp_size=2,
+        seq_len=2048,
+        n_heads=4,
+        n_kv_heads=2,
+        block=128,
+        documents=_DOCUMENTS,
+    ),
+    dict(
+        testcase_name="cp4_blocks_mqa_window_documents",
+        cp_size=4,
+        seq_len=2048,
+        n_heads=4,
+        n_kv_heads=1,
+        block=128,
+        local_window_size=64,
+        documents=_DOCUMENTS,
+    ),
+    dict(
+        testcase_name="cp4_blocks_documents",
+        cp_size=4,
+        seq_len=2048,
+        n_heads=4,
+        n_kv_heads=4,
+        block=128,
+        documents=_DOCUMENTS,
+    ),
+)
+
+
+class HeadTailMaskTest(parameterized.TestCase):
+  """KV all-gather CP masks: stock Tokamax masks with head-tail Q rows."""
+
+  @parameterized.product(cp_size=(1, 2, 4), local_window_size=(None, 5))
+  def test_mask_matches_dense_reference(self, cp_size, local_window_size):
+    seq_len = 32
+    mask = tokamax_splash_attention._make_mask(
+        (seq_len, seq_len), True, local_window_size, cp_size
+    )
+    # Row i holds the query at original position headtail_positions(...)[i].
+    q_pos = headtail_positions(seq_len, cp_size)[:, None]
+    kv_pos = np.arange(seq_len)[None, :]
+    expected = q_pos >= kv_pos
+    if local_window_size is not None:
+      expected &= q_pos - kv_pos <= local_window_size
+    np.testing.assert_array_equal(mask[:, :], expected)
+
+  @parameterized.parameters(None, 5)
+  def test_mask_equality_follows_q_order(self, local_window_size):
+    make_mask = functools.partial(
+        tokamax_splash_attention._make_mask, (32, 32), True, local_window_size
+    )
+    mask, same = make_mask(cp_size=2), make_mask(cp_size=2)
+    self.assertEqual(mask, same)
+    self.assertEqual(hash(mask), hash(same))
+    for cp_size in (1, 4):
+      self.assertNotEqual(mask, make_mask(cp_size=cp_size))
+
+  def test_non_causal_mask_is_full(self):
+    mask = tokamax_splash_attention._make_mask((32, 32), False, None, 2)
+    self.assertTrue(np.all(mask[:, :]))
 
 
 class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
@@ -439,7 +526,6 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         )
     )
 
-
   def test_config_change_retraces_kernel(self):
     """A TokamaxConfig change must not reuse a kernel compiled for the old one.
 
@@ -475,6 +561,97 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
 
     # fwd + bwd each traced once per config value.
     self.assertEqual(sorted(seen), [False, False, True, True])
+
+  @parameterized.named_parameters(*_CP_SHARD_CASES)
+  def test_cp_shard_parity(
+      self,
+      cp_size,
+      local_window_size=None,
+      seq_len=512,
+      n_heads=2,
+      n_kv_heads=2,
+      block=None,
+      documents=None,
+  ):
+    """Head-tail CP Q shards against the full K/V match full attention.
+
+    KV all-gather CP gives rank r the r-th slice of the head-tail sequence; the
+    kernel must mask those queries by their original positions (causal or
+    sliding window, and by document) in every Q and KV block. dK and dV add up
+    over the ranks.
+    """
+    device = self.accelerator_device
+    torch.manual_seed(0)
+    if block is not None:
+      cfg = tokamax_splash_attention.TokamaxConfig
+      for name in (
+          "block_q",
+          "block_kv",
+          "block_kv_compute",
+          "block_q_dkv",
+          "block_kv_dkv",
+          "block_kv_dkv_compute",
+      ):
+        self.addCleanup(setattr, cfg, name, getattr(cfg, name))
+        setattr(cfg, name, block)
+
+    # (B, S, H, D), the layout this kernel takes.
+    b, head_dim = (1 if documents is None else len(documents)), 128
+    q, grad_out = (torch.randn(b, seq_len, n_heads, head_dim) for _ in range(2))
+    k, v = (torch.randn(b, seq_len, n_kv_heads, head_dim) for _ in range(2))
+    segment_ids = None if documents is None else _packed_segment_ids(documents)
+    pos = torch.arange(seq_len)
+    allowed = pos[:, None] >= pos[None, :]
+    if local_window_size is not None:
+      allowed &= pos[:, None] - pos[None, :] <= local_window_size
+    if segment_ids is not None:
+      same_document = segment_ids[:, :, None] == segment_ids[:, None, :]
+      allowed = (allowed & same_document)[:, None]
+    q_ref, k_ref, v_ref = (
+        x.transpose(1, 2).clone().requires_grad_(True) for x in (q, k, v)
+    )
+    n_rep = n_heads // n_kv_heads
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      out_ref = F.scaled_dot_product_attention(
+          q_ref,
+          k_ref.repeat_interleave(n_rep, dim=1),
+          v_ref.repeat_interleave(n_rep, dim=1),
+          attn_mask=allowed,
+      )
+    out_ref.backward(grad_out.transpose(1, 2))
+    out_ref = out_ref.detach().transpose(1, 2)
+    dq_ref, dk_ref, dv_ref = (
+        x.grad.transpose(1, 2) for x in (q_ref, k_ref, v_ref)
+    )
+
+    k_test = k.to(device).requires_grad_(True)
+    v_test = v.to(device).requires_grad_(True)
+    shards = torch.from_numpy(headtail_positions(seq_len, cp_size)).long()
+    for r, rows in enumerate(shards.reshape(cp_size, -1)):
+      q_test = q[:, rows].to(device).requires_grad_(True)
+      out = tokamax_splash_attention.splash_sdpa(
+          q_test,
+          k_test,
+          v_test,
+          segment_ids=None if segment_ids is None else segment_ids.to(device),
+          cp_rank=torch.tensor([r], dtype=torch.int32, device=device),
+          local_window_size=local_window_size,
+          enable_gqa=n_heads != n_kv_heads,
+      )
+      out.backward(grad_out[:, rows].to(device))
+      for name, got, want in (
+          ("out", out, out_ref),
+          ("dq", q_test.grad, dq_ref),
+      ):
+        torch.testing.assert_close(
+            got.cpu(),
+            want[:, rows],
+            rtol=5e-2,
+            atol=5e-2,
+            msg=lambda m, name=name, r=r: f"{name} of rank {r}: {m}",
+        )
+    torch.testing.assert_close(k_test.grad.cpu(), dk_ref, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(v_test.grad.cpu(), dv_ref, rtol=5e-2, atol=5e-2)
 
 
 if __name__ == "__main__":

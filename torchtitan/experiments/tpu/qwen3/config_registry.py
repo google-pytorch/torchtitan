@@ -395,7 +395,7 @@ def _qwen3_cp(
     strategy: Literal["ulysses", "all_gather"],
     cp_degree: int,
 ) -> TPUTrainerConfig:
-  """Enables TPU context parallelism, like torchtitan_recipes/muse_glimmer.py.
+  """Enables TPU context parallelism, following pattern set by upstream torchtitan_recipes/muse_glimmer.py for CUDA.
 
   Sets the CP degree, the SPMD backend and the load balancer, then applies
   core ContextParallelTransform with the TPU CP inner attention for the

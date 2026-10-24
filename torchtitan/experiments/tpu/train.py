@@ -33,6 +33,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
+from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as qwen3_5_graph_trainer
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools.logging import init_logger, logger
@@ -288,6 +289,8 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
       from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import (
           model_registry as gt_registry,
       )
+    elif model_name == "qwen3_5":
+      gt_registry = qwen3_5_graph_trainer.model_registry
     else:
       raise ValueError(
           f"Model {model_name} is not currently supported with GraphTrainer."

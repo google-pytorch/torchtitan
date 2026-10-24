@@ -458,6 +458,20 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
 
 
+def _rms_norm_gated(
+    norm: torch.nn.Module, x_THV: torch.Tensor, gate_THV: torch.Tensor
+) -> torch.Tensor:
+  """``norm(x, gate)`` (``RMSNormGated``), as one Pallas kernel pass on TPU."""
+  if x_THV.device.type == "tpu":
+    from torchtitan.experiments.tpu.kernels import rms_norm_gated  # pylint: disable=g-import-not-at-top
+
+    if rms_norm_gated.supports(x_THV):
+      return rms_norm_gated.rms_norm_gated(
+          x_THV, gate_THV, norm.weight, norm.eps
+      )
+  return norm(x_THV, gate_THV)
+
+
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 
@@ -529,6 +543,6 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         positions=positions if self.reset_at_documents else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
-    output_THV = self.norm(output_THV, gate_THV)
+    output_THV = _rms_norm_gated(self.norm, output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)

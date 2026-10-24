@@ -84,6 +84,8 @@ def _make_mask(
     # Every key is visible, so the Q order does not matter.
     return splash_attention_mask.FullMask(mask_shape)
   if cp_size > 1:
+    # Assumes Splash reads mask.q_sequence lazily (__getitem__, __eq__/__hash__,
+    # process_mask); guarded by HeadTailMaskTest and test_cp_shard_parity.
     mask.q_sequence = headtail_positions(mask_shape[0], cp_size)
   return mask
 

@@ -260,18 +260,44 @@ def _repeat_kv_heads(x: torch.Tensor, cp: int) -> torch.Tensor:
   return out
 
 
+_orig_segment_ids_from_positions = segment_ids_from_positions
+
+
+def _cp_segment_ids_from_positions(positions: torch.Tensor) -> torch.Tensor:
+  """Returns precomputed full-sequence ``segment_ids`` when sharded by ``cp_shard``."""
+  full_seg = getattr(positions, "_cp_full_segment_ids", None)
+  if full_seg is not None:
+    return full_seg
+  return _orig_segment_ids_from_positions(positions)
+
+
+def _patch_segment_ids_from_positions() -> None:
+  """Patches ``Decoder`` to reuse full-sequence ``segment_ids`` from ``cp_shard``."""
+  from torchtitan.models.common import decoder as decoder_mod  # pylint: disable=g-import-not-at-top
+
+  decoder_mod.segment_ids_from_positions = _cp_segment_ids_from_positions
+  for name, mod in list(sys.modules.items()):
+    if (
+        name.startswith("torchtitan.")
+        and name != __name__
+        and vars(mod).get("segment_ids_from_positions")
+        is _orig_segment_ids_from_positions
+    ):
+      mod.segment_ids_from_positions = _cp_segment_ids_from_positions
+
+
 @spmd.no_typecheck()
 def _full_sequence_segment_ids(
     positions: torch.Tensor, group: Any
 ) -> torch.Tensor:
-  """Packed-document ``segment_ids`` of the whole (unsharded) sequence."""
+  """Fallback packed-document ``segment_ids`` when ``cp_shard`` was not used."""
   if _tracing():
     positions = _wait(funcol.all_gather_tensor(positions, _TOKEN_DIM, group))
   else:
     positions = spmd.redistribute(
         positions, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
     )
-  return segment_ids_from_positions(positions)
+  return _orig_segment_ids_from_positions(positions)
 
 
 class _TPUCPInnerAttention(CPInnerAttention):
@@ -312,11 +338,24 @@ class UlyssesCPInnerAttention(_TPUCPInnerAttention):
       ptrr_mask_key: str | None,
   ) -> dict[str, Any]:
     # Attention sees the full sequence, so masks stay unsharded, and there is
-    # no per-rank causal imbalance to load-balance.
+    # no per-rank causal imbalance to load-balance. Precompute full-sequence
+    # segment_ids once per step before sharding positions so Decoder.forward
+    # can thread them into every layer without per-layer positions all-gathers.
+    _patch_segment_ids_from_positions()
+    raw_positions = input_dict.get("positions")
+    full_segment_ids = (
+        _orig_segment_ids_from_positions(raw_positions)
+        if isinstance(raw_positions, torch.Tensor)
+        else None
+    )
     attention_masks = input_dict.pop("attention_masks", None)
     prepare_context_parallel_input(
         input_dict, input_shardings, cp_mesh, None, None
     )
+    if full_segment_ids is not None and isinstance(
+        input_dict.get("positions"), torch.Tensor
+    ):
+      input_dict["positions"]._cp_full_segment_ids = full_segment_ids
     if attention_masks is not None:
       input_dict["attention_masks"] = attention_masks
     return input_dict
@@ -366,11 +405,17 @@ class UlyssesCPInnerAttention(_TPUCPInnerAttention):
     )
     if "enable_gqa" in kwargs:
       kwargs["enable_gqa"] = q_THK.shape[_HEAD_DIM] != k_THK.shape[_HEAD_DIM]
-    # Decoder.forward derived segment_ids from the token-sharded positions;
-    # the local attention needs them for the full sequence.
+    # In normal training, cp_shard + Decoder.forward compute full-sequence
+    # segment_ids once per step before the layer loop. Fall back to
+    # all-gathering positions only when called directly with sharded inputs.
     positions = kwargs.pop("positions", None)
-    if positions is not None:
-      kwargs["segment_ids"] = _full_sequence_segment_ids(positions, group)
+    seg = kwargs.get("segment_ids")
+    if seg is None or seg.shape[_TOKEN_DIM] != q_THK.shape[_TOKEN_DIM]:
+      full_seg = getattr(positions, "_cp_full_segment_ids", None)
+      if full_seg is not None:
+        kwargs["segment_ids"] = full_seg
+      elif positions is not None:
+        kwargs["segment_ids"] = _full_sequence_segment_ids(positions, group)
 
     local_attn = self._local_attn_override or self.local_forward
     type_check = _type_checking()
@@ -458,8 +503,10 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
       load_balancer_type: str | None,
       ptrr_mask_key: str | None,
   ) -> dict[str, Any]:
-    # Populate the per-device CP rank tensor in eager mode before tracing.
+    # Populate the per-device CP rank tensor in eager mode before tracing, and
+    # ensure Decoder.forward reuses full-sequence segment_ids from cp_shard.
     _cache_cp_rank_for_mesh(cp_mesh)
+    _patch_segment_ids_from_positions()
 
     if load_balancer_type != "headtail":
       raise ValueError(
@@ -471,6 +518,21 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
     seq_len = get_unflatten_seq_len()
     cp = cp_mesh.size(0)
     inp = input_dict.get("input")
+    raw_positions = input_dict.get("positions")
+    full_segment_ids = None
+    if isinstance(raw_positions, torch.Tensor):
+      if (
+          seq_len is not None
+          and raw_positions.ndim == 1
+          and raw_positions.shape[0] > seq_len
+          and raw_positions.shape[0] % seq_len == 0
+      ):
+        full_segment_ids = _orig_segment_ids_from_positions(
+            raw_positions.reshape(-1, seq_len)
+        )
+      else:
+        seg = _orig_segment_ids_from_positions(raw_positions)
+        full_segment_ids = seg.unsqueeze(0) if seg.ndim == 1 else seg
 
     # When multiple sequences (B > 1) are folded into 1D [B * S], head-tail
     # reordering and CP sharding must happen per sequence of length S, not
@@ -517,6 +579,10 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
       prepare_context_parallel_input(
           input_dict, input_shardings, cp_mesh, "headtail", ptrr_mask_key
       )
+    if full_segment_ids is not None and isinstance(
+        input_dict.get("positions"), torch.Tensor
+    ):
+      input_dict["positions"]._cp_full_segment_ids = full_segment_ids
     if attention_masks is not None:
       input_dict["attention_masks"] = attention_masks
     return input_dict
@@ -641,7 +707,7 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
         .reshape(bsz, cp * q_seq_len)
     )
     pos_bs = reorder_sequence(pos_bs, cp_size=cp, seq_dim=1, to_contiguous=True)
-    return segment_ids_from_positions(pos_bs)
+    return _orig_segment_ids_from_positions(pos_bs)
 
   def forward(
       self,
@@ -740,29 +806,37 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
       if "enable_gqa" in kwargs:
         kwargs["enable_gqa"] = q_4d.shape[2] != k_4d.shape[2]
 
+      # In normal training, cp_shard + Decoder.forward compute full-sequence
+      # (B, S) segment_ids once per step before the layer loop. Fall back to
+      # all-gathering positions/segment_ids only when called with sharded inputs.
       positions = kwargs.pop("positions", None)
-      if positions is not None:
+      seg = kwargs.get("segment_ids")
+      if seg is not None and seg.numel() == bsz * kv_seq_len:
+        kwargs["segment_ids"] = seg.reshape(bsz, kv_seq_len)
+      elif getattr(positions, "_cp_full_segment_ids", None) is not None:
+        kwargs["segment_ids"] = positions._cp_full_segment_ids.reshape(
+            bsz, kv_seq_len
+        )
+      elif positions is not None:
         kwargs["segment_ids"] = self._full_sequence_segment_ids_all_gather(
             positions, group, bsz, q_seq_len
         )
-      elif kwargs.get("segment_ids") is not None:
-        seg = kwargs["segment_ids"]
-        if seg.numel() == bsz * q_seq_len:
-          seg_ag = (
-              _wait(funcol.all_gather_tensor(seg, _TOKEN_DIM, group))
-              if _tracing()
-              else spmd.redistribute(
-                  seg, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
-              )
-          )
-          seg_bs = (
-              seg_ag.reshape(cp, bsz, q_seq_len)
-              .movedim(0, 1)
-              .reshape(bsz, kv_seq_len)
-          )
-          kwargs["segment_ids"] = reorder_sequence(
-              seg_bs, cp_size=cp, seq_dim=1, to_contiguous=True
-          )
+      elif seg is not None and seg.numel() == bsz * q_seq_len:
+        seg_ag = (
+            _wait(funcol.all_gather_tensor(seg, _TOKEN_DIM, group))
+            if _tracing()
+            else spmd.redistribute(
+                seg, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
+            )
+        )
+        seg_bs = (
+            seg_ag.reshape(cp, bsz, q_seq_len)
+            .movedim(0, 1)
+            .reshape(bsz, kv_seq_len)
+        )
+        kwargs["segment_ids"] = reorder_sequence(
+            seg_bs, cp_size=cp, seq_dim=1, to_contiguous=True
+        )
 
       kwargs["cp_rank"] = cp_rank
       out_4d = local_attn(q_4d, k_4d, v_4d, **kwargs)
@@ -1081,6 +1155,7 @@ def install_tpu_cp_patches() -> None:
   ``FSDPParam._resolve_spmd_types_for_storage``.
   """
   global _patched
+  _patch_segment_ids_from_positions()
   if _patched:
     return
   _patched = True

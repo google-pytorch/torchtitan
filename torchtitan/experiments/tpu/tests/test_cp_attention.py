@@ -495,6 +495,57 @@ class CPShardTest(parameterized.TestCase):
         cached,
     )
 
+  def test_cp_shard_precomputes_full_segment_ids_once_per_step(self):
+    """cp_shard attaches full-sequence segment_ids to sharded positions for Decoder."""
+    from torchtitan.models.common import decoder as decoder_mod  # pylint: disable=g-import-not-at-top
+
+    cp, bsz, seq_len = 2, 2, 8
+    raw_positions = torch.tensor(
+        [0, 1, 2, 0, 1, 2, 3, 4, 0, 1, 0, 1, 2, 0, 1, 2], dtype=torch.long
+    )
+
+    def prepare(input_dict, input_shardings, cp_mesh, lb_type, ptrr_key):
+      del input_shardings, cp_mesh, lb_type, ptrr_key
+      for key in ("input", "positions"):
+        if key in input_dict:
+          input_dict[key] = input_dict[key].chunk(cp)[0]
+      return input_dict
+
+    cp_mesh = SimpleNamespace(
+        device_type="cpu", get_local_rank=lambda: 0, size=lambda dim=0: cp
+    )
+    with set_unflatten_seq_len(seq_len), mock.patch.object(
+        cp_attention, "prepare_context_parallel_input", prepare
+    ):
+      out_ag = KVAllGatherCPInnerAttention.cp_shard(
+          {"input": raw_positions.clone(), "positions": raw_positions.clone()},
+          None,
+          cp_mesh,
+          "headtail",
+          None,
+      )
+      out_ul = UlyssesCPInnerAttention.cp_shard(
+          {"input": raw_positions.clone(), "positions": raw_positions.clone()},
+          None,
+          cp_mesh,
+          None,
+          None,
+      )
+
+    seg_ag = decoder_mod.segment_ids_from_positions(out_ag["positions"])
+    seg_ul = decoder_mod.segment_ids_from_positions(out_ul["positions"])
+    self.assertEqual(tuple(seg_ag.shape), (bsz, seq_len))
+    self.assertEqual(tuple(seg_ul.shape), (bsz * seq_len,))
+    torch.testing.assert_close(
+        seg_ag,
+        cp_attention._orig_segment_ids_from_positions(
+            raw_positions.reshape(bsz, seq_len)
+        ),
+    )
+    torch.testing.assert_close(
+        seg_ul, cp_attention._orig_segment_ids_from_positions(raw_positions)
+    )
+
   @parameterized.parameters(
       (16, 2), (16, 4), (16, 8), (48, 3), (64, 4), (64, 8)
   )

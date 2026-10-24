@@ -82,8 +82,8 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   Pretraining runs it over whole `[B, S]` rows (`reset_at_documents=False`):
   restarting at packed documents makes the kernels lay every document out
   from a 64-token chunk boundary (6.74 vs 9.78 s/step at 64K tokens per rank
-  on `2x2x1`). The causal convolution and its input gradient are
-  computed from shifted slices.
+  on `2x2x1`). The causal convolution + SiLU runs as a Pallas kernel
+  (`kernels/causal_conv1d.py`).
 * **MoE**: Pallas paired grouped matmuls with kernel-native expert weights
   and the fused route-score backward.
 * **Attention**: Splash attention with segment ids from `positions`; 1024
@@ -108,7 +108,7 @@ packed-document resets, `mixed_precision_reduce="float32"`,
 
 | Slice (chips, ranks) | Step time | Tokens/s/rank | TFLOPS/rank | MFU | HBM |
 | --- | --- | --- | --- | --- | --- |
-| `2x2x1` (4, 8) | 6.74 s | 9,727 | 213.89 | 18.54% | 40.12 GiB |
+| `2x2x1` (4, 8) | 6.46 s | 10,153 | 223.24 | 19.35% | 37.84 GiB |
 
 ## Expert Parallelism
 

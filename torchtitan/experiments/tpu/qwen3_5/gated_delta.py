@@ -171,6 +171,12 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
+  if segment_ids_BS is None and x_BSC.device.type == "tpu":
+    # Whole rows on TPU: fused Pallas kernels (~2x faster than the slices).
+    from torchtitan.experiments.tpu.kernels import causal_conv1d  # pylint: disable=g-import-not-at-top
+
+    if causal_conv1d.supports(x_BSC):
+      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 

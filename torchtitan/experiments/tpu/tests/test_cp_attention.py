@@ -578,16 +578,12 @@ class CPValidationTest(parameterized.TestCase):
   """Unsupported CP configurations raise up front."""
 
   def _config(self, strategy, cp=2):
-    config = config_registry.qwen3_debugmodel()
-    for layer in config.model_spec.model.layers:
-      inner = cp_attention.tpu_cp_inner_attention(
-          layer.attention.inner_attention._owner, strategy
-      )
-      layer.attention.inner_attention = inner.Config()
-    config.parallelism.context_parallel_degree = cp
-    config.parallelism.context_parallel_load_balancer = (
-        cp_attention.tpu_cp_load_balancer(strategy)
+    config = (
+        config_registry.qwen3_debugmodel_allgather_cp2()
+        if strategy == "all_gather"
+        else config_registry.qwen3_debugmodel_ulysses_cp2()
     )
+    config.parallelism.context_parallel_degree = cp
     return config
 
   @parameterized.parameters("all_gather", "ulysses")
@@ -729,6 +725,16 @@ class CPValidationTest(parameterized.TestCase):
     )
     with self.assertRaisesRegex(ValueError, "needs positions"):
       varlen(q, q, q, attention_masks=object())
+
+  @parameterized.parameters(
+      "qwen3_1_7b_allgather_cp4", "qwen3_1_7b_ulysses_cp4"
+  )
+  def test_qwen3_1_7b_cp_recipes_build_and_validate(self, recipe):
+    config = getattr(config_registry, recipe)()
+    self.assertEqual(config.parallelism.context_parallel_degree, 4)
+    self.assertEqual(config.training.max_context_length, 32768)
+    self.assertTrue(config.splash_attention_kernel.use_splash_attention_kernel)
+    config.__post_init__()  # Core + TPU CP validation, incl. Splash blocks.
 
 
 class InstallTPUCPPatchesTest(absltest.TestCase):

@@ -182,17 +182,23 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     if local_window_size is None:
       local_window_size = getattr(parent_module, "sliding_window_size", None)
 
+    # Ulysses CP inner attentions keep their all-to-all and take the kernel as
+    # their local attention; see experiments/tpu/cp_attention.py.
+    is_cp = hasattr(child_module, "set_local_attention")
     splash_attn = SplashAttention(
         is_causal=True,  # Default for LMs
         local_window_size=local_window_size,
-        original_module=child_module,
+        original_module=child_module.local_forward if is_cp else child_module,
         **sa_kwargs,
     )
     # TT-UNFLATTEN-SHIM:
     from torchtitan.experiments.tpu.unflatten_shim import UnflattenShim
     splash_attn = UnflattenShim(splash_attn)
 
-    setattr(parent_module, child_name, splash_attn)
+    if is_cp:
+      child_module.set_local_attention(splash_attn)
+    else:
+      setattr(parent_module, child_name, splash_attn)
     _patched += 1
     if local_window_size is not None:
       _windowed += 1
@@ -404,6 +410,9 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         module._sdpa_native_torch = types.MethodType(
             _splash_sdpa_native, module
         )
+      elif hasattr(module, "set_local_attention"):  # Ulysses CP
+        module.set_local_attention(types.MethodType(_splash_forward, module))
+        _patched_forward += 1
       else:
         module.forward = types.MethodType(_splash_forward, module)
         _patched_forward += 1
@@ -699,6 +708,13 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
 
   # Enable CPU safe histc workaround.
   use_cpu_safe_histc_patch()
+
+  if job_config.parallelism.context_parallel_degree > 1:
+    from torchtitan.experiments.tpu.cp_attention import install_tpu_cp_patches  # pylint: disable=g-import-not-at-top
+
+    # Runtime patch, so install it here (in every process, right before
+    # parallelize) rather than in the config.
+    install_tpu_cp_patches()
 
   # Splash Attention Patch
   if hasattr(job_config, "splash_attention_kernel"):

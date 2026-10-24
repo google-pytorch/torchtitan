@@ -23,6 +23,7 @@ from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import train_minimal
+from torchtitan.experiments.tpu.cp_attention import revert_tpu_context_parallel
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
@@ -485,11 +486,12 @@ def config_to_input_distribution(
     config: The job configuration.
 
   Returns:
-    The determined InputDistribution based on the data parallel shard degree.
+    The determined InputDistribution based on the data/context parallel degrees.
   """
   dp_degree = config.parallelism.data_parallel_shard_degree
   rep_degree = config.parallelism.data_parallel_replicate_degree
-  if dp_degree > 1 or rep_degree > 1:
+  cp_degree = config.parallelism.context_parallel_degree
+  if dp_degree > 1 or rep_degree > 1 or cp_degree > 1:
     return InputDistribution.SPLIT_BATCH
   else:
     return InputDistribution.REPLICATE
@@ -541,7 +543,15 @@ def _run_cpu_verification(
   cpu_config.parallelism.tensor_parallel_degree = 1
   cpu_config.parallelism.data_parallel_shard_degree = 1
   cpu_config.parallelism.data_parallel_replicate_degree = 1
+  cpu_config.parallelism.context_parallel_degree = 1
   cpu_config.compile.enable = False
+  if (
+      isinstance(cpu_config, tpu_job_config_module.BaseTPUTrainerConfig)
+      and cpu_config.model_spec is not None
+  ):
+    # A CP recipe's attention is a CP inner attention; the single-device
+    # reference needs the plain one.
+    revert_tpu_context_parallel(cpu_config.model_spec.model)
 
   # Disable splash attention patch on CPU to avoid ValueError
   if hasattr(cpu_config, "splash_attention_kernel"):
@@ -746,6 +756,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       ] = None,
       enable_compile: bool = False,
       data_parallel_replicate_degree: int | None = None,
+      context_parallel_degree: int | None = None,
   ):
     """Tests the minimal distributed training setup for torchtitan models."""
     if skip_devices and self.accelerator_device_type in skip_devices:
@@ -780,6 +791,12 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
         data_parallel_replicate_degree = self.num_devices
       global_flags.append(
           f"--parallelism.data_parallel_replicate_degree={data_parallel_replicate_degree}"
+      )
+    if context_parallel_degree is not None:
+      if context_parallel_degree == -1:
+        context_parallel_degree = self.num_devices
+      global_flags.append(
+          f"--parallelism.context_parallel_degree={context_parallel_degree}"
       )
 
     # Prepend flags collected in global_flags to config_args so they are
@@ -818,6 +835,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       param_rtol: float = 5e-3,
       enable_compile: bool = False,
       data_parallel_replicate_degree: int | None = None,
+      context_parallel_degree: int | None = None,
       cpu_config_fn: str | None = None,
   ):
     """Orchestrates a distributed parity test: Record Distributed -> Verify on CPU."""
@@ -845,6 +863,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
           start_trainer=DistributedTrainWithRecorder(output_path=temp_path),
           enable_compile=enable_compile,
           data_parallel_replicate_degree=data_parallel_replicate_degree,
+          context_parallel_degree=context_parallel_degree,
       )
 
       # Verify the distributed run produced data

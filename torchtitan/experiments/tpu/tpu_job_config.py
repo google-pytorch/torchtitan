@@ -6,6 +6,7 @@ from typing import Literal
 import torchtitan.config
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolicy
 from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
 
 
@@ -276,6 +277,18 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # after decoration, leaving the ``__class__`` cell that zero-arg
     # ``super()`` relies on pointing at a stale class. See bpo-46404.
     super(BaseTPUTrainerConfig, self).__post_init__()
+    if (
+        self.model_spec is not None
+        and self.parallelism.context_parallel_degree > 1
+    ):
+      # CP recipes apply core ContextParallelTransform with a TPU CP inner
+      # attention; core validates the CP backend, this adds the TPU rules.
+      validate_tpu_context_parallel(
+          self.model_spec.model,
+          self.parallelism,
+          training=self.training,
+          splash_attention_kernel=self.splash_attention_kernel,
+      )
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed
     # that is crashing when running on TAP.

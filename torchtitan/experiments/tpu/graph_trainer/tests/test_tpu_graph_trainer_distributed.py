@@ -120,6 +120,30 @@ class TpuGraphTrainerDistributedTest(
           ],
       ),
       dict(
+          testcase_name="qwen3_explicit_fsdp",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.fsdp_implementation=explicit",
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_explicit_fsdp_hsdp",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          # Unset, so FSDP gets the remaining num_devices / 2.
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          data_parallel_replicate_degree=2,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.fsdp_implementation=explicit",
+          ],
+      ),
+      dict(
           testcase_name="llama3_simple_fsdp_scan_layers_hsdp",
           module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
@@ -222,6 +246,47 @@ class TpuGraphTrainerDistributedTest(
     # severed carry moves the loss by percent, far outside this.
     for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
       self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
+
+  # Both models, both layer layouts: the explicit FSDP must be a drop-in for
+  # SimpleFSDP wherever the recipes run it.
+  @parameterized.named_parameters([
+      dict(testcase_name=f"{m['testcase_name']}_{layout}", layout=layout, **{
+          k: v for k, v in m.items() if k != "testcase_name"
+      })
+      for m in _MODELS
+      for layout in ("loop", "scan")
+  ])
+  def test_explicit_fsdp_matches_simple_fsdp(self, module, config, layout):
+    """Explicit TPU FSDP must train to the same losses as SimpleFSDP.
+
+    The two differ only in who emits the collectives (a hand-written autograd
+    function vs DTensor's redistribute), so every step's loss has to agree to
+    the bit: initialization goes through the same DTensor RNG, and the gather
+    and reduce-scatter are the same funcol ops in the same dtypes.
+    """
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    scan = ["--tpu_config.use_scan_layers"] if layout == "scan" else []
+    for fsdp in ("simple_fsdp", "explicit"):
+      path = os.path.join(tempdir, f"{fsdp}.json")
+      self._test_train_distributed(
+          config_args=_train_args(module, config)
+          + ["--tpu_config.use_simple_fsdp"]
+          + [f"--tpu_config.fsdp_implementation={fsdp}"]
+          + scan,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        losses[fsdp] = json.load(f)
+
+    self.assertNotEmpty(losses["simple_fsdp"])
+    for (step, explicit), (_, simple) in zip(
+        losses["explicit"], losses["simple_fsdp"]
+    ):
+      self.assertEqual(explicit, simple, msg=f"step {step}")
 
 
 if __name__ == "__main__":

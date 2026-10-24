@@ -36,6 +36,7 @@ from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import apply_tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.tests import test_layer_stack
 from torchtitan.experiments.tpu.layer_loop import tpu_model_class
 from torchtitan.models.llama3 import model_registry
@@ -49,8 +50,15 @@ def _layer_loop(config):
     return derive(config, tpu_model_class(type(config)).Config)
 
 
-def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
-    """The trainer's build order, at an arbitrary data-parallel width."""
+def _build(
+    world_size: int, *, stacked: bool, fsdp: str = "simple_fsdp"
+) -> torch.nn.Module:
+    """The trainer's build order, at an arbitrary data-parallel width.
+
+    ``fsdp`` is the FSDP implementation (``TPUConfig.fsdp_implementation``):
+    the checkpoint format must not depend on it, so the round trips below
+    cross that boundary as well as the stacked/unrolled one.
+    """
     # ParallelDims reads the accelerator type at import; there is none here.
     import torchtitan.distributed.parallel_dims as parallel_dims_module
 
@@ -77,7 +85,8 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         model = convert(
             model_registry("debugmodel", attn_backend="sdpa").model
         ).build()
-    model = apply_simple_fsdp(
+    apply_fsdp = {"simple_fsdp": apply_simple_fsdp, "explicit": apply_tpu_fsdp}[fsdp]
+    model = apply_fsdp(
         model,
         parallel_dims=parallel_dims,
         training=TrainingConfig(
@@ -85,7 +94,10 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         ),
     )
     model.to_empty(device="cpu")
-    torch.manual_seed(SEED)
+    # The CPU generator only: `torch.manual_seed` also seeds every custom
+    # device, and torch_tpu would then initialize the TPU in each of the 8 + 4
+    # spawned processes of a test that never touches it.
+    torch.default_generator.manual_seed(SEED)
     model.init_weights()
     return model
 
@@ -109,9 +121,16 @@ def _process_group(rank: int, world_size: int, port: int):
         dist.destroy_process_group()
 
 
-def _save_worker(rank: int, world_size: int, port: int, path: str, stacked: bool):
+def _save_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    path: str,
+    stacked: bool,
+    fsdp: str = "simple_fsdp",
+):
     with _process_group(rank, world_size, port):
-        model = _build(world_size, stacked=stacked)
+        model = _build(world_size, stacked=stacked, fsdp=fsdp)
         dcp.save(model.state_dict(), checkpoint_id=os.path.join(path, "ckpt"))
         # Written from the source of truth so the load side has something to be
         # wrong against; a load that quietly no-ops would otherwise pass.
@@ -120,9 +139,16 @@ def _save_worker(rank: int, world_size: int, port: int, path: str, stacked: bool
             torch.save(whole, os.path.join(path, "expected.pt"))
 
 
-def _load_worker(rank: int, world_size: int, port: int, path: str, stacked: bool):
+def _load_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    path: str,
+    stacked: bool,
+    fsdp: str = "simple_fsdp",
+):
     with _process_group(rank, world_size, port):
-        model = _build(world_size, stacked=stacked)
+        model = _build(world_size, stacked=stacked, fsdp=fsdp)
         # Perturb first: `init_weights` is seeded, so without this the model
         # already holds the saved values and any load at all would pass.
         with torch.no_grad():
@@ -192,13 +218,24 @@ def _load_flattened_optim_worker(rank: int, world_size: int, port: int, path: st
 class ReshardTest(unittest.TestCase):
     """Eight ranks out, four ranks back, across both layouts."""
 
-    def _round_trip(self, *, saved_stacked: bool, loaded_stacked: bool):
+    def _round_trip(
+        self,
+        *,
+        saved_stacked: bool,
+        loaded_stacked: bool,
+        saved_fsdp: str = "simple_fsdp",
+        loaded_fsdp: str = "simple_fsdp",
+    ):
         with tempfile.TemporaryDirectory() as path:
             mp.spawn(
-                _save_worker, args=(8, _free_port(), path, saved_stacked), nprocs=8
+                _save_worker,
+                args=(8, _free_port(), path, saved_stacked, saved_fsdp),
+                nprocs=8,
             )
             mp.spawn(
-                _load_worker, args=(4, _free_port(), path, loaded_stacked), nprocs=4
+                _load_worker,
+                args=(4, _free_port(), path, loaded_stacked, loaded_fsdp),
+                nprocs=4,
             )
 
     def test_stacked_to_stacked(self):
@@ -211,6 +248,33 @@ class ReshardTest(unittest.TestCase):
     def test_unrolled_to_stacked(self):
         """The migration this work exists to make safe: an old checkpoint in."""
         self._round_trip(saved_stacked=False, loaded_stacked=True)
+
+    def test_explicit_fsdp_to_explicit_fsdp(self):
+        """Explicit TPU FSDP writes the same sharded DCP format and reshards."""
+        self._round_trip(
+            saved_stacked=True,
+            loaded_stacked=True,
+            saved_fsdp="explicit",
+            loaded_fsdp="explicit",
+        )
+
+    def test_simple_fsdp_to_explicit_fsdp(self):
+        """A SimpleFSDP checkpoint loads into an explicit-FSDP run, unrolled too."""
+        self._round_trip(
+            saved_stacked=True,
+            loaded_stacked=False,
+            saved_fsdp="simple_fsdp",
+            loaded_fsdp="explicit",
+        )
+
+    def test_explicit_fsdp_to_simple_fsdp(self):
+        """And the other way, so the switch never strands a checkpoint."""
+        self._round_trip(
+            saved_stacked=False,
+            loaded_stacked=True,
+            saved_fsdp="explicit",
+            loaded_fsdp="simple_fsdp",
+        )
 
 
 class OptimizerStateTest(unittest.TestCase):

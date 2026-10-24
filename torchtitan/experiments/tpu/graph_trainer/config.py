@@ -7,6 +7,7 @@
 """TPU GraphTrainer config conversion."""
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -148,6 +149,18 @@ def to_tpu_graph_trainer_config(
   _maybe_use_maxtext_flops(train_config, graph_config)
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
+  if tpu_config.fsdp_implementation != "simple_fsdp":
+    # The trainer calls `parallelize_fn` with a fixed keyword set, so the
+    # choice rides along as a bound keyword. Only parallelize functions that
+    # accept it (the TPU graph-trainer wrappers) can run under it; anything
+    # else fails loudly at the call rather than silently using SimpleFSDP.
+    graph_config.model_spec = dataclasses.replace(
+        graph_config.model_spec,
+        parallelize_fn=functools.partial(
+            graph_config.model_spec.parallelize_fn,
+            fsdp_implementation=tpu_config.fsdp_implementation,
+        ),
+    )
   if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards the routed experts on a mesh of their own. A

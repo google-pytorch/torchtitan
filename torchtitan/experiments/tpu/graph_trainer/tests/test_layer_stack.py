@@ -37,6 +37,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import apply_tpu_fsdp
 
 # Imported here so it is not first imported under the mocked `call_backward`
 # below: it captures that method at import time.
@@ -130,13 +131,15 @@ def _build(
     device: str | torch.device = "cpu",
     world_size: int = 1,
     flatten: bool = False,
+    fsdp: str = "simple_fsdp",
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
     ``stacked``/``scan`` pick the converter, exactly as
     ``to_tpu_graph_trainer_config`` does -- the model arrives from ``build()``
-    already stacked, and ``apply_simple_fsdp`` is given the same arguments in
-    every arm.
+    already stacked, and the FSDP implementation ``fsdp`` names
+    (``simple_fsdp`` or ``explicit``, see ``TPUConfig.fsdp_implementation``)
+    is given the same arguments in every arm.
 
     ``device`` and ``world_size`` exist for ``test_layer_stack_distributed``,
     which builds the same two models on a real mesh.
@@ -168,7 +171,8 @@ def _build(
         for holder in holders:
             holder.flatten_for(world_size)
             holder._fsdp_shard_dim = holder.plan_shard_dims(world_size)  # pylint: disable=protected-access
-    model = apply_simple_fsdp(
+    apply_fsdp = {"simple_fsdp": apply_simple_fsdp, "explicit": apply_tpu_fsdp}[fsdp]
+    model = apply_fsdp(
         model,
         parallel_dims=parallel_dims,
         training=training,
@@ -186,7 +190,13 @@ def _build(
     with torch.no_grad():
         for t in itertools.chain(model.parameters(), model.buffers()):
             t.zero_()
-    torch.manual_seed(SEED)
+    if torch.device(device).type == "cpu":
+        # The CPU generator only: `torch.manual_seed` also seeds every custom
+        # device, and torch_tpu would then initialize the TPU in each spawned
+        # process of a CPU-only test (more processes than chips fails).
+        torch.default_generator.manual_seed(SEED)
+    else:
+        torch.manual_seed(SEED)
     model.init_weights()
     return model
 

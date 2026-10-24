@@ -6,6 +6,7 @@
 
 """Compiled gradient-norm helpers for TPU training."""
 
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -17,6 +18,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
 )
+from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_pass,
 )
@@ -34,17 +36,37 @@ GradSignature = tuple[
 ]
 
 
-def _grad_signature(grads: list[torch.Tensor]) -> GradSignature:
-  return tuple(
-      (grad.shape, grad.dtype, grad.device_mesh, grad.placements)
-      if isinstance(grad, DTensor)
-      else (grad.shape, grad.dtype, None, None)
-      for grad in grads
-  )
+def _grad_signature(
+    grads: list[torch.Tensor], specs: list[tpu_fsdp.ShardSpec | None]
+) -> GradSignature:
+  signature = []
+  for grad, spec in zip(grads, specs, strict=True):
+    if isinstance(grad, DTensor):
+      signature.append((grad.shape, grad.dtype, grad.device_mesh, grad.placements))
+    elif spec is not None:
+      # Explicit TPU FSDP: the shard's mesh and placements live on its spec.
+      signature.append((grad.shape, grad.dtype, spec.mesh, spec.placements))
+    else:
+      signature.append((grad.shape, grad.dtype, None, None))
+  return tuple(signature)
 
 
-def global_grad_norm(grads: list[torch.Tensor]) -> torch.Tensor:
-  """Compute the global L2 norm while preserving DTensor placement semantics."""
+def global_grad_norm(
+    grads: list[torch.Tensor],
+    specs: list[tpu_fsdp.ShardSpec | None] | None = None,
+) -> torch.Tensor:
+  """Compute the global L2 norm of ``grads`` over the whole mesh.
+
+  DTensor gradients (SimpleFSDP) carry their own placements, and
+  ``get_total_norm`` leaves a partial scalar whose ``full_tensor`` is the
+  reduction. Plain shards under explicit TPU FSDP carry theirs in ``specs``
+  (``None`` for a parameter that is not sharded), and ``tpu_fsdp`` reduces
+  them over the shard axis explicitly.
+  """
+  if specs is not None and any(spec is not None for spec in specs):
+    if any(isinstance(grad, DTensor) for grad in grads):
+      raise ValueError("gradients mix DTensors and explicitly sharded tensors")
+    return tpu_fsdp.global_grad_norm(grads, specs)
   total_norm = torch.nn.utils.get_total_norm(
       grads,
       norm_type=2.0,
@@ -71,11 +93,11 @@ class CompiledGradNorm:
       parameters: list[torch.Tensor],
       max_norm: float,
   ) -> torch.Tensor:
-    grads = cast(
-        list[torch.Tensor],
-        [parameter.grad for parameter in parameters if parameter.grad is not None],
-    )
-    signature = _grad_signature(grads)
+    with_grad = [parameter for parameter in parameters if parameter.grad is not None]
+    grads = cast(list[torch.Tensor], [parameter.grad for parameter in with_grad])
+    spec_by_id = tpu_fsdp.param_specs_of(parameters)
+    specs = [spec_by_id.get(id(parameter)) for parameter in with_grad]
+    signature = _grad_signature(grads, specs)
     if self._runner is None:
       if not grads:
         raise ValueError("compile_grad_norm requires at least one gradient")
@@ -85,7 +107,11 @@ class CompiledGradNorm:
           "[compiled_grad_norm] compiling global norm for %d gradients",
           len(grads),
       )
-      traced = minimal_fx_tracer(global_grad_norm)(grads)
+      # The specs are trace-time constants (group names, placements), so they
+      # are bound here and only the gradients are graph inputs.
+      traced = minimal_fx_tracer(
+          functools.partial(global_grad_norm, specs=specs)
+      )(grads)
       # This is a standalone graph; is_fwd avoids backward-only AC marking and
       # selects the forward debug-dump bucket.
       traced.gm = tpu_backend_compile_pass(

@@ -62,6 +62,12 @@ class GraphSplitterConfig:
 @dataclasses.dataclass
 class TPUConfig:
   use_simple_fsdp: bool = False
+  # How the graph trainer shards parameters over the data-parallel mesh.
+  # ``simple_fsdp``: graph_trainer's DTensor parametrization. ``explicit``:
+  # parameters are plain local shards and the gather / reduce-scatter pair is
+  # emitted directly (torchtitan/experiments/tpu/graph_trainer/tpu_fsdp.py);
+  # DTensor appears only as a view for initialization and checkpoints.
+  fsdp_implementation: Literal["simple_fsdp", "explicit"] = "simple_fsdp"
   compile_mode: str = "layer"
   apply_rope_complex_workaround: bool = False
   # Compute dense Llama3/Qwen3 transformer blocks on [B, L, ...] views instead
@@ -346,6 +352,20 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
           "--tpu-config.use-scan-layers needs "
           "--tpu-config.use-graph-trainer; no other lane applies it."
       )
+    if self.tpu_config.fsdp_implementation != "simple_fsdp":
+      # Only the graph trainer's parallelize wrappers take the choice; the
+      # `use_simple_fsdp` flag is what makes upstream skip its own FSDP so a
+      # TPU implementation (either one) can shard instead.
+      if not (self.tpu_config.use_graph_trainer and self.parallelism.use_simple_fsdp):
+        raise ValueError(
+            f"--tpu-config.fsdp-implementation={self.tpu_config.fsdp_implementation} "
+            "needs --tpu-config.use-graph-trainer and --parallelism.use-simple-fsdp"
+        )
+      if self.parallelism.tensor_parallel_degree > 1:
+        raise ValueError(
+            "--tpu-config.fsdp-implementation=explicit does not support "
+            "tensor parallelism yet"
+        )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.
     if not self.dump_folder:

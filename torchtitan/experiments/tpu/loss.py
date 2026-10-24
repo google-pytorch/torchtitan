@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import math
+import spmd_types as spmd
 import torch
 from torchtitan.components import loss as components_loss
 import torchtitan.config
@@ -15,6 +16,8 @@ import torchtitan.trainer
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 
 
+# Pallas/JAX custom ops carry no spmd_types annotations; CP forces spmd_types.
+@spmd.no_typecheck()
 def pallas_cross_entropy_loss(
     pred: tuple[torch.Tensor, torch.Tensor],
     labels: torch.Tensor,

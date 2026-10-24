@@ -11,7 +11,7 @@ Covers:
    autograd of ``conv1d``, also with packed documents.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
-   (with negative controls).
+   (with negative controls), plus Splash parity on TPU.
 4. Flavor, registry and recipe checks.
 """
 
@@ -25,6 +25,7 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -35,6 +36,7 @@ from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
@@ -899,6 +901,56 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         0.1,
         msg="Negative control failed: unpacked positions did not change Doc B",
     )
+
+  def test_splash_attention_matches_sdpa_on_packed_documents(self):
+    """Tests Splash Attention patch on TpuQwen35Attention vs CPU SDPA."""
+    if not self._is_tpu():
+      self.skipTest("Splash Attention is a TPU-only Pallas kernel.")
+    config = qwen3_5_tpu.model_registry("debugmodel").model
+    batch, seq_len = 2, 256
+    attn_cpu = config.layers[3].attention.build()
+    attn_cpu.init_states(buffer_device=torch.device("cpu"))
+    attn_cpu = attn_cpu.cpu()
+    attn_tpu = copy.deepcopy(attn_cpu).to(self.accelerator_device)
+
+    sa_config = SplashAttentionKernelConfig(
+        use_splash_attention_kernel=True,
+        sa_block_q=128,
+        sa_block_kv=128,
+        sa_block_kv_compute=128,
+        sa_block_q_dkv=128,
+        sa_block_kv_dkv=128,
+        sa_block_kv_dkv_compute=128,
+        sa_block_q_dq=128,
+        sa_block_kv_dq=128,
+    )
+    workarounds.use_splash_attention_patch(attn_tpu, sa_config)
+
+    x_cpu, x_tpu = self._create_input_tensor_cpu_device(
+        (batch * seq_len, config.dim), requires_grad=True
+    )
+    positions_cpu = torch.cat([
+        torch.arange(100),
+        torch.arange(seq_len - 100),
+        torch.arange(seq_len),
+    ])
+    positions_tpu = positions_cpu.to(self.accelerator_device)
+
+    with set_unflatten_seq_len(seq_len):
+      out_cpu = attn_cpu(x_cpu, None, positions_cpu)
+      out_tpu = attn_tpu(x_tpu, None, positions_tpu)
+      with torch.no_grad():
+        out_cpu_unpacked = attn_cpu(
+            x_cpu, None, torch.arange(seq_len).repeat(batch)
+        )
+
+    self.assertGreater(_relative_l2_error(out_cpu_unpacked, out_cpu), 0.1)
+    self.assertLessEqual(_relative_l2_error(out_tpu, out_cpu), 1e-2)
+
+    grad_out = torch.randn_like(out_cpu)
+    out_cpu.backward(grad_out)
+    out_tpu.backward(grad_out.to(self.accelerator_device))
+    self.assertLessEqual(_relative_l2_error(x_tpu.grad, x_cpu.grad), 2.5e-2)
 
   def test_flavors_and_registry(self):
     """Tests the 35B-A3B geometry and the TPU modules of every flavor."""

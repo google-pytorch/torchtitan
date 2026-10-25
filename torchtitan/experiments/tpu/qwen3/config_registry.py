@@ -1173,6 +1173,13 @@ def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_235b_scan_proxy_explicit_fsdp() -> TPUTrainerConfig:
+  """`qwen3_moe_235b_scan_proxy` sharded by explicit TPU FSDP (A/B treatment)."""
+  cfg = qwen3_moe_235b_scan_proxy()
+  cfg.tpu_config.fsdp_implementation = "explicit"
+  return cfg
+
+
 def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
   """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
 

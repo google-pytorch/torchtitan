@@ -42,6 +42,7 @@ import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
@@ -76,8 +77,7 @@ class ScanFSDPSpec:
     """How the scan body gathers one row of a stacked parameter.
 
     The minimal, mesh-free form of :class:`ShardSpec`: the scan body sees plain
-    tensors and process-group names only. ``ShardSpec.scan_spec`` produces one;
-    ``scan_fsdp.plan_stacked_gathers`` reads one back off a SimpleFSDP DTensor.
+    tensors and process-group names only. ``ShardSpec.scan_spec`` produces one.
 
     Attributes:
         group_name: resolved process-group name, in the form funcol collectives
@@ -186,12 +186,16 @@ class ShardSpec:
         """This rank's shard shape and its offset in the whole tensor.
 
         DTensor's own arithmetic, so the shard matches what a DTensor view with
-        these placements describes -- uneven last shards included.
+        these placements describes -- uneven last shards included. Computed
+        outside any fake-tensor mode: the arithmetic goes through tensors, and
+        a caller sharding a model under ``FakeTensorMode`` (a pass test tracing
+        a toy) would otherwise get a fake offset it cannot turn into an int.
         """
-        shape, offset = compute_local_shape_and_global_offset(
-            torch.Size(self.global_shape), self.mesh, self.placements
-        )
-        return tuple(shape), tuple(offset)
+        with unset_fake_temporarily():
+            shape, offset = compute_local_shape_and_global_offset(
+                torch.Size(self.global_shape), self.mesh, self.placements
+            )
+        return tuple(int(x) for x in shape), tuple(int(x) for x in offset)
 
     def chunk_size(self) -> int:
         """Rows every rank's shard is padded to when the split is uneven."""

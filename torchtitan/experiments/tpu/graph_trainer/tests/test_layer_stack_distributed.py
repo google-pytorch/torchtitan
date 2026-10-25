@@ -24,16 +24,13 @@ from torch.distributed.tensor import (
     Shard,
 )
 
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    data_parallel,
-    MixedPrecisionPolicy,
-)
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
-    gather_slice,
-    plan_stacked_gathers,
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
+    shard_module,
+    SPECS_ATTR,
 )
 from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
@@ -45,8 +42,8 @@ from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
 
 def _models(device, world_size):
     """A plain model and a stacked one, built identically on ``device``."""
-    # SimpleFSDP reads this to place its mesh, and a stack is a DTensor, so it
-    # has to name the device the weights are actually on.
+    # The FSDP mesh is placed on this device type, so it has to name the
+    # device the weights are actually on.
     import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
 
     parallel_dims.device_type = device.type
@@ -129,19 +126,29 @@ def stacks_are_sharded_off_the_layer_axis(device, rank, world_size):
     del rank
     _, stacked = _models(device, world_size)
     holder = getattr(stacked, STACK_ATTR)
-    for name, stack in holder.named_parameters(recurse=False):
-        assert stack.placements == (Shard(1),), f"{name} is {stack.placements}"
+    specs = getattr(holder, SPECS_ATTR)
+    for name, _ in holder.named_parameters(recurse=False):
+        placements = specs[name].placements
+        assert placements == (Shard(1),), f"{name} is {placements}"
+
+
+def _shard_stacks(holder, mesh, mode, *, shard_dim, param_dtype=None, reduce_dtype=None):
+    """Shard a bare holder's stacks and return the scan body's per-row plan."""
+    shard_module(
+        holder, mesh, mode, shard_dim=shard_dim, param_dtype=param_dtype, reduce_dtype=reduce_dtype
+    )
+    specs = getattr(holder, SPECS_ATTR)
+    return specs, {name: spec.layer_slice().scan_spec() for name, spec in specs.items()}
 
 
 def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
     """A stack too narrow to shard must still have its gradient summed.
 
-    ``data_parallel`` downgrades ``Shard`` to ``Replicate`` when dim 1 is below
+    ``shard_module`` downgrades ``Shard`` to ``Replicate`` when dim 1 is below
     the mesh size -- a norm weight on a wide mesh. There is then no gather for
-    the body to differentiate through. Unrolled, the sum comes from
-    ``to_local(grad_placements=Partial)``; the body reads the local tensor
-    directly, so it has to ask for the sum itself. Skip it and every rank steps
-    on its own microbatch's gradient, silently.
+    the body to differentiate through, and the body has to ask for the sum
+    itself. Skip it and every rank steps on its own microbatch's gradient,
+    silently.
     """
     if world_size == 1:
         logging.warning("skipped: one rank, nothing to downgrade or sum")
@@ -152,14 +159,14 @@ def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
     holder.register_parameter(
         "narrow", nn.Parameter(torch.zeros(2, 1, 4, device=device))
     )
-    data_parallel(holder, mesh, "fully_shard", shard_dim=1)
+    specs, plan = _shard_stacks(holder, mesh, "fully_shard", shard_dim=1)
 
     param = holder._parameters["narrow"]
-    assert param.placements == (Replicate(),), param.placements
-    replica = param.to_local().detach().clone().requires_grad_(True)
+    assert specs["narrow"].placements == (Replicate(),), specs["narrow"].placements
+    replica = param.detach().clone().requires_grad_(True)
 
     # Scaling by the rank makes an unsummed gradient visibly this rank's own.
-    weight = gather_slice(replica[0], plan_stacked_gathers(holder)["narrow"])
+    weight = gather_slice(replica[0], plan["narrow"])
     (weight.sum() * (rank + 1)).backward()
 
     summed = float(world_size * (world_size + 1) // 2)
@@ -171,13 +178,13 @@ def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
 def a_sharded_stack_gathers_and_reduces_like_unrolled(
     device, rank, world_size, shard_dim=1
 ):
-    """The body's gather must compute what SimpleFSDP's does unrolled.
+    """The body's gather must compute what DTensor's redistribute does.
 
-    ``_AllGatherReduceScatter`` hand-writes the pair ``redistribute`` gives the
-    unrolled path, so the two can drift apart: a gather on the wrong axis, a
-    reduce that never runs, a reduce in the wrong dtype. On one rank both
-    collectives are the identity and every version passes, so this only means
-    anything on a real mesh.
+    ``_AllGatherReduceScatter`` hand-writes the pair ``redistribute`` runs, so
+    the two can drift apart: a gather on the wrong axis, a reduce that never
+    runs, a reduce in the wrong dtype. On one rank both collectives are the
+    identity and every version passes, so this only means anything on a real
+    mesh.
     """
     if world_size == 1:
         logging.warning("skipped: one rank, both collectives are the identity")
@@ -189,22 +196,21 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(
         "stack",
         nn.Parameter(torch.randn(2, 4 * world_size, 2 * world_size, device=device)),
     )
-    data_parallel(
+    specs, plan = _shard_stacks(
         holder,
         mesh,
         "fully_shard",
         shard_dim=shard_dim,
-        mp_policy=MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
-        ),
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
     )
     param = holder._parameters["stack"]
-    assert param.placements == (Shard(shard_dim),), param.placements
+    assert specs["stack"].placements == (Shard(shard_dim),), specs["stack"].placements
 
-    # Unrolled: the weight SimpleFSDP hands layer 0, straight off the DTensor.
-    want_shard = param.to_local().detach().clone().requires_grad_(True)
+    # Unrolled: the weight DTensor's redistribute hands layer 0.
+    want_shard = param.detach().clone().requires_grad_(True)
     want = (
-        DTensor.from_local(want_shard, mesh, (Shard(shard_dim),))
+        specs["stack"].to_dtensor(want_shard)
         .redistribute(
             placements=[Replicate()],
             forward_dtype=torch.bfloat16,
@@ -214,10 +220,8 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(
     )
 
     # Scanned: what the body computes for the same row.
-    got_shard = param.to_local().detach().clone().requires_grad_(True)
-    got = funcol.wait_tensor(
-        gather_slice(got_shard[0], plan_stacked_gathers(holder)["stack"])
-    )
+    got_shard = param.detach().clone().requires_grad_(True)
+    got = funcol.wait_tensor(gather_slice(got_shard[0], plan["stack"]))
 
     assert got.dtype == torch.bfloat16, got.dtype
     torch.testing.assert_close(got, want, rtol=0, atol=0)
@@ -231,7 +235,7 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(
 def a_doubly_replicated_stack_sums_on_both_axes(device, rank, world_size):
     """A stack too narrow to shard is `Partial` on both axes, not one.
 
-    `data_parallel` downgrades the shard placement to `Replicate` when dim 1 is
+    `shard_module` downgrades the shard placement to `Replicate` when dim 1 is
     below the shard degree -- a norm weight on any wide mesh, so this is the
     common case and not a corner. Under `hybrid_shard` that leaves the weight
     replicated twice over and a gradient owing a sum to each axis. Sum only the
@@ -252,23 +256,21 @@ def a_doubly_replicated_stack_sums_on_both_axes(device, rank, world_size):
     holder.register_parameter(
         "narrow", nn.Parameter(torch.randn(2, 1, 4, device=device))
     )
-    data_parallel(holder, mesh, "hybrid_shard", shard_dim=1)
+    specs, plan = _shard_stacks(holder, mesh, "hybrid_shard", shard_dim=1)
 
     param = holder._parameters["narrow"]
-    assert param.placements == (Replicate(), Replicate()), param.placements
+    assert specs["narrow"].placements == (Replicate(), Replicate()), specs["narrow"].placements
 
-    # Unrolled: replicated already, so SimpleFSDP's only contribution is asking
+    # Unrolled: replicated already, so DTensor's only contribution is asking
     # for the sum on both axes on the way back.
-    want_local = param.to_local().detach().clone().requires_grad_(True)
+    want_local = param.detach().clone().requires_grad_(True)
     want = DTensor.from_local(
         want_local, mesh, (Replicate(), Replicate())
     ).to_local(grad_placements=[Partial(), Partial()])[0]
 
     # Scanned: what the body computes for the same row.
-    got_local = param.to_local().detach().clone().requires_grad_(True)
-    got = funcol.wait_tensor(
-        gather_slice(got_local[0], plan_stacked_gathers(holder)["narrow"])
-    )
+    got_local = param.detach().clone().requires_grad_(True)
+    got = funcol.wait_tensor(gather_slice(got_local[0], plan["narrow"]))
     torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     # Scaling by the rank makes an unsummed gradient visibly this rank's own.
@@ -301,24 +303,22 @@ def a_hybrid_sharded_stack_sums_over_both_axes(device, rank, world_size):
     holder.register_parameter(
         "wide", nn.Parameter(torch.randn(2, shard_degree, 4, device=device))
     )
-    data_parallel(holder, mesh, "hybrid_shard", shard_dim=1)
+    specs, plan = _shard_stacks(holder, mesh, "hybrid_shard", shard_dim=1)
 
     param = holder._parameters["wide"]
-    assert param.placements == (Replicate(), Shard(1)), param.placements
+    assert specs["wide"].placements == (Replicate(), Shard(1)), specs["wide"].placements
 
-    # Unrolled: the weight SimpleFSDP hands layer 0, straight off the DTensor.
-    want_shard = param.to_local().detach().clone().requires_grad_(True)
+    # Unrolled: the weight DTensor's redistribute hands layer 0.
+    want_shard = param.detach().clone().requires_grad_(True)
     want = (
-        DTensor.from_local(want_shard, mesh, (Replicate(), Shard(1)))
+        specs["wide"].to_dtensor(want_shard)
         .redistribute(placements=[Replicate(), Replicate()])
         .to_local(grad_placements=[Partial(), Partial()])[0]
     )
 
     # Scanned: what the body computes for the same row.
-    got_shard = param.to_local().detach().clone().requires_grad_(True)
-    got = funcol.wait_tensor(
-        gather_slice(got_shard[0], plan_stacked_gathers(holder)["wide"])
-    )
+    got_shard = param.detach().clone().requires_grad_(True)
+    got = funcol.wait_tensor(gather_slice(got_shard[0], plan["wide"]))
     torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     # Scaling by the rank makes an unsummed gradient visibly this rank's own.
@@ -329,10 +329,11 @@ def a_hybrid_sharded_stack_sums_over_both_axes(device, rank, world_size):
 def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     """A stack the mesh cannot split evenly must fail while the plan is built.
 
-    ``distribute_tensor`` leaves the last rank a short shard, and the body's
-    ``all_gather`` needs equal ones. Unrolled it still trains, because
-    ``redistribute`` pads around its gather. So only the scan path has to
-    refuse, and it should do that here rather than at a collective in the loop.
+    ``shard_module`` leaves the last rank a short shard, and the body's
+    ``all_gather`` needs equal ones. Unrolled it still trains, because the
+    module-attribute gather pads around its collectives. So only the scan path
+    has to refuse, and it should do that here rather than at a collective in
+    the loop.
     """
     del rank
     if world_size == 1:
@@ -345,13 +346,13 @@ def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     holder.register_parameter(
         "uneven", nn.Parameter(torch.zeros(2, world_size + 1, 4, device=device))
     )
-    data_parallel(holder, mesh, "fully_shard", shard_dim=1)
-
-    assert holder._parameters["uneven"].placements == (Shard(1),)
+    shard_module(holder, mesh, "fully_shard", shard_dim=1, param_dtype=None, reduce_dtype=None)
+    spec = getattr(holder, SPECS_ATTR)["uneven"]
+    assert spec.placements == (Shard(1),), spec.placements
     try:
-        plan_stacked_gathers(holder)
+        spec.layer_slice().scan_spec()
     except ValueError as err:
-        assert "uneven" in str(err), err
+        assert "evenly" in str(err), err
     else:
         raise AssertionError("an unevenly sharded stack was planned")
 
@@ -378,15 +379,15 @@ def an_unevenly_sharded_hybrid_stack_is_refused(device, rank, world_size):
     holder.register_parameter(
         "uneven", nn.Parameter(torch.zeros(2, shard_degree + 1, 4, device=device))
     )
-    data_parallel(holder, mesh, "hybrid_shard", shard_dim=1)
-
-    assert holder._parameters["uneven"].placements == (Replicate(), Shard(1))
+    shard_module(holder, mesh, "hybrid_shard", shard_dim=1, param_dtype=None, reduce_dtype=None)
+    spec = getattr(holder, SPECS_ATTR)["uneven"]
+    assert spec.placements == (Replicate(), Shard(1)), spec.placements
     try:
-        plan_stacked_gathers(holder)
+        spec.layer_slice().scan_spec()
     except ValueError as err:
         # The degree it names has to be the shard axis, not the whole mesh:
         # asking the mesh refuses sizes that shard fine.
-        assert "uneven" in str(err) and f"{shard_degree} ranks" in str(err), err
+        assert f"{shard_degree} ranks" in str(err), err
     else:
         raise AssertionError("an unevenly sharded hybrid stack was planned")
 

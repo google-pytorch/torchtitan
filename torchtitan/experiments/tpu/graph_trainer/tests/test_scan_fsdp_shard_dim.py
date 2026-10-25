@@ -1,7 +1,7 @@
 """One shard axis per stack, not one per holder.
 
 Sharding every stack on dim 1 breaks once the mesh is wider than dim 1 of some
-stack: ``data_parallel`` quietly replicates that parameter, and the run OOMs
+stack: ``shard_module`` quietly replicates that parameter, and the run OOMs
 with nothing pointing at the cause. Qwen3-235B hits this at 129 ranks, where
 the expert stacks' dim 1 is ``num_experts = 128``.
 
@@ -26,13 +26,15 @@ from torch.distributed.tensor import (
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     _shard_dim,
     LayerStackHolder,
 )
 from torchtitan.experiments.tpu.graph_trainer import scan_fsdp
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import plan_stacked_gathers
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
+    shard_module,
+    SPECS_ATTR,
+)
 
 
 N_LAYERS = 94
@@ -77,25 +79,43 @@ def _holder(shapes=Q235_STACKS, device="meta"):
     return holder
 
 
+def _data_parallel(holder, mesh, style, *, shard_dim):
+    """Shard a holder's stacks; the stacks become this rank's local shards."""
+    shard_module(
+        holder, mesh, style, shard_dim=shard_dim, param_dtype=None, reduce_dtype=None
+    )
+
+
+def _specs(holder):
+    return getattr(holder, SPECS_ATTR)
+
+
+def _plan(holder):
+    """The scan body's per-row plan, as `LayerStack.run` builds it."""
+    return {
+        name: spec.layer_slice().scan_spec() for name, spec in _specs(holder).items()
+    }
+
+
 def _shard(holder, mesh, style="fully_shard"):
-    """`configure_qwen_simple_fsdp_shard_dims` + `apply_simple_fsdp`, in order."""
+    """`configure_qwen_simple_fsdp_shard_dims` + `apply_tpu_fsdp`, in order."""
     degree = mesh.size(mesh.ndim - 1)
     holder.flatten_for(degree)
-    data_parallel(holder, mesh, style, shard_dim=holder.plan_shard_dims(degree))
+    _data_parallel(holder, mesh, style, shard_dim=holder.plan_shard_dims(degree))
     holder.build_split_meshes()
     return holder
 
 
 @contextlib.contextmanager
 def _sharded_holder(world, shapes=Q235_STACKS, shard_dim=None):
-    """The stacks, wrapped by SimpleFSDP on a `world`-wide fake mesh."""
+    """The stacks, sharded on a `world`-wide fake mesh."""
     with _fake_pg(world):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("fsdp",))
         holder = _holder(shapes)
         if shard_dim is None:
             _shard(holder, mesh)
         else:
-            data_parallel(holder, mesh, "fully_shard", shard_dim=shard_dim)
+            _data_parallel(holder, mesh, "fully_shard", shard_dim=shard_dim)
         yield holder
 
 
@@ -201,7 +221,7 @@ class TestShardDimPicker(unittest.TestCase):
         self,
     ):
         # Llama 3 8B at 8192 ranks: `[128256, 4096]` has `128256 % 8192 != 0`
-        # and `4096 < 8192`. Setting `_fsdp_shard_dim = 1` lets `data_parallel`
+        # and `4096 < 8192`. Setting `_fsdp_shard_dim = 1` lets `shard_module`
         # downgrade `Shard(1)` to `Replicate()`.
         model = nn.Module()
         model.tok_embeddings = nn.Embedding(128256, 4096, device="meta")
@@ -220,14 +240,14 @@ class TestShardDimPicker(unittest.TestCase):
         self.assertEqual(model.lm_head._fsdp_shard_dim, 1)
         with _fake_pg(8192):
             mesh = init_device_mesh("cpu", (8192,), mesh_dim_names=("fsdp",))
-            data_parallel(
+            _data_parallel(
                 model.tok_embeddings,
                 mesh,
                 "fully_shard",
                 shard_dim=model.tok_embeddings._fsdp_shard_dim,
             )
             self.assertEqual(
-                model.tok_embeddings._parameters["weight"].placements,
+                _specs(model.tok_embeddings)["weight"].placements,
                 (Replicate(),),
             )
         # Still refuses when `shape[1] >= fsdp_degree` and neither axis divides.
@@ -313,22 +333,22 @@ class TestShardDimPicker(unittest.TestCase):
 
 
 class TestQ235Placements(unittest.TestCase):
-    """What ``data_parallel`` and the scan body's plan end up with."""
+    """What ``shard_module`` and the scan body's plan end up with."""
 
     def test_a_dict_places_exactly_like_the_int_it_repeats(self):
-        # Every other `data_parallel` caller passes an int, so the dict has to
+        # Every other `shard_module` caller passes an int, so the dict has to
         # be a superset of that path and not a second one beside it.
         def placements(shard_dim):
             with _sharded_holder(128, shard_dim=shard_dim) as holder:
-                return {n: p.placements for n, p in holder._parameters.items()}
+                return {n: s.placements for n, s in _specs(holder).items()}
 
         self.assertEqual(
             placements(1), placements({name: 1 for name in Q235_STACKS})
         )
 
     def test_an_already_distributed_parameter_is_refused(self):
-        # A DTensor here means EP or TP ran first, and `ReplicateComputation`
-        # would re-wrap it with the module-level axis, losing the per-stack one.
+        # A DTensor here means EP or TP ran first; the TPU FSDP shards plain
+        # tensors only.
         with _fake_pg(8):
             mesh = init_device_mesh("cpu", (8,), mesh_dim_names=("fsdp",))
             holder = LayerStackHolder()
@@ -341,7 +361,7 @@ class TestQ235Placements(unittest.TestCase):
                 ),
             )
             with self.assertRaises(NotImplementedError):
-                data_parallel(holder, mesh, "fully_shard", shard_dim={"w": 1})
+                _data_parallel(holder, mesh, "fully_shard", shard_dim={"w": 1})
 
     def test_hsdp_plans_off_the_shard_axis_not_the_whole_mesh(self):
         # `dp_replicate=16, dp_shard=128` is how 235B reaches 8k chips. Only the
@@ -351,7 +371,7 @@ class TestQ235Placements(unittest.TestCase):
                 "cpu", (16, 128), mesh_dim_names=("dp_replicate", "fsdp")
             )
             holder = _shard(_holder(), mesh, "hybrid_shard")
-            for name, spec in plan_stacked_gathers(holder).items():
+            for name, spec in _plan(holder).items():
                 self.assertTrue(spec.sharded, name)
                 self.assertEqual(spec.gather_dim, 0, name)  # dim 1 still divides
 
@@ -366,20 +386,18 @@ class TestFlattenedStacks(unittest.TestCase):
         with _sharded_holder(128) as holder:
             self.assertEqual(self._flattened(holder), [])
             for name, shape in Q235_STACKS.items():
-                self.assertEqual(tuple(holder._parameters[name].shape), shape, name)
+                self.assertEqual(_specs(holder)[name].global_shape, shape, name)
 
     def test_axes_one_and_two_are_flattened(self):
         for world in (256, 2048):
             with self.subTest(world=world), _sharded_holder(world) as holder:
                 self.assertEqual(self._flattened(holder), sorted(FLATTENED))
-                plan = plan_stacked_gathers(holder)
+                plan = _plan(holder)
                 for name in FLATTENED:
                     layers, a, b, *rest = Q235_STACKS[name]
-                    param = holder._parameters[name]
-                    self.assertEqual(
-                        tuple(param.shape), (layers, a * b, *rest), name
-                    )
-                    self.assertEqual(param.placements[-1], Shard(1), name)
+                    spec = _specs(holder)[name]
+                    self.assertEqual(spec.global_shape, (layers, a * b, *rest), name)
+                    self.assertEqual(spec.placements[-1], Shard(1), name)
                     self.assertEqual(
                         tuple(holder.layer_shapes[name]), (a, b, *rest)
                     )
@@ -387,7 +405,7 @@ class TestFlattenedStacks(unittest.TestCase):
                     self.assertEqual(plan[name].gather_dim, 0, name)
                 for name in set(Q235_STACKS) - set(FLATTENED):
                     self.assertEqual(
-                        tuple(holder._parameters[name].shape), Q235_STACKS[name]
+                        _specs(holder)[name].global_shape, Q235_STACKS[name]
                     )
 
     def test_a_shard_spanning_two_experts_is_not_flattened(self):
@@ -453,16 +471,14 @@ class TestFlattenedStacks(unittest.TestCase):
         with _fake_pg(4):
             mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("fsdp",))
             holder = _shard(_holder({"w1": (2, 2, 4, 3)}, device="cpu"), mesh)
-            stack = holder._parameters["w1"]
+            stack = holder._parameters["w1"]  # this rank's local shard
             view = holder.as_layer_shape("w1", stack[0])
             self.assertEqual(tuple(view.shape), (2, 4, 3))
 
             with torch.no_grad():
                 nn.init.constant_(view, 7.0)  # a DTensor op, like init_states
-            torch.testing.assert_close(
-                stack.to_local()[0], torch.full_like(stack.to_local()[0], 7.0)
-            )
-            self.assertEqual(stack.to_local()[1].abs().sum().item(), 0.0)
+            torch.testing.assert_close(stack[0], torch.full_like(stack[0], 7.0))
+            self.assertEqual(stack[1].abs().sum().item(), 0.0)
 
             src = torch.arange(6.0).reshape(1, 2, 3)
             with torch.no_grad():  # load_state_dict copies DTensor to DTensor
@@ -475,7 +491,7 @@ class TestFlattenedStacks(unittest.TestCase):
                         stride=view.stride(),
                     )
                 )
-            torch.testing.assert_close(stack.to_local()[0], src.reshape(2, 3))
+            torch.testing.assert_close(stack[0], src.reshape(2, 3))
 
 
 if __name__ == "__main__":

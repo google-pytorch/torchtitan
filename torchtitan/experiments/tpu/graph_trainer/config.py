@@ -7,17 +7,12 @@
 """TPU GraphTrainer config conversion."""
 
 import dataclasses
-import functools
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from torch import nn
 from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
-)
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
-    configure_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
@@ -149,18 +144,6 @@ def to_tpu_graph_trainer_config(
   _maybe_use_maxtext_flops(train_config, graph_config)
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
-  if tpu_config.fsdp_implementation != "simple_fsdp":
-    # The trainer calls `parallelize_fn` with a fixed keyword set, so the
-    # choice rides along as a bound keyword. Only parallelize functions that
-    # accept it (the TPU graph-trainer wrappers) can run under it; anything
-    # else fails loudly at the call rather than silently using SimpleFSDP.
-    graph_config.model_spec = dataclasses.replace(
-        graph_config.model_spec,
-        parallelize_fn=functools.partial(
-            graph_config.model_spec.parallelize_fn,
-            fsdp_implementation=tpu_config.fsdp_implementation,
-        ),
-    )
   if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards the routed experts on a mesh of their own. A
@@ -175,30 +158,18 @@ def to_tpu_graph_trainer_config(
       )
     # Scanning is a property of the model, so it is expressed as a config
     # rewrite: the recipe gets put on a model class that stacks its layer
-    # weights on construction and runs them as one scan, and nothing in the
-    # parallelize path has to know about it.
+    # weights on construction and runs them as one scan. The parallelize path
+    # (`graph_trainer.parallelize`) plans each stack's shard axis before
+    # sharding, scan or not.
     #
     # The rewrite happens here rather than in the recipe because the
     # GraphTrainer model spec built above comes from a fixed class in the
     # graph-trainer registry, which discards whatever the recipe had set.
-    orig_parallelize_fn = graph_config.model_spec.parallelize_fn
-
-    def parallelize_fn_with_shard_dims(
-        model: nn.Module, **kwargs: Any
-    ) -> nn.Module:
-      configure_simple_fsdp_shard_dims(model, kwargs.get("parallel_dims"))
-      model = orig_parallelize_fn(model, **kwargs)
-      for holder in model.modules():
-        if hasattr(holder, "build_split_meshes"):
-          holder.build_split_meshes()
-      return model
-
     graph_config.model_spec = dataclasses.replace(
         graph_config.model_spec,
         model=with_tpu_stacked_layers(
             graph_config.model_spec.model, use_scan=True
         ),
-        parallelize_fn=parallelize_fn_with_shard_dims,
     )
     # The rewrite is only a config edit, so anything added after it that
     # rebuilds `model_spec` from a fixed class drops it again -- and an

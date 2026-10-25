@@ -142,7 +142,7 @@ class SimpleFSDPShardingTest(absltest.TestCase):
     self.assertEqual(model.tok_embeddings._fsdp_shard_dim, 1)
     self.assertEqual(model.lm_head._fsdp_shard_dim, 1)
 
-  def test_graph_trainer_configures_shard_dims_before_simple_fsdp(self) -> None:
+  def test_graph_trainer_parallelize_passes_the_qwen_shard_dims_hook(self) -> None:
     model = _model()
     parallel_dims = _parallel_dims(4)
     training = cast(
@@ -150,17 +150,11 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         SimpleNamespace(mixed_precision_reduce="bfloat16"),
     )
 
-    with (
-        mock.patch.object(
-            graph_trainer_qwen3,
-            "graph_trainer_parallelize_qwen3",
-            return_value=model,
-        ) as upstream_parallelize,
-        mock.patch.object(
-            graph_trainer_qwen3,
-            "install_tpu_replicate_computation",
-        ) as install_tpu_replicate,
-    ):
+    with mock.patch.object(
+        graph_trainer_qwen3,
+        "parallelize_tpu_graph_trainer",
+        return_value=model,
+    ) as shared_parallelize:
       result = graph_trainer_qwen3.parallelize_qwen3(
           cast(GraphTrainerQwen3Model, model),
           training=training,
@@ -168,13 +162,13 @@ class SimpleFSDPShardingTest(absltest.TestCase):
       )
 
     self.assertIs(result, model)
-    self.assertEqual(model.layers["0"].moe.experts._fsdp_shard_dim, 1)
-    upstream_parallelize.assert_called_once_with(
+    shared_parallelize.assert_called_once_with(
         model,
+        annotate=graph_trainer_qwen3.annotate_qwen3,
+        configure_shard_dims=configure_qwen_simple_fsdp_shard_dims,
         training=training,
         parallel_dims=parallel_dims,
     )
-    install_tpu_replicate.assert_called_once_with(model)
 
 
 if __name__ == "__main__":

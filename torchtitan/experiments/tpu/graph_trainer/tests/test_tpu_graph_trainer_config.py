@@ -1456,63 +1456,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           graph_config,
       )
 
-  def test_to_tpu_graph_trainer_config_configures_simple_fsdp_shard_dims_with_scan(
-      self,
-  ) -> None:
-    config = llama3_8b_scan()
-    config.parallelism.data_parallel_shard_degree = 512
-    called_with: list[nn.Module] = []
-
-    def stub_registry(flavor: str):
-      spec = llama3_gt.model_registry(flavor)
-      return dataclasses.replace(
-          spec,
-          parallelize_fn=lambda model, **kwargs: (
-              called_with.append(model) or model
-          ),
-      )
-
-    graph_config = to_tpu_graph_trainer_config(
-        config,
-        stub_registry,
-        target_cls=TpuGraphTrainer.Config,
-    )
-    wrapped_fn = graph_config.model_spec.parallelize_fn
-
-    class DummyHolder(nn.Module):
-      def __init__(self):
-        super().__init__()
-        self.flattened_for = None
-        self.split_meshes_built = False
-
-      def flatten_for(self, degree: int) -> list[str]:
-        self.flattened_for = degree
-        return []
-
-      def plan_shard_dims(self, degree: int) -> dict[str, int]:
-        return {"w": 1}
-
-      def build_split_meshes(self) -> None:
-        self.split_meshes_built = True
-
-    class DummyModel(nn.Module):
-      def __init__(self):
-        super().__init__()
-        self.tok_embeddings = nn.Embedding(128256, 4096)
-        self.lm_head = nn.Linear(4096, 128256, bias=False)
-        self.layer_stacks = DummyHolder()
-
-    m = DummyModel()
-    pdims = SimpleNamespace(dp_shard=512, cp=1)
-    out = wrapped_fn(m, parallel_dims=pdims)
-    self.assertIs(out, m)
-    self.assertEqual(called_with, [m])
-    self.assertEqual(getattr(m.tok_embeddings, "_fsdp_shard_dim", None), 1)
-    self.assertEqual(getattr(m.lm_head, "_fsdp_shard_dim", None), 1)
-    self.assertEqual(m.layer_stacks.flattened_for, 512)
-    self.assertEqual(getattr(m.layer_stacks, "_fsdp_shard_dim", None), {"w": 1})
-    self.assertTrue(m.layer_stacks.split_meshes_built)
-
 
 if __name__ == "__main__":
   absltest.main()

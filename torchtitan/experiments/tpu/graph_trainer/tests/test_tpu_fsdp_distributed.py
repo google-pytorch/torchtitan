@@ -1,10 +1,13 @@
-"""Explicit TPU FSDP must compute what SimpleFSDP's DTensor path computes.
+"""The TPU FSDP must compute what DTensor's collectives compute.
 
-Every check compares against DTensor's own ``redistribute`` (the collective
-pair SimpleFSDP ran) or against a SimpleFSDP-sharded model built the same way,
-on ``--device`` across ``--num_devices`` ranks. On one rank both collectives
-are the identity and every version passes, so these only mean anything on a
-real mesh; each worker skips itself with a warning when the mesh is too small.
+Every per-parameter check compares against DTensor's own ``redistribute``
+(the gather / reduce-scatter pair, with its dtypes and padding), and every
+model-level check against the same model with DTensor parameters (for the
+seeded init) or holding the whole weights unsharded (for the forward and the
+gradients), on ``--device`` across ``--num_devices`` ranks. On one rank both
+collectives are the identity and every version passes, so these only mean
+anything on a real mesh; each worker skips itself with a warning when the mesh
+is too small.
 """
 
 import functools
@@ -15,7 +18,13 @@ import torch
 import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor import (
+    distribute_tensor,
+    DTensor,
+    Partial,
+    Replicate,
+    Shard,
+)
 
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
@@ -186,72 +195,134 @@ def dtensor_window_shares_storage(device, rank, world_size):
     torch.testing.assert_close(shard.detach(), torch.full_like(shard, 3.0))
 
 
-def init_matches_simple_fsdp(device, rank, world_size, *, stacked, flatten=False):
-    """Seeded initialization gives the same weights under both implementations.
+def _distribute_like(reference: nn.Module, sharded: nn.Module) -> None:
+    """Give ``reference``'s parameters the DTensor placements ``sharded`` uses."""
+    modules = dict(reference.named_modules())
+    for name, module in sharded.named_modules():
+        specs = getattr(module, SPECS_ATTR, None)
+        if not specs:
+            continue
+        target = modules[name]
+        for pname, spec in specs.items():
+            param = target._parameters[pname]
+            target._parameters[pname] = nn.Parameter(
+                distribute_tensor(param.detach(), spec.mesh, spec.placements),
+                requires_grad=param.requires_grad,
+            )
 
-    Checked through ``state_dict`` as whole tensors, which is also the
-    checkpoint format, so the two write interchangeable checkpoints.
+
+def _whole(state_dict) -> dict[str, torch.Tensor]:
+    return {
+        k: v.full_tensor() if isinstance(v, DTensor) else v
+        for k, v in state_dict.items()
+    }
+
+
+def init_matches_dtensor_init(device, rank, world_size):
+    """Seeded init of plain shards equals the init of the same DTensor parameters.
+
+    The init runs inside the DTensor window, so it is DTensor's sharded RNG in
+    both cases; this pins that the window hands the initializer the same
+    placements the sharded model would have had as DTensors, unrolled. Checked
+    through ``state_dict`` as whole tensors, which is also the checkpoint
+    format.
     """
     del rank
-    if flatten and (world_size < 4 or world_size % 2):
-        logging.warning("skipped: 2 experts flatten only on an even mesh of >= 4")
+    if world_size == 1:
+        logging.warning("skipped: one rank, nothing is sharded")
         return
     import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
 
     parallel_dims.device_type = device.type
-    config = test_layer_stack._moe_config(num_experts=2) if flatten else None  # pylint: disable=protected-access
-    models = {}
-    for fsdp in ("simple_fsdp", "explicit"):
-        models[fsdp] = test_layer_stack._build(  # pylint: disable=protected-access
-            stacked=stacked,
-            flatten=flatten,
-            config=config,
-            device=device,
-            world_size=world_size,
-            fsdp=fsdp,
-        )
-    want = {k: v.full_tensor() for k, v in models["simple_fsdp"].state_dict().items()}
-    got = {k: v.full_tensor() for k, v in models["explicit"].state_dict().items()}
+    explicit = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=False, device=device, world_size=world_size
+    )
+    reference = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=False,
+        device=device,
+        world_size=world_size,
+        shard=False,
+        prepare=functools.partial(_distribute_like, sharded=explicit),
+    )
+    want = _whole(reference.state_dict())
+    got = _whole(explicit.state_dict())
     assert set(want) == set(got), set(want) ^ set(got)
     for key in want:
         torch.testing.assert_close(got[key], want[key], rtol=0, atol=0, msg=key)
-    # The explicit model holds plain shards at rest, and none of them is a DTensor.
-    explicit = models["explicit"]
     assert all(not isinstance(p, DTensor) for p in explicit.parameters())
     assert tpu_fsdp.uses_tpu_fsdp(explicit)
 
 
-def forward_and_grads_match_simple_fsdp(device, rank, world_size, *, scan, moe=False):
-    """Same weights in, same logits and same shard gradients out.
+def stacked_init_matches_unrolled(device, rank, world_size):
+    """Sharded stacks initialize to what the unrolled sharded model does.
 
-    ``moe`` uses the 2-layer qwen3 MoE (TPU grouped experts, router gate), whose
-    expert stacks shard on a hidden axis and whose kernels read weights their
-    own way; the llama3 debug model covers the dense path. Unrolled only: the
-    test MoE config keeps the aux-loss routing metrics on, which a scan body
-    cannot carry (the e2e test covers the scanned MoE through the recipe).
+    The per-layer DTensor views the stack puts up for ``init_states`` have to
+    describe the same rows the unrolled model initializes, or the seeded draws
+    land in different places. Only where the two models give a weight the
+    same placements: without DTensor's offset-based RNG tracker (CPU and TPU
+    have none) a sharded draw depends on the placement, so a flattened stack
+    (``Shard(1)`` of ``[L, E*X, ...]``) and its unrolled ``[E, X, ...]`` expert
+    cannot be compared this way; ``test_layer_stack_distributed`` checks the
+    flattened views by loading weights through them instead.
+    """
+    del rank
+    if world_size == 1:
+        logging.warning("skipped: one rank, nothing is sharded")
+        return
+    import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
+
+    parallel_dims.device_type = device.type
+    unrolled = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=False, device=device, world_size=world_size
+    )
+    stacked = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=True, device=device, world_size=world_size
+    )
+    want = _whole(unrolled.state_dict())
+    got = _whole(stacked.state_dict())
+    assert set(want) == set(got), set(want) ^ set(got)
+    for key in want:
+        torch.testing.assert_close(got[key], want[key], rtol=0, atol=0, msg=key)
+
+
+def forward_and_grads_match_unsharded(device, rank, world_size, *, scan, moe=False):
+    """Same weights in, same logits and the summed gradient out.
+
+    The reference holds the whole weights on every rank (no FSDP) and is
+    loaded from the sharded model's checkpoint. Every rank runs the same
+    tokens, so the sharded model's reduce-scatter (or all-reduce, for a
+    replicated weight) hands each shard ``world_size`` times the reference's
+    gradient, on this rank's rows. ``moe`` uses the 2-layer qwen3 MoE (TPU
+    grouped experts, router gate); the llama3 debug model covers the dense
+    path. Unrolled only: the test MoE config keeps the aux-loss routing metrics
+    on, which a scan body cannot carry. ``scan`` runs on CPU only: eager
+    ``scan`` does not compute the layers on TPU (the model has to be traced),
+    and the traced scan is graded against the loop end to end by
+    ``test_tpu_graph_trainer_distributed.test_scan_matches_the_layer_loop``.
     """
     del rank
     if world_size == 1:
         logging.warning("skipped: one rank, nothing is gathered")
         return
+    if scan and device.type != "cpu":
+        logging.warning("skipped: eager scan is CPU-only; the traced scan is covered e2e")
+        return
     import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
 
     parallel_dims.device_type = device.type
     config = test_layer_stack._moe_config(num_experts=2) if moe else None  # pylint: disable=protected-access
-    models = {
-        fsdp: test_layer_stack._build(  # pylint: disable=protected-access
-            stacked=scan,
-            scan=scan,
-            config=config,
-            device=device,
-            world_size=world_size,
-            fsdp=fsdp,
-        )
-        for fsdp in ("simple_fsdp", "explicit")
-    }
-    tokens = torch.randint(
-        0, models["explicit"].config.vocab_size, (test_layer_stack.TOKENS,), device=device
+    sharded = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=scan, scan=scan, config=config, device=device, world_size=world_size
     )
+    reference = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=False, config=config, device=device, world_size=world_size, shard=False
+    )
+    reference.load_state_dict(_whole(sharded.state_dict()))
+
+    tokens = torch.randint(
+        0, sharded.config.vocab_size, (test_layer_stack.TOKENS,),
+        generator=torch.Generator().manual_seed(7),
+    ).to(device)
     positions = (
         torch.arange(test_layer_stack.SEQ_LEN, device=device).repeat(
             test_layer_stack.TOKENS // test_layer_stack.SEQ_LEN
@@ -260,24 +331,44 @@ def forward_and_grads_match_simple_fsdp(device, rank, world_size, *, scan, moe=F
         else None
     )
     outs = {}
-    for fsdp, model in models.items():
+    for arm, model in (("sharded", sharded), ("reference", reference)):
         out = model(tokens, positions) if moe else model(tokens)
-        outs[fsdp] = out.detach()
+        outs[arm] = out.detach()
         out.float().sum().backward()
-    torch.testing.assert_close(outs["explicit"], outs["simple_fsdp"], rtol=0, atol=0)
-    want = {
-        name: p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-        for name, p in models["simple_fsdp"].named_parameters()
-    }
+    torch.testing.assert_close(outs["sharded"], outs["reference"], rtol=0, atol=0)
+
+    # The reference's gradient of every stack row, as a stack, or of the
+    # parameter itself, keyed by the sharded model's parameter names.
+    ref_params = dict(reference.named_parameters())
+    n_layers = len(reference.layers)
+
+    def reference_grad(name: str) -> torch.Tensor:
+        if name.startswith(f"{STACK_ATTR}."):
+            per_layer = name[len(STACK_ATTR) + 1 :].replace("__", ".")
+            return torch.stack(
+                [ref_params[f"layers.{i}.{per_layer}"].grad for i in range(n_layers)]
+            )
+        return ref_params[name].grad
+
+    specs = tpu_fsdp.param_specs(sharded)
     mismatched = []
-    for name, p in models["explicit"].named_parameters():
+    for name, p in sharded.named_parameters():
         assert p.grad is not None, name
-        if not torch.equal(p.grad, want[name]):
-            diff = (p.grad.float() - want[name].float()).abs().max().item()
-            mismatched.append(f"{name}: shape {tuple(p.grad.shape)} max|diff| {diff:.3g}")
-    assert not mismatched, "gradients differ from SimpleFSDP:\n" + "\n".join(mismatched)
+        spec = specs[id(p)]
+        want = reference_grad(name) * world_size
+        d = spec.shard_dim
+        if d is not None:
+            shape, offset = spec.local_shape_and_offset()
+            want = want.narrow(d, offset[d], shape[d])
+        try:
+            torch.testing.assert_close(p.grad, want, rtol=1e-5, atol=5e-5)
+        except AssertionError as err:
+            mismatched.append(f"{name}: shape {tuple(p.grad.shape)}: {err}")
+    assert not mismatched, "gradients differ from the unsharded model:\n" + "\n".join(
+        mismatched
+    )
     if scan:
-        holder = getattr(models["explicit"], STACK_ATTR)
+        holder = getattr(sharded, STACK_ATTR)
         assert getattr(holder, SPECS_ATTR), "the stacks were not sharded explicitly"
 
 
@@ -421,32 +512,26 @@ class TestTpuFSDP(base_distributed_device_test.BaseDistributedDeviceTest):
     def test_dtensor_window_shares_storage(self):
         self._on_devices(dtensor_window_shares_storage)
 
-    def test_init_matches_simple_fsdp_unrolled(self):
-        self._on_devices(functools.partial(init_matches_simple_fsdp, stacked=False))
+    def test_init_matches_dtensor_init(self):
+        self._on_devices(init_matches_dtensor_init)
 
-    def test_init_matches_simple_fsdp_stacked(self):
-        self._on_devices(functools.partial(init_matches_simple_fsdp, stacked=True))
+    def test_stacked_init_matches_unrolled(self):
+        self._on_devices(stacked_init_matches_unrolled)
 
-    def test_init_matches_simple_fsdp_flattened_stacks(self):
+    def test_forward_and_grads_match_unsharded(self):
         self._on_devices(
-            functools.partial(init_matches_simple_fsdp, stacked=True, flatten=True)
+            functools.partial(forward_and_grads_match_unsharded, scan=False)
         )
 
-    def test_forward_and_grads_match_simple_fsdp(self):
+    def test_scan_forward_and_grads_match_unsharded(self):
         self._on_devices(
-            functools.partial(forward_and_grads_match_simple_fsdp, scan=False)
+            functools.partial(forward_and_grads_match_unsharded, scan=True)
         )
 
-    def test_scan_forward_and_grads_match_simple_fsdp(self):
+    def test_moe_forward_and_grads_match_unsharded(self):
         self._on_devices(
-            functools.partial(forward_and_grads_match_simple_fsdp, scan=True)
+            functools.partial(forward_and_grads_match_unsharded, scan=False, moe=True)
         )
-
-    def test_moe_forward_and_grads_match_simple_fsdp(self):
-        self._on_devices(
-            functools.partial(forward_and_grads_match_simple_fsdp, scan=False, moe=True)
-        )
-
 
     def test_grad_norm_fsdp(self):
         self._on_devices(functools.partial(grad_norm_matches_dtensor, hybrid=False))

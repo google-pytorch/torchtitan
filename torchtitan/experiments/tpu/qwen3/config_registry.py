@@ -1122,18 +1122,6 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_scan_explicit_fsdp() -> TPUTrainerConfig:
-  """`qwen3_moe_235b_scan` sharded by explicit TPU FSDP instead of SimpleFSDP.
-
-  Same model, batch, flags and scan body; only `tpu_config.fsdp_implementation`
-  differs, so an A/B against `qwen3_moe_235b_scan` in one pod isolates the
-  sharding implementation (torchtitan/experiments/tpu/graph_trainer/tpu_fsdp.py).
-  """
-  cfg = qwen3_moe_235b_scan()
-  cfg.tpu_config.fsdp_implementation = "explicit"
-  return cfg
-
-
 def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
   """`qwen3_moe_235b_scan` cut to 12 of its 94 layers, so it fits a 32-chip slice.
 
@@ -1158,8 +1146,7 @@ def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
   The 235B scan recipe's body prerequisites on the small proxy: FSDP only, a
   4-rank global batch, MoE routing metrics off and the discarded-token counter
   overridden (a scan body cannot write to tensors it closed over). The local
-  iteration row for sharding and scan-body changes; pair it with
-  `--tpu_config.fsdp_implementation` to A/B the FSDP implementation.
+  iteration row for sharding and scan-body changes.
   """
   cfg = qwen3_moe_30b_proxy()
   cfg.parallelism.expert_parallel_degree = 1
@@ -1170,13 +1157,6 @@ def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
   cfg.metrics.enable_moe_routing = False
   cfg.metrics.log_freq = 1
   cfg.tpu_config.use_scan_layers = True
-  return cfg
-
-
-def qwen3_moe_235b_scan_proxy_explicit_fsdp() -> TPUTrainerConfig:
-  """`qwen3_moe_235b_scan_proxy` sharded by explicit TPU FSDP (A/B treatment)."""
-  cfg = qwen3_moe_235b_scan_proxy()
-  cfg.tpu_config.fsdp_implementation = "explicit"
   return cfg
 
 

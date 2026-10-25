@@ -62,12 +62,6 @@ class GraphSplitterConfig:
 @dataclasses.dataclass
 class TPUConfig:
   use_simple_fsdp: bool = False
-  # How the graph trainer shards parameters over the data-parallel mesh.
-  # ``simple_fsdp``: graph_trainer's DTensor parametrization. ``explicit``:
-  # parameters are plain local shards and the gather / reduce-scatter pair is
-  # emitted directly (torchtitan/experiments/tpu/graph_trainer/tpu_fsdp.py);
-  # DTensor appears only as a view for initialization and checkpoints.
-  fsdp_implementation: Literal["simple_fsdp", "explicit"] = "simple_fsdp"
   compile_mode: str = "layer"
   apply_rope_complex_workaround: bool = False
   # Compute dense Llama3/Qwen3 transformer blocks on [B, L, ...] views instead
@@ -352,19 +346,16 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
           "--tpu-config.use-scan-layers needs "
           "--tpu-config.use-graph-trainer; no other lane applies it."
       )
-    if self.tpu_config.fsdp_implementation != "simple_fsdp":
-      # Only the graph trainer's parallelize wrappers take the choice (the graph
-      # trainer always shards with a TPU-side FSDP; the eager lanes do not).
-      if not self.tpu_config.use_graph_trainer:
-        raise ValueError(
-            f"--tpu-config.fsdp-implementation={self.tpu_config.fsdp_implementation} "
-            "needs --tpu-config.use-graph-trainer"
-        )
-      if self.parallelism.tensor_parallel_degree > 1:
-        raise ValueError(
-            "--tpu-config.fsdp-implementation=explicit does not support "
-            "tensor parallelism yet"
-        )
+    if (
+        self.tpu_config.use_graph_trainer
+        and self.parallelism.tensor_parallel_degree > 1
+    ):
+      # The graph trainer's FSDP (graph_trainer/tpu_fsdp.py) shards plain
+      # tensors over the data-parallel mesh only; nothing inserts the TP-axis
+      # reductions a replicated weight would need.
+      raise ValueError(
+          "--tpu-config.use-graph-trainer does not support tensor parallelism"
+      )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.
     if not self.dump_folder:

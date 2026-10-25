@@ -57,7 +57,6 @@ from torch.func import functional_call
 from torchtitan.config import derive
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     gather_slice,
-    plan_stacked_gathers,
     ScanFSDPSpec,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
@@ -180,17 +179,17 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     for d in range(1, param.ndim):
         if param.shape[d] % degree == 0:
             return d
-    # Nothing divides: the widest axis. `data_parallel` replicates it if it is
-    # narrower than the mesh, and `plan_stacked_gathers` refuses it if not.
+    # Nothing divides: the widest axis. `shard_module` replicates it if it is
+    # narrower than the mesh, and `ShardSpec.scan_spec` refuses it if not.
     return max(range(1, param.ndim), key=lambda d: param.shape[d])
 
 
 class _AsScanInput(torch.autograd.Function):
     """Identity whose output autograd does not record as a view of the input.
 
-    The plain-shard counterpart of ``DTensor.to_local``'s ``_ToTorchTensor``:
-    the scan body's ``xs`` have to be regular intermediates of the joint
-    graph, not the graph's parameter inputs (see ``LayerStack.run``).
+    The scan body's ``xs`` have to be regular intermediates of the joint
+    graph, not the graph's parameter inputs (see ``LayerStack.run``); this is
+    what ``DTensor.to_local`` provided when the stacks were DTensors.
     """
 
     @staticmethod
@@ -215,8 +214,8 @@ class LayerStackHolder(Module):
     itself in its own ``__init__`` and so the holder is already in the tree when
     ``verify_module_protocol`` walks it.
 
-    Put nothing else in here: SimpleFSDP skips a module once it has sharded it,
-    so anything else parked here would silently go unsharded.
+    Put nothing else in here: ``shard_module`` skips a module once it has
+    sharded it, so anything else parked here would silently go unsharded.
     """
 
     # Dim 1 for every stack, until someone calls `plan_shard_dims` with the mesh
@@ -307,7 +306,7 @@ class LayerStackHolder(Module):
         return dict(self.layer_shapes)
 
     def plan_shard_dims(self, degree: int) -> dict[str, int]:
-        """Returns the axis ``apply_simple_fsdp`` shards each stack on.
+        """Returns the axis ``apply_tpu_fsdp`` shards each stack on.
 
         Read-only. The result reflects the stacks as currently stored, so call
         ``flatten_for`` first. Covers every stack, so a missing key downstream
@@ -324,18 +323,13 @@ class LayerStackHolder(Module):
 
         For each flattened stack, splits the shard axis of its FSDP mesh into
         ``(A, ranks // A)``. This creates process groups, so all ranks must call
-        it at the same point; call it right after ``apply_simple_fsdp``.
+        it at the same point; call it right after ``apply_tpu_fsdp``.
         """
         specs = getattr(self, SPECS_ATTR, {})
         for name, shape in self.layer_shapes.items():
-            param = self._parameters.get(name)
-            if isinstance(param, DTensor):
-                mesh = param.device_mesh
-            elif name in specs:
-                # Explicit TPU FSDP: a plain shard, its mesh on the spec.
-                mesh = specs[name].mesh
-            else:
+            if name not in specs:
                 continue
+            mesh = specs[name].mesh
             dim1_len = shape[0]
             if (mesh, dim1_len) in self.split_meshes:
                 continue
@@ -357,33 +351,35 @@ class LayerStackHolder(Module):
         initialization and the state-dict hooks; the scan body reshapes plain
         tensors instead (see ``LayerStack.run``).
 
-        A sharded layer is an ``[A*B, ...]`` DTensor with ``Shard(0)``. When
-        ``A`` is smaller than the mesh, no placement on a 1-D mesh describes it
-        as ``[A, B, ...]``. Splitting the shard axis into ``(A, ranks // A)``
-        describes the same local data as ``(Shard(0), Shard(1))``, without the
-        copy that ``redistribute`` would make.
+        The stack is a plain shard and ``layer`` is its local row. Once the
+        stack is sharded (a :class:`ShardSpec` on the holder), the row comes
+        back as a DTensor view built from that spec, so initialization and
+        checkpoints see one distributed tensor per layer parameter. Inside
+        ``tpu_fsdp.dtensor_params`` (``init_states``) the stack already is a
+        DTensor view and ``layer`` is its row; that row carries the same
+        placements the spec would give it.
 
-        Under explicit TPU FSDP the stack is a plain shard and ``layer`` is its
-        local row; the row's DTensor view is built here from the stack's spec,
-        so initialization and checkpoints see the same DTensor they would under
-        SimpleFSDP.
+        A sharded row of a flattened stack is ``[A*B, ...]`` with ``Shard(0)``.
+        When ``A`` is smaller than the mesh, no placement on a 1-D mesh
+        describes it as ``[A, B, ...]``. Splitting the shard axis into
+        ``(A, ranks // A)`` describes the same local data as
+        ``(Shard(0), Shard(1))``, without the copy that ``redistribute`` would
+        make.
         """
         shape = self.layer_shapes.get(name)
         spec: ShardSpec | None = getattr(self, SPECS_ATTR, {}).get(name)
         if isinstance(layer, DTensor):
-            placements, mesh, local = layer.placements, layer.device_mesh, None
-        elif spec is not None:
+            if shape is None:
+                return layer
+            placements, mesh, local = layer.placements, layer.device_mesh, layer.to_local()
+        elif spec is None:
+            return layer if shape is None else layer.view(shape)
+        else:
             row = spec.layer_slice()
             if shape is None:
                 return row.to_dtensor(layer)
             placements, mesh, local = row.placements, row.mesh, layer
-        elif shape is None:
-            return layer
-        else:
-            return layer.view(shape)
-        if shape is None:
-            return layer
-        # SimpleFSDP shards on the last mesh axis. Earlier axes, such as HSDP's
+        # The shard axis is the last mesh axis. Earlier axes, such as HSDP's
         # replicate axis, are kept as they are.
         *outer, last = placements
         if last != Shard(0):
@@ -403,10 +399,8 @@ class LayerStackHolder(Module):
             # ranks that reach this line would join them, so the job hangs.
             raise RuntimeError(
                 f"no split mesh for {name}; call build_split_meshes() on every "
-                "rank right after apply_simple_fsdp"
+                "rank right after apply_tpu_fsdp"
             )
-        if local is None:
-            local = layer.to_local()
         return DTensor.from_local(
             local.view(1, dim2_len // ranks_per_entry, *shape[2:]),
             self.split_meshes[(mesh, dim1_len)],
@@ -423,8 +417,7 @@ class StackedLayers(TpuLayerLoop):
     A ``TpuLayerLoop`` runs its own layers, so swapping the container is all it
     takes to change how they run: as ``n_layers`` ``functional_call``s, or as
     one ``scan`` over the stacks. Either way the layer modules inside are the
-    same objects as before, so their parameters, FQNs and SimpleFSDP
-    parametrizations are untouched.
+    same objects as before, so their parameters and FQNs are untouched.
     """
 
     def __init__(self, layers: nn.ModuleDict, stack: "LayerStack", *, use_scan: bool):
@@ -459,9 +452,9 @@ class LayerStack:
         # `unrolled()`, and the views themselves, to check nothing swapped them.
         self._hidden: dict[str, nn.Parameter] = {}
         self._views: dict[tuple[int, str], nn.Parameter] = {}
-        # The DTensor attributes each stack is sharded with, saved because the
-        # scan body only ever sees plain tensors. Filled on the first scan, not
-        # here; see `scan_fsdp`.
+        # How the scan body gathers one row of each stack, read off the
+        # stacks' `ShardSpec`s. Filled on the first scan, not here, because the
+        # stacks are sharded after `__init__`.
         self.fsdp_plan: dict[str, ScanFSDPSpec] = {}
 
     def _slots(self) -> Iterator[tuple[int, str, nn.Module, str]]:
@@ -547,9 +540,9 @@ class LayerStack:
         """
         assert self._unregistered and not self._views_attached
         for i, name, mod, attr in self._slots():
-            # Read out of `_parameters`, not with `getattr`: after SimpleFSDP
-            # the attribute returns the *gathered* tensor, and a view of that
-            # would alias a temporary, not this rank's shard.
+            # Read out of `_parameters`, not with `getattr`: once sharded, the
+            # attribute returns the *gathered* tensor, and a view of that would
+            # alias a temporary, not this rank's shard.
             stack = self.holder._parameters[_mangle(name)]
             # `stack[i]` is basic indexing -- a plain integer, no mask, no index
             # tensor -- which in torch always returns a view, never a copy. So
@@ -558,8 +551,8 @@ class LayerStack:
             # stack rather than in a temporary; `test_init_differs_per_row`
             # checks it.
             #
-            # Registered by hand, because `setattr` would go through SimpleFSDP's
-            # parametrization instead of the raw slot.
+            # Registered by hand, because `setattr` would go through the FSDP
+            # property instead of the raw slot.
             layer = self.holder.as_layer_shape(_mangle(name), stack[i])
             view = nn.Parameter(layer, requires_grad=stack.requires_grad)
             mod._parameters[attr] = view
@@ -683,8 +676,8 @@ class LayerStack:
         time and program size stop growing with depth.
 
         The other is where the all-gather happens. The loop reads each stack
-        with ``getattr``, which runs SimpleFSDP's parametrization and gathers
-        the whole ``[n_layers, ...]`` tensor. Every layer's weights are then
+        with ``getattr``, which runs the FSDP property and gathers the whole
+        ``[n_layers, ...]`` tensor. Every layer's weights are then
         resident until the backward is done: about 137 GiB per chip at
         llama3-70b, which does not fit. ``scan`` instead passes this rank's
         *shard* of each stack and gathers one layer inside the body, so only
@@ -733,20 +726,16 @@ class LayerStack:
         # dict with the same keys holding row i: [8192, 8192], [1024, 8192], ...
         if use_scan:
             # On the first forward, not at install time: the stacks are sharded
-            # after `__init__`, so a plan built there would see meta tensors,
-            # find nothing sharded, and silently run every layer on this rank's
-            # shard of it. Under explicit TPU FSDP the specs are right there on
-            # the holder and the per-layer row is one method call away; the
-            # DTensor plan is SimpleFSDP's.
+            # after `__init__`, so a plan built there would see no specs, and
+            # silently run every layer on this rank's shard of it. A holder
+            # without specs was never sharded (no mesh at all), and its rows
+            # pass through the body as they are.
             if not self.fsdp_plan:
-                specs = getattr(self.holder, SPECS_ATTR, None)
-                if specs is not None:
-                    self.fsdp_plan = {
-                        name: specs[name].layer_slice().scan_spec()
-                        for name in specs
-                    }
-                else:
-                    self.fsdp_plan = plan_stacked_gathers(self.holder)
+                specs = getattr(self.holder, SPECS_ATTR, {})
+                self.fsdp_plan = {
+                    name: spec.layer_slice().scan_spec()
+                    for name, spec in specs.items()
+                }
             if template.training and not h.requires_grad:
                 # When the init carry doesn't require grad, `scan`'s backward
                 # returns `zeros_like(carry)`. That cuts the gradient chain
@@ -758,22 +747,17 @@ class LayerStack:
                     "loss and no error"
                 )
             # `xs` is the body's input, one layer per step. `getattr` would
-            # fire the FSDP parametrization and gather the whole stack here,
-            # outside the loop. `_parameters` passes this rank's shard instead,
-            # and the body gathers one layer. Under explicit TPU FSDP the slot
-            # already holds the plain shard.
-            xs = {}
-            for name in self.names:
-                param = self.holder._parameters[_mangle(name)]
-                if isinstance(param, DTensor):
-                    xs[_mangle(name)] = param.to_local()
-                else:
-                    # Through an autograd function, as `to_local` is: `scan`
-                    # saves its xs for backward, and a saved tensor that the
-                    # joint tracer sees as a graph input, or as a view of one,
-                    # drops out of its outputs-to-grad while the tangent stays
-                    # ("outs_to_grad length != tangents length").
-                    xs[_mangle(name)] = _AsScanInput.apply(param)
+            # fire the FSDP property and gather the whole stack here, outside
+            # the loop. `_parameters` passes this rank's shard instead, and the
+            # body gathers one layer. Through an autograd function: `scan`
+            # saves its xs for backward, and a saved tensor that the joint
+            # tracer sees as a graph input, or as a view of one, drops out of
+            # its outputs-to-grad while the tangent stays ("outs_to_grad length
+            # != tangents length").
+            xs = {
+                _mangle(name): _AsScanInput.apply(self.holder._parameters[_mangle(name)])
+                for name in self.names
+            }
 
             def scan_body(carry, slices):
                 # `scan` hands the body row i of every stack, under the same
@@ -949,7 +933,7 @@ def with_tpu_stacked_layers(
     """Put ``model_config`` on a model that arrives already stacked.
 
     Stacking is a property of the model, not of how it gets parallelized. The
-    model is built stacked, and ``apply_simple_fsdp`` then shards the stacks it
+    model is built stacked, and ``apply_tpu_fsdp`` then shards the stacks it
     finds like any other parameter, on the axis ``_fsdp_shard_dim`` names above.
     Nothing in the parallelize path has to know that stacking exists.
 

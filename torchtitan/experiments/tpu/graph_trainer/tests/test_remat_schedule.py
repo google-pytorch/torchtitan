@@ -43,10 +43,7 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import (
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    data_parallel,
-    MixedPrecisionPolicy,
-)
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import shard_module
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _TPU_FSDP_RS_DEADLINE_META,
     _TPU_REMAT_BARRIER_KIND_META,
@@ -130,8 +127,21 @@ class _ToyModel(nn.Module):
         return self.norm(x)
 
 
+def _shard_every_module(model, mesh, *, param_dtype, reduce_dtype=None):
+    """Shard every module's direct parameters, as ``apply_tpu_fsdp`` does."""
+    for module in model.modules():
+        shard_module(
+            module,
+            mesh,
+            "fully_shard",
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+        )
+    return model
+
+
 def _trace_simple_fsdp_remat_graph(n_layers: int = 3):
-    """Trace a real SimpleFSDP graph and add its layer-entry barriers."""
+    """Trace a real FSDP graph and add its layer-entry barriers."""
     assert not dist.is_initialized()
     dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
     try:
@@ -139,12 +149,7 @@ def _trace_simple_fsdp_remat_graph(n_layers: int = 3):
         with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
             model = _ToyModel(dim=8, n_layers=n_layers)
             annotate_module_fqns(model)
-            model = data_parallel(
-                model,
-                device_mesh=mesh,
-                mode="fully_shard",
-                mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
-            )
+            model = _shard_every_module(model, mesh, param_dtype=torch.bfloat16)
             inputs = torch.randn(
                 2, 8, dtype=torch.bfloat16, requires_grad=True
             )

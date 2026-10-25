@@ -28,10 +28,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    data_parallel,
-    MixedPrecisionPolicy,
-)
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import shard_module
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
@@ -158,7 +155,7 @@ class GraphSplitTest(absltest.TestCase):
       reduce_dtype: torch.dtype = torch.float32,
       fsdp_reshard_after_forward: str = "always",
   ):
-    """Trace the shared model through real SimpleFSDP with fake collectives."""
+    """Trace the shared model through the TPU FSDP with fake collectives."""
 
     self.assertFalse(dist.is_initialized())
     dist.init_process_group(
@@ -168,15 +165,14 @@ class GraphSplitTest(absltest.TestCase):
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
         model = self._build_toy_model(n_layers)
-        model = data_parallel(
-            model,
-            device_mesh=mesh,
-            mode="fully_shard",
-            mp_policy=MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=reduce_dtype,
-            ),
-        )
+        for module in model.modules():
+          shard_module(
+              module,
+              mesh,
+              "fully_shard",
+              param_dtype=torch.bfloat16,
+              reduce_dtype=reduce_dtype,
+          )
         inputs = torch.randn(
             2, 8, dtype=torch.bfloat16, requires_grad=True
         )

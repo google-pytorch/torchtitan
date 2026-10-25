@@ -39,10 +39,7 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    data_parallel,
-    MixedPrecisionPolicy,
-)
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import shard_module
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _optimization_barrier,
     apply_tpu_remat_schedule,
@@ -285,8 +282,21 @@ def _trace_toy(model: nn.Module):
     return minimal_fx_tracer(step, module=model)(x), x
 
 
+def _shard_every_module(model, mesh, *, param_dtype, reduce_dtype=None):
+    """Shard every module's direct parameters, as ``apply_tpu_fsdp`` does."""
+    for module in model.modules():
+        shard_module(
+            module,
+            mesh,
+            "fully_shard",
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+        )
+    return model
+
+
 def _trace_simple_fsdp_graph() -> torch.fx.GraphModule:
-    """Trace a two-rank SimpleFSDP toy on a fake process group."""
+    """Trace a two-rank FSDP toy on a fake process group."""
     assert not dist.is_initialized()
     dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
     try:
@@ -294,12 +304,7 @@ def _trace_simple_fsdp_graph() -> torch.fx.GraphModule:
         with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
             model = _DenseToy()
             annotate_module_fqns(model)
-            model = data_parallel(
-                model,
-                device_mesh=mesh,
-                mode="fully_shard",
-                mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
-            )
+            model = _shard_every_module(model, mesh, param_dtype=torch.bfloat16)
             inputs = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
 
             def step(inputs: torch.Tensor) -> list[torch.Tensor]:

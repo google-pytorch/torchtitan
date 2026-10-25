@@ -29,7 +29,6 @@ from torchtitan.components.optimizer.optimizer import (
 from torchtitan.config import apply_overrides, derive, OverrideConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     check_layers_are_stackable,
     LayerStackHolder,
@@ -37,7 +36,10 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
-from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import apply_tpu_fsdp
+from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
+    apply_tpu_fsdp,
+    SPECS_ATTR,
+)
 
 # Imported here so it is not first imported under the mocked `call_backward`
 # below: it captures that method at import time.
@@ -131,22 +133,26 @@ def _build(
     device: str | torch.device = "cpu",
     world_size: int = 1,
     flatten: bool = False,
-    fsdp: str = "simple_fsdp",
+    shard: bool = True,
+    prepare=None,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
     ``stacked``/``scan`` pick the converter, exactly as
     ``to_tpu_graph_trainer_config`` does -- the model arrives from ``build()``
-    already stacked, and the FSDP implementation ``fsdp`` names
-    (``simple_fsdp`` or ``explicit``, see ``TPUConfig.fsdp_implementation``)
-    is given the same arguments in every arm.
+    already stacked, and ``apply_tpu_fsdp`` is given the same arguments in
+    every arm.
 
     ``device`` and ``world_size`` exist for ``test_layer_stack_distributed``,
     which builds the same two models on a real mesh.
 
     ``flatten`` runs the stack half of ``configure_qwen_simple_fsdp_shard_dims``
-    before sharding, and the ``build_split_meshes`` both Qwen3 parallelize
-    paths run right after it.
+    before sharding, and the ``build_split_meshes`` the parallelize path runs
+    right after it.
+
+    ``shard=False`` skips FSDP: an unsharded reference holding whole weights.
+    ``prepare`` runs on the meta model right before sharding would, for a test
+    that wants to distribute the parameters some other way.
     """
     parallel_dims = ParallelDims(
         dp_replicate=1,
@@ -171,12 +177,14 @@ def _build(
         for holder in holders:
             holder.flatten_for(world_size)
             holder._fsdp_shard_dim = holder.plan_shard_dims(world_size)  # pylint: disable=protected-access
-    apply_fsdp = {"simple_fsdp": apply_simple_fsdp, "explicit": apply_tpu_fsdp}[fsdp]
-    model = apply_fsdp(
-        model,
-        parallel_dims=parallel_dims,
-        training=training,
-    )
+    if prepare is not None:
+        prepare(model)
+    if shard:
+        model = apply_tpu_fsdp(
+            model,
+            parallel_dims=parallel_dims,
+            training=training,
+        )
     if flatten:
         # Creates process groups, so every rank runs it, before anything
         # (here `init_weights`) views a flattened layer.
@@ -295,8 +303,9 @@ class TestLayerStack(unittest.TestCase):
         is below the mesh size, which is the usual case -- so pin the dim.
         """
         holder = getattr(_build(stacked=True), STACK_ATTR)
-        for name, stack in holder.named_parameters(recurse=False):
-            self.assertEqual(stack.placements, (Shard(1),), name)
+        specs = getattr(holder, SPECS_ATTR)
+        for name, _ in holder.named_parameters(recurse=False):
+            self.assertEqual(specs[name].placements, (Shard(1),), name)
 
     def test_forward_matches_unrolled(self):
         model = _build(stacked=False)
@@ -380,25 +389,25 @@ class TestLayerStack(unittest.TestCase):
         for model in (plain, scanned):
             model(tokens).sum().backward()
 
-        # `_parameters`, not `get_parameter`: after SimpleFSDP the attribute
+        # `_parameters`, not `get_parameter`: once sharded, the attribute
         # returns the gathered tensor, which has no `.grad`.
         stacks = getattr(scanned, STACK_ATTR)._parameters
         for i, layer in enumerate(plain.layers.values()):
             for name, param in layer.named_parameters():
                 stack = stacks[name.replace(".", "__")]
                 torch.testing.assert_close(
-                    stack.grad[i].to_local(),
-                    param.grad.to_local(),
+                    stack.grad[i],
+                    param.grad,
                     rtol=1e-5,
                     atol=5e-5,
                     msg=f"layers.{i}.{name}",
                 )
 
     def test_the_body_gathers_in_the_compute_dtype(self):
-        """The gather is also the cast, exactly as SimpleFSDP's is.
+        """The gather is also the cast, exactly as the unrolled gather is.
 
         The stacks are stored in fp32 and the layers run in bf16; unrolled,
-        SimpleFSDP's parametrization casts as it gathers. If the in-body gather
+        the module-attribute gather casts as it gathers. If the in-body gather
         skipped that, the scanned model would run its layers in fp32 -- slower,
         more memory, and numerically *closer* to the reference, so a loss
         comparison would not catch it.
@@ -646,10 +655,10 @@ class TestQwen3(unittest.TestCase):
 
     def _build(self, **kwargs):
         # Weight tying off, and not because of stacking: `init_states` re-ties
-        # by assigning `lm_head.weight` to `tok_embeddings.weight`, and under
-        # SimpleFSDP that attribute is a parametrization returning a plain
-        # gathered tensor, which `nn.Module.__setattr__` refuses. The unrolled
-        # arm fails identically, so it is a gap in this lane, not in the stack.
+        # by assigning `lm_head.weight` to `tok_embeddings.weight`, and once
+        # sharded that attribute is a property returning a gathered tensor,
+        # which `nn.Module.__setattr__` refuses. The unrolled arm fails
+        # identically, so it is a gap in this lane, not in the stack.
         #
         # With tying off nothing initializes `tok_embeddings` -- `init_states`
         # was its only writer, and `skip_param_init` skips it -- so it holds
@@ -760,10 +769,9 @@ class TestQwen3(unittest.TestCase):
         for i, (layer, no_aux_layer) in enumerate(
             zip(plain.layers.values(), no_aux.layers.values(), strict=True)
         ):
-            want = dict(layer.named_parameters())[gate].grad.to_local()
-            got = stacks[gate.replace(".", "__")].grad[i].to_local()
-            reference = dict(no_aux_layer.named_parameters())[gate]
-            reference = reference.grad.to_local()
+            want = dict(layer.named_parameters())[gate].grad
+            got = stacks[gate.replace(".", "__")].grad[i]
+            reference = dict(no_aux_layer.named_parameters())[gate].grad
             scan_error.append(((got - want).norm() / want.norm()).item())
             aux_effect.append(((want - reference).norm() / want.norm()).item())
         # Per layer, relative Frobenius norms: scan-vs-loop error, and how much

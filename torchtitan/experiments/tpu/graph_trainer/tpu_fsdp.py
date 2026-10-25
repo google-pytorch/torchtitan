@@ -53,12 +53,12 @@ from torchtitan.tools.logging import logger
 
 __all__ = [
     "apply_tpu_fsdp",
-    "clip_grad_norm_",
     "disable_gather",
     "dtensor_params",
     "gather_slice",
-    "global_grad_norm",
+    "grads_as_dtensors",
     "param_specs",
+    "param_specs_for",
     "ScanFSDPSpec",
     "shard_module",
     "ShardSpec",
@@ -257,6 +257,19 @@ class ShardSpec:
 # ---------------------------------------------------------------------------
 
 
+def _waited(t: torch.Tensor) -> torch.Tensor:
+    """Wait on a functional collective's result, as DTensor's redistribute does.
+
+    An unwaited ``AsyncCollectiveTensor`` is a tensor subclass; letting one
+    flow out of an autograd function makes the joint graph's output and
+    tangent counts disagree. Waiting here puts the ``wait_tensor`` node right
+    after the collective, which is also the shape the FSDP passes match.
+    """
+    if isinstance(t, funcol.AsyncCollectiveTensor):
+        return t.wait()
+    return t
+
+
 def _gather_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
     """All-gather ``x`` along ``dim``, always collecting on dim 0.
 
@@ -266,19 +279,25 @@ def _gather_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
     fixes; they apply here too, because the attribute is read at call time.
     """
     if dim == 0:
-        return funcol.all_gather_tensor(x, gather_dim=0, group=group_name)
-    out = funcol.all_gather_tensor(x.movedim(dim, 0), gather_dim=0, group=group_name)
+        return _waited(funcol.all_gather_tensor(x, gather_dim=0, group=group_name))
+    out = _waited(
+        funcol.all_gather_tensor(x.movedim(dim, 0), gather_dim=0, group=group_name)
+    )
     return out.movedim(0, dim)
 
 
 def _scatter_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
     """Reduce-scatter ``x`` along ``dim``, always scattering on dim 0."""
     if dim == 0:
-        return funcol.reduce_scatter_tensor(
-            x, reduceOp="sum", scatter_dim=0, group=group_name
+        return _waited(
+            funcol.reduce_scatter_tensor(
+                x, reduceOp="sum", scatter_dim=0, group=group_name
+            )
         )
-    out = funcol.reduce_scatter_tensor(
-        x.movedim(dim, 0), reduceOp="sum", scatter_dim=0, group=group_name
+    out = _waited(
+        funcol.reduce_scatter_tensor(
+            x.movedim(dim, 0), reduceOp="sum", scatter_dim=0, group=group_name
+        )
     )
     return out.movedim(0, dim)
 
@@ -350,7 +369,7 @@ class _AllGatherReduceScatter(torch.autograd.Function):
             # HSDP: the gradient is Partial on the replicate axis too. Reduce it
             # after the scatter, not before -- same sum, on a tensor that is
             # already `1/shard_degree` the size.
-            out = funcol.all_reduce(out, "sum", group=ctx.replicate_group_name)
+            out = _waited(funcol.all_reduce(out, "sum", group=ctx.replicate_group_name))
         if out.shape[ctx.shard_dim] != ctx.local_size:
             out = out.narrow(ctx.shard_dim, 0, ctx.local_size)
         return out.to(ctx.shard_dtype), None, None, None, None, None, None
@@ -384,7 +403,7 @@ class _ReduceGradOnly(torch.autograd.Function):
         if ctx.reduce_dtype is not None:
             grad = grad.to(ctx.reduce_dtype)
         for group_name in ctx.group_names:
-            grad = funcol.all_reduce(grad, "sum", group=group_name)
+            grad = _waited(funcol.all_reduce(grad, "sum", group=group_name))
         return grad.to(ctx.replica_dtype), None, None, None
 
 
@@ -583,12 +602,7 @@ def shard_module(
             # `narrow` on a meta tensor is free; on a materialized one the
             # `contiguous` copy is what lets the whole tensor be freed.
             local = local.narrow(d, offset[d], shape[d]).contiguous()
-        shard = nn.Parameter(local, requires_grad=param.requires_grad)
-        # Stamped on the tensor as well as recorded on the module: the grad
-        # norm sees a flat parameter list. `to_empty` keeps the Parameter
-        # object (it swaps `.data`), so the stamp survives materialization.
-        shard._tpu_fsdp_spec = spec
-        module._parameters[name] = shard
+        module._parameters[name] = nn.Parameter(local, requires_grad=param.requires_grad)
         specs[name] = spec
     if not specs:
         return
@@ -614,18 +628,18 @@ def param_specs(model: nn.Module) -> dict[int, ShardSpec]:
     return out
 
 
-def param_specs_of(parameters: list[torch.Tensor]) -> dict[int, ShardSpec]:
-    """``id(parameter) -> spec`` for the sharded tensors among ``parameters``.
+def param_specs_for(model_parts: list[nn.Module]) -> dict[int, ShardSpec]:
+    """``id(parameter) -> spec`` over every model part, from the module tables.
 
-    The spec is stamped on the shard itself when it is created, so a flat
-    parameter list (an optimizer's, a trainer's) can be resolved without the
-    owning module.
+    Resolved from the modules, not from a stamp on the tensor: the graph
+    trainer re-registers parameters after sharding (its own unwrapping and
+    static-input handling), which creates new Parameter objects, while the
+    module's ``_tpu_fsdp_specs`` table keys them by name and stays valid.
     """
-    return {
-        id(p): p._tpu_fsdp_spec  # pyrefly: ignore[missing-attribute]
-        for p in parameters
-        if getattr(p, "_tpu_fsdp_spec", None) is not None
-    }
+    out: dict[int, ShardSpec] = {}
+    for model in model_parts:
+        out.update(param_specs(model))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -811,54 +825,22 @@ def apply_tpu_fsdp(
 # ---------------------------------------------------------------------------
 
 
-def global_grad_norm(
+def grads_as_dtensors(
     grads: list[torch.Tensor], specs: list[ShardSpec | None]
-) -> torch.Tensor:
-    """The L2 norm of all gradients over the whole mesh.
+) -> list[torch.Tensor]:
+    """Wrap each shard's gradient as the DTensor its spec describes.
 
-    A sharded gradient contributes its local squared norm, summed over the
-    shard group. A gradient the backward already all-reduced -- a weight
-    replicated on the shard axis, or any gradient under HSDP along the
-    replicate axis -- is identical on every rank and counts once. Plain
-    parameters without a spec are treated as replicated.
+    The gradient norm is then computed by the same DTensor code path SimpleFSDP
+    used (``get_total_norm`` on DTensors, ``full_tensor`` for the reduction),
+    which keeps its floating-point order and so the clipped step bit-identical.
+    This is the third and last DTensor window; it exists only inside the norm.
     """
-    if not grads:
-        raise ValueError("global_grad_norm needs at least one gradient")
-    by_group: dict[str, list[torch.Tensor]] = {}
-    replicated: list[torch.Tensor] = []
+    out = []
     for grad, spec in zip(grads, specs, strict=True):
-        if spec is not None and spec.sharded:
-            by_group.setdefault(spec.shard_group, []).append(grad)
-        else:
-            replicated.append(grad)
-
-    def sq_sum(ts: list[torch.Tensor]) -> torch.Tensor:
-        norms = torch._foreach_norm(ts, 2.0)
-        return torch.sum(torch.stack([n.float() ** 2 for n in norms]))
-
-    total = None
-    for group_name, ts in by_group.items():
-        part = funcol.all_reduce(sq_sum(ts), "sum", group=group_name)
-        total = part if total is None else total + part
-    if replicated:
-        part = sq_sum(replicated)
-        total = part if total is None else total + part
-    assert total is not None
-    return torch.sqrt(total)
-
-
-@torch.no_grad()
-def clip_grad_norm_(
-    parameters: list[torch.Tensor], max_norm: float, *, foreach: bool | None = True
-) -> torch.Tensor:
-    """Clip every parameter's gradient by the global norm, eagerly."""
-    params = list(parameters)
-    specs = param_specs_of(params)
-    with_grad = [p for p in params if p.grad is not None]
-    total_norm = global_grad_norm(
-        [p.grad for p in with_grad], [specs.get(id(p)) for p in with_grad]
-    )
-    if isinstance(total_norm, funcol.AsyncCollectiveTensor):
-        total_norm = total_norm.wait()
-    torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach)
-    return total_norm
+        if spec is None:
+            raise ValueError(
+                "a gradient without a shard spec cannot be mixed into the explicit "
+                "FSDP norm; every parameter the graph trainer trains is sharded"
+            )
+        out.append(spec.to_dtensor(grad))
+    return out

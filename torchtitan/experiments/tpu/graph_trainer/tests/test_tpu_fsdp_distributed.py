@@ -19,6 +19,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
+from torchtitan.experiments.tpu import grad_norm
 from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
@@ -220,8 +221,15 @@ def init_matches_simple_fsdp(device, rank, world_size, *, stacked, flatten=False
     assert tpu_fsdp.uses_tpu_fsdp(explicit)
 
 
-def forward_and_grads_match_simple_fsdp(device, rank, world_size, *, scan):
-    """Same weights in, same logits and same shard gradients out."""
+def forward_and_grads_match_simple_fsdp(device, rank, world_size, *, scan, moe=False):
+    """Same weights in, same logits and same shard gradients out.
+
+    ``moe`` uses the 2-layer qwen3 MoE (TPU grouped experts, router gate), whose
+    expert stacks shard on a hidden axis and whose kernels read weights their
+    own way; the llama3 debug model covers the dense path. Unrolled only: the
+    test MoE config keeps the aux-loss routing metrics on, which a scan body
+    cannot carry (the e2e test covers the scanned MoE through the recipe).
+    """
     del rank
     if world_size == 1:
         logging.warning("skipped: one rank, nothing is gathered")
@@ -229,18 +237,31 @@ def forward_and_grads_match_simple_fsdp(device, rank, world_size, *, scan):
     import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
 
     parallel_dims.device_type = device.type
+    config = test_layer_stack._moe_config(num_experts=2) if moe else None  # pylint: disable=protected-access
     models = {
         fsdp: test_layer_stack._build(  # pylint: disable=protected-access
-            stacked=scan, scan=scan, device=device, world_size=world_size, fsdp=fsdp
+            stacked=scan,
+            scan=scan,
+            config=config,
+            device=device,
+            world_size=world_size,
+            fsdp=fsdp,
         )
         for fsdp in ("simple_fsdp", "explicit")
     }
     tokens = torch.randint(
         0, models["explicit"].config.vocab_size, (test_layer_stack.TOKENS,), device=device
     )
+    positions = (
+        torch.arange(test_layer_stack.SEQ_LEN, device=device).repeat(
+            test_layer_stack.TOKENS // test_layer_stack.SEQ_LEN
+        )
+        if moe
+        else None
+    )
     outs = {}
     for fsdp, model in models.items():
-        out = model(tokens)
+        out = model(tokens, positions) if moe else model(tokens)
         outs[fsdp] = out.detach()
         out.float().sum().backward()
     torch.testing.assert_close(outs["explicit"], outs["simple_fsdp"], rtol=0, atol=0)
@@ -248,16 +269,20 @@ def forward_and_grads_match_simple_fsdp(device, rank, world_size, *, scan):
         name: p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
         for name, p in models["simple_fsdp"].named_parameters()
     }
+    mismatched = []
     for name, p in models["explicit"].named_parameters():
         assert p.grad is not None, name
-        torch.testing.assert_close(p.grad, want[name], rtol=0, atol=0, msg=name)
+        if not torch.equal(p.grad, want[name]):
+            diff = (p.grad.float() - want[name].float()).abs().max().item()
+            mismatched.append(f"{name}: shape {tuple(p.grad.shape)} max|diff| {diff:.3g}")
+    assert not mismatched, "gradients differ from SimpleFSDP:\n" + "\n".join(mismatched)
     if scan:
         holder = getattr(models["explicit"], STACK_ATTR)
         assert getattr(holder, SPECS_ATTR), "the stacks were not sharded explicitly"
 
 
 def grad_norm_matches_dtensor(device, rank, world_size, *, hybrid):
-    """The explicit global norm equals the DTensor-derived one on the same grads."""
+    """The spec-aware global norm equals the DTensor one on the same grads."""
     if _skip_small(world_size, hybrid=hybrid):
         return
     mesh = _mesh(device, world_size, hybrid=hybrid)
@@ -283,9 +308,10 @@ def grad_norm_matches_dtensor(device, rank, world_size, *, hybrid):
         grads.append(g)
         spec_list.append(specs[name])
         dgrads.append(specs[name].to_dtensor(g))
-    got = _wait(tpu_fsdp.global_grad_norm(grads, spec_list))
+    got = _wait(grad_norm.global_grad_norm(grads, spec_list))
     want = torch.nn.utils.get_total_norm(dgrads, 2.0, False, True).full_tensor()
-    torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+    # Same DTensor arithmetic on both sides, so the bits agree.
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def scan_row_gather_matches_dtensor(device, rank, world_size, *, shard_dim):
@@ -415,6 +441,12 @@ class TestTpuFSDP(base_distributed_device_test.BaseDistributedDeviceTest):
         self._on_devices(
             functools.partial(forward_and_grads_match_simple_fsdp, scan=True)
         )
+
+    def test_moe_forward_and_grads_match_simple_fsdp(self):
+        self._on_devices(
+            functools.partial(forward_and_grads_match_simple_fsdp, scan=False, moe=True)
+        )
+
 
     def test_grad_norm_fsdp(self):
         self._on_devices(functools.partial(grad_norm_matches_dtensor, hybrid=False))

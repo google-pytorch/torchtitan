@@ -21,7 +21,7 @@ import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
+from torchtitan.experiments.tpu.grad_norm import clip_grad_norm_eager_, CompiledGradNorm
 from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
@@ -81,15 +81,17 @@ class TPUTrainer(torchtitan.train.Trainer):
 
   def _clip_grad_norm(self) -> torch.Tensor:
     parameters = [p for m in self.model_parts for p in m.parameters()]
+    spec_by_id = tpu_fsdp.param_specs_for(self.model_parts)
     if self._compiled_grad_norm is not None:
       return self._compiled_grad_norm.clip_grad_norm_(
           parameters,
           self.config.training.max_norm,
+          spec_by_id,
       )
-    if tpu_fsdp.param_specs_of(parameters):
+    if spec_by_id:
       # Explicit TPU FSDP shards are plain tensors, so the base trainer's
       # DTensor-aware clip would see local norms only.
-      return tpu_fsdp.clip_grad_norm_(parameters, self.config.training.max_norm)
+      return clip_grad_norm_eager_(parameters, self.config.training.max_norm, spec_by_id)
     return super()._clip_grad_norm()
 
   def forward_backward_step(

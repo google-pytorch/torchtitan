@@ -247,13 +247,13 @@ class TpuGraphTrainerDistributedTest(
     for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
       self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
 
-  # Both models, both layer layouts: the explicit FSDP must be a drop-in for
-  # SimpleFSDP wherever the recipes run it.
+  # Both layer layouts: the explicit FSDP must be a drop-in for SimpleFSDP
+  # wherever the recipes run it. qwen3 only: llama3 on the TPU graph trainer
+  # uses upstream's registry, whose parallelize takes no
+  # `fsdp_implementation` (TODO: a TPU llama3 wrapper like graph_trainer/qwen3.py).
   @parameterized.named_parameters([
-      dict(testcase_name=f"{m['testcase_name']}_{layout}", layout=layout, **{
-          k: v for k, v in m.items() if k != "testcase_name"
-      })
-      for m in _MODELS
+      dict(testcase_name=f"qwen3_{layout}", module="torchtitan.experiments.tpu.qwen3",
+           config="qwen3_debugmodel", layout=layout)
       for layout in ("loop", "scan")
   ])
   def test_explicit_fsdp_matches_simple_fsdp(self, module, config, layout):

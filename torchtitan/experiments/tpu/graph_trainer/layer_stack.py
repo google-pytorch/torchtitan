@@ -185,6 +185,25 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     return max(range(1, param.ndim), key=lambda d: param.shape[d])
 
 
+class _AsScanInput(torch.autograd.Function):
+    """Identity whose output autograd does not record as a view of the input.
+
+    The plain-shard counterpart of ``DTensor.to_local``'s ``_ToTorchTensor``:
+    the scan body's ``xs`` have to be regular intermediates of the joint
+    graph, not the graph's parameter inputs (see ``LayerStack.run``).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # pyrefly: ignore[bad-override]
+        del ctx
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):  # pyrefly: ignore[bad-override]
+        del ctx
+        return grad
+
+
 class LayerStackHolder(Module):
     """``model.layer_stacks``: the stacks, and nothing else.
 
@@ -746,9 +765,15 @@ class LayerStack:
             xs = {}
             for name in self.names:
                 param = self.holder._parameters[_mangle(name)]
-                xs[_mangle(name)] = (
-                    param.to_local() if isinstance(param, DTensor) else param
-                )
+                if isinstance(param, DTensor):
+                    xs[_mangle(name)] = param.to_local()
+                else:
+                    # Through an autograd function, as `to_local` is: `scan`
+                    # saves its xs for backward, and a saved tensor that the
+                    # joint tracer sees as a graph input, or as a view of one,
+                    # drops out of its outputs-to-grad while the tangent stays
+                    # ("outs_to_grad length != tangents length").
+                    xs[_mangle(name)] = _AsScanInput.apply(param)
 
             def scan_body(carry, slices):
                 # `scan` hands the body row i of every stack, under the same

@@ -66,7 +66,8 @@ def global_grad_norm(
   if specs is not None and any(spec is not None for spec in specs):
     if any(isinstance(grad, DTensor) for grad in grads):
       raise ValueError("gradients mix DTensors and explicitly sharded tensors")
-    return tpu_fsdp.global_grad_norm(grads, specs)
+    # Same arithmetic as the SimpleFSDP path below, on DTensor views.
+    grads = tpu_fsdp.grads_as_dtensors(grads, specs)
   total_norm = torch.nn.utils.get_total_norm(
       grads,
       norm_type=2.0,
@@ -92,10 +93,13 @@ class CompiledGradNorm:
       self,
       parameters: list[torch.Tensor],
       max_norm: float,
+      spec_by_id: dict[int, tpu_fsdp.ShardSpec] | None = None,
   ) -> torch.Tensor:
+    """``spec_by_id`` (``tpu_fsdp.param_specs_for``) marks explicitly sharded
+    parameters; absent or empty, every gradient is a DTensor or replicated."""
     with_grad = [parameter for parameter in parameters if parameter.grad is not None]
     grads = cast(list[torch.Tensor], [parameter.grad for parameter in with_grad])
-    spec_by_id = tpu_fsdp.param_specs_of(parameters)
+    spec_by_id = spec_by_id or {}
     specs = [spec_by_id.get(id(parameter)) for parameter in with_grad]
     signature = _grad_signature(grads, specs)
     if self._runner is None:
@@ -140,3 +144,21 @@ class CompiledGradNorm:
         foreach=True,
     )
     return total_norm
+
+
+@torch.no_grad()
+def clip_grad_norm_eager_(
+    parameters: list[torch.Tensor],
+    max_norm: float,
+    spec_by_id: dict[int, tpu_fsdp.ShardSpec],
+) -> torch.Tensor:
+  """Eager clip for explicitly sharded parameters (no compiled norm).
+
+  The base trainer's clip sees plain shards and would use their local norms;
+  this routes them through the same DTensor-view norm the compiled path uses.
+  """
+  with_grad = [p for p in parameters if p.grad is not None]
+  grads = cast(list[torch.Tensor], [p.grad for p in with_grad])
+  total_norm = global_grad_norm(grads, [spec_by_id.get(id(p)) for p in with_grad])
+  torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach=True)
+  return total_norm

@@ -42,7 +42,8 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
+from torchtitan.experiments.tpu.grad_norm import clip_grad_norm_eager_, CompiledGradNorm
+from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     GraphSplitter,
 )
@@ -85,6 +86,27 @@ def _optimizer_compile_enabled(config, tpu_extra) -> bool:
     if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
         return True
     return bool(getattr(config.compile, "optimizer_compile", False))
+
+
+def _detach_example_inputs(traced):
+    """Record parameter example inputs without ``requires_grad``.
+
+    The tracer fakeifies parameters as they are. DTensor parameters are
+    unwrapped to their local tensors first, which never require grad, so the
+    SimpleFSDP path always recorded grad-free example inputs. Explicit TPU
+    FSDP's plain shards do require grad, and every later re-execution of the
+    joint graph with those inputs (the TPU backend compiler) would re-enter the
+    scan operator's autograd on an already-partitioned body
+    ("outs_to_grad length != tangents length"). The joint graph carries its
+    backward explicitly, so the example inputs need no autograd.
+    """
+    import dataclasses
+
+    example_inputs = tuple(
+        t.detach() if isinstance(t, torch.Tensor) and t.requires_grad else t
+        for t in traced.example_inputs
+    )
+    return dataclasses.replace(traced, example_inputs=example_inputs)
 
 
 class TpuGraphTrainer(GraphTrainer):
@@ -360,16 +382,18 @@ class TpuGraphTrainer(GraphTrainer):
                 )
                 maybe_register_blockmask_pytree_node()
                 with self.train_context():
-                    self._traced_step = minimal_fx_tracer(
-                        fwd_bwd_fn,
-                        module=model,
-                        prepare_inputs=self._prepare_trace_inputs,
-                        prepare_call_inputs=self._prepare_trace_call_inputs,
-                    )(
-                        inputs,
-                        labels,
-                        global_valid_tokens,
-                        extra_kwargs,
+                    self._traced_step = _detach_example_inputs(
+                        minimal_fx_tracer(
+                            fwd_bwd_fn,
+                            module=model,
+                            prepare_inputs=self._prepare_trace_inputs,
+                            prepare_call_inputs=self._prepare_trace_call_inputs,
+                        )(
+                            inputs,
+                            labels,
+                            global_valid_tokens,
+                            extra_kwargs,
+                        )
                     )
             if self.config.compile.enable_passes:
                 if self._graph_splitter.enabled:
@@ -417,13 +441,21 @@ class TpuGraphTrainer(GraphTrainer):
         return loss
 
     def _clip_grad_norm(self) -> torch.Tensor:
-        if self._compiled_grad_norm is None:
-            return super()._clip_grad_norm()
         parameters = [p for m in self.model_parts for p in m.parameters()]
-        return self._compiled_grad_norm.clip_grad_norm_(
-            parameters,
-            self.config.training.max_norm,
-        )
+        spec_by_id = tpu_fsdp.param_specs_for(self.model_parts)
+        if self._compiled_grad_norm is not None:
+            return self._compiled_grad_norm.clip_grad_norm_(
+                parameters,
+                self.config.training.max_norm,
+                spec_by_id,
+            )
+        if spec_by_id:
+            # Explicit TPU FSDP shards are plain tensors; the base trainer's
+            # DTensor-aware clip would see their local norms only.
+            return clip_grad_norm_eager_(
+                parameters, self.config.training.max_norm, spec_by_id
+            )
+        return super()._clip_grad_norm()
 
     def _fwd_bwd_adamw_step(
         self,
@@ -479,14 +511,16 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
             with self.train_context():
-                self._traced_step = minimal_fx_tracer(
-                    fwd_bwd_adamw,
-                    module=model,
-                )(
-                    inputs,
-                    labels,
-                    global_valid_tokens,
-                    extra_kwargs,
+                self._traced_step = _detach_example_inputs(
+                    minimal_fx_tracer(
+                        fwd_bwd_adamw,
+                        module=model,
+                    )(
+                        inputs,
+                        labels,
+                        global_valid_tokens,
+                        extra_kwargs,
+                    )
                 )
             pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
             passes = pipeline_fn(self._traced_step, self.config)

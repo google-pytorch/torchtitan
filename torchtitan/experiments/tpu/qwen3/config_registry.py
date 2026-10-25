@@ -1152,6 +1152,27 @@ def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
+  """`qwen3_moe_30b_proxy` (4 layers) run as a scan on one 4-chip host.
+
+  The 235B scan recipe's body prerequisites on the small proxy: FSDP only, a
+  4-rank global batch, MoE routing metrics off and the discarded-token counter
+  overridden (a scan body cannot write to tensors it closed over). The local
+  iteration row for sharding and scan-body changes; pair it with
+  `--tpu_config.fsdp_implementation` to A/B the FSDP implementation.
+  """
+  cfg = qwen3_moe_30b_proxy()
+  cfg.parallelism.expert_parallel_degree = 1
+  cfg.training.num_tokens_per_train_step = (
+      4 * cfg.training.num_tokens_per_microbatch_per_dp_rank
+  )
+  cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
+  cfg.metrics.enable_moe_routing = False
+  cfg.metrics.log_freq = 1
+  cfg.tpu_config.use_scan_layers = True
+  return cfg
+
+
 def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
   """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
 

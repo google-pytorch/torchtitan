@@ -353,13 +353,12 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
           "--tpu-config.use-graph-trainer; no other lane applies it."
       )
     if self.tpu_config.fsdp_implementation != "simple_fsdp":
-      # Only the graph trainer's parallelize wrappers take the choice; the
-      # `use_simple_fsdp` flag is what makes upstream skip its own FSDP so a
-      # TPU implementation (either one) can shard instead.
-      if not (self.tpu_config.use_graph_trainer and self.parallelism.use_simple_fsdp):
+      # Only the graph trainer's parallelize wrappers take the choice (the graph
+      # trainer always shards with a TPU-side FSDP; the eager lanes do not).
+      if not self.tpu_config.use_graph_trainer:
         raise ValueError(
             f"--tpu-config.fsdp-implementation={self.tpu_config.fsdp_implementation} "
-            "needs --tpu-config.use-graph-trainer and --parallelism.use-simple-fsdp"
+            "needs --tpu-config.use-graph-trainer"
         )
       if self.parallelism.tensor_parallel_degree > 1:
         raise ValueError(

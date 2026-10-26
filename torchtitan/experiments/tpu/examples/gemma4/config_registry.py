@@ -39,6 +39,7 @@ from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
+    SplashAttentionKernelConfig,
     TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
@@ -282,6 +283,9 @@ def gemma4_31b() -> TPUTrainerConfig:
           enable=False,
           freq=5,
           steps=10,
+      ),
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
       ),
   )
   _enable_pallas_cross_entropy(cfg)

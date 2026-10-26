@@ -9,9 +9,11 @@ those two come in as callables and the rest is shared.
 
 Upstream graph_trainer's per-model ``parallelize_*`` functions apply
 SimpleFSDP unconditionally and so cannot be reused; this keeps their step
-order (annotate, model-parallel ``Module.parallelize``, MoE aux-loss meshes,
-FSDP, EP eager chunking, compile) and adds the TPU shard-axis planning in
-front, which has to see the stacks before anything shards them.
+order (annotate, ``Module.parallelize`` under spmd_types, MoE aux-loss
+meshes, FSDP, compile) and adds the TPU shard-axis planning in front, which
+has to see the stacks before anything shards them. TP and EP are refused by
+the graph trainer's config (``to_tpu_graph_trainer_config``,
+``TPUTrainerConfig``): the FSDP here has no spec for a DTensor parameter.
 """
 
 from collections.abc import Callable
@@ -23,9 +25,6 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
-    maybe_apply_ep_overlap_eager_chunking,
-)
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
@@ -73,11 +72,7 @@ def parallelize_tpu_graph_trainer(
         )
     configure_shard_dims(model, parallel_dims)
     annotate(model)
-    if (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.tp_enabled
-        or parallel_dims.ep_enabled
-    ):
+    if parallelism.spmd_backend == "spmd_types":
         model.parallelize(parallel_dims)
     configure_moe_aux_loss_reduction(model, parallel_dims)
     model = apply_tpu_fsdp(model, parallel_dims=parallel_dims, training=training)
@@ -85,7 +80,6 @@ def parallelize_tpu_graph_trainer(
     for holder in model.modules():
         if hasattr(holder, "build_split_meshes"):
             holder.build_split_meshes()
-    maybe_apply_ep_overlap_eager_chunking(model, compile_config)
     return apply_compile(
         model,
         compile_config=compile_config,

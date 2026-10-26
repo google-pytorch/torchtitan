@@ -52,7 +52,6 @@ from torch.distributed.tensor._utils import compute_local_shape_and_global_offse
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.utils import get_spmd_backend
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.tools.logging import logger
 
 
@@ -885,17 +884,12 @@ def apply_tpu_fsdp(
 
     The TPU counterpart of ``apply_simple_fsdp``: the same meshes, the same
     modes (``fully_shard`` / ``hybrid_shard`` / ``replicate``), the same
-    mixed-precision policy from ``training``, the same per-submodule
-    ``_fsdp_shard_dim`` hook, and the same separate wrap of routed experts on
-    the expert-FSDP mesh under EP. Model-parallel axes other than EP are not
-    handled: SimpleFSDP owns the TP-axis gradient reductions, and nothing here
-    replaces that yet.
+    mixed-precision policy from ``training`` and the same per-submodule
+    ``_fsdp_shard_dim`` hook. Model-parallel axes are not handled: a
+    parameter that arrives as a DTensor (TP or EP sharded) is refused by
+    ``shard_module``, and the graph trainer's config refuses both degrees
+    before the model is built.
     """
-    if parallel_dims.tp_enabled:
-        raise NotImplementedError(
-            "explicit TPU FSDP does not handle tensor parallelism yet "
-            "(the TP-axis reductions SimpleFSDP inserts for replicated weights)"
-        )
     use_spmd_types = get_spmd_backend() == "spmd_types"
     if use_spmd_types:
         fsdp_mesh = parallel_dims.get_optional_mesh(
@@ -927,28 +921,6 @@ def apply_tpu_fsdp(
     param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
     reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
     dtypes = dict(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-
-    if parallel_dims.ep_enabled and isinstance(model, Decoder):
-        edp_mesh_names = (
-            ["dp_replicate", "efsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["efsdp"]
-        )
-        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-        assert edp_mesh is not None
-        for _, transformer_block in model.layers.items():
-            if not isinstance(transformer_block, TransformerBlock):
-                continue
-            moe = getattr(transformer_block, "moe", None)
-            if moe is None:
-                continue
-            inner_experts = moe.routed_experts.inner_experts
-            experts_shard_dim = 0
-            if edp_mesh["efsdp"].size() * parallel_dims.ep > inner_experts.num_experts:
-                experts_shard_dim = 1
-            shard_module(
-                inner_experts, edp_mesh, dp_mode, shard_dim=experts_shard_dim, **dtypes
-            )
 
     # A submodule carrying `_fsdp_shard_dim` is sharded on that axis instead of
     # the default -- layer stacking sets it, because dim 0 of a stack is the

@@ -112,7 +112,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_qwen3_graph_config_reports_torchtitan_flops_by_default(
       self,
   ) -> None:
-    self.assertEqual(self._qwen3_graph_flops(qwen3_moe_30b()), 23_083_044_864)
+    config = qwen3_moe_30b()
+    # The recipe runs expert parallel, which the graph trainer refuses; the
+    # FLOPs count is a property of the model, not of the mesh.
+    config.parallelism.expert_parallel_degree = 1
+    self.assertEqual(self._qwen3_graph_flops(config), 23_083_044_864)
 
   def test_maxtext_recipe_reports_maxtext_flops_on_graph_trainer(self) -> None:
     """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion.
@@ -210,6 +214,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_8b()
     config.tpu_config.use_scan_layers = True
     config.parallelism.expert_parallel_degree = 2
+
+    with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
+      self._qwen3_graph_config(config)
+
+  def test_graph_trainer_refuses_expert_parallelism(self) -> None:
+    # `Module.parallelize` would hand the experts over as DTensors, which the
+    # graph trainer's FSDP has no spec for; the recipe is refused by name.
+    config = qwen3_moe_30b()
+    self.assertGreater(config.parallelism.expert_parallel_degree, 1)
 
     with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
       self._qwen3_graph_config(config)

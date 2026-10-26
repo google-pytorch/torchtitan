@@ -43,13 +43,7 @@ class ParallelizeTest(unittest.TestCase):
   def test_shard_dims_are_planned_before_sharding_and_split_meshes_after(self):
     model = _DummyModel()
     seen: list[str] = []
-    pdims = SimpleNamespace(
-        dp_shard=512,
-        cp=1,
-        seq_len_divisor=1,
-        tp_enabled=False,
-        ep_enabled=False,
-    )
+    pdims = SimpleNamespace(dp_shard=512, cp=1, seq_len_divisor=1)
     training = SimpleNamespace(num_tokens_per_microbatch_per_dp_rank=4096)
 
     def fake_apply_tpu_fsdp(m, *, parallel_dims, training):
@@ -73,7 +67,6 @@ class ParallelizeTest(unittest.TestCase):
         mock.patch.object(parallelize_lib, "apply_tpu_fsdp", fake_apply_tpu_fsdp),
         mock.patch.object(parallelize_lib, "apply_compile", fake_apply_compile),
         mock.patch.object(parallelize_lib, "configure_moe_aux_loss_reduction"),
-        mock.patch.object(parallelize_lib, "maybe_apply_ep_overlap_eager_chunking"),
     ):
       out = parallelize_lib.parallelize_tpu_graph_trainer(
           model,
@@ -89,7 +82,7 @@ class ParallelizeTest(unittest.TestCase):
     self.assertEqual(seen, ["annotate", "fsdp", "compile"])
 
   def test_rejects_a_token_count_the_mesh_cannot_split(self):
-    pdims = SimpleNamespace(dp_shard=1, cp=1, seq_len_divisor=4, tp_enabled=False, ep_enabled=False)
+    pdims = SimpleNamespace(dp_shard=1, cp=1, seq_len_divisor=4)
     with self.assertRaisesRegex(ValueError, "divisible"):
       parallelize_lib.parallelize_tpu_graph_trainer(
           _DummyModel(),

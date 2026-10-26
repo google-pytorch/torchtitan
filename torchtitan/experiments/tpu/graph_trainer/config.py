@@ -144,18 +144,22 @@ def to_tpu_graph_trainer_config(
   _maybe_use_maxtext_flops(train_config, graph_config)
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
+  # Expert parallelism shards the routed experts on a mesh of their own, and
+  # `Module.parallelize` hands them over as DTensors. The graph trainer's FSDP
+  # (`graph_trainer/tpu_fsdp.py`) shards plain tensors over the data-parallel
+  # mesh only and has no spec for an EP-sharded parameter yet; a stack is one
+  # tensor sharded once, so scan has nowhere to put the EP axis either. The
+  # check is here so the flag gets named instead of failing somewhere further
+  # in.
+  if train_config.parallelism.expert_parallel_degree > 1:
+    raise ValueError(
+        "--tpu-config.use-graph-trainer cannot be combined with "
+        "--parallelism.expert-parallel-degree > 1: its FSDP has no spec for "
+        "an EP-sharded parameter "
+        "(https://github.com/google-pytorch/torchtitan/issues/25)."
+    )
   if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
-    # Expert parallelism shards the routed experts on a mesh of their own. A
-    # stack is one tensor sharded once, so there is nowhere to put that.
-    # Refusing MoE already covers every model that can set this; the check is
-    # here so the flag gets named instead of failing somewhere further in.
-    if train_config.parallelism.expert_parallel_degree > 1:
-      raise ValueError(
-          "--tpu-config.use-scan-layers cannot be combined with "
-          "--parallelism.expert-parallel-degree > 1 "
-          "(https://github.com/google-pytorch/torchtitan/issues/25)."
-      )
     # Scanning is a property of the model, so it is expressed as a config
     # rewrite: the recipe gets put on a model class that stacks its layer
     # weights on construction and runs them as one scan. The parallelize path

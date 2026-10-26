@@ -159,6 +159,12 @@ class TpuGraphTrainer(GraphTrainer):
                 group["capturable"] = True
 
         self._tpu_extra = tpu_extra
+        # Adam's moments are shards of the parameters they belong to; DCP has
+        # to see them as such (one replicated-looking tensor per key would be
+        # written by one rank and read back by all).
+        tpu_fsdp.install_optimizer_state_hooks(
+            self.optimizers.optimizers, self.model_parts
+        )
         self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.tpu_config.compile_grad_norm else None
@@ -225,16 +231,15 @@ class TpuGraphTrainer(GraphTrainer):
             param_fqns.append(name)
             parent_path, _, leaf = name.rpartition(".")
             parent = model.get_submodule(parent_path) if parent_path else model
-            parent.register_buffer(
-                f"_optstate_{leaf}_exp_avg",
-                torch.zeros_like(p, requires_grad=False),
-                persistent=True,
-            )
-            parent.register_buffer(
-                f"_optstate_{leaf}_exp_avg_sq",
-                torch.zeros_like(p, requires_grad=False),
-                persistent=True,
-            )
+            # Shaped like the parameter's shard, so checkpoints see the
+            # moments as the same DTensor the parameter is saved as.
+            for kind in ("exp_avg", "exp_avg_sq"):
+                tpu_fsdp.register_sharded_buffer(
+                    parent,
+                    f"_optstate_{leaf}_{kind}",
+                    torch.zeros_like(p, requires_grad=False),
+                    like=leaf,
+                )
         model.register_buffer(
             "_optstate_step",
             torch.zeros((), dtype=torch.float32, device=self.device),

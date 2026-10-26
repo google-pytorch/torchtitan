@@ -24,7 +24,11 @@ shares its storage:
   seed; and
 * ``state_dict()`` / ``load_state_dict()``, so DCP sees the same sharded
   format as before. Checkpoints reshard across world sizes and interchange
-  with SimpleFSDP and FSDP2 runs.
+  with SimpleFSDP and FSDP2 runs. The optimizer's parameter-shaped state
+  (Adam's moments) and the fused optimizer's ``_optstate_*`` buffers are
+  shards too, and get the same views (:func:`install_optimizer_state_hooks`,
+  :func:`register_sharded_buffer`): a plain per-rank tensor under one key
+  would be written by one rank and read back by all of them.
 
 Both windows are opened by :func:`dtensor_params`.
 """
@@ -33,7 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from itertools import count
 from typing import Any
 
@@ -58,8 +62,11 @@ __all__ = [
     "dtensor_params",
     "gather_slice",
     "grads_as_dtensors",
+    "install_optimizer_state_hooks",
     "param_specs",
+    "param_specs_by_fqn",
     "param_specs_for",
+    "register_sharded_buffer",
     "ScanFSDPSpec",
     "shard_module",
     "ShardSpec",
@@ -70,6 +77,10 @@ __all__ = [
 
 
 SPECS_ATTR = "_tpu_fsdp_specs"
+# Buffers sharded like one of the module's parameters: buffer name -> parameter
+# name (`register_sharded_buffer`). They get the parameter's DTensor view in
+# the checkpoint window.
+BUFFER_SPECS_ATTR = "_tpu_fsdp_buffer_params"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -646,6 +657,57 @@ def param_specs_for(model_parts: list[nn.Module]) -> dict[int, ShardSpec]:
     return out
 
 
+def param_specs_by_fqn(model_parts: list[nn.Module]) -> dict[str, ShardSpec]:
+    """``parameter FQN -> spec`` over every model part, from the module tables.
+
+    The optimizer names its parameters by FQN (``param_names``), which is what
+    its state dict is keyed by; the module tables are read at call time, so a
+    parameter re-registered after sharding is still found by its name.
+    """
+    out: dict[str, ShardSpec] = {}
+    for model in model_parts:
+        for module_fqn, module in model.named_modules():
+            specs = getattr(module, SPECS_ATTR, None)
+            if not specs:
+                continue
+            prefix = f"{module_fqn}." if module_fqn else ""
+            for name, spec in specs.items():
+                out[prefix + name] = spec
+    return out
+
+
+def register_sharded_buffer(
+    module: nn.Module,
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    like: str,
+    persistent: bool = True,
+) -> None:
+    """Register ``tensor`` as a buffer shaped like ``module``'s parameter ``like``.
+
+    If that parameter is sharded here, the buffer is this rank's shard of a
+    tensor the parameter's spec describes, and :func:`dtensor_params` presents
+    it as that DTensor view: the fused optimizer's moments checkpoint and
+    reshard exactly like the weights they belong to. On a module that is not
+    sharded this is ``register_buffer``.
+    """
+    module.register_buffer(name, tensor, persistent=persistent)
+    specs = getattr(module, SPECS_ATTR, None)
+    if not specs or like not in specs:
+        return
+    if tuple(tensor.shape) != tuple(module._parameters[like].shape):
+        raise ValueError(
+            f"{name} has shape {tuple(tensor.shape)}, but the shard of {like} it "
+            f"is registered like has {tuple(module._parameters[like].shape)}"
+        )
+    table = getattr(module, BUFFER_SPECS_ATTR, None)
+    if table is None:
+        table = {}
+        setattr(module, BUFFER_SPECS_ATTR, table)
+    table[name] = like
+
+
 # ---------------------------------------------------------------------------
 # The DTensor windows: initialization and checkpoints
 # ---------------------------------------------------------------------------
@@ -662,6 +724,7 @@ def dtensor_params(model: nn.Module) -> Iterator[None]:
     row views from the same specs.
     """
     swapped: list[tuple[nn.Module, str, nn.Parameter, nn.Parameter]] = []
+    swapped_buffers: list[tuple[nn.Module, str, torch.Tensor]] = []
     with disable_gather():
         try:
             for module in model.modules():
@@ -678,8 +741,16 @@ def dtensor_params(model: nn.Module) -> Iterator[None]:
                     )
                     module._parameters[name] = view
                     swapped.append((module, name, param, view))
+                for name, like in getattr(module, BUFFER_SPECS_ATTR, {}).items():
+                    buffer = module._buffers.get(name)
+                    if buffer is None or isinstance(buffer, DTensor):
+                        continue
+                    module._buffers[name] = specs[like].to_dtensor(buffer)
+                    swapped_buffers.append((module, name, buffer))
             yield
         finally:
+            for module, name, buffer in swapped_buffers:
+                module._buffers[name] = buffer
             # `Decoder.init_states` re-ties `tok_embeddings.weight` to
             # `lm_head.weight` inside this window. A slot that now holds a
             # different module's view is re-tied to that module's shard, so
@@ -691,6 +762,78 @@ def dtensor_params(model: nn.Module) -> Iterator[None]:
                     module._parameters[name] = param
                 elif id(current) in plain_of_view:
                     module._parameters[name] = plain_of_view[id(current)]
+
+
+def install_optimizer_state_hooks(
+    optimizers: Iterable[torch.optim.Optimizer], model_parts: list[nn.Module]
+) -> None:
+    """Present parameter-shaped optimizer state as DTensor views in ``state_dict``.
+
+    An optimizer over plain shards keeps plain per-rank moments. Handed to DCP
+    under one key per parameter they look like one replicated tensor, so a
+    single rank's copy is written and every rank reads it back. The post-hook
+    wraps each tensor shaped like its parameter's shard in that parameter's
+    view (``step`` and other scalars pass through); the load pre-hook unwraps
+    what the checkpoint hands back, so the optimizer's own ``load_state_dict``
+    sees plain tensors again. Specs are resolved by FQN at call time.
+    """
+    for optim in optimizers:
+        if getattr(optim, "_tpu_fsdp_state_hooks", False):
+            continue
+
+        def index_to_spec(optim: torch.optim.Optimizer) -> dict[int, ShardSpec]:
+            # `Optimizer.state_dict` numbers parameters across the groups in
+            # order; `param_names` sits beside `params` in each group.
+            specs = param_specs_by_fqn(model_parts)
+            out: dict[int, ShardSpec] = {}
+            index = 0
+            for group in optim.param_groups:
+                names = group.get("param_names")
+                if names is None:
+                    raise ValueError(
+                        "the optimizer must be built with (name, param) tuples so "
+                        "its state can be matched to the parameters' shard specs"
+                    )
+                for name in names:
+                    spec = specs.get(name)
+                    if spec is not None:
+                        out[index] = spec
+                    index += 1
+            return out
+
+        def as_views(optim: torch.optim.Optimizer, state_dict: dict[str, Any]):
+            specs = index_to_spec(optim)
+            state: dict[Any, Any] = {}
+            for index, per_param in state_dict["state"].items():
+                spec = specs.get(index)
+                if spec is None:
+                    state[index] = per_param
+                    continue
+                local_shape, _ = spec.local_shape_and_offset()
+                state[index] = {
+                    key: spec.to_dtensor(value)
+                    if isinstance(value, torch.Tensor)
+                    and not isinstance(value, DTensor)
+                    and tuple(value.shape) == local_shape
+                    else value
+                    for key, value in per_param.items()
+                }
+            return {**state_dict, "state": state}
+
+        def as_locals(optim: torch.optim.Optimizer, state_dict: dict[str, Any]):
+            del optim
+            state = {
+                index: {
+                    key: value.to_local() if isinstance(value, DTensor) else value
+                    for key, value in per_param.items()
+                }
+                for index, per_param in state_dict["state"].items()
+            }
+            return {**state_dict, "state": state}
+
+        optim.register_state_dict_post_hook(as_views)
+        optim.register_load_state_dict_pre_hook(as_locals)
+        optim._tpu_fsdp_state_hooks = True
 
 
 def _install_root_hooks(model: nn.Module) -> None:

@@ -11,11 +11,14 @@ is too small.
 """
 
 import functools
+import os
+import tempfile
 
 from absl import logging
 from absl.testing import absltest
 import torch
 import torch.distributed._functional_collectives as funcol
+import torch.distributed.checkpoint as dcp
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import (
@@ -26,6 +29,11 @@ from torch.distributed.tensor import (
     Shard,
 )
 
+from torchtitan.components.optimizer.utils import (
+    get_flat_optim_state_dict,
+    init_optim_state,
+    load_flat_optim_state_dict,
+)
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import grad_norm
@@ -446,6 +454,117 @@ def scan_row_gather_matches_dtensor(device, rank, world_size, *, shard_dim):
     torch.testing.assert_close(got_shard.grad, want_shard.grad, rtol=0, atol=0)
 
 
+
+def optimizer_state_round_trips_through_dcp(device, rank, world_size, *, path):
+    """Adam's moments are saved as shards and come back rank by rank.
+
+    Without the state-dict hooks every rank hands DCP a plain tensor under
+    the same key; DCP keeps one copy and every rank loads it.
+    """
+    if world_size == 1:
+        logging.warning("skipped: one rank cannot tell a shard from a replica")
+        return
+    mesh = _mesh(device, world_size, hybrid=False)
+
+    def build():
+        module = nn.Module()
+        module.register_parameter(
+            "weight", nn.Parameter(_randn(4 * world_size, 8, device=device))
+        )
+        # Narrower than the mesh: replicated, so its moments are identical
+        # across ranks and DCP keeping one copy is correct.
+        module.register_parameter("scale", nn.Parameter(_randn(1, 3, device=device)))
+        shard_module(
+            module, mesh, "fully_shard", shard_dim=0, param_dtype=None, reduce_dtype=None
+        )
+        optim = torch.optim.AdamW(list(module.named_parameters()), lr=1e-3)
+        init_optim_state(optim)
+        tpu_fsdp.install_optimizer_state_hooks([optim], [module])
+        return module, optim
+
+    def wanted(name: str, spec) -> float:
+        return float(rank + 1) if spec.sharded else 5.0
+
+    module, optim = build()
+    specs = getattr(module, SPECS_ATTR)
+    for name, p in module.named_parameters():
+        optim.state[p]["exp_avg"].fill_(wanted(name, specs[name]))
+        optim.state[p]["exp_avg_sq"].fill_(10 * wanted(name, specs[name]))
+        optim.state[p]["step"].fill_(7)
+    flat = get_flat_optim_state_dict(optim)
+    view = flat["state.weight.exp_avg"]
+    assert isinstance(view, DTensor), type(view)
+    assert view.placements == specs["weight"].placements, view.placements
+    assert tuple(view.shape) == (4 * world_size, 8), view.shape
+    assert not isinstance(flat["state.weight.step"], DTensor)
+    # The live state stays plain: the view is for DCP only.
+    assert not isinstance(optim.state[module._parameters["weight"]]["exp_avg"], DTensor)
+    dcp.save(flat, checkpoint_id=os.path.join(path, "optim"))
+
+    module2, optim2 = build()
+    flat2 = get_flat_optim_state_dict(optim2)
+    dcp.load(flat2, checkpoint_id=os.path.join(path, "optim"))
+    load_flat_optim_state_dict(optim2, flat2)
+    specs2 = getattr(module2, SPECS_ATTR)
+    for name, p in module2.named_parameters():
+        state = optim2.state[p]
+        assert not isinstance(state["exp_avg"], DTensor), name
+        torch.testing.assert_close(
+            state["exp_avg"], torch.full_like(p, wanted(name, specs2[name])), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            state["exp_avg_sq"],
+            torch.full_like(p, 10 * wanted(name, specs2[name])),
+            rtol=0,
+            atol=0,
+        )
+        assert float(state["step"]) == 7.0, state["step"]
+
+
+def sharded_buffers_checkpoint_as_dtensors(device, rank, world_size):
+    """A buffer registered like a sharded parameter gets that parameter's view."""
+    if world_size == 1:
+        logging.warning("skipped: one rank cannot tell a shard from a replica")
+        return
+    mesh = _mesh(device, world_size, hybrid=False)
+    module = nn.Module()
+    module.register_parameter(
+        "weight", nn.Parameter(_randn(4 * world_size, 8, device=device))
+    )
+    shard_module(
+        module, mesh, "fully_shard", shard_dim=0, param_dtype=None, reduce_dtype=None
+    )
+    spec = getattr(module, SPECS_ATTR)["weight"]
+    shard = module._parameters["weight"]
+    tpu_fsdp.register_sharded_buffer(
+        module, "_optstate_weight_exp_avg", torch.full_like(shard, rank + 1), like="weight"
+    )
+    module.register_buffer("count", torch.zeros((), device=device))
+    try:
+        tpu_fsdp.register_sharded_buffer(
+            module, "wrong", torch.zeros(3, device=device), like="weight"
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a buffer of another shape was registered like weight")
+
+    with dtensor_params(module):
+        sd = module.state_dict()
+    view = sd["_optstate_weight_exp_avg"]
+    assert isinstance(view, DTensor), type(view)
+    assert view.placements == spec.placements, view.placements
+    assert tuple(view.shape) == (4 * world_size, 8), view.shape
+    assert not isinstance(sd["count"], DTensor)
+    buffer = module._buffers["_optstate_weight_exp_avg"]
+    assert not isinstance(buffer, DTensor), "the window did not close"
+    assert view.to_local().data_ptr() == buffer.data_ptr(), "the view copied"
+    torch.testing.assert_close(
+        view.to_local(), torch.full_like(shard, rank + 1), rtol=0, atol=0
+    )
+    assert not isinstance(module.state_dict()["_optstate_weight_exp_avg"], DTensor)
+
+
 class TestTpuFSDP(base_distributed_device_test.BaseDistributedDeviceTest):
 
     def _on_devices(self, worker):
@@ -532,6 +651,15 @@ class TestTpuFSDP(base_distributed_device_test.BaseDistributedDeviceTest):
         self._on_devices(
             functools.partial(forward_and_grads_match_unsharded, scan=False, moe=True)
         )
+
+    def test_optimizer_state_round_trips_through_dcp(self):
+        with tempfile.TemporaryDirectory() as path:
+            self._on_devices(
+                functools.partial(optimizer_state_round_trips_through_dcp, path=path)
+            )
+
+    def test_fused_optimizer_buffers_checkpoint_as_dtensors(self):
+        self._on_devices(sharded_buffers_checkpoint_as_dtensors)
 
     def test_grad_norm_fsdp(self):
         self._on_devices(functools.partial(grad_norm_matches_dtensor, hybrid=False))

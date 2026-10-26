@@ -13,10 +13,15 @@ GMM (`maxtext/kernels/megablox/ops.py`):
   quantized to e5m2 per column (over tokens); the forward's raw e4m3 X is
   reused.
 
+Every operand is therefore quantized once per forward (and once more in the
+activation-checkpoint recompute); autograd saves the FP8 values and scales
+instead of the BF16 inputs, so the backward never re-reads or re-quantizes X
+or W.
+
 All scales are absmax, computed in FP32 and applied by the kernels to their
 FP32 accumulators. Quantization happens in XLA outside the kernels, with a
 proper FP8 cast (tokamax's in-kernel quantizer rounds to integers, which is
-meant for int8).
+meant for int8). FP8 residuals cross the torch boundary bitcast to int8.
 """
 
 import jax
@@ -43,6 +48,8 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as tokamax_gmm 
 
 jaxtyping.jaxtyped = _real_jaxtyped
 
+import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
+from torch_tpu._internal import pallas  # noqa: E402  pylint: disable=g-import-not-at-top
 from torchtitan.experiments.tpu.kernels import fp8_scale  # noqa: E402  pylint: disable=g-import-not-at-top
 
 FWD_DTYPE = jnp.float8_e4m3fn
@@ -186,10 +193,169 @@ def fp8_gmm_bwd(
     )
 
 
+# ---------------------------------------------------------------------------
+# torch ops. The forward returns the FP8 residuals (bitcast to int8, which
+# crosses the torch boundary everywhere) so autograd saves those, not BF16.
+# ---------------------------------------------------------------------------
+
+
+def _to_i8(x: jax.Array) -> jax.Array:
+    return jax.lax.bitcast_convert_type(x, jnp.int8)
+
+
+def _from_i8(x: jax.Array) -> jax.Array:
+    return jax.lax.bitcast_convert_type(x, FWD_DTYPE)
+
+
+def _fwd_with_residuals(lhs, rhs, group_sizes, tiling, interpret=False):
+    lhs_q, lhs_scale, rhs_q, rhs_scale = quantize_operands(lhs, rhs)
+    out = fp8_gmm_fwd_quantized(
+        lhs_q,
+        lhs_scale,
+        rhs_q,
+        rhs_scale,
+        group_sizes,
+        tiling,
+        lhs.dtype,
+        interpret=interpret,
+    )
+    return out, _to_i8(lhs_q), lhs_scale, _to_i8(rhs_q), rhs_scale
+
+
+def _bwd_from_residuals(
+    residuals, dout, dlhs_tiling, drhs_tiling, interpret=False
+):
+    lhs_q, lhs_scale, rhs_q, rhs_scale, group_sizes = residuals
+    return fp8_gmm_bwd_quantized(
+        dout,
+        _from_i8(lhs_q),
+        lhs_scale,
+        _from_i8(rhs_q),
+        rhs_scale,
+        group_sizes,
+        dlhs_tiling,
+        drhs_tiling,
+        dout.dtype,
+        interpret=interpret,
+    )
+
+
+_Residuals = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+
+# Every forward op takes all nine tiling ints -- forward, dInput, dWeight --
+# so autograd can hand the backward ones to the backward op. torch's custom-op
+# schema is inferred from annotations, which rules out varargs.
+
+
+@pallas.jax_op("tt_experts::fp8_grouped_mm")
+def _fp8_grouped_mm_fwd(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> _Residuals:
+    del dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk, drhs_tn
+    return _fwd_with_residuals(lhs, rhs, group_sizes, (fwd_tm, fwd_tk, fwd_tn))
+
+
+@pallas.jax_op("tt_experts::fp8_grouped_mm_bwd")
+def _fp8_grouped_mm_bwd(
+    dout: jax.Array,
+    lhs_q: jax.Array,
+    lhs_scale: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array]:
+    return _bwd_from_residuals(
+        (lhs_q, lhs_scale, rhs_q, rhs_scale, group_sizes),
+        dout,
+        (dlhs_tm, dlhs_tk, dlhs_tn),
+        (drhs_tm, drhs_tk, drhs_tn),
+    )
+
+
+def _register_autograd(fwd_op, bwd_op, num_weights: int) -> None:
+    """Autograd that saves the forward's FP8 residuals instead of its inputs."""
+
+    def setup_context(ctx, inputs, output):
+        group_sizes = inputs[1 + num_weights]
+        _, lhs_q, lhs_scale, rhs_q, rhs_scale = output
+        ctx.mark_non_differentiable(lhs_q, lhs_scale, rhs_q, rhs_scale)
+        ctx.save_for_backward(lhs_q, lhs_scale, rhs_q, rhs_scale, group_sizes)
+        ctx.num_static = len(inputs) - (2 + num_weights)
+        # Drop the forward tiling; the backward op takes dInput and dWeight's.
+        ctx.bwd_tilings = tuple(inputs[2 + num_weights + 3 :])
+
+    def backward(ctx, grad_out, *unused_residual_grads):
+        del unused_residual_grads
+        grads = bwd_op(grad_out, *ctx.saved_tensors, *ctx.bwd_tilings)
+        # (lhs, *weights) grads, then group_sizes and the static ints.
+        return tuple(grads) + (None,) * (1 + ctx.num_static)
+
+    fwd_op.register_autograd(backward, setup_context=setup_context)
+
+
+_register_autograd(_fp8_grouped_mm_fwd, _fp8_grouped_mm_bwd, num_weights=1)
+
+
+def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:
+    static = (*fwd, *dlhs, *drhs)
+    assert len(static) == 9, static
+    return static
+
+
+def _int32(group_sizes: torch.Tensor) -> torch.Tensor:
+    return (
+        group_sizes
+        if group_sizes.dtype == torch.int32
+        else group_sizes.to(torch.int32)
+    )
+
+
+def fp8_segment_matmul_pallas_2d(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    fwd_tiling: Tiling = (512, 0, 0),
+    dlhs_tiling: Tiling = (512, 0, 0),
+    drhs_tiling: Tiling = (512, 0, 0),
+) -> torch.Tensor:
+    """FP8 per-expert matmuls; see the module docstring for the numerics.
+
+    Each tiling is ``(tile_m, tile_k, tile_n)`` in the kernel's own operand
+    order, with zero K/N selecting the full dimension: forward ``(M, K, N)``,
+    dInput ``(M, N, K)``, dWeight ``(M, K, N)``.
+    """
+    out, *_ = _fp8_grouped_mm_fwd(
+        lhs,
+        rhs,
+        _int32(group_sizes),
+        *_static(fwd_tiling, dlhs_tiling, drhs_tiling),
+    )
+    return out
+
+
 __all__ = [
     "fp8_gmm_bwd",
     "fp8_gmm_bwd_quantized",
     "fp8_gmm_fwd",
     "fp8_gmm_fwd_quantized",
+    "fp8_segment_matmul_pallas_2d",
     "quantize_operands",
 ]

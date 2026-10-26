@@ -9,6 +9,7 @@ from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu.kernels import fp8_expert_segment_matmul as fp8_esm
 
 _TILING = (128, 0, 0)
+_TILINGS = dict(fwd_tiling=_TILING, dlhs_tiling=_TILING, drhs_tiling=_TILING)
 _GROUP_SIZES = (0, 103, 17, 136, 0, 256)
 
 
@@ -86,6 +87,96 @@ class Fp8GmmTest(base_device_test.BaseAcceleratorDeviceTest):
         for g, size in enumerate(_GROUP_SIZES):
             if size == 0:
                 self.assertEqual(float(jnp.abs(drhs[g]).max()), 0.0)
+
+
+class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
+
+    def _operands(self, k=256, n=256, group_sizes=_GROUP_SIZES):
+        torch.manual_seed(0)
+        m = sum(group_sizes)
+        lhs = torch.randn(m, k, dtype=torch.bfloat16)
+        rhs = torch.randn(len(group_sizes), k, n, dtype=torch.bfloat16) * 0.05
+        dout = torch.randn(m, n, dtype=torch.bfloat16)
+        sizes = torch.tensor(group_sizes, dtype=torch.int32)
+        return lhs, rhs, dout, sizes
+
+    def _to_dev(self, *tensors, grad=False):
+        return [
+            t.to(self.accelerator_device).requires_grad_(grad) for t in tensors
+        ]
+
+    def test_forward_matches_dequantized_reference(self):
+        lhs, rhs, _, sizes = self._operands()
+        lhs_d, rhs_d, sizes_d = self._to_dev(lhs, rhs, sizes)
+        out = fp8_esm.fp8_segment_matmul_pallas_2d(
+            lhs_d, rhs_d, sizes_d, **_TILINGS
+        ).cpu()
+
+        # lhs is scaled per row; rhs per output column, shared by all experts.
+        want = _grouped_reference(
+            _dequantized(lhs, dims=1),
+            _dequantized(rhs, dims=(0, 1)),
+            _GROUP_SIZES,
+        )
+        self.assertEqual(out.dtype, torch.bfloat16)
+        # XLA's FP32 -> FP8 convert may round a few elements one FP8 ulp
+        # differently from torch's, so compare in norm.
+        self.assertLess(_rel_err(out, want), 5e-3)
+
+    def test_backward_is_close_to_bf16(self):
+        lhs, rhs, dout, sizes = self._operands()
+        lhs_d, rhs_d = self._to_dev(lhs, rhs, grad=True)
+        (sizes_d,) = self._to_dev(sizes)
+        out = fp8_esm.fp8_segment_matmul_pallas_2d(
+            lhs_d, rhs_d, sizes_d, **_TILINGS
+        )
+        dlhs, drhs = torch.autograd.grad(
+            out, (lhs_d, rhs_d), dout.to(self.accelerator_device)
+        )
+
+        lhs_r, rhs_r = (
+            lhs.float().requires_grad_(),
+            rhs.float().requires_grad_(),
+        )
+        want = _grouped_reference(lhs_r, rhs_r, _GROUP_SIZES)
+        want_dlhs, want_drhs = torch.autograd.grad(
+            want, (lhs_r, rhs_r), dout.float()
+        )
+
+        self.assertEqual(drhs.dtype, torch.bfloat16)
+        self.assertLess(_rel_err(dlhs, want_dlhs), 0.1)
+        self.assertLess(_rel_err(drhs, want_drhs), 0.1)
+        # Experts that received no rows get exactly zero weight gradient.
+        drhs = drhs.cpu()
+        for g, size in enumerate(_GROUP_SIZES):
+            if size == 0:
+                torch.testing.assert_close(drhs[g], torch.zeros_like(drhs[g]))
+
+    def test_tiny_gradient_rows_stay_finite(self):
+        # A dout row whose (dout * rhs_scale) amax / 57344 is subnormal in FP32
+        # gets a zero scale on TPU (flush-to-zero) unless the scale is floored;
+        # the row then quantizes to inf/NaN and, through dW's per-column
+        # scales, poisons every expert's weight gradient.
+        lhs, rhs, dout, sizes = self._operands()
+        dout[5] = dout[5] * 1e-32
+        lhs_d, rhs_d = self._to_dev(lhs, rhs, grad=True)
+        (sizes_d,) = self._to_dev(sizes)
+        out = fp8_esm.fp8_segment_matmul_pallas_2d(
+            lhs_d, rhs_d, sizes_d, **_TILINGS
+        )
+        dlhs, drhs = torch.autograd.grad(
+            out, (lhs_d, rhs_d), dout.to(self.accelerator_device)
+        )
+        self.assertTrue(torch.isfinite(dlhs.float()).all())
+        self.assertTrue(torch.isfinite(drhs.float()).all())
+
+        lhs_r, rhs_r = (
+            lhs.float().requires_grad_(),
+            rhs.float().requires_grad_(),
+        )
+        want = _grouped_reference(lhs_r, rhs_r, _GROUP_SIZES)
+        want_drhs = torch.autograd.grad(want, (rhs_r,), dout.float())[0]
+        self.assertLess(_rel_err(drhs, want_drhs), 0.1)
 
 
 if __name__ == "__main__":

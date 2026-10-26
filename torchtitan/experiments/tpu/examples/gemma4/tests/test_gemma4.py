@@ -1015,6 +1015,19 @@ class TestGemma4SplashAttentionParity(BaseDeviceTest):
         cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel
     )
 
+  def test_production_recipes_saturation_token_budgets(self):
+    cfg_31b = gemma4_31b()
+    self.assertEqual(cfg_31b.training.max_context_length, 4096)
+    self.assertEqual(
+        cfg_31b.training.num_tokens_per_microbatch_per_dp_rank, 2 * 4096
+    )
+
+    cfg_26b = gemma4_26b_a4b()
+    self.assertEqual(cfg_26b.training.max_context_length, 4096)
+    self.assertEqual(
+        cfg_26b.training.num_tokens_per_microbatch_per_dp_rank, 6 * 4096
+    )
+
   @parameterized.named_parameters(
       dict(testcase_name="splash", kernel="splash"),
       dict(testcase_name="tokamax", kernel="tokamax"),

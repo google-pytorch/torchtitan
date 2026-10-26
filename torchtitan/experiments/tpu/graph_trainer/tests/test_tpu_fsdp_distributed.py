@@ -38,6 +38,7 @@ from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import grad_norm
 from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
+from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 from torchtitan.experiments.tpu.graph_trainer.tests import test_layer_stack
@@ -565,6 +566,84 @@ def sharded_buffers_checkpoint_as_dtensors(device, rank, world_size):
     assert not isinstance(module.state_dict()["_optstate_weight_exp_avg"], DTensor)
 
 
+
+class _Scaled(nn.Module):
+    """``sum(weight * scale)``: the gradient of ``weight`` is ``scale`` everywhere."""
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight)
+
+    def forward(self, scale: torch.Tensor) -> torch.Tensor:
+        return (self.weight * scale).sum()
+
+
+def _fused_adamw_step(model, device, scale, *, max_norm):
+    """One fused AdamW step on ``model`` (the graph trainer's in-graph path), eagerly."""
+    for name, p in model.named_parameters():
+        parent_path, _, leaf = name.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        for kind in ("exp_avg", "exp_avg_sq"):
+            parent.register_buffer(f"_optstate_{leaf}_{kind}", torch.zeros_like(p))
+    model.register_buffer("_optstate_step", torch.zeros((), device=device))
+    model.register_buffer("_optstate_lr", torch.tensor(0.1, device=device))
+    step = tpu_graph_trainer._make_fwd_bwd_adamw_fn(
+        model,
+        loss_fn=lambda pred, labels, global_valid_tokens: pred,
+        param_fqns=["weight"],
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        weight_decay=0.0,
+        max_norm=max_norm,
+        capturable=False,
+    )
+    out = step(scale, None, torch.tensor(1.0, device=device), {})
+    # (loss, new weight, new exp_avg, ...). Adam's first update is lr * sign
+    # whatever the clip, so the clip is read off the first moment.
+    return out[2]
+
+
+def fused_adamw_clips_on_the_global_norm(device, rank, world_size):
+    """The in-graph optimizer clips by the norm over every rank's shard.
+
+    Each rank's loss scales the whole weight by its own factor, so after the
+    reduce-scatter every shard's gradient is the sum of the factors. The
+    local norm of one shard is then ``1/sqrt(world_size)`` of the global
+    one; ``max_norm`` sits between the two, so a clip on the local norm would
+    not clip at all.
+    """
+    if world_size == 1:
+        logging.warning("skipped: one rank, the local norm is the global norm")
+        return
+    mesh = _mesh(device, world_size, hybrid=False)
+    rows = 4 * world_size
+    whole = _randn(rows, 8, device=device)
+    total = 0.25
+    scale = torch.tensor(total * (rank + 1) / sum(range(1, world_size + 1)), device=device)
+    # Shard grad norm: total * sqrt(4 * 8); global: sqrt(world_size) x that.
+    local_norm = total * (4 * 8) ** 0.5
+    max_norm = local_norm * (1 + world_size**0.5) / 2
+
+    sharded = _Scaled(whole.clone())
+    shard_module(
+        sharded, mesh, "fully_shard", shard_dim=0, param_dtype=None, reduce_dtype=None
+    )
+    spec = getattr(sharded, SPECS_ATTR)["weight"]
+    got = _fused_adamw_step(sharded, device, scale, max_norm=max_norm)
+
+    # Reference: the whole weight on one process, with the summed factor.
+    reference = _Scaled(whole.clone())
+    want = _fused_adamw_step(
+        reference, device, torch.tensor(total, device=device), max_norm=max_norm
+    )
+    shape, offset = spec.local_shape_and_offset()
+    want = want.narrow(0, offset[0], shape[0])
+    # Unclipped, the first moment is (1 - beta1) * total everywhere.
+    assert want.abs().max() < 0.1 * total * 0.999, "the reference did not clip"
+    torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+
+
 class TestTpuFSDP(base_distributed_device_test.BaseDistributedDeviceTest):
 
     def _on_devices(self, worker):
@@ -660,6 +739,9 @@ class TestTpuFSDP(base_distributed_device_test.BaseDistributedDeviceTest):
 
     def test_fused_optimizer_buffers_checkpoint_as_dtensors(self):
         self._on_devices(sharded_buffers_checkpoint_as_dtensors)
+
+    def test_fused_adamw_clips_on_the_global_norm(self):
+        self._on_devices(fused_adamw_clips_on_the_global_norm)
 
     def test_grad_norm_fsdp(self):
         self._on_devices(functools.partial(grad_norm_matches_dtensor, hybrid=False))

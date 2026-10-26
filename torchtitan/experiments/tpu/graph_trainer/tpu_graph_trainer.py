@@ -42,7 +42,11 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
-from torchtitan.experiments.tpu.grad_norm import clip_grad_norm_eager_, CompiledGradNorm
+from torchtitan.experiments.tpu.grad_norm import (
+    clip_grad_norm_eager_,
+    CompiledGradNorm,
+    global_grad_norm,
+)
 from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     GraphSplitter,
@@ -622,9 +626,12 @@ def _make_fwd_bwd_adamw_fn(
         )
 
         if max_norm is not None and max_norm > 0.0:
-            total_norm = torch.linalg.vector_norm(
-                torch.stack([torch.linalg.vector_norm(g) for g in grads]),
-                2.0,
+            # The one global norm the eager and compiled clips use. The grads
+            # are shards; their specs (resolved here, at trace time) carry the
+            # reduction, which a norm of the plain tensors would not do.
+            spec_by_id = tpu_fsdp.param_specs(model)
+            total_norm = global_grad_norm(
+                list(grads), [spec_by_id.get(id(p)) for p in canonical_params]
             )
             clip_coef = max_norm / (total_norm + _GRAD_CLIP_EPS)
             clip_coef_clamped = torch.clamp(clip_coef, max=_GRAD_CLIP_MAX_SCALE)

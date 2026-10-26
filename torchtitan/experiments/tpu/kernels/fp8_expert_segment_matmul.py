@@ -16,7 +16,10 @@ GMM (`maxtext/kernels/megablox/ops.py`):
 Every operand is therefore quantized once per forward (and once more in the
 activation-checkpoint recompute); autograd saves the FP8 values and scales
 instead of the BF16 inputs, so the backward never re-reads or re-quantizes X
-or W.
+or W. The W1/W3 projections of a SwiGLU expert share their input, so
+`fp8_paired_segment_matmul_pallas_2d` runs them as one GEMM over the
+concatenated ``[W1 | W3]`` weight: X is quantized once, and dX comes out of a
+single dInput GEMM instead of two GEMMs and an add.
 
 All scales are absmax, computed in FP32 and applied by the kernels to their
 FP32 accumulators. Quantization happens in XLA outside the kernels, with a
@@ -266,6 +269,28 @@ def _fp8_grouped_mm_fwd(
     return _fwd_with_residuals(lhs, rhs, group_sizes, (fwd_tm, fwd_tk, fwd_tn))
 
 
+@pallas.jax_op("tt_experts::fp8_paired_grouped_mm")
+def _fp8_paired_grouped_mm_fwd(
+    lhs: jax.Array,
+    rhs_a: jax.Array,
+    rhs_b: jax.Array,
+    group_sizes: jax.Array,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> _Residuals:
+    del dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk, drhs_tn
+    # XLA fuses the concatenation into the FP8 cast that writes `rhs_q`.
+    rhs = jnp.concatenate([rhs_a, rhs_b], axis=2)
+    return _fwd_with_residuals(lhs, rhs, group_sizes, (fwd_tm, fwd_tk, fwd_tn))
+
+
 @pallas.jax_op("tt_experts::fp8_grouped_mm_bwd")
 def _fp8_grouped_mm_bwd(
     dout: jax.Array,
@@ -287,6 +312,31 @@ def _fp8_grouped_mm_bwd(
         (dlhs_tm, dlhs_tk, dlhs_tn),
         (drhs_tm, drhs_tk, drhs_tn),
     )
+
+
+@pallas.jax_op("tt_experts::fp8_paired_grouped_mm_bwd")
+def _fp8_paired_grouped_mm_bwd(
+    dout: jax.Array,
+    lhs_q: jax.Array,
+    lhs_scale: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    grad_lhs, grad_rhs = _bwd_from_residuals(
+        (lhs_q, lhs_scale, rhs_q, rhs_scale, group_sizes),
+        dout,
+        (dlhs_tm, dlhs_tk, dlhs_tn),
+        (drhs_tm, drhs_tk, drhs_tn),
+    )
+    grad_a, grad_b = jnp.split(grad_rhs, 2, axis=2)
+    return grad_lhs, grad_a, grad_b
 
 
 def _register_autograd(fwd_op, bwd_op, num_weights: int) -> None:
@@ -311,6 +361,9 @@ def _register_autograd(fwd_op, bwd_op, num_weights: int) -> None:
 
 
 _register_autograd(_fp8_grouped_mm_fwd, _fp8_grouped_mm_bwd, num_weights=1)
+_register_autograd(
+    _fp8_paired_grouped_mm_fwd, _fp8_paired_grouped_mm_bwd, num_weights=2
+)
 
 
 def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:
@@ -351,11 +404,38 @@ def fp8_segment_matmul_pallas_2d(
     return out
 
 
+def fp8_paired_segment_matmul_pallas_2d(
+    lhs: torch.Tensor,
+    rhs_a: torch.Tensor,
+    rhs_b: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    fwd_tiling: Tiling = (512, 0, 0),
+    dlhs_tiling: Tiling = (512, 0, 0),
+    drhs_tiling: Tiling = (512, 0, 0),
+    split: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    """``(lhs @ rhs_a, lhs @ rhs_b)`` per expert as one FP8 GEMM over ``[a | b]``.
+
+    Tilings are as in `fp8_segment_matmul_pallas_2d`, for N = 2 * rhs_a's N.
+    With ``split=False`` returns the ``[M, 2N]`` concatenation instead.
+    """
+    out, *_ = _fp8_paired_grouped_mm_fwd(
+        lhs,
+        rhs_a,
+        rhs_b,
+        _int32(group_sizes),
+        *_static(fwd_tiling, dlhs_tiling, drhs_tiling),
+    )
+    return out.chunk(2, dim=-1) if split else out
+
+
 __all__ = [
     "fp8_gmm_bwd",
     "fp8_gmm_bwd_quantized",
     "fp8_gmm_fwd",
     "fp8_gmm_fwd_quantized",
+    "fp8_paired_segment_matmul_pallas_2d",
     "fp8_segment_matmul_pallas_2d",
     "quantize_operands",
 ]

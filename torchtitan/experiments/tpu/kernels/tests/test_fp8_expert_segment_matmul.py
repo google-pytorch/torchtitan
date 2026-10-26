@@ -178,6 +178,62 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         want_drhs = torch.autograd.grad(want, (rhs_r,), dout.float())[0]
         self.assertLess(_rel_err(drhs, want_drhs), 0.1)
 
+    def test_paired_matches_unpaired(self):
+        lhs, rhs_a, dout_a, sizes = self._operands()
+        _, rhs_b, dout_b, _ = self._operands(n=256)
+        rhs_b = rhs_b.flip(0) * 0.5
+        dout_b = dout_b.flip(0)
+        dev = self.accelerator_device
+
+        def unpaired():
+            x, a, b = self._to_dev(lhs, rhs_a, rhs_b, grad=True)
+            out_a = fp8_esm.fp8_segment_matmul_pallas_2d(
+                x, a, sizes.to(dev), **_TILINGS
+            )
+            out_b = fp8_esm.fp8_segment_matmul_pallas_2d(
+                x, b, sizes.to(dev), **_TILINGS
+            )
+            grads = torch.autograd.grad(
+                (out_a, out_b), (x, a, b), (dout_a.to(dev), dout_b.to(dev))
+            )
+            return (out_a, out_b), grads
+
+        def paired():
+            x, a, b = self._to_dev(lhs, rhs_a, rhs_b, grad=True)
+            out_a, out_b = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+                x, a, b, sizes.to(dev), **_TILINGS
+            )
+            grads = torch.autograd.grad(
+                (out_a, out_b), (x, a, b), (dout_a.to(dev), dout_b.to(dev))
+            )
+            return (out_a, out_b), grads
+
+        # Column scales are per column, so concatenating [a | b] leaves every
+        # forward operand unchanged. dInput is one GEMM over 2N instead of two
+        # GEMMs and a sum, so it only matches to rounding.
+        (pa, pb), (pdx, pda, pdb) = paired()
+        (ua, ub), (udx, uda, udb) = unpaired()
+        torch.testing.assert_close(pa.cpu(), ua.cpu())
+        torch.testing.assert_close(pb.cpu(), ub.cpu())
+        torch.testing.assert_close(pda.cpu(), uda.cpu())
+        torch.testing.assert_close(pdb.cpu(), udb.cpu())
+        # dY is quantized per row over [a | b] instead of per half.
+        self.assertLess(_rel_err(pdx, udx), 0.06)
+
+    def test_paired_unsplit_is_concatenation(self):
+        lhs, rhs, _, sizes = self._operands()
+        dev = self.accelerator_device
+        x, a, b = self._to_dev(lhs, rhs, rhs.flip(0))
+        split = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+            x, a, b, sizes.to(dev), **_TILINGS
+        )
+        joint = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+            x, a, b, sizes.to(dev), split=False, **_TILINGS
+        )
+        torch.testing.assert_close(
+            joint.cpu(), torch.cat(split, dim=-1).cpu(), rtol=0, atol=0
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

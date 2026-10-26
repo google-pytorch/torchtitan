@@ -10,7 +10,7 @@ TPU Muse Glimmer model registry and FSDP policy:
   TPU-only ``testmodel`` flavor available.
 * Before sharding, vocab-sized weights whose dim 0 does not divide the FSDP
   degree switch to dim-1 sharding (``configure_muse_glimmer_simple_fsdp_shard_dims``
-  on top of the shared ``configure_simple_fsdp_shard_dims``).
+  on top of the shared ``configure_fsdp_shard_dims``).
 
 Only FSDP / HSDP is supported here. Upstream's GraphTrainer TP path goes
 through ``Module.parallelize`` with ``spmd_types``, which the fork does not use,
@@ -25,13 +25,13 @@ from torchtitan.experiments.graph_trainer.common_utils import annotate_module_fq
 from torchtitan.experiments.graph_trainer.muse_glimmer.model import GraphTrainerMuseGlimmerModel
 from torchtitan.experiments.tpu import muse_glimmer as tpu_muse_glimmer
 from torchtitan.experiments.tpu.graph_trainer.parallelize import parallelize_tpu_graph_trainer
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.graph_trainer.fsdp_shard_dims import configure_fsdp_shard_dims
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import configure_muse_glimmer_simple_fsdp_shard_dims
 from torchtitan.protocols.model_spec import ModelSpec
 
 
 def _configure_shard_dims(model: nn.Module, parallel_dims: ParallelDims) -> None:
-  configure_simple_fsdp_shard_dims(model, parallel_dims)
+  configure_fsdp_shard_dims(model, parallel_dims)
   configure_muse_glimmer_simple_fsdp_shard_dims(model, parallel_dims)
 
 

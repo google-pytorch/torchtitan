@@ -6,9 +6,9 @@ described by a :class:`ShardSpec` (the data-parallel mesh, which tensor axis
 is split, which dtypes compute and reduce in). Reading the parameter through
 its module attribute runs one hand-written autograd function: all-gather in
 the forward, reduce-scatter in the backward, plus an all-reduce over the
-replicate axis under HSDP. That is the pair the scan body has always used
-(``scan_fsdp``); here it covers every parameter, and the scan body reuses it
-for its per-layer rows.
+replicate axis under HSDP. That is the pair the scan body has always used;
+here it covers every parameter, and the scan body reuses it for its
+per-layer rows.
 
 What this removes from the runtime path: DTensor, its dispatcher, the
 spmd_types translation SimpleFSDP does to get a DTensor back, and the

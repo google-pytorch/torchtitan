@@ -31,7 +31,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import _tile_fold
 from torchtitan.tools.logging import logger
 
 
-__all__ = ["configure_simple_fsdp_shard_dims"]
+__all__ = ["configure_fsdp_shard_dims"]
 
 
 _orig_all_gather_single = funcol.all_gather_single
@@ -108,7 +108,7 @@ funcol.reduce_scatter_single = _movedim_reduce_scatter_tensor
 funcol.reduce_scatter_tensor = _movedim_reduce_scatter_tensor
 
 
-def configure_simple_fsdp_shard_dims(
+def configure_fsdp_shard_dims(
     model: nn.Module,
     parallel_dims: Any,
 ) -> list[str]:

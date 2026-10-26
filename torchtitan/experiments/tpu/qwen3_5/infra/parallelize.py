@@ -7,7 +7,7 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.graph_trainer.fsdp_shard_dims import configure_fsdp_shard_dims
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
@@ -79,7 +79,7 @@ def parallelize_qwen3_5(
   )
   if parallelism.use_simple_fsdp:
     # TPU: SimpleFSDP instead of FSDP2, on shard dims that divide the mesh.
-    configure_simple_fsdp_shard_dims(model, parallel_dims)
+    configure_fsdp_shard_dims(model, parallel_dims)
     model = apply_simple_fsdp(
         model,
         parallel_dims=parallel_dims,

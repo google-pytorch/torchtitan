@@ -21,13 +21,13 @@ import torchtitan.distributed
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.graph_trainer.fsdp_shard_dims import configure_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
 # Muse Glimmer's ``tok_embeddings`` is an ``EmbeddingWithNorm``; its weight
 # lives on ``tok_embeddings.embedding``, which the generic
-# ``configure_simple_fsdp_shard_dims`` (it looks at ``tok_embeddings.weight``)
+# ``configure_fsdp_shard_dims`` (it looks at ``tok_embeddings.weight``)
 # does not see.
 _EMBEDDING_FQN = "tok_embeddings.embedding"
 
@@ -40,7 +40,7 @@ def configure_muse_glimmer_simple_fsdp_shard_dims(
 
   Muse Glimmer's vocab (202048) is not divisible by large FSDP degrees (e.g. 128
   on tpu7x-4x4x4). ``lm_head`` (and any layer stacks) are handled by the shared
-  ``configure_simple_fsdp_shard_dims``; this adds the same rule for the
+  ``configure_fsdp_shard_dims``; this adds the same rule for the
   embedding weight nested inside ``EmbeddingWithNorm``.
 
   Args:
@@ -84,7 +84,7 @@ def configure_muse_glimmer_simple_fsdp_shard_dims(
       hidden_axis_modules.append(_EMBEDDING_FQN)
 
   hidden_axis_modules.extend(
-      configure_simple_fsdp_shard_dims(model, parallel_dims)
+      configure_fsdp_shard_dims(model, parallel_dims)
   )
 
   if hidden_axis_modules:

@@ -25,8 +25,8 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
-    configure_simple_fsdp_shard_dims,
+from torchtitan.experiments.tpu.graph_trainer.fsdp_shard_dims import (
+    configure_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import apply_tpu_fsdp
 from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
@@ -41,7 +41,7 @@ def parallelize_tpu_graph_trainer(
     annotate: Callable[[nn.Module], None],
     configure_shard_dims: Callable[
         [nn.Module, ParallelDims], object
-    ] = configure_simple_fsdp_shard_dims,
+    ] = configure_fsdp_shard_dims,
     training: TrainingConfig,
     parallel_dims: ParallelDims,
     parallelism: ParallelismConfig,

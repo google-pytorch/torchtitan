@@ -31,7 +31,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     LayerStackHolder,
     scan_plan,
 )
-from torchtitan.experiments.tpu.graph_trainer import scan_fsdp
+from torchtitan.experiments.tpu.graph_trainer import fsdp_shard_dims
 from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
     shard_module,
@@ -182,12 +182,12 @@ class TestShardDimPicker(unittest.TestCase):
 
             cases = (
                 (
-                    lambda x: scan_fsdp._movedim_all_gather_tensor(x, 0, group_name),
+                    lambda x: fsdp_shard_dims._movedim_all_gather_tensor(x, 0, group_name),
                     (rows, cols),
                     lambda x: torch.cat([x] * ranks, dim=0),
                 ),
                 (
-                    lambda x: scan_fsdp._movedim_reduce_scatter_tensor(
+                    lambda x: fsdp_shard_dims._movedim_reduce_scatter_tensor(
                         x, "sum", 0, group_name
                     ),
                     (rows * ranks, cols),
@@ -196,10 +196,10 @@ class TestShardDimPicker(unittest.TestCase):
             )
             with (
                 unittest.mock.patch.object(
-                    scan_fsdp, "_orig_all_gather_single", fake_all_gather
+                    fsdp_shard_dims, "_orig_all_gather_single", fake_all_gather
                 ),
                 unittest.mock.patch.object(
-                    scan_fsdp, "_orig_reduce_scatter_single", fake_reduce_scatter
+                    fsdp_shard_dims, "_orig_reduce_scatter_single", fake_reduce_scatter
                 ),
             ):
                 for collective, shape, expected in cases:
@@ -217,7 +217,7 @@ class TestShardDimPicker(unittest.TestCase):
         with self.assertRaises(ValueError):
             _pick((N_LAYERS,), 128)
 
-    def test_configure_simple_fsdp_shard_dims_allows_narrow_hidden_axis_for_replication(
+    def test_configure_fsdp_shard_dims_allows_narrow_hidden_axis_for_replication(
         self,
     ):
         # Llama 3 8B at 8192 ranks: `[128256, 4096]` has `128256 % 8192 != 0`
@@ -227,8 +227,8 @@ class TestShardDimPicker(unittest.TestCase):
         model.tok_embeddings = nn.Embedding(128256, 4096, device="meta")
         model.lm_head = nn.Linear(4096, 128256, bias=False, device="meta")
         pdims = unittest.mock.MagicMock(dp_shard=8192, cp=1)
-        with self.assertLogs(scan_fsdp.logger, level="WARNING") as cm:
-            moved = scan_fsdp.configure_simple_fsdp_shard_dims(model, pdims)
+        with self.assertLogs(fsdp_shard_dims.logger, level="WARNING") as cm:
+            moved = fsdp_shard_dims.configure_fsdp_shard_dims(model, pdims)
         self.assertTrue(
             any(
                 "tok_embeddings.weight" in msg and "replicate" in msg
@@ -254,7 +254,7 @@ class TestShardDimPicker(unittest.TestCase):
         bad = nn.Module()
         bad.tok_embeddings = nn.Embedding(128256, 6144, device="meta")
         with self.assertRaises(ValueError):
-            scan_fsdp.configure_simple_fsdp_shard_dims(
+            fsdp_shard_dims.configure_fsdp_shard_dims(
                 bad, unittest.mock.MagicMock(dp_shard=4096, cp=1)
             )
 
@@ -302,7 +302,7 @@ class TestShardDimPicker(unittest.TestCase):
                     placements=(Shard(gather_dim),),
                     global_shape=tuple(whole_shape),
                 )
-                # The graph trainer's own fold, with scan_fsdp's funcol patch
+                # The graph trainer's own fold, with fsdp_shard_dims's funcol patch
                 # out of the way: the attributes `_gather_on` / `_scatter_on`
                 # read are the fakes themselves.
                 with (

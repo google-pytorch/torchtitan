@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import math
 from collections.abc import Iterable, Iterator
 from itertools import count
 from typing import Any
@@ -227,36 +228,69 @@ def _waited(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def _fold_rows(t: torch.Tensor, k: int) -> torch.Tensor:
+    """View 2-D ``t`` as ``[rows * k, cols // k]``.
+
+    ``.contiguous()`` cannot be used here: it is a no-op at trace time when the
+    fake tensor looks row-major, but TorchTPU may replay the graph with a
+    transposed input (the fused loss's ``lm_head`` gradient), and ``view``
+    would then read it in the wrong order.
+    ``clone(memory_format=torch.contiguous_format)`` always records the copy.
+    """
+    return t.clone(memory_format=torch.contiguous_format).view(
+        t.shape[0] * k, t.shape[1] // k
+    )
+
+
+def _tile_fold(t: torch.Tensor, shard_rows: int) -> tuple[torch.Tensor, int | None]:
+    """Fold a 2-D shard so every rank's rows are a multiple of 8, when they can be.
+
+    TPU stores 2-D tensors in ``(8, 128)`` tiles. At high FSDP degrees a rank's
+    rows need not divide by 8 (1187 rows of the 235B embedding at 128 ranks,
+    18 or 36 rows of a fused ``wqkv`` at 512), and XLA pads or relayouts the
+    collective. Folding ``k = 8 // gcd(rows, 8)`` columns into the rows gives
+    it an aligned ``[rows * k, cols // k]`` instead; the caller reshapes the
+    result back with the returned column count. Anything that is not 2-D, is
+    already aligned, or whose columns do not fold is returned as is.
+    """
+    if t.ndim != 2 or shard_rows <= 0 or shard_rows % 8 == 0:
+        return t, None
+    k = 8 // math.gcd(shard_rows, 8)
+    if t.shape[1] % (k * 128) != 0:
+        return t, None
+    return _fold_rows(t, k), t.shape[1]
+
+
 def _gather_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
-    """All-gather ``x`` along ``dim``, always collecting on dim 0.
+    """All-gather ``x`` along ``dim``, on dim 0 and in 8-row tiles.
 
     Off dim 0, funcol falls back to ``cat(chunk(t, world_size))`` -- a 2048-rank
     gather would emit 2048 slices and a concat. A transpose either side is two
-    ops instead. ``scan_fsdp`` may have patched funcol with TPU tile-alignment
-    fixes; they apply here too, because the attribute is read at call time.
+    ops instead. The tile fold is this module's own (``_tile_fold``), so it
+    does not depend on the funcol patch the eager SimpleFSDP lanes install.
     """
-    if dim == 0:
-        return _waited(funcol.all_gather_tensor(x, gather_dim=0, group=group_name))
-    out = _waited(
-        funcol.all_gather_tensor(x.movedim(dim, 0), gather_dim=0, group=group_name)
-    )
-    return out.movedim(0, dim)
+    t = x.movedim(dim, 0) if dim != 0 else x
+    t, cols = _tile_fold(t, t.shape[0])
+    out = _waited(funcol.all_gather_tensor(t, gather_dim=0, group=group_name))
+    if cols is not None:
+        out = out.reshape(-1, cols)
+    return out.movedim(0, dim) if dim != 0 else out
 
 
 def _scatter_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
-    """Reduce-scatter ``x`` along ``dim``, always scattering on dim 0."""
-    if dim == 0:
-        return _waited(
-            funcol.reduce_scatter_tensor(
-                x, reduceOp="sum", scatter_dim=0, group=group_name
-            )
-        )
+    """Reduce-scatter ``x`` along ``dim``, on dim 0 and in 8-row tiles."""
+    t = x.movedim(dim, 0) if dim != 0 else x
+    cols = None
+    if t.ndim == 2:
+        degree = funcol.c10d._get_group_size_by_name(group_name)
+        if t.shape[0] % degree == 0:
+            t, cols = _tile_fold(t, t.shape[0] // degree)
     out = _waited(
-        funcol.reduce_scatter_tensor(
-            x.movedim(dim, 0), reduceOp="sum", scatter_dim=0, group=group_name
-        )
+        funcol.reduce_scatter_tensor(t, reduceOp="sum", scatter_dim=0, group=group_name)
     )
-    return out.movedim(0, dim)
+    if cols is not None:
+        out = out.reshape(-1, cols)
+    return out.movedim(0, dim) if dim != 0 else out
 
 
 def _pad_dim(x: torch.Tensor, dim: int, size: int) -> torch.Tensor:

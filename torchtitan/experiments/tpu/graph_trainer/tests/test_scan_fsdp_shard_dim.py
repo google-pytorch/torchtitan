@@ -263,7 +263,7 @@ class TestShardDimPicker(unittest.TestCase):
     ):
         # For 2-D weight shards `[rows, cols]`, when `rows % 8 != 0` (e.g.
         # Llama 405B w1/w3 at 26 rows/rank, Qwen3 wqkv at 9 rows/rank, or
-        # Llama 70B wk/wv at 4 cols/rank on gather_dim=1), `_movedim_*` folds
+        # Llama 70B wk/wv at 4 cols/rank on gather_dim=1), `_tile_fold` folds
         # `k = 8 // gcd(rows, 8)` from `cols` into `rows` so XLA sees an
         # 8-row-aligned collective.
         ranks = 4
@@ -302,14 +302,15 @@ class TestShardDimPicker(unittest.TestCase):
                     placements=(Shard(gather_dim),),
                     global_shape=tuple(whole_shape),
                 )
+                # The graph trainer's own fold, with scan_fsdp's funcol patch
+                # out of the way: the attributes `_gather_on` / `_scatter_on`
+                # read are the fakes themselves.
                 with (
                     unittest.mock.patch.object(
-                        scan_fsdp, "_orig_all_gather_single", fake_all_gather
+                        tpu_fsdp.funcol, "all_gather_tensor", fake_all_gather
                     ),
                     unittest.mock.patch.object(
-                        scan_fsdp,
-                        "_orig_reduce_scatter_single",
-                        fake_reduce_scatter,
+                        tpu_fsdp.funcol, "reduce_scatter_tensor", fake_reduce_scatter
                     ),
                 ):
                     whole = tpu_fsdp.unshard(shard, spec)

@@ -1,6 +1,6 @@
 jax==0.11.1
 jaxlib==0.11.1
-libtpu==0.0.50
+libtpu==0.0.51
 tokamax==0.0.14
 torchao==0.17.0
 portpicker

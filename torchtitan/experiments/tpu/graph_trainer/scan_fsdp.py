@@ -9,11 +9,10 @@ Here the body takes this rank's shard of one layer and gathers that instead --
 ``n_layers`` times smaller. A functional collective traces into a scan body, so
 the gather lowers into the loop and lands next to the compute that needs it.
 
-``gather_slice`` (in ``tpu_fsdp``, re-exported here) is what the body calls on
-one row; its spec comes from the stack's ``ShardSpec.layer_slice().scan_spec()``.
-This module keeps the TPU funcol fixes (collectives moved onto dim 0, 2-D
-shards folded to 8-row tiles) and the shard-axis planning for stacks and
-vocab-sized weights.
+``tpu_fsdp.unshard`` is what the body calls on one row; its spec is the stack's
+``ShardSpec.layer_slice()`` (``layer_stack.scan_plan``). This module keeps the
+TPU funcol fixes (collectives moved onto dim 0, 2-D shards folded to 8-row
+tiles) and the shard-axis planning for stacks and vocab-sized weights.
 
 Recomputing this gather in the backward is safe, despite upstream's *Note
 [Recomputing collectives in the partitioner]*: what that bans is a duplication
@@ -28,22 +27,10 @@ import torch
 import torch.distributed._functional_collectives as funcol
 from torch import nn
 
-# The collectives and the scan-body spec live with the TPU FSDP; re-exported
-# so existing imports keep resolving.
-from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (  # noqa: F401  pylint: disable=unused-import
-    _gather_on,
-    _scatter_on,
-    gather_slice,
-    ScanFSDPSpec,
-)
 from torchtitan.tools.logging import logger
 
 
-__all__ = [
-    "ScanFSDPSpec",
-    "configure_simple_fsdp_shard_dims",
-    "gather_slice",
-]
+__all__ = ["configure_simple_fsdp_shard_dims"]
 
 
 _orig_all_gather_single = funcol.all_gather_single

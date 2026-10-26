@@ -55,16 +55,13 @@ from torch.distributed.tensor import DTensor, Shard
 from torch.func import functional_call
 
 from torchtitan.config import derive
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
-    gather_slice,
-    ScanFSDPSpec,
-)
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_body_remat_window,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
     ShardSpec,
     SPECS_ATTR,
+    unshard,
 )
 from torchtitan.experiments.tpu.layer_loop import (
     model_subclass,
@@ -180,8 +177,29 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
         if param.shape[d] % degree == 0:
             return d
     # Nothing divides: the widest axis. `shard_module` replicates it if it is
-    # narrower than the mesh, and `ShardSpec.scan_spec` refuses it if not.
+    # narrower than the mesh, and `scan_plan` refuses it if not.
     return max(range(1, param.ndim), key=lambda d: param.shape[d])
+
+
+def scan_plan(specs: dict[str, ShardSpec]) -> dict[str, ShardSpec]:
+    """The per-row specs the scan body gathers with, from the stacks' specs.
+
+    One row of a ``[n_layers, ...]`` stack drops the layer axis, so the shard
+    axis moves down by one (``ShardSpec.layer_slice``). An uneven split is
+    refused, as it always was in the scan body: ``unshard`` pads around its
+    collectives, but a padded row inside the scan has never been run.
+    """
+    plan = {}
+    for name, spec in specs.items():
+        d = spec.shard_dim
+        if d is not None and not spec.even:
+            raise ValueError(
+                f"{name}: dim {d} = {spec.global_shape[d]} cannot be split evenly "
+                f"over {spec.shard_degree} ranks, and the scan body's all-gather "
+                "needs equal shards"
+            )
+        plan[name] = spec.layer_slice()
+    return plan
 
 
 class _AsScanInput(torch.autograd.Function):
@@ -452,10 +470,10 @@ class LayerStack:
         # `unrolled()`, and the views themselves, to check nothing swapped them.
         self._hidden: dict[str, nn.Parameter] = {}
         self._views: dict[tuple[int, str], nn.Parameter] = {}
-        # How the scan body gathers one row of each stack, read off the
-        # stacks' `ShardSpec`s. Filled on the first scan, not here, because the
-        # stacks are sharded after `__init__`.
-        self.fsdp_plan: dict[str, ScanFSDPSpec] = {}
+        # How the scan body gathers one row of each stack: the stacks'
+        # `ShardSpec`s, one layer axis down. Filled on the first scan, not
+        # here, because the stacks are sharded after `__init__`.
+        self.fsdp_plan: dict[str, ShardSpec] = {}
 
     def _slots(self) -> Iterator[tuple[int, str, nn.Module, str]]:
         """Every per-layer parameter, as (row, FQN, owning module, attribute).
@@ -731,11 +749,7 @@ class LayerStack:
             # without specs was never sharded (no mesh at all), and its rows
             # pass through the body as they are.
             if not self.fsdp_plan:
-                specs = getattr(self.holder, SPECS_ATTR, {})
-                self.fsdp_plan = {
-                    name: spec.layer_slice().scan_spec()
-                    for name, spec in specs.items()
-                }
+                self.fsdp_plan = scan_plan(getattr(self.holder, SPECS_ATTR, {}))
             if template.training and not h.requires_grad:
                 # When the init carry doesn't require grad, `scan`'s backward
                 # returns `zeros_like(carry)`. That cuts the gradient chain
@@ -759,15 +773,17 @@ class LayerStack:
                 for name in self.names
             }
 
+            plan = self.fsdp_plan
+
             def scan_body(carry, slices):
                 # `scan` hands the body row i of every stack, under the same
-                # keys, and `gather_slice` makes each row whole.
+                # keys, and `unshard` makes each sharded row whole.
                 out = body(
                     carry,
                     {
-                        name: gather_slice(
-                            slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
-                        )
+                        name: unshard(slices[_mangle(name)], plan[_mangle(name)])
+                        if _mangle(name) in plan
+                        else slices[_mangle(name)]
                         for name in self.names
                     },
                 )

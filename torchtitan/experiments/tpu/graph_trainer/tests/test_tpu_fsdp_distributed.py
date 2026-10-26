@@ -40,7 +40,6 @@ from torchtitan.experiments.tpu import grad_norm
 from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 from torchtitan.experiments.tpu.graph_trainer.tests import test_layer_stack
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
     dtensor_params,
@@ -447,7 +446,7 @@ def scan_row_gather_matches_dtensor(device, rank, world_size, *, shard_dim):
         .to_local(grad_placements=[Partial()])[0]
     )
     got_shard = shard.detach().clone().requires_grad_(True)
-    got = _wait(gather_slice(got_shard[0], spec.layer_slice().scan_spec()))
+    got = _wait(tpu_fsdp.unshard(got_shard[0], spec.layer_slice()))
     assert got.dtype == torch.bfloat16, got.dtype
     torch.testing.assert_close(got, want, rtol=0, atol=0)
     for gathered in (want, got):

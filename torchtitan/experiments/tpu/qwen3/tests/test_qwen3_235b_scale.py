@@ -118,10 +118,10 @@ class Qwen3_235BScaleTest(absltest.TestCase):
       for holder in holders:
         for name, spec in getattr(holder, SPECS_ATTR).items():
           placement = spec.placements[-1]
-          row = spec.layer_slice().scan_spec()
+          row = spec.layer_slice()
           self.assertEqual(row.sharded, isinstance(placement, Shard), name)
           if row.sharded:
-            self.assertEqual(row.gather_dim, placement.dim - 1, name)
+            self.assertEqual(row.shard_dim, placement.dim - 1, name)
 
   def test_128_ranks_still_shards_every_stack_on_dim_one(self) -> None:
     # Every published 235B number was taken here. If any stack moves off dim 1

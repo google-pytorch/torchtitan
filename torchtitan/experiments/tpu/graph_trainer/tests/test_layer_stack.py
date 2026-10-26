@@ -35,10 +35,10 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     STACK_ATTR,
     with_tpu_stacked_layers,
 )
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
     apply_tpu_fsdp,
     SPECS_ATTR,
+    unshard,
 )
 
 # Imported here so it is not first imported under the mocked `call_backward`
@@ -429,7 +429,7 @@ class TestLayerStack(unittest.TestCase):
         for name, spec in stack.fsdp_plan.items():
             param = holder._parameters[name]
             local = param.to_local() if isinstance(param, DTensor) else param
-            gathered = funcol.wait_tensor(gather_slice(local[0], spec))
+            gathered = funcol.wait_tensor(unshard(local[0], spec))
             self.assertEqual(gathered.dtype, torch.bfloat16, name)
             # ... and the stored weight is untouched, so the optimizer still
             # steps in fp32.

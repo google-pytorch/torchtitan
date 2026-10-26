@@ -29,8 +29,10 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     _shard_dim,
     LayerStackHolder,
+    scan_plan,
 )
 from torchtitan.experiments.tpu.graph_trainer import scan_fsdp
+from torchtitan.experiments.tpu.graph_trainer import tpu_fsdp
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
     shard_module,
     SPECS_ATTR,
@@ -92,9 +94,7 @@ def _specs(holder):
 
 def _plan(holder):
     """The scan body's per-row plan, as `LayerStack.run` builds it."""
-    return {
-        name: spec.layer_slice().scan_spec() for name, spec in _specs(holder).items()
-    }
+    return scan_plan(_specs(holder))
 
 
 def _shard(holder, mesh, style="fully_shard"):
@@ -156,9 +156,9 @@ class TestShardDimPicker(unittest.TestCase):
             return torch.cat([x] * ranks, dim=0)
 
         with unittest.mock.patch.object(
-            scan_fsdp.funcol, "all_gather_tensor", fake_all_gather
+            tpu_fsdp.funcol, "all_gather_tensor", fake_all_gather
         ):
-            out = scan_fsdp._gather_on(shard, 2, "group")
+            out = tpu_fsdp._gather_on(shard, 2, "group")
         self.assertTrue(torch.equal(out, torch.cat([shard] * ranks, dim=2)))
 
     def test_fold_survives_strides_that_change_between_trace_and_replay(self):
@@ -295,12 +295,12 @@ class TestShardDimPicker(unittest.TestCase):
                     seen_scatter_shapes.append(tuple(x.shape))
                     return x.chunk(ranks, dim=0)[0] * ranks
 
-                spec = scan_fsdp.ScanFSDPSpec(
-                    group_name=group_name,
-                    param_dtype=None,
-                    reduce_dtype=None,
-                    sharded=True,
-                    gather_dim=gather_dim,
+                whole_shape = list(shape)
+                whole_shape[gather_dim] *= ranks
+                spec = tpu_fsdp.ShardSpec(
+                    mesh=mesh,
+                    placements=(Shard(gather_dim),),
+                    global_shape=tuple(whole_shape),
                 )
                 with (
                     unittest.mock.patch.object(
@@ -312,7 +312,7 @@ class TestShardDimPicker(unittest.TestCase):
                         fake_reduce_scatter,
                     ),
                 ):
-                    whole = scan_fsdp.gather_slice(shard, spec)
+                    whole = tpu_fsdp.unshard(shard, spec)
                     expected_whole = torch.cat([shard] * ranks, dim=gather_dim)
                     self.assertEqual(
                         tuple(whole.shape), tuple(expected_whole.shape)
@@ -373,7 +373,7 @@ class TestQ235Placements(unittest.TestCase):
             holder = _shard(_holder(), mesh, "hybrid_shard")
             for name, spec in _plan(holder).items():
                 self.assertTrue(spec.sharded, name)
-                self.assertEqual(spec.gather_dim, 0, name)  # dim 1 still divides
+                self.assertEqual(spec.shard_dim, 0, name)  # dim 1 still divides
 
 
 class TestFlattenedStacks(unittest.TestCase):
@@ -402,7 +402,7 @@ class TestFlattenedStacks(unittest.TestCase):
                         tuple(holder.layer_shapes[name]), (a, b, *rest)
                     )
                     # The point of flattening: no transpose around the gather.
-                    self.assertEqual(plan[name].gather_dim, 0, name)
+                    self.assertEqual(plan[name].shard_dim, 0, name)
                 for name in set(Q235_STACKS) - set(FLATTENED):
                     self.assertEqual(
                         _specs(holder)[name].global_shape, Q235_STACKS[name]

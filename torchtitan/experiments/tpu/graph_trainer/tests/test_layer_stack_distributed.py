@@ -26,11 +26,11 @@ from torch.distributed.tensor import (
 
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
-from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
+from torchtitan.experiments.tpu.graph_trainer.layer_stack import scan_plan, STACK_ATTR
 from torchtitan.experiments.tpu.graph_trainer.tpu_fsdp import (
     shard_module,
     SPECS_ATTR,
+    unshard,
 )
 from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
@@ -138,7 +138,7 @@ def _shard_stacks(holder, mesh, mode, *, shard_dim, param_dtype=None, reduce_dty
         holder, mesh, mode, shard_dim=shard_dim, param_dtype=param_dtype, reduce_dtype=reduce_dtype
     )
     specs = getattr(holder, SPECS_ATTR)
-    return specs, {name: spec.layer_slice().scan_spec() for name, spec in specs.items()}
+    return specs, scan_plan(specs)
 
 
 def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
@@ -166,7 +166,7 @@ def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
     replica = param.detach().clone().requires_grad_(True)
 
     # Scaling by the rank makes an unsummed gradient visibly this rank's own.
-    weight = gather_slice(replica[0], plan["narrow"])
+    weight = unshard(replica[0], plan["narrow"])
     (weight.sum() * (rank + 1)).backward()
 
     summed = float(world_size * (world_size + 1) // 2)
@@ -221,7 +221,7 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(
 
     # Scanned: what the body computes for the same row.
     got_shard = param.detach().clone().requires_grad_(True)
-    got = funcol.wait_tensor(gather_slice(got_shard[0], plan["stack"]))
+    got = funcol.wait_tensor(unshard(got_shard[0], plan["stack"]))
 
     assert got.dtype == torch.bfloat16, got.dtype
     torch.testing.assert_close(got, want, rtol=0, atol=0)
@@ -270,7 +270,7 @@ def a_doubly_replicated_stack_sums_on_both_axes(device, rank, world_size):
 
     # Scanned: what the body computes for the same row.
     got_local = param.detach().clone().requires_grad_(True)
-    got = funcol.wait_tensor(gather_slice(got_local[0], plan["narrow"]))
+    got = funcol.wait_tensor(unshard(got_local[0], plan["narrow"]))
     torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     # Scaling by the rank makes an unsummed gradient visibly this rank's own.
@@ -318,7 +318,7 @@ def a_hybrid_sharded_stack_sums_over_both_axes(device, rank, world_size):
 
     # Scanned: what the body computes for the same row.
     got_shard = param.detach().clone().requires_grad_(True)
-    got = funcol.wait_tensor(gather_slice(got_shard[0], plan["wide"]))
+    got = funcol.wait_tensor(unshard(got_shard[0], plan["wide"]))
     torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     # Scaling by the rank makes an unsummed gradient visibly this rank's own.
@@ -350,7 +350,7 @@ def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     spec = getattr(holder, SPECS_ATTR)["uneven"]
     assert spec.placements == (Shard(1),), spec.placements
     try:
-        spec.layer_slice().scan_spec()
+        scan_plan({"uneven": spec})
     except ValueError as err:
         assert "evenly" in str(err), err
     else:
@@ -383,7 +383,7 @@ def an_unevenly_sharded_hybrid_stack_is_refused(device, rank, world_size):
     spec = getattr(holder, SPECS_ATTR)["uneven"]
     assert spec.placements == (Replicate(), Shard(1)), spec.placements
     try:
-        spec.layer_slice().scan_spec()
+        scan_plan({"uneven": spec})
     except ValueError as err:
         # The degree it names has to be the shard axis, not the whole mesh:
         # asking the mesh refuses sizes that shard fine.

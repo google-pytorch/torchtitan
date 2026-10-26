@@ -59,18 +59,15 @@ __all__ = [
     "apply_tpu_fsdp",
     "disable_gather",
     "dtensor_params",
-    "gather_slice",
     "grads_as_dtensors",
     "install_optimizer_state_hooks",
     "param_specs",
     "param_specs_by_fqn",
     "param_specs_for",
     "register_sharded_buffer",
-    "ScanFSDPSpec",
     "shard_module",
     "ShardSpec",
     "unshard",
-    "unshard_local",
     "uses_tpu_fsdp",
 ]
 
@@ -80,37 +77,6 @@ SPECS_ATTR = "_tpu_fsdp_specs"
 # name (`register_sharded_buffer`). They get the parameter's DTensor view in
 # the checkpoint window.
 BUFFER_SPECS_ATTR = "_tpu_fsdp_buffer_params"
-
-
-@dataclasses.dataclass(frozen=True)
-class ScanFSDPSpec:
-    """How the scan body gathers one row of a stacked parameter.
-
-    The minimal, mesh-free form of :class:`ShardSpec`: the scan body sees plain
-    tensors and process-group names only. ``ShardSpec.scan_spec`` produces one.
-
-    Attributes:
-        group_name: resolved process-group name, in the form funcol collectives
-            take.
-        param_dtype: compute dtype for the gathered weight; ``None`` leaves it
-            alone.
-        reduce_dtype: dtype to reduce the gradient in; ``None`` means reduce in
-            whatever dtype the forward gathered in.
-        sharded: ``False`` for a parameter left replicated. Nothing to gather
-            in the forward; the gradient still has to be summed.
-        replicate_group_name: under HSDP, the process group of the *replicate*
-            mesh axis; ``None`` for a 1-D dp mesh. The forward needs nothing
-            from it, but the gradient is Partial on it and has to be summed.
-        gather_dim: which axis of the per-layer slice to gather on -- the
-            stack's shard axis minus the scan axis, so dim 1 becomes 0.
-    """
-
-    group_name: str
-    param_dtype: torch.dtype | None
-    reduce_dtype: torch.dtype | None
-    sharded: bool
-    replicate_group_name: str | None = None
-    gather_dim: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -229,29 +195,6 @@ class ShardSpec:
         )
         return dataclasses.replace(
             self, placements=placements, global_shape=tuple(self.global_shape[1:])
-        )
-
-    def scan_spec(self) -> ScanFSDPSpec:
-        """This spec in the mesh-free form the scan body dispatches on.
-
-        Call on ``layer_slice()``: the scan body gathers rows, not stacks. An
-        uneven split is refused, as it always was in the scan body -- the
-        gather there is a bare collective with no padding around it.
-        """
-        d = self.shard_dim
-        if d is not None and not self.even:
-            raise ValueError(
-                f"dim {d} = {self.global_shape[d]} cannot be split evenly over "
-                f"{self.shard_degree} ranks, and the scan body's all-gather "
-                "needs equal shards"
-            )
-        return ScanFSDPSpec(
-            group_name=self.shard_group,
-            param_dtype=self.param_dtype,
-            reduce_dtype=self.reduce_dtype,
-            sharded=d is not None,
-            replicate_group_name=self.replicate_group,
-            gather_dim=d if d is not None else 0,
         )
 
     def to_dtensor(self, local: torch.Tensor) -> DTensor:
@@ -421,63 +364,26 @@ class _ReduceGradOnly(torch.autograd.Function):
         return grad.to(ctx.replica_dtype), None, None, None
 
 
-def unshard_local(
-    shard: torch.Tensor,
-    *,
-    group_name: str,
-    shard_dim: int | None,
-    param_dtype: torch.dtype | None,
-    reduce_dtype: torch.dtype | None,
-    replicate_group_name: str | None = None,
-    global_size: int | None = None,
-) -> torch.Tensor:
-    """Turn a local shard into the whole weight, with the backward that undoes it.
+def unshard(shard: torch.Tensor, spec: ShardSpec) -> torch.Tensor:
+    """The whole weight described by ``spec``, from this rank's ``shard``.
 
-    ``shard_dim=None`` means the weight is replicated on the shard axis: no
-    gather, but the gradient still owes a sum on every axis. An empty
-    ``group_name`` means no mesh at all (single process): only the cast.
+    All-gather in the forward, reduce-scatter in the backward. A weight
+    replicated on the shard axis (``shard_dim`` is ``None``) has nothing to
+    gather, but its gradient still owes a sum on every mesh axis. The scan
+    body calls this on one row of a stack with ``spec.layer_slice()``.
     """
-    if shard_dim is None:
-        groups = tuple(g for g in (group_name, replicate_group_name) if g)
-        if not groups:
-            return shard if param_dtype is None else shard.to(param_dtype)
-        return _ReduceGradOnly.apply(shard, groups, param_dtype, reduce_dtype)
+    d = spec.shard_dim
+    if d is None:
+        groups = tuple(g for g in (spec.shard_group, spec.replicate_group) if g)
+        return _ReduceGradOnly.apply(shard, groups, spec.param_dtype, spec.reduce_dtype)
     return _AllGatherReduceScatter.apply(
         shard,
-        group_name,
-        shard_dim,
-        param_dtype,
-        reduce_dtype,
-        replicate_group_name,
-        global_size,
-    )
-
-
-def unshard(shard: torch.Tensor, spec: ShardSpec) -> torch.Tensor:
-    """The whole weight described by ``spec``, from this rank's ``shard``."""
-    d = spec.shard_dim
-    return unshard_local(
-        shard,
-        group_name=spec.shard_group,
-        shard_dim=d,
-        param_dtype=spec.param_dtype,
-        reduce_dtype=spec.reduce_dtype,
-        replicate_group_name=spec.replicate_group,
-        global_size=None if d is None or spec.even else spec.global_shape[d],
-    )
-
-
-def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor:
-    """Turns one layer's local shard into that layer's whole weight (scan body)."""
-    if spec is None:
-        return shard
-    return unshard_local(
-        shard,
-        group_name=spec.group_name,
-        shard_dim=spec.gather_dim if spec.sharded else None,
-        param_dtype=spec.param_dtype,
-        reduce_dtype=spec.reduce_dtype,
-        replicate_group_name=spec.replicate_group_name,
+        spec.shard_group,
+        d,
+        spec.param_dtype,
+        spec.reduce_dtype,
+        spec.replicate_group,
+        None if spec.even else spec.global_shape[d],
     )
 
 

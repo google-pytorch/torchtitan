@@ -227,6 +227,17 @@ DISABLE_ENHANCED_LAUNCH_BARRIER: FlagMap = {
     "xla_tpu_use_enhanced_launch_barrier": "false",
 }
 
+# MaxText's latency-hiding scheduler settings for its Ironwood MoE recipes:
+# rerun the scheduler, track memory pressure, and prefer deeper async overlap
+# over avoiding stalls. They hide more of Ring-of-Experts' token collectives
+# but slow the FSDP-only Qwen3-235B recipe.
+EXPERIMENTAL_LATENCY_HIDING_SCHEDULER: FlagMap = {
+    "xla_tpu_enable_all_experimental_scheduler_features": "true",
+    "xla_tpu_enable_scheduler_memory_pressure_tracking": "true",
+    "xla_lhs_prioritize_async_depth_over_stall": "ENABLED",
+    "xla_latency_hiding_scheduler_rerun": "2",
+}
+
 
 def _apply_flags(
     env_var: str,

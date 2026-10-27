@@ -347,32 +347,54 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
             continue
 
         mesh = param.device_mesh
-        # 1-D: `fully_shard`, one Shard placement. 2-D: `hybrid_shard`, which
-        # SimpleFSDP builds as exactly (Replicate(), Shard(dim)) over
-        # ("dp_replicate", "fsdp") -- so the shard axis is the last one, and the
-        # first contributes only the backward all-reduce.
-        if mesh.ndim == 1:
-            replicate_group_name = None
-        elif mesh.ndim == 2 and isinstance(param.placements[0], Replicate):
-            replicate_group_name = mesh.get_group(0).group_name
+        has_ep_axis = bool(
+            mesh.mesh_dim_names and mesh.mesh_dim_names[-1] == "ep"
+        )
+        if has_ep_axis:
+            if param.placements[-1] != Shard(1):
+                raise ValueError(
+                    f"{name} on EP mesh {mesh.mesh_dim_names} must place "
+                    f"Shard(1) on the trailing 'ep' axis, got "
+                    f"{param.placements}"
+                )
+            shard_axis = mesh.ndim - 2
+            if mesh.ndim == 2:
+                replicate_group_name = None
+            elif mesh.ndim == 3 and isinstance(param.placements[0], Replicate):
+                replicate_group_name = mesh.get_group(0).group_name
+            else:
+                raise ValueError(
+                    "the scan body's EP gather understands a 2-D (efsdp, ep) "
+                    f"mesh or a 3-D (dp_replicate, efsdp, ep) mesh, got "
+                    f"{mesh.ndim}-D with placements {param.placements} for "
+                    f"{name}"
+                )
         else:
-            raise ValueError(
-                "the scan body's gather understands a 1-D dp mesh or a 2-D "
-                f"hybrid_shard mesh, got {mesh.ndim}-D with placements "
-                f"{param.placements} for {name}"
-            )
-        placement = param.placements[-1]
+            shard_axis = mesh.ndim - 1
+            # 1-D: `fully_shard`, one Shard placement. 2-D: `hybrid_shard`, which
+            # SimpleFSDP builds as exactly (Replicate(), Shard(dim)) over
+            # ("dp_replicate", "fsdp") -- so the shard axis is the last one, and the
+            # first contributes only the backward all-reduce.
+            if mesh.ndim == 1:
+                replicate_group_name = None
+            elif mesh.ndim == 2 and isinstance(param.placements[0], Replicate):
+                replicate_group_name = mesh.get_group(0).group_name
+            else:
+                raise ValueError(
+                    "the scan body's gather understands a 1-D dp mesh or a 2-D "
+                    f"hybrid_shard mesh, got {mesh.ndim}-D with placements "
+                    f"{param.placements} for {name}"
+                )
+        placement = param.placements[shard_axis]
         if isinstance(placement, Shard):
             if placement.dim == 0:
                 raise ValueError(
                     f"{name} is sharded on dim 0, but dim 0 is the scan axis "
                     "and the body only ever sees one layer"
                 )
-            # Only the last axis shards the tensor, so only its degree matters.
-            # `mesh.size()` is every axis multiplied together, which under
-            # hybrid_shard asks for `replicate * shard` and rejects sizes that
-            # shard fine.
-            shard_degree = mesh.size(mesh.ndim - 1)
+            # Only the FSDP/EFSDP axis is all-gathered inside the scan body; any
+            # trailing 'ep' axis stays local to each EP rank.
+            shard_degree = mesh.size(shard_axis)
             if param.shape[placement.dim] % shard_degree:
                 # Uneven shards. `redistribute` pads around its all-gather, so
                 # the unrolled path handles them; a bare collective cannot.
@@ -397,8 +419,13 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
                 f"{name} is {placement} on the shard axis, and the scan body's "
                 "gather handles only Shard and Replicate"
             )
+        group_name = (
+            ""
+            if has_ep_axis and not sharded and mesh.size(shard_axis) <= 1
+            else mesh.get_group(shard_axis).group_name
+        )
         plan[name] = ScanFSDPSpec(
-            group_name=mesh.get_group(mesh.ndim - 1).group_name,
+            group_name=group_name,
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
             sharded=sharded,
@@ -433,6 +460,9 @@ def configure_simple_fsdp_shard_dims(
     """
     if parallel_dims is None:
         return []
+    for holder in model.modules():
+        if hasattr(holder, "stash_expert_stacks_for_ep"):
+            holder.stash_expert_stacks_for_ep(parallel_dims)
     fsdp_degree = getattr(parallel_dims, "dp_shard", 1) * getattr(
         parallel_dims, "cp", 1
     )

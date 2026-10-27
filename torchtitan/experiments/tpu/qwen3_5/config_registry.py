@@ -20,7 +20,11 @@ from torchtitan.experiments.tpu.datasets import (
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
 from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    TPUConfig,
+    TpuTrainerCompileConfig,
+    TPUTrainerConfig,
+)
 
 _TPU_MOE_CONVERTERS = [
     TpuTokenDispatcherConverter.Config(),
@@ -115,11 +119,12 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       ),
       comm=CommConfig(train_timeout_seconds=600),
       activation_checkpoint=FullAC.Config(preserve_rng_state=False),
-      compile=CompileConfig(enable=False, backend="tpu"),
+      compile=TpuTrainerCompileConfig(
+          enable=False, backend="tpu", compile_grad_norm=True
+      ),
       validator=Validator.Config(enable=False),
       tpu_config=TPUConfig(
           enable_amp=False,
           eager_mode="DEFER_AND_FUSE",
-          compile_grad_norm=True,
       ),
   )

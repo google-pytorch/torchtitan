@@ -226,8 +226,8 @@ Gate before any cluster dispatch, every time:
   this is a proxy by design, not a substitute for the multi-rank smoke that
   the first dispatch is;
 - the image carries the commit you think it does;
-- the optimizer path is exactly one of eager / `compile_optimizer` /
-  `optimizer_in_graph`;
+- the optimizer path (`compile.optimizer_compile`) is the intended one of
+  `eager` / `separate_graph` / `in_graph`;
 - the token budget matches the trainer's formula: `num_tokens_per_train_step`
   is `-1` (one accumulation step) or a multiple of
   `num_tokens_per_microbatch_per_dp_rank x num_pp_microbatches x dp_degree`,

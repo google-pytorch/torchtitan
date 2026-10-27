@@ -74,7 +74,6 @@ def conformer_test() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           use_simple_fsdp=True,
-          compile_mode="layer",
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,

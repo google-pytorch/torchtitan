@@ -126,7 +126,7 @@ def parallelize_conformer(
   )
   compile_mode = "layer"
   if isinstance(train_config, tpu_job_config.TPUTrainerConfig):
-    compile_mode = train_config.tpu_config.compile_mode
+    compile_mode = train_config.compile.mode
 
   if model_compile_enabled:
     model = apply_compile(model, train_config)
@@ -193,7 +193,7 @@ def apply_compile(
   """Apply torch.compile to layers or whole model."""
   compile_mode = "layer"
   if isinstance(train_config, tpu_job_config.TPUTrainerConfig):
-    compile_mode = train_config.tpu_config.compile_mode
+    compile_mode = train_config.compile.mode
 
   if hasattr(model, "model"):
     encoder = model.model

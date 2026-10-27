@@ -6,9 +6,9 @@
 
 """Split a GraphTrainer joint FX graph into independently compiled modules.
 
-``use_graph_split`` first divides the mandatory joint graph into forward and
-backward GraphModules connected by explicit residual tensors. The forward graph
-can then be divided into sequential layer ranges. The backward graph can remain
+``compile.graph_split.enabled`` divides the mandatory joint graph into forward
+and backward GraphModules connected by explicit residual tensors. The forward
+graph can then be divided into sequential layer ranges. The backward graph can remain
 whole, group adjacent layer computations with their FSDP collectives, or form
 staggered all-gather/compute/reduce-scatter pipeline stages. These subdivisions
 are therefore always nested under the forward/backward split.
@@ -70,9 +70,11 @@ from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
   from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
-  from torchtitan.experiments.tpu.tpu_job_config import (
+  from torchtitan.experiments.tpu.graph_trainer.config import (
       GraphSplitterConfig,
-      TPUTrainerConfig,
+  )
+  from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+      TpuGraphTrainer,
   )
 
 
@@ -259,12 +261,12 @@ class GraphSplitter:
   @classmethod
   def from_trainer_config(
       cls,
-      config: "TPUTrainerConfig",
+      config: "TpuGraphTrainer.Config",
       *,
       optimizer_in_graph: bool,
   ) -> "GraphSplitter":
-    enabled = bool(config.tpu_config.use_graph_split)
-    split_config = config.tpu_config.graph_split
+    split_config = config.compile.graph_split
+    enabled = split_config.enabled
     if split_config.forward_layers_per_executable == 0 or (
         split_config.forward_layers_per_executable < -1
     ):
@@ -284,7 +286,9 @@ class GraphSplitter:
           "backward_layers_per_executable must be at least 1"
       )
     if split_config.backward_partition_mode != "none" and not enabled:
-      raise ValueError("backward_partition_mode requires use_graph_split")
+      raise ValueError(
+          "backward_partition_mode requires compile.graph_split.enabled"
+      )
     if split_config.cpu_offload_prefetch_executables < 0:
       raise ValueError(
           "cpu_offload_prefetch_executables must be nonnegative"
@@ -295,16 +299,18 @@ class GraphSplitter:
       raise ValueError(
           "cpu_offload_prefetch_executables requires a split backward graph"
       )
-    if enabled and config.tpu_config.graph_trainer_fsdp_schedule != "none":
+    if enabled and config.compile.fsdp_barrier_policy != "none":
       raise ValueError(
           "Graph splitting does not currently compose with "
-          "graph_trainer_fsdp_schedule"
+          "compile.fsdp_barrier_policy because the whole-graph collective "
+          "placement pass is not partition-boundary aware"
       )
     # Optimizer-in-graph needs a third explicit phase rather than treating its
     # state reads, mutations, and parameter updates as backward.
     if enabled and optimizer_in_graph:
       raise ValueError(
-          "TPU GraphTrainer graph split does not support optimizer_in_graph"
+          "TPU GraphTrainer graph split does not support "
+          "optimizer_compile='in_graph'"
       )
     # This artifact format stores one transformed FX graph. TorchTPU's XLA and
     # Tier-2 executable caches remain supported for every compiled child.

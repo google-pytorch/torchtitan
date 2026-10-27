@@ -8,6 +8,9 @@ import torch
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu.kernels import fp8_linear
 
+_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
 def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
     got, want = got.detach().float().cpu(), want.detach().float().cpu()
     return ((got - want).norm() / want.norm()).item()
@@ -72,6 +75,86 @@ class Fp8RowQuantizeTest(base_device_test.BaseAcceleratorDeviceTest):
         # Both rows get the floored scale instead of a zero one.
         self.assertEqual(float(scale[3]), torch.finfo(torch.float32).tiny)
         self.assertEqual(float(scale[5]), torch.finfo(torch.float32).tiny)
+
+
+class Fp8LinearTest(base_device_test.BaseAcceleratorDeviceTest):
+
+    def _inputs(self, lead=(2, 96), k=256, n=384):
+        torch.manual_seed(0)
+        x = torch.randn(*lead, k, dtype=torch.bfloat16)
+        w = torch.randn(n, k, dtype=torch.bfloat16) * 0.05
+        return x, w
+
+    def test_forward_matches_dequantized_reference(self):
+        x, w = self._inputs()
+        device = self.accelerator_device
+        y = fp8_linear.fp8_linear(x.to(device), w.to(device)).cpu()
+
+        # The kernel multiplies exact FP8 values and applies both scales to
+        # the FP32 accumulator. XLA's FP32 -> FP8 convert may round a few
+        # elements one FP8 ulp differently from torch's, so compare in norm.
+        want = (
+            _row_dequantized(x, torch.float8_e4m3fn)
+            @ _row_dequantized(w, torch.float8_e4m3fn).T
+        )
+        self.assertEqual(y.dtype, torch.bfloat16)
+        self.assertEqual(y.shape, (2, 96, 384))
+        self.assertLess(_rel_err(y, want), 5e-3)
+
+    def test_forward_is_close_to_bf16(self):
+        x, w = self._inputs()
+        device = self.accelerator_device
+        y = fp8_linear.fp8_linear(x.to(device), w.to(device)).cpu().float()
+        want = x.float() @ w.float().T
+        rel = (y - want).norm() / want.norm()
+        self.assertLess(rel.item(), 0.05)
+
+    def test_all_zero_rows_stay_zero(self):
+        x, w = self._inputs(lead=(64,))
+        x[3] = 0
+        device = self.accelerator_device
+        y = fp8_linear.fp8_linear(x.to(device), w.to(device)).cpu()
+        self.assertTrue(torch.isfinite(y.float()).all())
+        torch.testing.assert_close(y[3], torch.zeros_like(y[3]))
+
+    def test_tiny_rows_stay_finite(self):
+        # amax / 448 of a 1e-37-scaled row is subnormal in FP32; TPUs flush it
+        # to zero, so without a scale floor the row would quantize to NaN.
+        x, w = self._inputs(lead=(64,))
+        x[3] = x[3] * 1e-37
+        device = self.accelerator_device
+        x_d, w_d = x.to(device).requires_grad_(), w.to(device)
+        y = fp8_linear.fp8_linear(x_d, w_d)
+        dy = torch.randn_like(y) * 1e-30
+        (dx,) = torch.autograd.grad(y, (x_d,), dy)
+        self.assertTrue(torch.isfinite(y.float()).all())
+        self.assertTrue(torch.isfinite(dx.float()).all())
+        self.assertLess(y[3].float().abs().max().item(), 1e-30)
+
+    def test_fp8_grad_input(self):
+        x, w = self._inputs(lead=(128,))
+        device = self.accelerator_device
+        dy = torch.randn(128, 384, dtype=torch.bfloat16)
+
+        x_dev = x.to(device).requires_grad_()
+        w_dev = w.to(device).requires_grad_()
+        y = fp8_linear.fp8_linear(x_dev, w_dev)
+        dx, dw = torch.autograd.grad(y, (x_dev, w_dev), dy.to(device))
+
+        # dx = dy @ w with w's channel scale folded into the e5m2 dy.
+        w_amax = w.float().abs().amax(dim=1, keepdim=True)
+        w_scale = w_amax / _E4M3_MAX
+        w_q = (w.float() / w_scale).to(torch.float8_e4m3fn).float()
+        want_dx = (
+            _row_dequantized(dy.float() * w_scale.T, torch.float8_e5m2) @ w_q
+        )
+        self.assertLess(_rel_err(dx, want_dx), 5e-3)
+
+        # dw is BF16.
+        torch.testing.assert_close(
+            dw.cpu().float(), dy.float().T @ x.float(), rtol=1e-2, atol=5e-2
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

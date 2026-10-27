@@ -64,11 +64,13 @@ def _validate_fsdp_allreduce_slice(
 def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
   save_regions = tpu_config.graph_trainer_save_regions
   last_n_layers = tpu_config.graph_trainer_save_last_n_layers
-  if tpu_config.graph_trainer_memory_policy != "tpu_selective":
+  policy = tpu_config.graph_trainer_memory_policy
+  if policy not in ("tpu_selective", "tpu_selective_and_offload"):
     if save_regions or last_n_layers:
       raise ValueError(
           "graph_trainer_save_regions and graph_trainer_save_last_n_layers "
-          "only apply to graph_trainer_memory_policy='tpu_selective'"
+          "only apply to graph_trainer_memory_policy='tpu_selective' or "
+          "'tpu_selective_and_offload'"
       )
     return
   if tpu_config.use_scan_layers:
@@ -76,10 +78,10 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
     # values these regions select live inside its body, where the policy
     # cannot see them.
     raise ValueError(
-        "graph_trainer_memory_policy='tpu_selective' does not support "
+        f"graph_trainer_memory_policy={policy!r} does not support "
         "--tpu-config.use-scan-layers"
     )
-  resolve_save_regions(save_regions, last_n_layers)
+  resolve_save_regions(save_regions, last_n_layers, policy)
 
 
 def _maybe_use_maxtext_flops(

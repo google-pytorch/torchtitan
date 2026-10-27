@@ -23,6 +23,7 @@ TpuGraphTrainerMemoryPolicy = Literal[
     "full_and_offload",
     "full_and_scan_offload",
     "tpu_selective",
+    "tpu_selective_and_offload",
 ]
 
 
@@ -101,11 +102,13 @@ class TPUConfig:
   graph_trainer_memory_policy: TpuGraphTrainerMemoryPolicy = "default"
   # CPU-offload controls propagated into GraphTrainer's compile config.
   graph_trainer_cpu_offload_budget_gb: float = 100.0
-  # ``tpu_selective`` only: full recompute, except these save regions, whose
-  # values are saved for backward in every layer: "moe.routing" and
+  # ``tpu_selective`` and ``tpu_selective_and_offload`` only: full recompute,
+  # except these save regions, whose values are saved for backward in every
+  # layer: "moe.routing" and
   # "attention.inner_attention" (see ``experiments/tpu/remat_regions.py``).
   graph_trainer_save_regions: tuple[str, ...] = ()
-  # ``tpu_selective`` only: save regions to save only in their last N
+  # ``tpu_selective`` and ``tpu_selective_and_offload`` only: save regions to
+  # save only in their last N
   # transformer layers, which backward reaches first. List each region here or
   # in graph_trainer_save_regions, not both. Example:
   # {"attention.inner_attention": 4}, or on the CLI

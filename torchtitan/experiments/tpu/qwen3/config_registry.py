@@ -1135,9 +1135,9 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
   # The 30B recipe's save regions apply only to tpu_selective.
   cfg.tpu_config.graph_trainer_save_regions = ()
-  # The 30B chain coalesces its packed-QKV and `wo` reductions (commit
-  # 186bd3ba8c). Scan leaves no per-layer FQN to match, so the pass would
-  # find none of its targets and refuse to run.
+  # The 30B recipe's reduce-scatter -> all-reduce pass picks weights by
+  # per-layer name (layers.*...). Scan stacks the layers into one tensor, so no
+  # name matches and the pass would raise; turn it off.
   cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
   # The routing metrics stash tensors on the module, which a scan body cannot
   # do (https://github.com/google-pytorch/torchtitan/issues/28).

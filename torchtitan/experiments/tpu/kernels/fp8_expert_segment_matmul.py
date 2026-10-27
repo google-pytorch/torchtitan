@@ -56,6 +56,7 @@ from jax.experimental.pallas import tpu as pltpu  # noqa: E402  pylint: disable=
 import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
 from torch_tpu._internal import pallas  # noqa: E402  pylint: disable=g-import-not-at-top
 from torchtitan.experiments.tpu.kernels import fp8_scale  # noqa: E402  pylint: disable=g-import-not-at-top
+from torchtitan.experiments.tpu.kernels.pallas_naming import call_named  # noqa: E402  pylint: disable=g-import-not-at-top
 
 FWD_DTYPE = jnp.float8_e4m3fn
 BWD_DTYPE = jnp.float8_e5m2
@@ -102,7 +103,9 @@ def fp8_gmm_fwd_quantized(
     num_groups, k_dim, n_dim = rhs_q.shape
     # tokamax wants one scale per (group, column); the column scale is shared.
     rhs_scale = jnp.broadcast_to(rhs_scale[None], (num_groups, 1, n_dim))
-    return tokamax_gmm.gmm(
+    return call_named(
+        tokamax_gmm.gmm,
+        "fp8_moe_gmm_fwd",
         qwix.QArray(qvalue=lhs_q, scale=lhs_scale),
         qwix.QArray(qvalue=rhs_q, scale=rhs_scale),
         group_sizes,
@@ -132,7 +135,9 @@ def fp8_gmm_bwd_quantized(
     # dX = dY @ W.T contracts over N, along which W is scaled: fold W's column
     # scale into dY so the forward's raw e4m3 W can be used as is.
     dlhs_dout, dlhs_dout_scale = _quantize(dout_f32 * rhs_scale, BWD_DTYPE, 1)
-    grad_lhs = tokamax_gmm.gmm(
+    grad_lhs = call_named(
+        tokamax_gmm.gmm,
+        "fp8_moe_gmm_dlhs",
         qwix.QArray(qvalue=dlhs_dout, scale=dlhs_dout_scale),  # scale [M, 1]
         rhs_q,
         group_sizes,
@@ -146,7 +151,9 @@ def fp8_gmm_bwd_quantized(
     # dW = X.T @ dY contracts over tokens, along which X is scaled: fold X's row
     # scale into dY, then give dY one scale per column.
     drhs_dout, drhs_dout_scale = _quantize(dout_f32 * lhs_scale, BWD_DTYPE, 0)
-    grad_rhs = tokamax_gmm.tgmm(
+    grad_rhs = call_named(
+        tokamax_gmm.tgmm,
+        "fp8_moe_tgmm_drhs",
         jnp.swapaxes(lhs_q, 0, 1),  # [K, M], raw e4m3 values
         qwix.QArray(qvalue=drhs_dout, scale=drhs_dout_scale),  # scale [1, N]
         group_sizes,
@@ -415,6 +422,7 @@ def swiglu_quantize(
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
+        name="fp8_swiglu_quantize",
     )(gate_up)
 
 
@@ -456,6 +464,7 @@ def swiglu_grad(
         out_shape=jax.ShapeDtypeStruct((rows, two_f), gate_up.dtype),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
+        name="fp8_swiglu_grad",
     )(gate_up, d_hidden)
 
 

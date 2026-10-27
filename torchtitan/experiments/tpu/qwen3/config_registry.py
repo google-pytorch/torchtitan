@@ -1093,9 +1093,9 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
-  # Contiguous [Q; K; V] rows instead of the fused projection's per-KV-group
-  # interleave, which XLA relayouted on every layer (an f32 q copy for q-norm
-  # and a QKV split copy): ~0.4 s/step at 64 chips.
+  # Store the QKV weights as [all Q][all K][all V] rather than grouped per KV
+  # head, so attention reads Q, K and V without per-layer copies (~0.4 s/step
+  # at 64 chips).
   cfg.model_spec.model = (
       TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
   )

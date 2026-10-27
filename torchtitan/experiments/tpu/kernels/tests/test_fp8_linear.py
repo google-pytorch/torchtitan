@@ -1,5 +1,7 @@
 """Accelerator tests for the TPU-native FP8 linear layer."""
 
+import dataclasses
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -8,6 +10,8 @@ import numpy as np
 import torch
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu.kernels import fp8_linear
+from torchtitan.models.common.linear import Linear
+from torchtitan.protocols.module import Module
 
 _E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
@@ -203,6 +207,36 @@ class ConvertLinearsTest(absltest.TestCase):
                     in_features=8, out_features=8, bias=True
                 )
             )
+
+    def test_converts_only_unfiltered_bias_free_linears(self):
+        cfg = _TinyModel.Config(
+            wq=Linear.Config(in_features=8, out_features=16),
+            wo=Linear.Config(in_features=16, out_features=8, bias=True),
+            layers=[Linear.Config(in_features=8, out_features=8)],
+            lm_head=Linear.Config(in_features=8, out_features=32),
+        )
+        cfg = fp8_linear.convert_linears(
+            cfg, filter_fqns=("lm_head",), fp8_grad_input=False
+        )
+
+        self.assertIsInstance(cfg.wq, fp8_linear.TpuFp8Linear.Config)
+        self.assertEqual((cfg.wq.in_features, cfg.wq.out_features), (8, 16))
+        self.assertFalse(cfg.wq.fp8_grad_weight)
+        self.assertFalse(cfg.wq.fp8_grad_input)
+        self.assertIsInstance(cfg.layers[0], fp8_linear.TpuFp8Linear.Config)
+        # Biased and filtered linears are left alone.
+        self.assertIs(type(cfg.wo), Linear.Config)
+        self.assertIs(type(cfg.lm_head), Linear.Config)
+
+
+class _TinyModel(Module):
+
+    @dataclasses.dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        wq: Linear.Config
+        wo: Linear.Config
+        layers: list[Linear.Config]
+        lm_head: Linear.Config
 
 
 if __name__ == "__main__":

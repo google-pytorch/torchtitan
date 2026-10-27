@@ -23,6 +23,7 @@ MaxText's `fp8_full`:
 """
 
 import dataclasses
+from typing import Sequence
 
 import jax
 from jax.experimental import pallas as pl
@@ -304,8 +305,40 @@ class TpuFp8Linear(Linear):
         )
 
 
+def convert_linears(
+    model_config,
+    filter_fqns: Sequence[str] = (),
+    fp8_grad_weight: bool = False,
+    fp8_grad_input: bool = True,
+):
+    """Swaps every bias-free `Linear.Config` not matching `filter_fqns`."""
+    for fqn, linear_config, parent, attr in model_config.traverse(
+        Linear.Config
+    ):
+        if type(linear_config) is not Linear.Config:  # pylint: disable=unidiomatic-typecheck
+            continue
+        if linear_config.bias or any(f in fqn for f in filter_fqns):
+            continue
+        new_config = TpuFp8Linear.Config(
+            in_features=linear_config.in_features,
+            out_features=linear_config.out_features,
+            bias=False,
+            param_init=linear_config.param_init,
+            fp8_grad_weight=fp8_grad_weight,
+            fp8_grad_input=fp8_grad_input,
+        )
+        if parent is None:
+            model_config = new_config
+        elif isinstance(parent, list):
+            parent[attr] = new_config
+        else:
+            setattr(parent, attr, new_config)
+    return model_config
+
+
 __all__ = [
     "TpuFp8Linear",
+    "convert_linears",
     "fp8_linear",
     "fp8_linear_bwd",
     "fp8_linear_bwd_hp_dw",

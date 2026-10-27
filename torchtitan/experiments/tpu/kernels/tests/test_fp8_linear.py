@@ -131,6 +131,23 @@ class Fp8LinearTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertTrue(torch.isfinite(dx.float()).all())
         self.assertLess(y[3].float().abs().max().item(), 1e-30)
 
+    def test_forward_only_backward_is_bf16(self):
+        x, w = self._inputs(lead=(128,))
+        device = self.accelerator_device
+        dy = torch.randn(128, 384, dtype=torch.bfloat16)
+
+        x_dev = x.to(device).requires_grad_()
+        w_dev = w.to(device).requires_grad_()
+        y = fp8_linear.fp8_linear(x_dev, w_dev, fp8_grad_input=False)
+        dx, dw = torch.autograd.grad(y, (x_dev, w_dev), dy.to(device))
+
+        torch.testing.assert_close(
+            dx.cpu().float(), dy.float() @ w.float(), rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            dw.cpu().float(), dy.float().T @ x.float(), rtol=1e-2, atol=5e-2
+        )
+
     def test_fp8_grad_input(self):
         x, w = self._inputs(lead=(128,))
         device = self.accelerator_device

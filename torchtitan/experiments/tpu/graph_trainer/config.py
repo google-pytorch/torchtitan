@@ -332,12 +332,6 @@ def apply_tpu_graph_trainer_model_transforms(
     return
 
   check_scan_parallelism(config.parallelism)
-  if config.parallelism.expert_parallel_degree > 1:
-    raise ValueError(
-        "--compile.use-scan-layers cannot be combined with "
-        "--parallelism.expert-parallel-degree > 1 "
-        "(https://github.com/google-pytorch/torchtitan/issues/25)."
-    )
   assert config.model_spec is not None
   orig_parallelize_fn = config.model_spec.parallelize_fn
   assert orig_parallelize_fn is not None

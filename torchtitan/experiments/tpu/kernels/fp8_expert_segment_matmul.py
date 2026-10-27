@@ -369,10 +369,12 @@ _register_autograd(
 
 
 # ---------------------------------------------------------------------------
-# SwiGLU kernels on the paired W1/W3 output ``[gate | up]``: one Pallas pass
-# computes ``silu(gate) * up`` and writes it as per-row e4m3 plus FP32 scales,
-# so the BF16 hidden never reaches HBM; another computes ``d[gate | up]`` in
-# the paired op's layout. ``fused=False`` runs the same math in XLA.
+# SwiGLU into W2: the op takes the paired W1/W3 output ``[gate | up]`` and
+# runs ``silu(gate) * up`` -> per-row e4m3 quantization -> W2 GEMM. With
+# ``fused_quant`` a Pallas kernel produces the FP8 hidden and its scales in one
+# pass over ``[gate | up]``; the BF16 hidden never reaches HBM. The backward
+# returns ``d[gate | up]`` in the paired op's layout, so no split or concat
+# sits between the two ops.
 # ---------------------------------------------------------------------------
 
 _SWIGLU_QUANT_TILE_M = 256
@@ -457,6 +459,129 @@ def swiglu_grad(
     )(gate_up, d_hidden)
 
 
+def swiglu_w2_fwd(gate_up, rhs, group_sizes, tiling, fused, interpret=False):
+    """Returns ``(out[M, N], h_q (int8 bits), h_scale, rhs_q (int8), rhs_scale)``."""
+    h_q, h_scale = swiglu_quantize(gate_up, fused, interpret=interpret)
+    rhs_q, rhs_scale = _quantize(rhs, FWD_DTYPE, axis=(0, 1))
+    rhs_scale = rhs_scale.reshape(1, -1)
+    out = fp8_gmm_fwd_quantized(
+        h_q,
+        h_scale,
+        rhs_q,
+        rhs_scale,
+        group_sizes,
+        tiling,
+        gate_up.dtype,
+        interpret=interpret,
+    )
+    return out, _to_i8(h_q), h_scale, _to_i8(rhs_q), rhs_scale
+
+
+def swiglu_w2_bwd(
+    dout,
+    gate_up,
+    h_q,
+    h_scale,
+    rhs_q,
+    rhs_scale,
+    group_sizes,
+    dlhs_tiling,
+    drhs_tiling,
+    fused,
+    interpret=False,
+):
+    """Returns ``(d_gate_up[M, 2F], d_rhs)``; straight-through over the cast."""
+    d_hidden, grad_rhs = fp8_gmm_bwd_quantized(
+        dout,
+        _from_i8(h_q),
+        h_scale,
+        _from_i8(rhs_q),
+        rhs_scale,
+        group_sizes,
+        dlhs_tiling,
+        drhs_tiling,
+        dout.dtype,
+        interpret=interpret,
+    )
+    return swiglu_grad(gate_up, d_hidden, fused, interpret=interpret), grad_rhs
+
+
+@pallas.jax_op("tt_experts::fp8_swiglu_grouped_mm")
+def _fp8_swiglu_fwd(
+    gate_up: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    fused_quant: int,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> _Residuals:
+    del dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk, drhs_tn
+    return swiglu_w2_fwd(
+        gate_up, rhs, group_sizes, (fwd_tm, fwd_tk, fwd_tn), bool(fused_quant)
+    )
+
+
+@pallas.jax_op("tt_experts::fp8_swiglu_grouped_mm_bwd")
+def _fp8_swiglu_bwd(
+    dout: jax.Array,
+    gate_up: jax.Array,
+    h_q: jax.Array,
+    h_scale: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    fused_quant: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array]:
+    return swiglu_w2_bwd(
+        dout,
+        gate_up,
+        h_q,
+        h_scale,
+        rhs_q,
+        rhs_scale,
+        group_sizes,
+        (dlhs_tm, dlhs_tk, dlhs_tn),
+        (drhs_tm, drhs_tk, drhs_tn),
+        bool(fused_quant),
+    )
+
+
+def _swiglu_setup_context(ctx, inputs, output):
+    gate_up, _, group_sizes, fused_quant, *tilings = inputs
+    _, h_q, h_scale, rhs_q, rhs_scale = output
+    ctx.mark_non_differentiable(h_q, h_scale, rhs_q, rhs_scale)
+    ctx.save_for_backward(gate_up, h_q, h_scale, rhs_q, rhs_scale, group_sizes)
+    ctx.num_static = 1 + len(tilings)
+    ctx.bwd_static = (fused_quant, *tilings[3:])
+
+
+def _swiglu_backward(ctx, grad_out, *unused_residual_grads):
+    del unused_residual_grads
+    d_gate_up, grad_rhs = _fp8_swiglu_bwd(
+        grad_out, *ctx.saved_tensors, *ctx.bwd_static
+    )
+    # gate_up, rhs, group_sizes, fused_quant + tiling ints.
+    return (d_gate_up, grad_rhs, None) + (None,) * ctx.num_static
+
+
+_fp8_swiglu_fwd.register_autograd(
+    _swiglu_backward, setup_context=_swiglu_setup_context
+)
+
+
 def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:
     static = (*fwd, *dlhs, *drhs)
     assert len(static) == 9, static
@@ -521,6 +646,31 @@ def fp8_paired_segment_matmul_pallas_2d(
     return out.chunk(2, dim=-1) if split else out
 
 
+def fp8_swiglu_segment_matmul_pallas_2d(
+    gate_up: torch.Tensor,
+    rhs: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    fused_quant: bool = True,
+    fwd_tiling: Tiling = (512, 0, 0),
+    dlhs_tiling: Tiling = (512, 0, 0),
+    drhs_tiling: Tiling = (512, 0, 0),
+) -> torch.Tensor:
+    """``(silu(gate) * up) @ rhs`` per expert, with ``gate_up = [gate | up]``.
+
+    The hidden is quantized per row to e4m3 (by a fused Pallas kernel when
+    ``fused_quant``); tilings are as in `fp8_segment_matmul_pallas_2d`.
+    """
+    out, *_ = _fp8_swiglu_fwd(
+        gate_up,
+        rhs,
+        _int32(group_sizes),
+        int(fused_quant),
+        *_static(fwd_tiling, dlhs_tiling, drhs_tiling),
+    )
+    return out
+
+
 __all__ = [
     "fp8_gmm_bwd",
     "fp8_gmm_bwd_quantized",
@@ -528,5 +678,6 @@ __all__ = [
     "fp8_gmm_fwd_quantized",
     "fp8_paired_segment_matmul_pallas_2d",
     "fp8_segment_matmul_pallas_2d",
+    "fp8_swiglu_segment_matmul_pallas_2d",
     "quantize_operands",
 ]

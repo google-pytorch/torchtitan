@@ -1,6 +1,7 @@
 """Accelerator tests for the FP8 expert grouped matmuls."""
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -286,6 +287,46 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         torch.testing.assert_close(
             joint.cpu(), torch.cat(split, dim=-1).cpu(), rtol=0, atol=0
         )
+
+
+    @parameterized.parameters(True, False)
+    def test_swiglu_matches_separate_ops(self, fused_quant):
+        torch.manual_seed(1)
+        group_sizes = _GROUP_SIZES
+        m, f, n = sum(group_sizes), 256, 256
+        gate_up = torch.randn(m, 2 * f, dtype=torch.bfloat16)
+        w2 = torch.randn(len(group_sizes), f, n, dtype=torch.bfloat16) * 0.05
+        dout = torch.randn(m, n, dtype=torch.bfloat16)
+        sizes = torch.tensor(group_sizes, dtype=torch.int32)
+        dev = self.accelerator_device
+
+        gu, w = self._to_dev(gate_up, w2, grad=True)
+        out = fp8_esm.fp8_swiglu_segment_matmul_pallas_2d(
+            gu, w, sizes.to(dev), fused_quant=fused_quant, **_TILINGS
+        )
+        d_gu, d_w = torch.autograd.grad(out, (gu, w), dout.to(dev))
+
+        # The op quantizes silu(gate) * up from FP32 instead of from BF16, so
+        # compare against an FP32 reference of the hidden.
+        gate, up = gate_up.float().chunk(2, dim=-1)
+        hidden = F.silu(gate) * up
+        want = _grouped_reference(
+            _dequantized(hidden, dims=1),
+            _dequantized(w2, dims=(0, 1)),
+            group_sizes,
+        )
+        self.assertLess(_rel_err(out, want), 1e-2)
+
+        gu_r = gate_up.float().requires_grad_()
+        w_r = w2.float().requires_grad_()
+        g_r, u_r = gu_r.chunk(2, dim=-1)
+        want_out = _grouped_reference(F.silu(g_r) * u_r, w_r, group_sizes)
+        want_dgu, want_dw = torch.autograd.grad(
+            want_out, (gu_r, w_r), dout.float()
+        )
+        self.assertLess(_rel_err(d_gu, want_dgu), 0.1)
+        self.assertLess(_rel_err(d_w, want_dw), 0.1)
+
 
 
 if __name__ == "__main__":

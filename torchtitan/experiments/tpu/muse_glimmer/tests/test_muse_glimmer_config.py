@@ -435,6 +435,14 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
               "--compile.save_regions",
           ),
           "full",
+          (),
+          {},
+      ),
+      # Splash only, without the w2 save.
+      (
+          ("--compile.save_regions", "attention.inner_attention"),
+          "tpu_selective",
+          ("attention.inner_attention",),
           {},
       ),
       # Splash saved in the last 26 layers only: no extra peak HBM.
@@ -446,11 +454,12 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
               "26",
           ),
           "tpu_selective",
+          (),
           {"attention.inner_attention": 26},
       ),
   )
   def test_30b_full_logits_readme_memory_overrides(
-      self, flags, memory_policy, last_n_layers
+      self, flags, memory_policy, save_regions, last_n_layers
   ):
     """Tests the memory-policy overrides documented in the recipe README."""
     config = ConfigManager().parse_args([
@@ -460,7 +469,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     ])
     compile_config = config.compile
     self.assertEqual(compile_config.memory_policy, memory_policy)
-    self.assertEqual(compile_config.save_regions, ())
+    self.assertEqual(compile_config.save_regions, save_regions)
     self.assertEqual(compile_config.save_last_n_layers, last_n_layers)
     if memory_policy == "tpu_selective":
       # The policy accepts the combination (each region listed once).

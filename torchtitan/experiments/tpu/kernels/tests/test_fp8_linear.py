@@ -178,6 +178,32 @@ class Fp8LinearTest(base_device_test.BaseAcceleratorDeviceTest):
                 dw.cpu().float(), exact_dw, rtol=1e-2, atol=5e-2
             )
 
+    def test_module_matches_function(self):
+        x, w = self._inputs(lead=(64,))
+        device = self.accelerator_device
+        module = fp8_linear.TpuFp8Linear(
+            fp8_linear.TpuFp8Linear.Config(in_features=256, out_features=384)
+        ).to(device)
+        with torch.no_grad():
+            module.weight.copy_(w.to(device))
+        torch.testing.assert_close(
+            module(x.to(device)).cpu(),
+            fp8_linear.fp8_linear(x.to(device), w.to(device)).cpu(),
+            rtol=0,
+            atol=0,
+        )
+
+
+class ConvertLinearsTest(absltest.TestCase):
+
+    def test_bias_is_rejected(self):
+        with self.assertRaises(ValueError):
+            fp8_linear.TpuFp8Linear(
+                fp8_linear.TpuFp8Linear.Config(
+                    in_features=8, out_features=8, bias=True
+                )
+            )
+
 
 if __name__ == "__main__":
     absltest.main()

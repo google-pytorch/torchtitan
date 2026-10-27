@@ -781,6 +781,62 @@ _fp8_paired_pre_fwd.register_autograd(
 )
 
 
+@pallas.jax_op("tt_experts::fp8_swiglu_grouped_mm_pre")
+def _fp8_swiglu_pre_fwd(
+    gate_up: jax.Array,
+    rhs: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    fused_quant: int,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_fp8_swiglu_fwd` on the pre-quantized W2; ignores ``rhs``'s value."""
+    del rhs, dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk, drhs_tn
+    h_q, h_scale = swiglu_quantize(gate_up, bool(fused_quant))
+    out = fp8_gmm_fwd_quantized(
+        h_q,
+        h_scale,
+        _from_i8(rhs_q),
+        rhs_scale,
+        group_sizes,
+        (fwd_tm, fwd_tk, fwd_tn),
+        gate_up.dtype,
+    )
+    return out, _to_i8(h_q), h_scale
+
+
+def _swiglu_pre_setup_context(ctx, inputs, output):
+    gate_up, _, rhs_q, rhs_scale, group_sizes, fused_quant, *tilings = inputs
+    _, h_q, h_scale = output
+    ctx.mark_non_differentiable(h_q, h_scale)
+    ctx.save_for_backward(gate_up, h_q, h_scale, rhs_q, rhs_scale, group_sizes)
+    ctx.num_static = 1 + len(tilings)
+    ctx.bwd_static = (fused_quant, *tilings[3:])
+
+
+def _swiglu_pre_backward(ctx, grad_out, *unused_residual_grads):
+    del unused_residual_grads
+    d_gate_up, grad_rhs = _fp8_swiglu_bwd(
+        grad_out, *ctx.saved_tensors, *ctx.bwd_static
+    )
+    # gate_up, rhs, rhs_q, rhs_scale, group_sizes, fused_quant + tiling ints.
+    return (d_gate_up, grad_rhs, None, None, None) + (None,) * ctx.num_static
+
+
+_fp8_swiglu_pre_fwd.register_autograd(
+    _swiglu_pre_backward, setup_context=_swiglu_pre_setup_context
+)
+
+
 def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:
     static = (*fwd, *dlhs, *drhs)
     assert len(static) == 9, static
@@ -878,12 +934,27 @@ def fp8_swiglu_segment_matmul_pallas_2d(
     fwd_tiling: Tiling = (512, 0, 0),
     dlhs_tiling: Tiling = (512, 0, 0),
     drhs_tiling: Tiling = (512, 0, 0),
+    rhs_q: torch.Tensor | None = None,
+    rhs_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``(silu(gate) * up) @ rhs`` per expert, with ``gate_up = [gate | up]``.
 
     The hidden is quantized per row to e4m3 (by a fused Pallas kernel when
     ``fused_quant``); tilings are as in `fp8_segment_matmul_pallas_2d`.
+    ``rhs_q``/``rhs_scale`` from `prequantize_weight_shard` replace quantizing
+    ``rhs``, which then only carries the weight gradient.
     """
+    if rhs_q is not None:
+        out, *_ = _fp8_swiglu_pre_fwd(
+            gate_up,
+            rhs,
+            rhs_q,
+            rhs_scale,
+            _int32(group_sizes),
+            int(fused_quant),
+            *_static(fwd_tiling, dlhs_tiling, drhs_tiling),
+        )
+        return out
     out, *_ = _fp8_swiglu_fwd(
         gate_up,
         rhs,

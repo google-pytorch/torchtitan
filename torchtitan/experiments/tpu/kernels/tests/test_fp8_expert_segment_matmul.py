@@ -422,6 +422,45 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             q2.cpu().float(), want_q2.cpu().float(), rtol=0, atol=0
         )
 
+    @parameterized.parameters(False, True)
+    def test_prequantized_paired_weights_match(self, fused_lhs_quant):
+        lhs, rhs_a, _, sizes = self._operands(k=512)
+        rhs_b = rhs_a.flip(0) * 0.5
+        dev = self.accelerator_device
+        dout = torch.randn(
+            lhs.shape[0], 2 * rhs_a.shape[-1], dtype=torch.bfloat16
+        )
+
+        def run(prequantize):
+            x, a, b = self._to_dev(lhs, rhs_a, rhs_b, grad=True)
+            kwargs = {}
+            if prequantize:
+                # One rank: the "all-gather" is the identity.
+                q, scale = fp8_esm.prequantize_weight_shard(
+                    torch.cat([a, b], dim=-1), lambda t: t
+                )
+                kwargs = dict(rhs_q=q, rhs_scale=scale)
+            out = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+                x,
+                a,
+                b,
+                sizes.to(dev),
+                split=False,
+                fused_lhs_quant=fused_lhs_quant,
+                **kwargs,
+                **_TILINGS,
+            )
+            grads = torch.autograd.grad(out, (x, a, b), dout.to(dev))
+            return out, grads
+
+        with _skip_if_no_fp8_mxu(self):
+            out, grads = run(prequantize=True)
+        want, want_grads = run(prequantize=False)
+        # Quantizing the shard with the gathered column scale gives the same
+        # FP8 weight as quantizing the gathered weight.
+        torch.testing.assert_close(out.cpu(), want.cpu(), rtol=0, atol=0)
+        for got, ref in zip(grads, want_grads):
+            torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

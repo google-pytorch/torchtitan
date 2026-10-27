@@ -182,8 +182,40 @@ _fp8_linear_hp_dw_op.register_autograd(
 )
 
 
-def fp8_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+@pallas.jax_op("tt_fp8::linear_fwd_only")
+def _fp8_linear_fwd_only_op(x: jax.Array, w: jax.Array) -> jax.Array:
+    return fp8_linear_fwd(x, w)[0]
+
+
+def _fwd_only_setup_context(ctx, inputs, output):
+    del output
+    ctx.save_for_backward(*inputs)
+
+
+def _fwd_only_backward(ctx, grad_out):
+    # Plain BF16 GEMMs: XLA consumes dy in whatever layout it arrives in, while
+    # quantizing dy needs a row-major copy plus an extra pass.
+    x, w = ctx.saved_tensors
+    dx = grad_out @ w
+    dw = grad_out.reshape(-1, grad_out.shape[-1]).t() @ x.reshape(
+        -1, x.shape[-1]
+    )
+    return dx, dw
+
+
+_fp8_linear_fwd_only_op.register_autograd(
+    _fwd_only_backward, setup_context=_fwd_only_setup_context
+)
+
+
+def fp8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    fp8_grad_input: bool = True,
+) -> torch.Tensor:
     """``x @ weight.T`` in FP8 (no bias); see the module docstring."""
+    if not fp8_grad_input:
+        return _fp8_linear_fwd_only_op(x, weight)
     return _fp8_linear_hp_dw_op(x, weight)[0]
 
 

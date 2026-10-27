@@ -153,6 +153,9 @@ class TpuGroupedExperts(GroupedExperts):
         fp8_w2_tilings: tuple[
             tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]
         ] = ((512, 0, 0), (512, 0, 0), (512, 768, 0))
+        # Quantize the routed rows inside the W1/W3 forward GEMM (tokamax
+        # GMM v2) instead of in standalone XLA amax/cast passes.
+        fp8_w13_fused_lhs_quant: bool = True
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -196,6 +199,7 @@ class TpuGroupedExperts(GroupedExperts):
         self.use_fp8_grouped_mm = config.use_fp8_grouped_mm
         self.fp8_w13_tilings = config.fp8_w13_tilings
         self.fp8_w2_tilings = config.fp8_w2_tilings
+        self.fp8_w13_fused_lhs_quant = config.fp8_w13_fused_lhs_quant
         self._native_sharding_applied = False
 
         if self.use_fp8_grouped_mm and not self.use_pallas_grouped_mm:
@@ -449,6 +453,7 @@ class TpuGroupedExperts(GroupedExperts):
             dlhs_tiling=dlhs,
             drhs_tiling=drhs,
             split=False,
+            fused_lhs_quant=self.fp8_w13_fused_lhs_quant,
         )
         fwd, dlhs, drhs = self.fp8_w2_tilings
         return fp8_swiglu_segment_matmul_pallas_2d(

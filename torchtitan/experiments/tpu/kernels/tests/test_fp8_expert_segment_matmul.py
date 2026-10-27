@@ -1,5 +1,7 @@
 """Accelerator tests for the FP8 expert grouped matmuls."""
 
+import contextlib
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -33,6 +35,20 @@ def _grouped_reference(lhs, rhs, group_sizes):
         out.append(lhs[start : start + size] @ rhs[g])
         start += size
     return torch.cat(out)
+
+
+@contextlib.contextmanager
+def _skip_if_no_fp8_mxu(test: absltest.TestCase):
+    """Skips ``test`` where tokamax GMM v2 cannot quantize lhs to e4m3.
+
+    In-kernel FP8 lhs quantization needs an FP8 x FP8 MXU (v7x).
+    """
+    try:
+        yield
+    except ValueError as e:
+        if "not a supported combination" not in str(e):
+            raise
+        test.skipTest(f"No FP8 x FP8 matmul on this TPU: {e}")
 
 
 def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -288,6 +304,35 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             joint.cpu(), torch.cat(split, dim=-1).cpu(), rtol=0, atol=0
         )
 
+
+    def test_fused_lhs_quant_is_close(self):
+        # GMM v2 scales lhs per row and 512-wide K block instead of per row.
+        lhs, rhs, dout, sizes = self._operands(k=1024)
+        dev = self.accelerator_device
+
+        def run(fused):
+            x, a, b = self._to_dev(lhs, rhs, rhs.flip(0), grad=True)
+            out = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+                x,
+                a,
+                b,
+                sizes.to(dev),
+                split=False,
+                fused_lhs_quant=fused,
+                **_TILINGS,
+            )
+            grads = torch.autograd.grad(
+                out, (x, a, b), torch.cat([dout, dout], -1).to(dev)
+            )
+            return out, grads
+
+        with _skip_if_no_fp8_mxu(self):
+            out, grads = run(fused=True)
+        want, want_grads = run(fused=False)
+        self.assertLess(_rel_err(out, want), 0.02)
+        # The backward is the same op either way.
+        for got, ref in zip(grads, want_grads):
+            torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=0, atol=0)
 
     @parameterized.parameters(True, False)
     def test_swiglu_matches_separate_ops(self, fused_quant):

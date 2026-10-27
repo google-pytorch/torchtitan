@@ -22,13 +22,17 @@ MaxText's `fp8_full`:
   dy, which is quantized to e5m2 per column; the forward's e4m3 x is reused.
 """
 
+import dataclasses
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import torch
+from torch.distributed.tensor import DTensor
 from torch_tpu._internal import pallas
 from torchtitan.experiments.tpu.kernels import fp8_scale
+from torchtitan.models.common.linear import Linear
 
 FWD_DTYPE = jnp.float8_e4m3fn
 BWD_DTYPE = jnp.float8_e5m2
@@ -273,7 +277,35 @@ def fp8_linear(
     return op(x, weight)[0]
 
 
+class TpuFp8Linear(Linear):
+    """Bias-free `Linear` whose matmuls run in FP8 through `fp8_linear`."""
+
+    @dataclasses.dataclass(kw_only=True, slots=True)
+    class Config(Linear.Config):
+        fp8_grad_weight: bool = False
+        """FP8 dWeight as in MaxText; BF16 when False (see module docstring)."""
+        fp8_grad_input: bool = True
+        """FP8 dInput; when False the whole backward is BF16."""
+
+    def __init__(self, config: Config):
+        if config.bias:
+            raise ValueError("TpuFp8Linear does not support bias.")
+        super().__init__(config)
+        self.fp8_grad_weight = config.fp8_grad_weight
+        self.fp8_grad_input = config.fp8_grad_input
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
+        weight = self.weight
+        # As in `TpuGroupedExperts`: FSDP has already gathered the weight.
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        return fp8_linear(
+            input, weight, self.fp8_grad_weight, self.fp8_grad_input
+        )
+
+
 __all__ = [
+    "TpuFp8Linear",
     "fp8_linear",
     "fp8_linear_bwd",
     "fp8_linear_bwd_hp_dw",

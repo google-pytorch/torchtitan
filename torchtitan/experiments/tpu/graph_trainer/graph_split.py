@@ -547,8 +547,19 @@ def _order_child_boundaries(parent: torch.fx.GraphModule) -> None:
   in that order, and an output cannot be written before its donor's last read.
   Sorting both sides lets the earliest-freed input back the earliest-ready
   output, e.g. a host-to-device reload that depends on nothing else.
+
+  TODO: drop this ordering once TorchTPU can pass explicit input->output
+  aliases to XLA; today it only marks donatable inputs (``jax.buffer_donor``)
+  and XLA picks the pairs. To check the pairs XLA picked, dump HLO with
+  ``XLA_FLAGS=--xla_dump_to=<dir>`` and read each module's
+  ``input_output_alias``.
   """
-  for call in parent.graph.find_nodes(op="call_module"):
+  calls = parent.graph.find_nodes(op="call_module")
+  # Each child is rewritten together with its one call site.
+  assert len({call.target for call in calls}) == len(calls), (
+      "a split child is called more than once"
+  )
+  for call in calls:
     child = parent.get_submodule(call.target)
     nodes = list(child.graph.nodes)
     position = {node: index for index, node in enumerate(nodes)}
@@ -557,6 +568,7 @@ def _order_child_boundaries(parent: torch.fx.GraphModule) -> None:
       depth[node] = 1 + max(map(depth.get, node.all_input_nodes), default=-1)
 
     inputs = [node for node in nodes if node.op == "placeholder"]
+    assert all(node.op == "placeholder" for node in nodes[: len(inputs)])
     last_read = {
         node: max((position[user] for user in node.users), default=-1)
         for node in inputs
@@ -576,9 +588,9 @@ def _order_child_boundaries(parent: torch.fx.GraphModule) -> None:
       )
       output.args = (tuple(values[i] for i in order),)
       new_index = {old: new for new, old in enumerate(order)}
+      assert all(_is_getitem(user) for user in call.users)
       for user in list(call.users):
-        if _is_getitem(user):
-          user.args = (call, new_index[user.args[1]])
+        user.args = (call, new_index[user.args[1]])
     child.recompile()
   parent.recompile()
 

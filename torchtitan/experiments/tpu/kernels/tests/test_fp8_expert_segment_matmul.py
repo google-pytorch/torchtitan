@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu.kernels import fp8_expert_segment_matmul as fp8_esm
 
@@ -87,6 +88,58 @@ class Fp8GmmTest(base_device_test.BaseAcceleratorDeviceTest):
         for g, size in enumerate(_GROUP_SIZES):
             if size == 0:
                 self.assertEqual(float(jnp.abs(drhs[g]).max()), 0.0)
+
+
+class Fp8SwigluKernelTest(base_device_test.BaseAcceleratorDeviceTest):
+    """The SwiGLU Pallas kernels, run by JAX directly."""
+
+    # Not a multiple of the 256-row tile, so the last tile is partial.
+    _ROWS, _HIDDEN = 600, 256
+
+    def _gate_up(self):
+        key = jax.random.key(2)
+        return jax.random.normal(
+            key, (self._ROWS, 2 * self._HIDDEN), jnp.bfloat16
+        )
+
+    def test_swiglu_quantize_matches_xla(self):
+        gate_up = self._gate_up()
+        q, scale = fp8_esm.swiglu_quantize(gate_up, fused=True)
+        want_q, want_scale = fp8_esm.swiglu_quantize(gate_up, fused=False)
+        self.assertEqual(q.dtype, jnp.float8_e4m3fn)
+        self.assertEqual(scale.shape, (self._ROWS, 1))
+        np.testing.assert_allclose(
+            np.asarray(scale), np.asarray(want_scale), rtol=1e-6
+        )
+        # The FP32 -> FP8 rounding may differ by one FP8 ulp per element.
+        got = _to_torch(q) * _to_torch(scale)
+        want = _to_torch(want_q) * _to_torch(want_scale)
+        self.assertLess(_rel_err(got, want), 1e-2)
+
+        gate, up = _to_torch(gate_up).chunk(2, dim=-1)
+        hidden = F.silu(gate) * up
+        self.assertLess(_rel_err(got, _dequantized(hidden, dims=1)), 1e-2)
+
+    def test_swiglu_grad_matches_autodiff(self):
+        gate_up = self._gate_up()
+        d_hidden = jax.random.normal(
+            jax.random.key(3), (self._ROWS, self._HIDDEN), jnp.bfloat16
+        )
+        got = fp8_esm.swiglu_grad(gate_up, d_hidden, fused=True)
+        unfused = fp8_esm.swiglu_grad(gate_up, d_hidden, fused=False)
+        self.assertEqual(got.dtype, jnp.bfloat16)
+        self.assertEqual(got.shape, gate_up.shape)
+        np.testing.assert_array_equal(
+            np.asarray(got.astype(jnp.float32)),
+            np.asarray(unfused.astype(jnp.float32)),
+        )
+
+        gu_r = _to_torch(gate_up).requires_grad_()
+        g_r, u_r = gu_r.chunk(2, dim=-1)
+        (want,) = torch.autograd.grad(
+            F.silu(g_r) * u_r, (gu_r,), _to_torch(d_hidden)
+        )
+        self.assertLess(_rel_err(_to_torch(got), want), 1e-2)
 
 
 class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):

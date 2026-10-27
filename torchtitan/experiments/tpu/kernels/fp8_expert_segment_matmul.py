@@ -51,6 +51,8 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as tokamax_gmm 
 
 jaxtyping.jaxtyped = _real_jaxtyped
 
+from jax.experimental import pallas as pl  # noqa: E402  pylint: disable=g-import-not-at-top
+from jax.experimental.pallas import tpu as pltpu  # noqa: E402  pylint: disable=g-import-not-at-top
 import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
 from torch_tpu._internal import pallas  # noqa: E402  pylint: disable=g-import-not-at-top
 from torchtitan.experiments.tpu.kernels import fp8_scale  # noqa: E402  pylint: disable=g-import-not-at-top
@@ -364,6 +366,95 @@ _register_autograd(_fp8_grouped_mm_fwd, _fp8_grouped_mm_bwd, num_weights=1)
 _register_autograd(
     _fp8_paired_grouped_mm_fwd, _fp8_paired_grouped_mm_bwd, num_weights=2
 )
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU kernels on the paired W1/W3 output ``[gate | up]``: one Pallas pass
+# computes ``silu(gate) * up`` and writes it as per-row e4m3 plus FP32 scales,
+# so the BF16 hidden never reaches HBM; another computes ``d[gate | up]`` in
+# the paired op's layout. ``fused=False`` runs the same math in XLA.
+# ---------------------------------------------------------------------------
+
+_SWIGLU_QUANT_TILE_M = 256
+
+
+def _swiglu_f32(gate_up: jax.Array) -> jax.Array:
+    gate, up = jnp.split(gate_up.astype(jnp.float32), 2, axis=-1)
+    return jax.nn.silu(gate) * up
+
+
+def _swiglu_quant_kernel(gate_up_ref, q_ref, scale_ref):
+    hidden = _swiglu_f32(gate_up_ref[...])
+    amax = jnp.max(jnp.abs(hidden), axis=1, keepdims=True)
+    scale = fp8_scale.scale_from_amax(amax, FWD_DTYPE)
+    q_ref[...] = (hidden / scale).astype(FWD_DTYPE)
+    scale_ref[...] = scale
+
+
+def swiglu_quantize(
+    gate_up: jax.Array, fused: bool, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """``silu(gate) * up`` as ``(e4m3 [M, F], FP32 row scale [M, 1])``."""
+    if not fused:
+        return _quantize(_swiglu_f32(gate_up), FWD_DTYPE, axis=1)
+    rows, two_f = gate_up.shape
+    tile_m = min(_SWIGLU_QUANT_TILE_M, rows)
+    return pl.pallas_call(
+        _swiglu_quant_kernel,
+        grid=(pl.cdiv(rows, tile_m),),
+        in_specs=[pl.BlockSpec((tile_m, two_f), lambda i: (i, 0))],
+        out_specs=[
+            pl.BlockSpec((tile_m, two_f // 2), lambda i: (i, 0)),
+            pl.BlockSpec((tile_m, 1), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, two_f // 2), FWD_DTYPE),
+            jax.ShapeDtypeStruct((rows, 1), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+    )(gate_up)
+
+
+def _swiglu_grad(gate_up, d_hidden):
+    """``d[gate | up]`` of ``silu(gate) * up`` (BF16 out, FP32 math)."""
+    num_hidden = gate_up.shape[-1] // 2
+    gate = gate_up[:, :num_hidden].astype(jnp.float32)
+    up = gate_up[:, num_hidden:].astype(jnp.float32)
+    d_hidden = d_hidden.astype(jnp.float32)
+    sig = jax.nn.sigmoid(gate)
+    d_gate = d_hidden * up * sig * (1.0 + gate * (1.0 - sig))
+    d_up = d_hidden * gate * sig
+    return d_gate.astype(gate_up.dtype), d_up.astype(gate_up.dtype)
+
+
+def _swiglu_grad_kernel(gate_up_ref, d_hidden_ref, d_gate_up_ref):
+    num_hidden = d_hidden_ref.shape[1]
+    d_gate, d_up = _swiglu_grad(gate_up_ref[...], d_hidden_ref[...])
+    d_gate_up_ref[:, :num_hidden] = d_gate
+    d_gate_up_ref[:, num_hidden:] = d_up
+
+
+def swiglu_grad(
+    gate_up: jax.Array, d_hidden: jax.Array, fused: bool, interpret=False
+) -> jax.Array:
+    """``d[gate | up]``, in one Pallas pass when ``fused``."""
+    if not fused:
+        return jnp.concatenate(_swiglu_grad(gate_up, d_hidden), axis=-1)
+    rows, two_f = gate_up.shape
+    tile_m = min(_SWIGLU_QUANT_TILE_M, rows)
+    return pl.pallas_call(
+        _swiglu_grad_kernel,
+        grid=(pl.cdiv(rows, tile_m),),
+        in_specs=[
+            pl.BlockSpec((tile_m, two_f), lambda i: (i, 0)),
+            pl.BlockSpec((tile_m, two_f // 2), lambda i: (i, 0)),
+        ],
+        out_specs=pl.BlockSpec((tile_m, two_f), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((rows, two_f), gate_up.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+    )(gate_up, d_hidden)
 
 
 def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:

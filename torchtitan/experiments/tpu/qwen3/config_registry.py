@@ -1094,8 +1094,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   # Store the QKV weights as [all Q][all K][all V] rather than grouped per KV
-  # head, so attention reads Q, K and V without per-layer copies (~0.4 s/step
-  # at 64 chips).
+  # head, so attention reads Q, K and V without per-layer copies.
   cfg.model_spec.model = (
       TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
   )

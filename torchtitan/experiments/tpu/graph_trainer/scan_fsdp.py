@@ -212,6 +212,17 @@ funcol.reduce_scatter_single = _movedim_reduce_scatter_tensor
 funcol.reduce_scatter_tensor = _movedim_reduce_scatter_tensor
 
 
+def gather_like(x: torch.Tensor, spec: ScanFSDPSpec) -> torch.Tensor:
+    """All-gathers ``x`` as ``gather_slice`` gathers a sharded layer, no grad.
+
+    For tensors derived from a shard -- e.g. its FP8 bits or per-column
+    amax -- that must be gathered across the same group along the same axis.
+    Takes the already-resolved ``spec.group``, like ``gather_slice``, since the
+    body must not resolve group names itself.
+    """
+    return _movedim_all_gather_tensor(x, spec.gather_dim, spec.group)
+
+
 def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor:
     """Turns one layer's local shard into that layer's whole weight.
 

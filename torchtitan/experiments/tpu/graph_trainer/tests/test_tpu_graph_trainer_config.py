@@ -1004,19 +1004,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         },
     )
     assert base.model_spec is not None and maxtext.model_spec is not None
-    # The FP32 route-score fusion is not a numerics knob: both scan recipes
-    # use it. The splitter instead scales routes before W2.
-    for config in (base, maxtext):
-      dispatchers = list(
-          config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-      )
-      self.assertLen(dispatchers, 94)
-      self.assertTrue(all(d.fuse_route_score_backward for _, d, _, _ in dispatchers))
+    # Scaling routes before W2 is not a numerics knob: both scan recipes and
+    # the splitter use it.
     splitter = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
-    assert splitter.model_spec is not None
-    routed = list(splitter.model_spec.model.traverse(TpuRoutedExperts.Config))
-    self.assertLen(routed, 94)
-    self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
+    for config in (base, maxtext, splitter):
+      assert config.model_spec is not None
+      routed = list(config.model_spec.model.traverse(TpuRoutedExperts.Config))
+      self.assertLen(routed, 94)
+      self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
     # Everything the base recipe works around is inherited, not re-derived.
     self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
     self.assertEqual(

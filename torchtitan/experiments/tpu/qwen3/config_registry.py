@@ -37,7 +37,6 @@ from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.token_dispatcher import (
-    TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
     TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
@@ -860,23 +859,6 @@ def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
     config.scale_before_down_proj = True
 
 
-def _fuse_route_score_backward(cfg: TPUTrainerConfig) -> None:
-  """Compute dScore in one fusion instead of saving an FP32 expert output.
-
-  The multiply and hidden-dimension reduction stay FP32, as in native
-  autograd; only the reduction order changes. On Q235 at 512 ranks this
-  removes a per-layer ``f32[524288, 4096]`` copy and reduction (1.12 s/step).
-  """
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("Qwen3 MoE route-score fusion needs a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
-
-
 def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
@@ -1090,12 +1072,13 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
+          TpuRoutedExpertsConverter.Config(),
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
-  _fuse_route_score_backward(cfg)
+  _scale_routes_before_down_proj(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.

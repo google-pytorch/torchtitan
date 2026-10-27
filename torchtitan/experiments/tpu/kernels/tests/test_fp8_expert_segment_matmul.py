@@ -423,34 +423,39 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         )
 
     @parameterized.parameters(False, True)
-    def test_prequantized_paired_weights_match(self, fused_lhs_quant):
-        lhs, rhs_a, _, sizes = self._operands(k=512)
+    def test_prequantized_weights_match(self, fused_lhs_quant):
+        lhs, rhs_a, dout, sizes = self._operands(k=512)
         rhs_b = rhs_a.flip(0) * 0.5
+        w2 = rhs_a.transpose(1, 2).contiguous()[:, :256] * 0.5
         dev = self.accelerator_device
-        dout = torch.randn(
-            lhs.shape[0], 2 * rhs_a.shape[-1], dtype=torch.bfloat16
-        )
+        dout2 = torch.randn(lhs.shape[0], w2.shape[-1], dtype=torch.bfloat16)
 
         def run(prequantize):
-            x, a, b = self._to_dev(lhs, rhs_a, rhs_b, grad=True)
-            kwargs = {}
+            x, a, b, w = self._to_dev(lhs, rhs_a, rhs_b, w2, grad=True)
+            kwargs13, kwargs2 = {}, {}
             if prequantize:
                 # One rank: the "all-gather" is the identity.
-                q, scale = fp8_esm.prequantize_weight_shard(
+                q13, s13 = fp8_esm.prequantize_weight_shard(
                     torch.cat([a, b], dim=-1), lambda t: t
                 )
-                kwargs = dict(rhs_q=q, rhs_scale=scale)
-            out = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+                q2, s2 = fp8_esm.prequantize_weight_shard(w, lambda t: t)
+                self.assertEqual(q13.dtype, torch.float8_e4m3fn)
+                kwargs13 = dict(rhs_q=q13, rhs_scale=s13)
+                kwargs2 = dict(rhs_q=q2, rhs_scale=s2)
+            gate_up = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
                 x,
                 a,
                 b,
                 sizes.to(dev),
                 split=False,
                 fused_lhs_quant=fused_lhs_quant,
-                **kwargs,
+                **kwargs13,
                 **_TILINGS,
             )
-            grads = torch.autograd.grad(out, (x, a, b), dout.to(dev))
+            out = fp8_esm.fp8_swiglu_segment_matmul_pallas_2d(
+                gate_up, w, sizes.to(dev), **kwargs2, **_TILINGS
+            )
+            grads = torch.autograd.grad(out, (x, a, b, w), dout2.to(dev))
             return out, grads
 
         with _skip_if_no_fp8_mxu(self):

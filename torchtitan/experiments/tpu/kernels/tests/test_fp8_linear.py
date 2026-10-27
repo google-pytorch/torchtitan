@@ -1,6 +1,7 @@
 """Accelerator tests for the TPU-native FP8 linear layer."""
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -148,14 +149,15 @@ class Fp8LinearTest(base_device_test.BaseAcceleratorDeviceTest):
             dw.cpu().float(), dy.float().T @ x.float(), rtol=1e-2, atol=5e-2
         )
 
-    def test_fp8_grad_input(self):
+    @parameterized.parameters(False, True)
+    def test_fp8_grad_input(self, fp8_grad_weight):
         x, w = self._inputs(lead=(128,))
         device = self.accelerator_device
         dy = torch.randn(128, 384, dtype=torch.bfloat16)
 
         x_dev = x.to(device).requires_grad_()
         w_dev = w.to(device).requires_grad_()
-        y = fp8_linear.fp8_linear(x_dev, w_dev)
+        y = fp8_linear.fp8_linear(x_dev, w_dev, fp8_grad_weight=fp8_grad_weight)
         dx, dw = torch.autograd.grad(y, (x_dev, w_dev), dy.to(device))
 
         # dx = dy @ w with w's channel scale folded into the e5m2 dy.
@@ -167,10 +169,14 @@ class Fp8LinearTest(base_device_test.BaseAcceleratorDeviceTest):
         )
         self.assertLess(_rel_err(dx, want_dx), 5e-3)
 
-        # dw is BF16.
-        torch.testing.assert_close(
-            dw.cpu().float(), dy.float().T @ x.float(), rtol=1e-2, atol=5e-2
-        )
+        exact_dw = dy.float().T @ x.float()
+        rel = (dw.cpu().float() - exact_dw).norm() / exact_dw.norm()
+        if fp8_grad_weight:
+            self.assertLess(rel.item(), 0.1)
+        else:
+            torch.testing.assert_close(
+                dw.cpu().float(), exact_dw, rtol=1e-2, atol=5e-2
+            )
 
 
 if __name__ == "__main__":

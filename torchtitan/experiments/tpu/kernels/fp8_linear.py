@@ -15,9 +15,11 @@ MaxText's `fp8_full`:
   one scale per output channel (over K).
 * dInput ``dx = dy @ w``: w's channel scale is folded into dy, which is
   quantized to e5m2 per row (over N); the forward's e4m3 w is reused.
-* dWeight ``dw = dy.T @ x``: BF16. Contracting over tokens needs dy scaled
-  per column, i.e. a second full pass over dy plus a transpose, which costs
-  more than the FP8 GEMM saves at these shapes.
+* dWeight ``dw = dy.T @ x``: BF16 by default. Contracting over tokens needs
+  dy scaled per column, i.e. a second full pass over dy plus a transpose,
+  which costs more than the FP8 GEMM saves at these shapes. With
+  ``fp8_grad_weight`` it is FP8 as in MaxText: x's row scale is folded into
+  dy, which is quantized to e5m2 per column; the forward's e4m3 x is reused.
 """
 
 import jax
@@ -127,6 +129,24 @@ def fp8_linear_dx(
     return dx.reshape(*dy.shape[:-1], w_q.shape[1])
 
 
+def fp8_linear_bwd(
+    dy: jax.Array,
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """``(dx, dw)``, both FP8 (MaxText `fp8_full`)."""
+    dx = fp8_linear_dx(dy, w_q, w_scale, interpret=interpret)
+    # dw contracts over tokens, along which x is scaled.
+    dw_q, dw_scale = _quantize(
+        _flat(dy).astype(jnp.float32) * _flat(x_scale), BWD_DTYPE, 0
+    )
+    dw = _dot(dw_q, _flat(x_q), 0, 0) * dw_scale.reshape(-1, 1)
+    return dx, dw.astype(dy.dtype)
+
+
 def fp8_linear_bwd_hp_dw(
     dy: jax.Array,
     x: jax.Array,
@@ -149,6 +169,25 @@ def _from_i8(x: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(x, FWD_DTYPE)
 
 
+@pallas.jax_op("tt_fp8::linear")
+def _fp8_linear_op(
+    x: jax.Array, w: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    y, x_q, x_scale, w_q, w_scale = fp8_linear_fwd(x, w)
+    return y, _to_i8(x_q), x_scale, _to_i8(w_q), w_scale
+
+
+@pallas.jax_op("tt_fp8::linear_bwd")
+def _fp8_linear_bwd_op(
+    dy: jax.Array,
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    return fp8_linear_bwd(dy, _from_i8(x_q), x_scale, _from_i8(w_q), w_scale)
+
+
 @pallas.jax_op("tt_fp8::linear_hp_dw")
 def _fp8_linear_hp_dw_op(
     x: jax.Array, w: jax.Array
@@ -164,6 +203,18 @@ def _fp8_linear_hp_dw_bwd_op(
     return fp8_linear_bwd_hp_dw(dy, x, _from_i8(w_q), w_scale)
 
 
+def _setup_context(ctx, inputs, output):
+    del inputs
+    _, x_q, x_scale, w_q, w_scale = output
+    ctx.mark_non_differentiable(x_q, x_scale, w_q, w_scale)
+    ctx.save_for_backward(x_q, x_scale, w_q, w_scale)
+
+
+def _backward(ctx, grad_out, *unused_residual_grads):
+    del unused_residual_grads
+    return tuple(_fp8_linear_bwd_op(grad_out.contiguous(), *ctx.saved_tensors))
+
+
 def _hp_dw_setup_context(ctx, inputs, output):
     _, w_q, w_scale = output
     ctx.mark_non_differentiable(w_q, w_scale)
@@ -177,6 +228,7 @@ def _hp_dw_backward(ctx, grad_out, *unused_residual_grads):
     )
 
 
+_fp8_linear_op.register_autograd(_backward, setup_context=_setup_context)
 _fp8_linear_hp_dw_op.register_autograd(
     _hp_dw_backward, setup_context=_hp_dw_setup_context
 )
@@ -211,16 +263,19 @@ _fp8_linear_fwd_only_op.register_autograd(
 def fp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
+    fp8_grad_weight: bool = False,
     fp8_grad_input: bool = True,
 ) -> torch.Tensor:
     """``x @ weight.T`` in FP8 (no bias); see the module docstring."""
     if not fp8_grad_input:
         return _fp8_linear_fwd_only_op(x, weight)
-    return _fp8_linear_hp_dw_op(x, weight)[0]
+    op = _fp8_linear_op if fp8_grad_weight else _fp8_linear_hp_dw_op
+    return op(x, weight)[0]
 
 
 __all__ = [
     "fp8_linear",
+    "fp8_linear_bwd",
     "fp8_linear_bwd_hp_dw",
     "fp8_linear_fwd",
     "row_quantize",

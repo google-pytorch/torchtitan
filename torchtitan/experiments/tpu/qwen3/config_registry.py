@@ -1201,6 +1201,26 @@ def qwen3_moe_235b_scan_proxy() -> TpuGraphTrainer.Config:
   return cfg
 
 
+def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_fp8_grouped_mm = True
+  return cfg
+
+
+def qwen3_moe_235b_scan_fp8() -> TpuGraphTrainer.Config:
+  """`qwen3_moe_235b_scan` with FP8 expert GEMMs.
+
+  The expert W1/W3/W2 GEMMs and their backward run on FP8 operands through
+  tokamax's Mosaic GMM/TGMM (e4m3 forward, e5m2 gradients, dynamic row-wise
+  scales; see `kernels/fp8_expert_segment_matmul.py`). Attention, router and
+  lm_head stay BF16.
+  """
+  return _with_fp8_experts(qwen3_moe_235b_scan())
+
+
 def qwen3_moe_235b_scan_maxtext() -> TpuGraphTrainer.Config:
   """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
 

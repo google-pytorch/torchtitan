@@ -1238,6 +1238,11 @@ def qwen3_moe_235b_scan_fp8() -> TpuGraphTrainer.Config:
   """
   cfg = _with_fp8_experts(qwen3_moe_235b_scan())
   assert cfg.model_spec is not None
+  # Same split as `qwen3_moe_235b_scan_torchao_float8`, so the two compare like
+  # for like: only wqkv/wo become FP8. The router gate (routing-sensitive, tiny,
+  # computed in FP32) and lm_head (its error lands on the logits) stay BF16.
+  # `convert_linears` skips `Linear.Config` subclasses such as the gate anyway;
+  # listing it keeps the exclusion explicit.
   cfg.model_spec.model = fp8_linear.convert_linears(
       cfg.model_spec.model,
       filter_fqns=("router.gate", "lm_head"),

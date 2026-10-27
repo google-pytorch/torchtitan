@@ -947,6 +947,10 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
   # Offload the layer boundaries, and keep the Splash output and LSE of the
   # last 36 layers in HBM so backward skips their forward recompute (~16 ms
   # each). Split-boundary donation is what frees the HBM for these saves.
+  # Each saved layer costs ~1 GiB at the HBM peak. Measured at world 512: N=16,
+  # 24, 32, 36, 40 cut step time 1.0, 1.4, 1.9, 2.1, 2.3%; N=36 leaves ~6 GiB
+  # free and N=40 ~2 GiB. Lower N first if something else needs HBM (longer
+  # context, bigger batch).
   cfg.tpu_config.graph_trainer_memory_policy = "tpu_selective_and_offload"
   cfg.tpu_config.graph_trainer_save_last_n_layers = {
       "attention.inner_attention": 36

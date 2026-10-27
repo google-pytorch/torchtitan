@@ -81,7 +81,7 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
         f"graph_trainer_memory_policy={policy!r} does not support "
         "--tpu-config.use-scan-layers"
     )
-  resolve_save_regions(save_regions, last_n_layers)
+  resolve_save_regions(save_regions, last_n_layers, policy)
 
 
 def _maybe_use_maxtext_flops(

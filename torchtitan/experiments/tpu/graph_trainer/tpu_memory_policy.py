@@ -357,7 +357,9 @@ def select_saves(
 
 
 def resolve_save_regions(
-    save_regions: Sequence[str], last_n_layers: Mapping[str, int]
+    save_regions: Sequence[str],
+    last_n_layers: Mapping[str, int],
+    policy: str = "tpu_selective",
 ) -> list[SaveRegion]:
     """Check the save-region settings and return the regions they name.
 
@@ -370,7 +372,7 @@ def resolve_save_regions(
     names = [*save_regions, *last_n_layers]
     if not names:
         raise ValueError(
-            "graph_trainer_memory_policy='tpu_selective' needs a region in "
+            f"graph_trainer_memory_policy={policy!r} needs a region in "
             "graph_trainer_save_regions or graph_trainer_save_last_n_layers; "
             f"known regions: {known}."
         )
@@ -432,7 +434,11 @@ def _tpu_selective_and_offload_memory_policy_pass(
     """
     tpu_config = config.tpu_config
     last_n_layers = tpu_config.graph_trainer_save_last_n_layers
-    regions = resolve_save_regions(tpu_config.graph_trainer_save_regions, last_n_layers)
+    regions = resolve_save_regions(
+        tpu_config.graph_trainer_save_regions,
+        last_n_layers,
+        "tpu_selective_and_offload",
+    )
     save_nodes = select_saves(gm, regions, last_n_layers)
     # Tag full remat first, so the layer boundaries are the only saved values
     # and therefore the only ones the offload tagger can send to host.

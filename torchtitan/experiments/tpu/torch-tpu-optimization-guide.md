@@ -441,6 +441,10 @@ is set by `graph_trainer_memory_policy`:
   `compile.full_recompute_save_ops` does not reach the TPU trainer (a TPU recipe's `compile` is the
   base config, and the GraphTrainer conversion builds a fresh compile config carrying only the
   policy and the offload budget).
+- `tpu_selective_and_offload`: `tpu_selective`, plus offload of everything else that is saved (the
+  layer boundaries) to host memory as in `full_and_offload` (§9). The save-region values stay in
+  HBM. The Qwen3-235B graph-splitter recipe uses it to keep the Splash output of its last 36
+  layers on device.
 - `eager`: alternates matmuls between save and recompute, matching TorchTitan's eager selective AC.
 - `sac_and_offload`, `full_and_offload`, `full_and_scan_offload`: `default` or `full`, plus offload
   of saved activations to host memory (§9).
@@ -448,7 +452,8 @@ is set by `graph_trainer_memory_policy`:
 Exceptions that matter for the memory budget: under every policy, FSDP all-gather outputs are
 force-saved only under ZeRO-2 (`fsdp_reshard_after_forward="never"`), because that is what "do not
 reshard" means; under ZeRO-3 the policy may recompute them. RNG ops (dropout) are saved by `full`
-and the policies built on it (`full_and_offload`, `full_and_scan_offload`, `tpu_selective`),
+and the policies built on it (`full_and_offload`, `full_and_scan_offload`, `tpu_selective`,
+`tpu_selective_and_offload`),
 because the graph path cannot replay their random state; under `default`, `eager` and
 `sac_and_offload` an RNG op inside a recompute region is a runtime error (no TPU recipe has
 dropout). Under scan, the MoE expert-count all-reduces are saved as well
@@ -621,6 +626,7 @@ Select it through the memory policy:
 |---|---|---|
 | `sac_and_offload` | unrolled graph or graph splitter | activations that selective recompute still saves |
 | `full_and_offload` | unrolled graph or graph splitter | saved layer boundaries under full recompute |
+| `tpu_selective_and_offload` | unrolled graph or graph splitter | saved layer boundaries; the `tpu_selective` save regions stay in HBM |
 | `full_and_scan_offload` | scan | the one stacked layer-input tensor |
 
 `graph_trainer_cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors

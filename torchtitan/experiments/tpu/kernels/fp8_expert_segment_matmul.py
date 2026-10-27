@@ -656,6 +656,56 @@ _fp8_swiglu_fwd.register_autograd(
 )
 
 
+# ---------------------------------------------------------------------------
+# Pre-quantized weights. Under scan FSDP every rank gathers each layer's whole
+# expert weight and then quantizes all of it -- the same work on every rank,
+# twice per step (forward and recompute). Instead each rank quantizes only its
+# own shard, with the global per-column scale (an all-gather of the shards'
+# column absmax), and the layer is gathered as FP8: 1/world of the
+# quantization work and half the gather bytes.
+# ---------------------------------------------------------------------------
+
+
+@pallas.jax_op("tt_experts::weight_col_amax")
+def _weight_col_amax(w: jax.Array) -> jax.Array:
+    """``[1, N]`` FP32 absmax of ``w[..., N]`` over all other axes."""
+    w2d = w.reshape(-1, w.shape[-1])
+    return jnp.max(jnp.abs(w2d), axis=0, keepdims=True).astype(jnp.float32)
+
+
+def _scale_from_amax(amax: jax.Array) -> jax.Array:
+    return fp8_scale.scale_from_amax(amax, FWD_DTYPE)
+
+
+@pallas.jax_op("tt_experts::weight_quant_fp8")
+def _weight_quant_fp8(w: jax.Array, amax: jax.Array) -> jax.Array:
+    """e4m3 ``w`` with per-column scale from ``amax [1, N]``."""
+    scale = _scale_from_amax(amax).reshape((1,) * (w.ndim - 1) + (-1,))
+    return (w.astype(jnp.float32) / scale).astype(FWD_DTYPE)
+
+
+def prequantize_weight_shard(
+    shard: torch.Tensor, all_gather
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantizes this rank's weight shard and gathers the FP8 layer.
+
+    Args:
+      shard: ``[E_local, K, N]`` this rank's experts of one layer (any float).
+      all_gather: gathers a tensor along dim 0 across the FSDP group.
+
+    Returns:
+      ``(rhs_q [E, K, N] float8_e4m3fn, rhs_scale [1, N] FP32)``, identical to
+      quantizing the gathered weight with `quantize_operands`.
+    """
+    shard = shard.detach()
+    amax = all_gather(_weight_col_amax(shard)).amax(dim=0, keepdim=True)
+    rhs_q = all_gather(_weight_quant_fp8(shard, amax))
+    rhs_scale = torch.clamp(
+        amax / float(jnp.finfo(FWD_DTYPE).max), min=fp8_scale.MIN_SCALE
+    )
+    return rhs_q, rhs_scale
+
+
 def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:
     static = (*fwd, *dlhs, *drhs)
     assert len(static) == 9, static
@@ -761,5 +811,6 @@ __all__ = [
     "fp8_paired_segment_matmul_pallas_2d",
     "fp8_segment_matmul_pallas_2d",
     "fp8_swiglu_segment_matmul_pallas_2d",
+    "prequantize_weight_shard",
     "quantize_operands",
 ]

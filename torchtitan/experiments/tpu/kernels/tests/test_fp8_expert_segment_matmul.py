@@ -382,6 +382,46 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertLess(_rel_err(d_gu, want_dgu), 0.1)
         self.assertLess(_rel_err(d_w, want_dw), 0.1)
 
+    def test_prequantize_weight_shard(self):
+        torch.manual_seed(2)
+        w = torch.randn(6, 256, 128, dtype=torch.bfloat16) * 0.05
+        w[:, :, 7] = 0  # an all-zero column gets the floored scale
+        (w_d,) = self._to_dev(w)
+
+        # One rank: the "all-gather" is the identity.
+        q, scale = fp8_esm.prequantize_weight_shard(w_d, lambda t: t)
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(q.shape), tuple(w.shape))
+        self.assertEqual(tuple(scale.shape), (1, 128))
+        # One scale per output column, shared by all experts.
+        want_scale = torch.clamp(
+            w.float().abs().amax(dim=(0, 1)).reshape(1, -1)
+            / torch.finfo(torch.float8_e4m3fn).max,
+            min=torch.finfo(torch.float32).tiny,
+        )
+        # TPU division may differ from CPU's in the last bit.
+        torch.testing.assert_close(scale.cpu(), want_scale, rtol=1e-6, atol=0)
+        self.assertLess(
+            _rel_err(q.cpu().float() * scale.cpu(), _dequantized(w, (0, 1))),
+            5e-3,
+        )
+
+        # Two ranks holding the same shard: the column absmax is reduced over
+        # the gathered shards and the FP8 shards are gathered on dim 0.
+        half = w_d[:3]
+        q2, scale2 = fp8_esm.prequantize_weight_shard(
+            half, lambda t: torch.cat([t, t])
+        )
+        want_q2, want_scale2 = fp8_esm.prequantize_weight_shard(
+            torch.cat([half, half]), lambda t: t
+        )
+        torch.testing.assert_close(
+            scale2.cpu(), want_scale2.cpu(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            q2.cpu().float(), want_q2.cpu().float(), rtol=0, atol=0
+        )
+
 
 
 if __name__ == "__main__":

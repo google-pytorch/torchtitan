@@ -11,6 +11,10 @@ from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
+from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import (
+    fp8_paired_segment_matmul_pallas_2d,
+    fp8_swiglu_segment_matmul_pallas_2d,
+)
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
 )
@@ -131,6 +135,24 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
+        # Run all expert GEMMs on FP8 operands through tokamax's
+        # Mosaic GMM/TGMM (MaxText `fp8_full` numerics). W1/W3 run as one
+        # paired GEMM; SwiGLU, its FP8 cast and W2 run as one op on the
+        # unsplit [gate | up], so the BF16 hidden never reaches HBM. Takes
+        # precedence over the BF16 single and paired Pallas paths.
+        use_fp8_grouped_mm: bool = False
+        # (tile_m, tile_k, tile_n) per FP8 GEMM, in each kernel's operand
+        # order -- forward (M, K, N), dInput (M, N, K), dWeight (M, K, N) --
+        # where a zero K/N tile selects the full dimension. W1/W3 run as one
+        # paired GEMM over [W1 | W3], so their N is 2F; the N (forward) and
+        # K-out (dInput) tiles keep each step's VMEM near the unpaired
+        # kernels'. Otherwise these follow MaxText's Qwen3-235B v7x fp8 tiles.
+        fp8_w13_tilings: tuple[
+            tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]
+        ] = ((512, 0, 1536), (512, 0, 2048), (1024, 1024, 0))
+        fp8_w2_tilings: tuple[
+            tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]
+        ] = ((512, 0, 0), (512, 0, 0), (512, 768, 0))
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -171,7 +193,13 @@ class TpuGroupedExperts(GroupedExperts):
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._use_transposed_w2_rhs = False
+        self.use_fp8_grouped_mm = config.use_fp8_grouped_mm
+        self.fp8_w13_tilings = config.fp8_w13_tilings
+        self.fp8_w2_tilings = config.fp8_w2_tilings
         self._native_sharding_applied = False
+
+        if self.use_fp8_grouped_mm and not self.use_pallas_grouped_mm:
+            raise ValueError("FP8 grouped matmul requires use_pallas_grouped_mm")
 
         if self.use_pallas_paired_grouped_mm:
             if not self.use_pallas_grouped_mm:
@@ -342,6 +370,15 @@ class TpuGroupedExperts(GroupedExperts):
             w2_tgmm_tiling = (
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
+        if self.use_fp8_grouped_mm:
+            if self._use_transposed_w2_rhs:
+                raise NotImplementedError(
+                    "FP8 grouped matmul does not support the transposed W2 RHS"
+                    " used for uneven SimpleFSDP expert sharding"
+                )
+            return self._fp8_experts_forward(
+                x_bf16, w1_EKN, w2_EKN, w3_EKN, num_tokens_per_expert_E
+            )[:num_rows].type_as(x_RD)
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16
@@ -392,6 +429,36 @@ class TpuGroupedExperts(GroupedExperts):
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
 
+    def _fp8_experts_forward(
+        self,
+        x_RD: torch.Tensor,
+        w1_EKN: torch.Tensor,
+        w2_EKN: torch.Tensor,
+        w3_EKN: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """SwiGLU experts with every GEMM on FP8 operands (BF16 in and out)."""
+
+        fwd, dlhs, drhs = self.fp8_w13_tilings
+        gate_up_RF2 = fp8_paired_segment_matmul_pallas_2d(
+            x_RD,
+            w1_EKN.bfloat16(),
+            w3_EKN.bfloat16(),
+            num_tokens_per_expert_E,
+            fwd_tiling=fwd,
+            dlhs_tiling=dlhs,
+            drhs_tiling=drhs,
+            split=False,
+        )
+        fwd, dlhs, drhs = self.fp8_w2_tilings
+        return fp8_swiglu_segment_matmul_pallas_2d(
+            gate_up_RF2,
+            w2_EKN.bfloat16(),
+            num_tokens_per_expert_E,
+            fwd_tiling=fwd,
+            dlhs_tiling=dlhs,
+            drhs_tiling=drhs,
+        )
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):
     """Select the TPU grouped-expert implementation before construction."""

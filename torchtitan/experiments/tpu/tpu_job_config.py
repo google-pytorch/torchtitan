@@ -47,11 +47,12 @@ class GraphSplitterConfig:
   # or repeating recompute, so it is intentionally outside this splitter.
   backward_layers_per_executable: int = 1
   # Reuse dead internal split-boundary buffers through XLA input donation.
-  # This should default to True: last-use donation is preferable and is safe
-  # unless reusable-buffer identification is wrong. It remains False until
-  # TorchTPU includes donation in its compilation cache key (torch_tpu#3614).
-  # Original graph inputs and forward-saved tensors are never candidates.
-  donate_internal_buffers: bool = False
+  # Without it, every executable queued ahead of the device reserves fresh
+  # HBM for its outputs at enqueue time. TorchTPU includes donation in its
+  # compilation cache key (torch_tpu#3614 is fixed). Original graph inputs
+  # and forward-saved tensors are never candidates. Keep the opt-out for
+  # diagnostics.
+  donate_internal_buffers: bool = True
   # Number of complete backward child executables by which to advance each H2D
   # reload pair relative to its first consumer. Zero keeps the pair in the
   # consumer child; one places it in the immediately preceding child and carries

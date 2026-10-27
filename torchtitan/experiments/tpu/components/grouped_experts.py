@@ -14,6 +14,7 @@ from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
 from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import (
     fp8_paired_segment_matmul_pallas_2d,
     fp8_swiglu_segment_matmul_pallas_2d,
+    prequantize_weight_shard,
 )
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
@@ -157,6 +158,12 @@ class TpuGroupedExperts(GroupedExperts):
         # GMM v2) instead of in standalone XLA amax/cast passes. Needs an
         # FP8 x FP8 MXU (v7x); GMM v2 rejects it on earlier TPUs.
         fp8_w13_fused_lhs_quant: bool = False
+        # Under the scan's FSDP, quantize each rank's shard of the expert
+        # weights (with the global per-column scale) and all-gather FP8
+        # instead of gathering BF16 and quantizing the whole layer on every
+        # rank. The scan body fills the ``fp8_*_q``/``_scale`` buffers; the
+        # unrolled path, where they stay empty, quantizes as before.
+        fp8_gather_quantized_weights: bool = False
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -201,7 +208,30 @@ class TpuGroupedExperts(GroupedExperts):
         self.fp8_w13_tilings = config.fp8_w13_tilings
         self.fp8_w2_tilings = config.fp8_w2_tilings
         self.fp8_w13_fused_lhs_quant = config.fp8_w13_fused_lhs_quant
+        self.fp8_gather_quantized_weights = config.fp8_gather_quantized_weights
         self._native_sharding_applied = False
+
+        if self.fp8_gather_quantized_weights:
+            if not (
+                self.use_fp8_grouped_mm and self.use_kernel_native_weight_layout
+            ):
+                raise ValueError(
+                    "fp8_gather_quantized_weights needs use_fp8_grouped_mm and "
+                    "the kernel-native weight layout"
+                )
+            # Empty placeholders, replaced per layer through `functional_call`
+            # by the scan body (see `scan_prequantize_groups`).
+            for key in self.scan_prequantize_groups():
+                self.register_buffer(
+                    f"{key}_q",
+                    torch.empty(0, dtype=torch.float8_e4m3fn),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    f"{key}_scale",
+                    torch.empty(0, dtype=torch.float32),
+                    persistent=False,
+                )
 
         if self.use_fp8_grouped_mm and not self.use_pallas_grouped_mm:
             raise ValueError("FP8 grouped matmul requires use_pallas_grouped_mm")
@@ -323,6 +353,34 @@ class TpuGroupedExperts(GroupedExperts):
         if self.activation == "gelu_tanh":
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
+
+    def scan_prequantize_groups(self) -> dict[str, tuple[str, ...]]:
+        """Buffer prefix -> the weights quantized together as one FP8 tensor.
+
+        Read by the scan body (``LayerStack.run``) on modules that set
+        ``fp8_gather_quantized_weights``: each group's shards are concatenated
+        on the last axis, quantized by `scan_prequantize`, and passed in as
+        ``<prefix>_q`` / ``<prefix>_scale``.
+        """
+        if not self.fp8_gather_quantized_weights:
+            return {}
+        return {"fp8_w13": ("w1_EDF", "w3_EDF"), "fp8_w2": ("w2_EFD",)}
+
+    @staticmethod
+    def scan_prequantize(
+        shard: torch.Tensor, all_gather
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(e4m3 [E, K, N], FP32 scale [1, N])`` from one shard."""
+        return prequantize_weight_shard(shard, all_gather)
+
+    def _prequantized(
+        self, key: str
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The scan body's FP8 weight and scale for ``key``, if it set them."""
+        q = getattr(self, f"{key}_q", None)
+        if q is None or q.numel() == 0:
+            return None, None
+        return q, getattr(self, f"{key}_scale")
 
     def forward(
         self,
@@ -459,6 +517,7 @@ class TpuGroupedExperts(GroupedExperts):
         """SwiGLU experts with every GEMM on FP8 operands (BF16 in and out)."""
 
         fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w13_tilings
+        w13_q, w13_scale = self._prequantized("fp8_w13")
         gate_up_RF2 = fp8_paired_segment_matmul_pallas_2d(
             x_RD,
             w1_EKN.bfloat16(),
@@ -469,8 +528,11 @@ class TpuGroupedExperts(GroupedExperts):
             drhs_tiling=drhs_tiling,
             split=False,
             fused_lhs_quant=self.fp8_w13_fused_lhs_quant,
+            rhs_q=w13_q,
+            rhs_scale=w13_scale,
         )
         fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w2_tilings
+        w2_q, w2_scale = self._prequantized("fp8_w2")
         return fp8_swiglu_segment_matmul_pallas_2d(
             gate_up_RF2,
             w2_EKN.bfloat16(),
@@ -478,6 +540,8 @@ class TpuGroupedExperts(GroupedExperts):
             fwd_tiling=fwd_tiling,
             dlhs_tiling=dlhs_tiling,
             drhs_tiling=drhs_tiling,
+            rhs_q=w2_q,
+            rhs_scale=w2_scale,
         )
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):

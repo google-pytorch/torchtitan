@@ -1135,6 +1135,13 @@ def qwen3_moe_235b_scan_torchao_float8() -> TPUTrainerConfig:
   """
   cfg = qwen3_moe_235b_scan()
   assert cfg.model_spec is not None
+  # Convert only the attention projections (wqkv/wo); the routed experts are
+  # grouped matmuls, not linears. filter_fqns entries match as substrings of a
+  # linear's FQN and keep it in BF16:
+  # * router.gate: its logits pick each token's top-k experts, so FP8 error can
+  #   flip routing, and it is tiny (dim x num_experts). The converter also
+  #   rejects router gates that are not filtered out.
+  # * lm_head: its error lands directly on the vocab logits and the loss.
   converter = TpuFloat8LinearConverter.Config(
       recipe_name="rowwise", filter_fqns=["router.gate", "lm_head"]
   ).build()

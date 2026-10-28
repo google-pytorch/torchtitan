@@ -38,6 +38,8 @@ from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
+    TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
@@ -656,6 +658,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
+          TpuRoutedExpertsConverter.Config(),
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
@@ -730,6 +733,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     experts.use_kernel_native_weight_layout = True
+  _scale_routes_before_down_proj(cfg)
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.
   cfg.training.max_context_length = 2048
@@ -830,21 +834,13 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   # policy choice, not a numerics-preserving optimization; keep it out of the
   # default recipe pending a longer convergence comparison.
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
   return cfg
 
 
 def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TPUTrainerConfig:
   """Q30 benchmark with MaxText's numerics and FLOP accounting.
 
-  The attention-parity benchmark (BF16 RoPE, fused route-score backward) plus
+  The attention-parity benchmark (BF16 RoPE) plus
   BF16 gradient reduction, matching the other ``*maxtext*`` recipes, and
   MaxText FLOPs, so its MFU is comparable with MaxText's published Q30 numbers.
   """
@@ -852,6 +848,16 @@ def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TPUTrainerConfig:
   cfg.training.mixed_precision_reduce = "bfloat16"
   _use_maxtext_flops(cfg)
   return cfg
+
+
+def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
+  """Apply routing scores before W2 so remat does not replay the W2 forward."""
+  assert cfg.model_spec is not None
+  routed = list(cfg.model_spec.model.traverse(TpuRoutedExperts.Config))
+  if not routed:
+    raise ValueError("Scaling routes before W2 needs TpuRoutedExperts")
+  for _, config, _, _ in routed:
+    config.scale_before_down_proj = True
 
 
 def _fuse_route_score_backward(cfg: TPUTrainerConfig) -> None:
@@ -889,6 +895,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
+          TpuRoutedExpertsConverter.Config(),
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
@@ -897,7 +904,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
-  _fuse_route_score_backward(cfg)
+  _scale_routes_before_down_proj(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):

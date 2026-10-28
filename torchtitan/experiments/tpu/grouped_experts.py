@@ -204,6 +204,12 @@ class TpuGroupedExperts(GroupedExperts):
 
         if self.use_fp8_grouped_mm and not self.use_pallas_grouped_mm:
             raise ValueError("FP8 grouped matmul requires use_pallas_grouped_mm")
+        if self.use_fp8_grouped_mm and self.activation != "silu":
+            # The fused SwiGLU + W2 op always computes silu(gate) * up.
+            raise ValueError(
+                "FP8 grouped matmul supports only the silu activation, got"
+                f" {self.activation!r}"
+            )
 
         if self.use_pallas_paired_grouped_mm:
             if not self.use_pallas_grouped_mm:

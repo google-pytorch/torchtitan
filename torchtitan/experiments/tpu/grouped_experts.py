@@ -458,26 +458,26 @@ class TpuGroupedExperts(GroupedExperts):
     ) -> torch.Tensor:
         """SwiGLU experts with every GEMM on FP8 operands (BF16 in and out)."""
 
-        fwd, dlhs, drhs = self.fp8_w13_tilings
+        fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w13_tilings
         gate_up_RF2 = fp8_paired_segment_matmul_pallas_2d(
             x_RD,
             w1_EKN.bfloat16(),
             w3_EKN.bfloat16(),
             num_tokens_per_expert_E,
-            fwd_tiling=fwd,
-            dlhs_tiling=dlhs,
-            drhs_tiling=drhs,
+            fwd_tiling=fwd_tiling,
+            dlhs_tiling=dlhs_tiling,
+            drhs_tiling=drhs_tiling,
             split=False,
             fused_lhs_quant=self.fp8_w13_fused_lhs_quant,
         )
-        fwd, dlhs, drhs = self.fp8_w2_tilings
+        fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w2_tilings
         return fp8_swiglu_segment_matmul_pallas_2d(
             gate_up_RF2,
             w2_EKN.bfloat16(),
             num_tokens_per_expert_E,
-            fwd_tiling=fwd,
-            dlhs_tiling=dlhs,
-            drhs_tiling=drhs,
+            fwd_tiling=fwd_tiling,
+            dlhs_tiling=dlhs_tiling,
+            drhs_tiling=drhs_tiling,
         )
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):

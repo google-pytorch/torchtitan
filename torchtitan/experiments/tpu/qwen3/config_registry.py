@@ -1210,6 +1210,9 @@ def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
     experts.use_fp8_grouped_mm = True
     # In-kernel W1/W3 lhs quantization needs v7x, which this recipe targets.
     experts.fp8_w13_fused_lhs_quant = True
+    # Each rank quantizes its FSDP shard of the expert weights and the scan
+    # body all-gathers FP8 instead of BF16.
+    experts.fp8_gather_quantized_weights = True
   # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2, so
   # keep the score multiply after the experts, with its backward in one FP32
   # fusion.

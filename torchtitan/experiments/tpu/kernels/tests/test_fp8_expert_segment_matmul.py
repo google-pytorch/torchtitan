@@ -382,6 +382,90 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertLess(_rel_err(d_gu, want_dgu), 0.1)
         self.assertLess(_rel_err(d_w, want_dw), 0.1)
 
+    def test_prequantize_weight_shard(self):
+        torch.manual_seed(2)
+        w = torch.randn(6, 256, 128, dtype=torch.bfloat16) * 0.05
+        w[:, :, 7] = 0  # an all-zero column gets the floored scale
+        (w_d,) = self._to_dev(w)
+
+        # One rank: the "all-gather" is the identity.
+        q, scale = fp8_esm.prequantize_weight_shard(w_d, lambda t: t)
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(q.shape), tuple(w.shape))
+        self.assertEqual(tuple(scale.shape), (1, 128))
+        # One scale per output column, shared by all experts.
+        want_scale = torch.clamp(
+            w.float().abs().amax(dim=(0, 1)).reshape(1, -1)
+            / torch.finfo(torch.float8_e4m3fn).max,
+            min=torch.finfo(torch.float32).tiny,
+        )
+        # TPU division may differ from CPU's in the last bit.
+        torch.testing.assert_close(scale.cpu(), want_scale, rtol=1e-6, atol=0)
+        self.assertLess(
+            _rel_err(q.cpu().float() * scale.cpu(), _dequantized(w, (0, 1))),
+            5e-3,
+        )
+
+        # Two ranks holding the same shard: the column absmax is reduced over
+        # the gathered shards and the FP8 shards are gathered on dim 0.
+        half = w_d[:3]
+        q2, scale2 = fp8_esm.prequantize_weight_shard(
+            half, lambda t: torch.cat([t, t])
+        )
+        want_q2, want_scale2 = fp8_esm.prequantize_weight_shard(
+            torch.cat([half, half]), lambda t: t
+        )
+        torch.testing.assert_close(
+            scale2.cpu(), want_scale2.cpu(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            q2.cpu().float(), want_q2.cpu().float(), rtol=0, atol=0
+        )
+
+    @parameterized.parameters(False, True)
+    def test_prequantized_weights_match(self, fused_lhs_quant):
+        lhs, rhs_a, dout, sizes = self._operands(k=512)
+        rhs_b = rhs_a.flip(0) * 0.5
+        w2 = rhs_a.transpose(1, 2).contiguous()[:, :256] * 0.5
+        dev = self.accelerator_device
+        dout2 = torch.randn(lhs.shape[0], w2.shape[-1], dtype=torch.bfloat16)
+
+        def run(prequantize):
+            x, a, b, w = self._to_dev(lhs, rhs_a, rhs_b, w2, grad=True)
+            kwargs13, kwargs2 = {}, {}
+            if prequantize:
+                # One rank: the "all-gather" is the identity.
+                q13, s13 = fp8_esm.prequantize_weight_shard(
+                    torch.cat([a, b], dim=-1), lambda t: t
+                )
+                q2, s2 = fp8_esm.prequantize_weight_shard(w, lambda t: t)
+                self.assertEqual(q13.dtype, torch.float8_e4m3fn)
+                kwargs13 = dict(rhs_q=q13, rhs_scale=s13)
+                kwargs2 = dict(rhs_q=q2, rhs_scale=s2)
+            gate_up = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+                x,
+                a,
+                b,
+                sizes.to(dev),
+                split=False,
+                fused_lhs_quant=fused_lhs_quant,
+                **kwargs13,
+                **_TILINGS,
+            )
+            out = fp8_esm.fp8_swiglu_segment_matmul_pallas_2d(
+                gate_up, w, sizes.to(dev), **kwargs2, **_TILINGS
+            )
+            grads = torch.autograd.grad(out, (x, a, b, w), dout2.to(dev))
+            return out, grads
+
+        with _skip_if_no_fp8_mxu(self):
+            out, grads = run(prequantize=True)
+        want, want_grads = run(prequantize=False)
+        # Quantizing the shard with the gathered column scale gives the same
+        # FP8 weight as quantizing the gathered weight.
+        torch.testing.assert_close(out.cpu(), want.cpu(), rtol=0, atol=0)
+        for got, ref in zip(grads, want_grads):
+            torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

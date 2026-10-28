@@ -1,12 +1,8 @@
 """Torchao float8 linear converter for TPU.
 
-`Float8LinearConverter` targets CUDA/ROCm, and two of its choices do not fit
-TPU:
-
-  1. Its constructor raises unless the device is NVIDIA SM89+ or AMD gfx942+.
-     TPU v7x has native float8 matmuls (TorchTPU lowers `torch._scaled_mm`).
-  2. torchao's recipes request `use_fast_accum=True` for the forward GEMM,
-     which TorchTPU's `_scaled_mm` rejects; see `TpuFloat8LinearConverter`.
+`Float8LinearConverter` targets CUDA/ROCm: its constructor raises unless the
+device is NVIDIA SM89+ or AMD gfx942+, whereas TPU v7x has native float8
+matmuls (TorchTPU lowers `torch._scaled_mm`).
 
 `TpuFloat8LinearConverter` builds the torchao config itself instead of patching
 the CUDA converter. The model swap (`convert`) is inherited, so the resulting
@@ -44,15 +40,9 @@ class TpuFloat8LinearConverter(Float8LinearConverter):
     # trading accuracy for speed. torchao enables it for the forward GEMM
     # (`gemm_config_output`) and keeps the two gradient GEMMs exact. TPU has no
     # such mode: its matmuls accumulate in FP32, and TorchTPU's `_scaled_mm`
-    # raises NotImplementedError for `use_fast_accum=True`
-    # (torch_tpu/csrc/ops/scaled_mm). Turning it off costs nothing on TPU and
-    # gives the forward GEMM the same accumulation as the gradient GEMMs.
-    self.torchao_config = dataclasses.replace(
-        torchao_config,
-        gemm_config_output=dataclasses.replace(
-            torchao_config.gemm_config_output, use_fast_accum=False
-        ),
-    )
+    # treats `use_fast_accum` as a no-op, giving the forward GEMM the same
+    # accumulation as the gradient GEMMs.
+    self.torchao_config = torchao_config
     if "auto_filter_small_kn" in config.filter_fqns:
       raise ValueError(
           "auto_filter_small_kn uses CUDA-tuned thresholds; list the FQNs to"

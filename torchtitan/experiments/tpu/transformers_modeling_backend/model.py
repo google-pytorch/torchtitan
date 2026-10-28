@@ -796,11 +796,13 @@ class TPUHFTransformerModel(HFTransformerModel):
     # (TorchTitan's init). This lane keeps the checkpoint's value instead
     # (update_from_config) so HF's *stock* init -- what runs when the patch
     # does not match: GPT-2, BERT, XLM-R -- uses 0.02 rather than 1.0. When
-    # the patch is what runs, restore TorchTitan's 1.0 for its duration.
+    # the patch is what runs, give it TorchTitan's 1.0 for the embedding only:
+    # overriding initializer_range itself would also reach model-specific
+    # _init_weights overrides (Flint's experts, router and attention sinks),
+    # which then start at std 1.0 -- a router saturated from step 0.
     patched = getattr(PreTrainedModel._init_weights, "__name__", "") == "_init_weights_patched"
-    saved = self.model.config.initializer_range
     if patched:
-      self.model.config.initializer_range = 1.0
+      self.model.config.embedding_init_std = 1.0
     # Sentinel: every parameter starts as NaN, so one the initializer never
     # wrote is detectable afterwards instead of training on to_empty garbage.
     # The base's Llama-like patch is installed on PreTrainedModel itself and
@@ -813,7 +815,7 @@ class TPUHFTransformerModel(HFTransformerModel):
     try:
       super().init_states(buffer_device=buffer_device)
     finally:
-      self.model.config.initializer_range = saved
+      self.model.config.__dict__.pop("embedding_init_std", None)
     self._init_untouched_parameters()
 
     # Titan MoE modules swapped in by moe_replacement stay on meta until the

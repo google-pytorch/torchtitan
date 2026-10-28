@@ -29,15 +29,9 @@ What changes for a reader:
   ``get_model_state_dict`` does not work on a stacked model.
   https://github.com/google-pytorch/torchtitan/issues/21
   https://github.com/google-pytorch/torchtitan/issues/23
-* Stacks whose axis 1 does not divide by the FSDP mesh degree (e.g. expert
-  stacks ``[n, E, X, ...]`` when the mesh degree exceeds ``E``) can be
-  flattened before sharding via ``LayerStackHolder.flatten_for(degree)`` into
-  ``[n, E*X, ...]``. This allows FSDP to shard along axis 1 instead of an inner
-  axis, avoiding transpose copies during all-gather and reduce-scatter.
-  Per-layer views in ``init_weights`` and ``state_dict()`` still see
-  ``[E, X, ...]`` via DTensors on split meshes, while the scan body gathers
-  contiguous rows and views them back to ``[E, X, ...]``. Live parameters (and
-  thus optimizer state) reflect the flattened shape.
+* A stack ``[n, E, X, ...]`` whose axis 1 the FSDP mesh outgrows (experts past
+  ``E`` ranks) is sharded on axes 1 and 2 of a split mesh; see
+  ``LayerStackHolder.shard_split_stacks``.
 
 Stacking happens in the model's ``__init__`` (:func:`with_tpu_stacked_layers`),
 which is always before FSDP shards anything.
@@ -51,14 +45,16 @@ import torch
 from torch import nn
 from torch._higher_order_ops.scan import scan
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
 from torch.func import functional_call
 
 from torchtitan.config import derive
+from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     gather_slice,
     plan_stacked_gathers,
     ScanFSDPSpec,
+    split_stack_spec,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_body_remat_window,
@@ -202,173 +198,121 @@ class LayerStackHolder(Module):
 
     def __init__(self):
         super().__init__()
-        # Original per-layer shape of each stack that `flatten_for` flattened,
-        # keyed by parameter name. Stacks not listed here are stored unchanged.
-        self.layer_shapes: dict[str, torch.Size] = {}
-        # Meshes used to view one layer of a flattened stack in its original
-        # shape, keyed by (FSDP mesh, size of the first per-layer axis).
-        self.split_meshes: dict[tuple[DeviceMesh, int], DeviceMesh] = {}
-
-    def flatten_for(self, degree: int) -> dict[str, torch.Size]:
-        """Flattens axes 1 and 2 of stacks that can't be sharded evenly on axis 1.
-
-        FSDP shards a stack ``[L, A, B, ...]`` on axis 1 when ``degree`` divides
-        ``A``, and the scan body then all-gathers each layer along its leading
-        axis without a transpose. Otherwise ``_shard_dim`` picks an inner axis,
-        and every gather and reduce-scatter in the body needs a transpose.
-        Storing the stack as ``[L, A*B, ...]`` makes axis 1 divisible again at
-        no cost, because the data is already contiguous.
-
-        A stack is flattened only when ``degree`` is a multiple of ``A`` and each
-        rank's shard stays within one index of ``A``, so that one layer can
-        still be viewed as ``[A, B, ...]`` (see ``as_layer_shape``).
-
-        This replaces the flattened parameters, so call it before sharding, while
-        the stacks are plain tensors and nothing else references them. Calling
-        it again with the same ``degree`` is a no-op.
-
-        Args:
-          degree: Number of ranks FSDP shards each stack across.
-
-        Returns:
-          A copy of ``layer_shapes``.
-        """
-
-        # Flatten `[L, dim1_len, dim2_len, ...]` only if each rank's shard of the
-        # flattened axis stays inside one entry of axis 1. Otherwise a layer
-        # can't be viewed in its original shape without a copy (see
-        # `as_layer_shape`).
-        def can_flatten(dim1_len: int, dim2_len: int) -> bool:
-            if dim1_len % degree == 0:  # Axis 1 already shards evenly.
-                return False
-            ranks_per_entry, rem = divmod(degree, dim1_len)
-            return rem == 0 and dim2_len % ranks_per_entry == 0
-
-        for name, param in list(self._parameters.items()):
-            # Flattened by an earlier call (`layer_shapes` is only set below).
-            if name in self.layer_shapes:
-                if not can_flatten(*self.layer_shapes[name][:2]):
-                    raise ValueError(
-                        f"{name} is already flattened to {list(param.shape)}, "
-                        f"which doesn't fit {degree} ranks"
-                    )
-                continue
-            # 2-D stacks (e.g. norm weights `[L, dim]`) have no axis 2 to merge.
-            if (
-                param is None
-                or param.dim() < 3
-                or not can_flatten(*param.shape[1:3])
-            ):
-                continue
-            if isinstance(param, DTensor):
-                # Already distributed by another parallelism; flattening would
-                # need a redistribute, so leave it as is.
-                continue
-            logger.info(
-                "Flattening %s from %s to %s to shard it over %d ranks",
-                name,
-                list(param.shape),
-                [param.shape[0], param.shape[1] * param.shape[2], *param.shape[3:]],
-                degree,
-            )
-            self.layer_shapes[name] = param.shape[1:]
-            # `view`, not `flatten`: on a non-contiguous stack `flatten`
-            # silently copies, and the new parameter would no longer share
-            # storage with the old one. `view` raises instead.
-            self._parameters[name] = nn.Parameter(
-                param.detach().view(
-                    param.shape[0], param.shape[1] * param.shape[2], *param.shape[3:]
-                ),
-                requires_grad=param.requires_grad,
-            )
-        return dict(self.layer_shapes)
+        # Each split mesh `shard_split_stacks` built -> the mesh it split.
+        self.split_meshes: dict[DeviceMesh, DeviceMesh] = {}
 
     def plan_shard_dims(self, degree: int) -> dict[str, int]:
-        """Returns the axis ``apply_simple_fsdp`` shards each stack on.
+        """The axis `apply_simple_fsdp` shards each stack on.
 
-        Read-only. The result reflects the stacks as currently stored, so call
-        ``flatten_for`` first. Covers every stack, so a missing key downstream
-        is a bug, not a default.
+        One axis cannot serve them all: dim 1 of an expert stack is
+        `num_experts` = 128, which caps FSDP at 128 ranks, while dim 1 of a
+        dense stack divides fine.
+
+        Covers every stack, so a missing key downstream is a bug, not a default.
         """
         return {
-            name: 1 if name in self.layer_shapes else _shard_dim(param, degree)
+            name: _shard_dim(param, degree)
             for name, param in self._parameters.items()
             if param is not None
         }
 
-    def build_split_meshes(self) -> None:
-        """Creates the meshes ``as_layer_shape`` uses.
+    def shard_split_stacks(self) -> None:
+        """Moves stacks whose axis 1 the FSDP mesh outgrows onto a split mesh.
 
-        For each flattened stack, splits the shard axis of its FSDP mesh into
-        ``(A, ranks // A)``. This creates process groups, so all ranks must call
-        it at the same point; call it right after ``apply_simple_fsdp``.
+        SimpleFSDP shards one axis. When a stack ``[L, A, B, ...]`` has fewer
+        entries ``A`` than ranks, ``_shard_dim`` picks an inner axis, and on
+        XLA:TPU every gather and reduce-scatter of it then pays a relayout.
+        If ``A`` divides the rank count ``n`` and ``n // A`` divides ``B``, this
+        re-places the stack on an ``(A, n // A)`` split of the FSDP axis as
+        ``(Shard(1), Shard(2))``. Rank ``r`` lands at ``(r // (n // A), r % (n
+        // A))``, so its shard is the ``r``-th contiguous block of ``[L, A*B,
+        ...]``, and ``gather_slice`` moves it as one flat collective over the
+        unsplit group. The parameter, its gradient and optimizer state keep
+        the logical shape, so init, checkpoints and DCP resharding see an
+        ordinary 2-D DTensor.
+
+        Creates process groups, so call it on every rank, right after
+        ``apply_simple_fsdp`` and before ``to_empty``: on meta, re-placing
+        moves no data.
         """
-        for name, shape in self.layer_shapes.items():
-            param = self._parameters.get(name)
-            if not isinstance(param, DTensor):
+        computations = getattr(self, "_simple_fsdp_parametrization_list", None)
+        if not computations or computations[0].mode == "replicate":
+            return
+        built: dict[tuple[DeviceMesh, int], DeviceMesh] = {}
+        for name, param in list(self._parameters.items()):
+            # Include Replicate: when every single axis is narrower than the
+            # mesh (e.g. 30B at 4k ranks, 235B at 8k), data_parallel downgrades
+            # Shard to Replicate even though axes 1 and 2 together divide.
+            if not (
+                isinstance(param, DTensor)
+                and param.ndim >= 3
+                and isinstance(param.placements[-1], (Shard, Replicate))
+                and param.device_mesh not in self.split_meshes
+            ):
                 continue
-            mesh, dim1_len = param.device_mesh, shape[0]
-            if (mesh, dim1_len) in self.split_meshes:
+            mesh, (dim1_len, dim2_len) = param.device_mesh, param.shape[1:3]
+            ranks = mesh.size(mesh.ndim - 1)
+            ranks_per_entry, rem = divmod(ranks, dim1_len)
+            if dim1_len % ranks == 0 or rem or dim2_len % ranks_per_entry:
                 continue
-            ranks_per_entry = mesh.size(mesh.ndim - 1) // dim1_len
-            axis = (mesh.mesh_dim_names or ("dp",))[-1]
-            base = f"{axis}_{dim1_len}x{ranks_per_entry}"
-            # pylint: disable-next=protected-access
-            self.split_meshes[(mesh, dim1_len)] = mesh._unflatten(
-                mesh.ndim - 1,
-                (dim1_len, ranks_per_entry),
-                (f"{base}_outer", f"{base}_inner"),
+            if not param.is_meta:
+                raise ValueError(
+                    f"{name} is already materialized; call shard_split_stacks() "
+                    "before to_empty"
+                )
+            if (mesh, dim1_len) not in built:
+                axis = (mesh.mesh_dim_names or ("dp",))[-1]
+                base = f"{axis}_{dim1_len}x{ranks_per_entry}"
+                # pylint: disable-next=protected-access
+                built[(mesh, dim1_len)] = mesh._unflatten(
+                    mesh.ndim - 1,
+                    (dim1_len, ranks_per_entry),
+                    (f"{base}_outer", f"{base}_inner"),
+                )
+                self.split_meshes[built[(mesh, dim1_len)]] = mesh
+            self._parameters[name] = nn.Parameter(
+                distribute_tensor(
+                    torch.empty(param.shape, dtype=param.dtype, device="meta"),
+                    built[(mesh, dim1_len)],
+                    (*param.placements[:-1], Shard(1), Shard(2)),
+                ),
+                requires_grad=param.requires_grad,
             )
+        if self.split_meshes:
+            for i, comp in enumerate(computations):
+                if not isinstance(comp, _SplitStackReplicateComputation):
+                    computations[i] = _SplitStackReplicateComputation(
+                        comp, self.split_meshes
+                    )
 
-    def as_layer_shape(self, name: str, layer: torch.Tensor) -> torch.Tensor:
-        """Returns ``layer``, one layer of stack ``name``, in its original shape.
 
-        Returns ``layer`` unchanged if the stack wasn't flattened. Otherwise the
-        result is a view, so writes to it update the stack. Used by weight
-        initialization and the state-dict hooks; the scan body reshapes plain
-        tensors instead (see ``LayerStack.run``).
+class _SplitStackReplicateComputation(ReplicateComputation):
+    """SimpleFSDP's parametrization, gathering split stacks flat.
 
-        A sharded layer is an ``[A*B, ...]`` DTensor with ``Shard(0)``. When
-        ``A`` is smaller than the mesh, no placement on a 1-D mesh describes it
-        as ``[A, B, ...]``. Splitting the shard axis into ``(A, ranks // A)``
-        describes the same local data as ``(Shard(0), Shard(1))``, without the
-        copy that ``redistribute`` would make.
-        """
-        shape = self.layer_shapes.get(name)
-        if shape is None:
-            return layer
-        if not isinstance(layer, DTensor):
-            return layer.view(shape)
-        # SimpleFSDP shards on the last mesh axis. Earlier axes, such as HSDP's
-        # replicate axis, are kept as they are.
-        *outer, last = layer.placements
-        if last != Shard(0):
-            raise ValueError(
-                f"expected SimpleFSDP's Shard(0) on the last mesh axis, got "
-                f"{layer.placements}"
-            )
-        mesh, (dim1_len, dim2_len) = layer.device_mesh, shape[:2]
-        ranks = mesh.size(mesh.ndim - 1)
-        ranks_per_entry = ranks // dim1_len
-        if ranks % dim1_len or dim2_len % ranks_per_entry:
-            raise ValueError(
-                f"{ranks} ranks don't split {list(shape)} by whole entries"
-            )
-        if (mesh, dim1_len) not in self.split_meshes:
-            # Not built lazily here: that creates process groups, and only the
-            # ranks that reach this line would join them, so the job hangs.
-            raise RuntimeError(
-                f"no split mesh for {name}; call build_split_meshes() on every "
-                "rank right after apply_simple_fsdp"
-            )
-        return DTensor.from_local(
-            layer.to_local().view(1, dim2_len // ranks_per_entry, *shape[2:]),
-            self.split_meshes[(mesh, dim1_len)],
-            (*outer, Shard(0), Shard(1)),
-            run_check=False,
-            shape=shape,
-            stride=torch.empty(shape, device="meta").stride(),
+    The unrolled loop reads the stacks through this. ``redistribute`` would
+    gather a split stack in two collectives, one per mesh axis; this runs the
+    one flat all-gather (and reduce-scatter back) over the unsplit group that
+    the scan body runs per layer. Everything else goes to SimpleFSDP.
+    """
+
+    def __init__(
+        self,
+        base: ReplicateComputation,
+        split_meshes: dict[DeviceMesh, DeviceMesh],
+    ):
+        self.__dict__.update(base.__dict__)
+        self.split_meshes = split_meshes
+
+    def replicate_compute(self, x: DTensor) -> torch.Tensor:
+        unsplit = self.split_meshes.get(x.device_mesh)
+        if unsplit is None:
+            return super().replicate_compute(x)
+        if getattr(self, "full_dtensor", False):
+            raise NotImplementedError("full_dtensor on a split stack")
+        spec = split_stack_spec(
+            unsplit, self.param_dtype, self.reduce_dtype, 1, x.shape
         )
+        return gather_slice(x.to_local(), spec)
 
 
 class StackedLayers(TpuLayerLoop):
@@ -514,8 +458,7 @@ class LayerStack:
             #
             # Registered by hand, because `setattr` would go through SimpleFSDP's
             # parametrization instead of the raw slot.
-            layer = self.holder.as_layer_shape(_mangle(name), stack[i])
-            view = nn.Parameter(layer, requires_grad=stack.requires_grad)
+            view = nn.Parameter(stack[i], requires_grad=stack.requires_grad)
             mod._parameters[attr] = view
             self._views[(i, name)] = view
         # Move the stacks aside while the views stand in for them. Both would
@@ -646,33 +589,12 @@ class LayerStack:
         """
         assert self._unregistered and not self._views_attached
         template = self.layers["0"]
-        # Original per-layer shape of each flattened stack, by per-layer name.
-        # The body views a gathered layer back to it. Stacks that weren't
-        # flattened aren't listed and pass through as they are.
-        layer_shapes = {
-            name: self.holder.layer_shapes[_mangle(name)]
-            for name in self.names
-            if _mangle(name) in self.holder.layer_shapes
-        }
-        # Ensure every flattened stack in the holder maps to a layer parameter.
-        # Otherwise, it would enter `body` still flattened without being reshaped.
-        unmatched = set(self.holder.layer_shapes) - {
-            _mangle(n) for n in layer_shapes
-        }
-        if unmatched:
-            raise RuntimeError(
-                f"flattened stacks with no layer name: {sorted(unmatched)}"
-            )
 
         def body(carry, params):
             # Layer 0's module stands in for every layer, one row at a time.
             # That is what makes the scan body a single traced graph instead of
             # n_layers of them. It has no parameters of its own to collide with,
             # because they were unregistered when the stacks were allocated.
-            params = {
-                n: t.view(layer_shapes[n]) if n in layer_shapes else t
-                for n, t in params.items()
-            }
             return functional_call(template, params, (carry, *args))
 
         # One [n_layers, *shape] stack per parameter, keyed by its mangled

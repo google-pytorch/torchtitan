@@ -1482,18 +1482,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     class DummyHolder(nn.Module):
       def __init__(self):
         super().__init__()
-        self.flattened_for = None
-        self.split_meshes_built = False
+        self.split_stacks_sharded = False
 
-      def flatten_for(self, degree: int) -> list[str]:
-        self.flattened_for = degree
-        return []
-
-      def plan_shard_dims(self, degree: int) -> dict[str, int]:
-        return {"w": 1}
-
-      def build_split_meshes(self) -> None:
-        self.split_meshes_built = True
+      def shard_split_stacks(self) -> None:
+        self.split_stacks_sharded = True
 
     class DummyModel(nn.Module):
       def __init__(self):
@@ -1509,9 +1501,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(called_with, [m])
     self.assertEqual(getattr(m.tok_embeddings, "_fsdp_shard_dim", None), 1)
     self.assertEqual(getattr(m.lm_head, "_fsdp_shard_dim", None), 1)
-    self.assertEqual(m.layer_stacks.flattened_for, 512)
-    self.assertEqual(getattr(m.layer_stacks, "_fsdp_shard_dim", None), {"w": 1})
-    self.assertTrue(m.layer_stacks.split_meshes_built)
+    self.assertTrue(m.layer_stacks.split_stacks_sharded)
 
 
 if __name__ == "__main__":

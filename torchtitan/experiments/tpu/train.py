@@ -21,7 +21,10 @@ import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
+from torchtitan.experiments.tpu.grad_norm import (
+    CompiledGradNorm,
+    clip_grad_norm_ as grad_norm_clip_grad_norm_,
+)
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
@@ -79,9 +82,15 @@ class TPUTrainer(torchtitan.train.Trainer):
         apply_compiled_optimizer(self)
 
   def _clip_grad_norm(self) -> torch.Tensor:
-    if self._compiled_grad_norm is None:
-      return super()._clip_grad_norm()
     parameters = [p for m in self.model_parts for p in m.parameters()]
+    if self._compiled_grad_norm is None:
+      return grad_norm_clip_grad_norm_(
+          parameters,
+          self.config.training.max_norm,
+          foreach=True,
+          pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+          ep_enabled=self.parallel_dims.ep_enabled,
+      )
     return self._compiled_grad_norm.clip_grad_norm_(
         parameters,
         self.config.training.max_norm,

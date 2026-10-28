@@ -6,13 +6,16 @@
 
 """Compiled gradient-norm helpers for TPU training."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+import math
 from typing import cast
 
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Placement
 
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
@@ -43,11 +46,26 @@ def _grad_signature(grads: list[torch.Tensor]) -> GradSignature:
   )
 
 
-def global_grad_norm(grads: list[torch.Tensor]) -> torch.Tensor:
-  """Compute the global L2 norm while preserving DTensor placement semantics."""
+def _mesh_groups(tensors: list[torch.Tensor]) -> list[list[int]]:
+  """Indices of ``tensors`` grouped by DTensor mesh; one group for one mesh.
+
+  ``get_total_norm`` and the foreach clip refuse to mix meshes, and stacks on a
+  split mesh (see ``graph_trainer/layer_stack.py``) put some gradients on a
+  second one. Plain tensors go with any single mesh, as they always have.
+  """
+  groups: dict[DeviceMesh | None, list[int]] = {}
+  for i, t in enumerate(tensors):
+    mesh = t.device_mesh if isinstance(t, DTensor) else None
+    groups.setdefault(mesh, []).append(i)
+  if len(groups.keys() - {None}) <= 1:
+    return [list(range(len(tensors)))]
+  return list(groups.values())
+
+
+def _total_norm(grads: list[torch.Tensor], norm_type: float) -> torch.Tensor:
   total_norm = torch.nn.utils.get_total_norm(
       grads,
-      norm_type=2.0,
+      norm_type=norm_type,
       error_if_nonfinite=False,
       foreach=True,
   )
@@ -55,6 +73,87 @@ def global_grad_norm(grads: list[torch.Tensor]) -> torch.Tensor:
     # get_total_norm leaves an internal partial scalar; full_tensor lowers its
     # global norm reduction here without gathering any gradient tensor.
     return total_norm.full_tensor()
+  return total_norm
+
+
+def global_grad_norm(
+    grads: list[torch.Tensor], norm_type: float = 2.0
+) -> torch.Tensor:
+  """Compute the global p-norm while preserving DTensor placement semantics.
+
+  With gradients on several meshes, each mesh's norm is made whole on its own
+  and the norms are combined by the same ``vector_norm`` that
+  ``get_total_norm`` applies to per-tensor norms (the max, for ``inf``).
+  """
+  norms = [
+      _total_norm([grads[i] for i in group], norm_type)
+      for group in _mesh_groups(grads)
+  ]
+  if len(norms) == 1:
+    return norms[0]
+  return torch.linalg.vector_norm(torch.stack(norms), norm_type)
+
+
+@torch.no_grad()
+def clip_grad_norm_(
+    parameters: torch.Tensor | Iterable[torch.Tensor],
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    pp_mesh: DeviceMesh | None = None,
+    ep_enabled: bool = False,
+) -> torch.Tensor:
+  """Eager ``dist_utils.clip_grad_norm_`` supporting multiple DTensor meshes."""
+  if ep_enabled:
+    return dist_utils.clip_grad_norm_(
+        parameters,
+        max_norm,
+        norm_type=norm_type,
+        error_if_nonfinite=error_if_nonfinite,
+        foreach=foreach,
+        pp_mesh=pp_mesh,
+        ep_enabled=True,
+    )
+  if isinstance(parameters, torch.Tensor):
+    parameters = [parameters]
+  else:
+    parameters = list(parameters)
+  with_grad = [p for p in parameters if p.grad is not None]
+  groups = _mesh_groups([cast(torch.Tensor, p.grad) for p in with_grad])
+  if len(groups) <= 1:
+    return dist_utils.clip_grad_norm_(
+        parameters,
+        max_norm,
+        norm_type=norm_type,
+        error_if_nonfinite=error_if_nonfinite,
+        foreach=foreach,
+        pp_mesh=pp_mesh,
+        ep_enabled=False,
+    )
+  param_groups = [[with_grad[i] for i in group] for group in groups]
+  norms = []
+  for group in param_groups:
+    norm = torch.nn.utils.get_total_norm(
+        [p.grad for p in group], norm_type, error_if_nonfinite, foreach
+    )
+    if isinstance(norm, DTensor):
+      norm = norm.full_tensor()
+    norms.append(norm)
+  total_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type)
+  if pp_mesh is not None:
+    if math.isinf(norm_type):
+      dist.all_reduce(
+          total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group()
+      )
+    else:
+      total_norm **= norm_type
+      dist.all_reduce(
+          total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group()
+      )
+      total_norm **= 1.0 / norm_type
+  for group in param_groups:
+    torch.nn.utils.clip_grads_with_norm_(group, max_norm, total_norm, foreach)
   return total_norm
 
 
@@ -107,10 +206,12 @@ class CompiledGradNorm:
     # bandwidth-bound eager foreach multiply. Capturing that mutation would
     # return every gradient and, without safe output donation, add a
     # model-sized copy-back or require rebinding every Parameter.grad.
-    torch.nn.utils.clip_grads_with_norm_(
-        parameters,
-        max_norm,
-        total_norm,
-        foreach=True,
-    )
+    with_grad = [p for p in parameters if p.grad is not None]
+    for group in _mesh_groups([p.grad for p in with_grad]):
+      torch.nn.utils.clip_grads_with_norm_(
+          [with_grad[i] for i in group],
+          max_norm,
+          total_norm,
+          foreach=True,
+      )
     return total_norm

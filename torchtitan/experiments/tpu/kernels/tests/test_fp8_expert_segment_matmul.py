@@ -84,7 +84,9 @@ class Fp8GmmTest(base_device_test.BaseAcceleratorDeviceTest):
             _GROUP_SIZES,
         )
         self.assertEqual(out.dtype, jnp.bfloat16)
-        self.assertLess(_rel_err(_to_torch(out), want), 5e-3)
+        # As in the torch-op test below: rounding differences, not the FP8
+        # quantization error (about 0.04 against exact FP32).
+        self.assertLess(_rel_err(_to_torch(out), want), 1e-2)
 
     def test_bwd_is_close_to_f32(self):
         lhs, rhs, dout, sizes = self._operands()
@@ -329,7 +331,12 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
                 sizes.to(dev),
                 split=False,
                 fused_lhs_quant=fused,
-                **_TILINGS,
+                fwd_tiling=_TILING,
+                dlhs_tiling=_TILING,
+                # tokamax's TGMM gives dY one scale per column over all rows
+                # and supports a dWeight K tile of at most that many rows
+                # (512 here), so do not take the full K = 1024.
+                drhs_tiling=(128, 256, 0),
             )
             grads = torch.autograd.grad(
                 out, (x, a, b), torch.cat([dout, dout], -1).to(dev)

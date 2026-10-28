@@ -1086,15 +1086,24 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   `num_tokens_per_microbatch_per_dp_rank` or config validation fails with a
   message that reads like a scan error.
   """
+  return _qwen3_moe_235b_scan(TpuTokenDispatcherConverter.Config())
+
+
+def _qwen3_moe_235b_scan(
+    token_dispatcher: TpuTokenDispatcherConverter.Config,
+    *,
+    scale_before_down_proj: bool = True,
+) -> TpuGraphTrainer.Config:
+  """`qwen3_moe_235b_scan` with the given token dispatcher converter."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
   cfg.model_spec = to_graph_trainer_model_spec(
       model_registry(
           "235B-A22B",
           attn_backend="sdpa",
           converters=[
-              TpuTokenDispatcherConverter.Config(),
-              TpuGroupedExpertsConverter.Config(),
               TpuRoutedExpertsConverter.Config(),
+              token_dispatcher,
+              TpuGroupedExpertsConverter.Config(),
           ],
       )
   )
@@ -1105,7 +1114,8 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   )
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
-  _scale_routes_before_down_proj(cfg)
+  if scale_before_down_proj:
+    _scale_routes_before_down_proj(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
@@ -1198,6 +1208,33 @@ def qwen3_moe_235b_scan_proxy() -> TpuGraphTrainer.Config:
   # token budgets. `qwen3_moe_235b_scan` leaves max_context_length at 4096.
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 1 * 4096
   cfg.training.num_tokens_per_train_step = 32 * 4096
+  return cfg
+
+
+def qwen3_moe_235b_scan_ep4() -> TpuGraphTrainer.Config:
+  """`qwen3_moe_235b_scan` with 4-way Ring-of-Experts expert parallelism.
+
+  Each layer's routed experts are split over EP groups of 4 ranks and FSDP-
+  sharded within each group's slice of experts. The token transport runs over 8
+  chunks so each chunk's EP all-gather and reduce-scatter overlap the other
+  chunks' grouped matmuls, and its buffer holds MaxText's 1.125x the routes a
+  rank expects, dropping any past that. A drop-free buffer is 4x larger and
+  does not fit next to the 235B state.
+
+  The extra scheduler flags help this transport but slow the FSDP-only recipe
+  (27.6 s to 28.1 s per step on 256 chips), so only this recipe sets them.
+  """
+  cfg = _qwen3_moe_235b_scan(
+      TpuTokenDispatcherConverter.Config(
+          num_moe_token_chunks=8, moe_capacity_factor=1.125
+      ),
+      scale_before_down_proj=False,
+  )
+  cfg.parallelism.expert_parallel_degree = 4
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      tpu_flags.EXPERIMENTAL_LATENCY_HIDING_SCHEDULER,
+  )
   return cfg
 
 

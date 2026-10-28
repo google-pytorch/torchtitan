@@ -87,6 +87,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_235b_fsdp_activation_offload_maxtext,
     qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_ep4,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
     reg_trainer_qwen3_8b,
@@ -250,13 +251,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with torch.device("meta"):
       self._qwen3_graph_config(config).model_spec.model.build()
 
-  def test_scanning_refuses_expert_parallelism(self) -> None:
-    config = qwen3_8b()
-    config.compile.use_scan_layers = True
-    config.parallelism.expert_parallel_degree = 2
+  def test_scanning_allows_expert_parallelism(self) -> None:
+    config = qwen3_moe_235b_scan()
+    config.parallelism.expert_parallel_degree = 8
 
-    with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
-      self._qwen3_graph_config(config)
+    graph_config = self._qwen3_graph_config(config)
+    self.assertEqual(graph_config.parallelism.expert_parallel_degree, 8)
 
   def test_regular_recipe_has_no_graph_compile_controls(self) -> None:
     config = llama3_debugmodel()
@@ -1139,6 +1139,56 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         16,
     )
     self.assertTrue(maxtext.compile.use_scan_layers)
+
+  def test_235b_ep4_recipe_adds_only_the_ep_transport_settings(self) -> None:
+    base = qwen3_moe_235b_scan()
+    ep4 = qwen3_moe_235b_scan_ep4()
+
+    self.assertEqual(base.parallelism.expert_parallel_degree, 1)
+    self.assertEqual(ep4.parallelism.expert_parallel_degree, 4)
+    scheduler = tpu_flags.EXPERIMENTAL_LATENCY_HIDING_SCHEDULER
+    self.assertEqual(
+        {name: ep4.libtpu_init_flags[name] for name in scheduler}, scheduler
+    )
+    self.assertFalse(set(scheduler) & set(base.libtpu_init_flags))
+    self.assertEqual(
+        {
+            name: value
+            for name, value in ep4.libtpu_init_flags.items()
+            if name not in scheduler
+        },
+        base.libtpu_init_flags,
+    )
+    # The GraphTrainer conversion rebuilds the model config from field values;
+    # the chunked experts and the dispatcher's capacity have to survive it.
+    graph_ep4 = self._qwen3_graph_config(ep4).model_spec.model
+    graph_base = self._qwen3_graph_config(base).model_spec.model
+    for config in (ep4.model_spec.model, graph_ep4):
+      experts = list(config.traverse(TpuRoutedExperts.Config))
+      self.assertLen(experts, 94)
+      self.assertTrue(
+          all(
+              e.num_moe_token_chunks == 8 and not e.scale_before_down_proj
+              for _, e, _, _ in experts
+          )
+      )
+      dispatchers = list(config.traverse(TpuAllToAllTokenDispatcher.Config))
+      self.assertLen(dispatchers, 94)
+      self.assertTrue(
+          all(d.capacity_factor == 1.125 for _, d, _, _ in dispatchers)
+      )
+    for config in (base.model_spec.model, graph_base):
+      experts = list(config.traverse(TpuRoutedExperts.Config))
+      self.assertLen(experts, 94)
+      self.assertTrue(
+          all(
+              e.num_moe_token_chunks == 1 and e.scale_before_down_proj
+              for _, e, _, _ in experts
+          )
+      )
+      dispatchers = list(config.traverse(TpuAllToAllTokenDispatcher.Config))
+      self.assertLen(dispatchers, 94)
+      self.assertTrue(all(d.capacity_factor is None for _, d, _, _ in dispatchers))
 
   def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
     config = ConfigManager().parse_args([

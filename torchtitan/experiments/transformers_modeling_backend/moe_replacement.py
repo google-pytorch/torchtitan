@@ -354,7 +354,10 @@ def _resolve_score_func(gate: nn.Module | None, config) -> str:
     if gate is not None and "e_score_correction_bias" in getattr(gate, "_buffers", {}):
         return "sigmoid"
 
-    scoring_func = getattr(config, "scoring_func", None)
+    # DeepSeek names it scoring_func, Flint router_score_function.
+    scoring_func = getattr(config, "scoring_func", None) or getattr(
+        config, "router_score_function", None
+    )
     if scoring_func is not None:
         if scoring_func in ("softmax", "sigmoid"):
             return scoring_func

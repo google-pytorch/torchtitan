@@ -255,6 +255,23 @@ class TestPrepareNativeMoeConfigs(unittest.TestCase):
         self.assertIsNotNone(params["shared_expert_info"])
         self.assertFalse(params["shared_expert_info"]["has_sigmoid_gate"])
 
+    def test_router_score_function_name(self):
+        """Flint names the scoring function router_score_function (DeepSeek: scoring_func)."""
+        from types import SimpleNamespace
+
+        from torchtitan.experiments.transformers_modeling_backend.moe_replacement import (
+            _resolve_score_func,
+        )
+
+        self.assertEqual(
+            _resolve_score_func(None, SimpleNamespace(router_score_function="sigmoid")),
+            "sigmoid",
+        )
+        self.assertEqual(
+            _resolve_score_func(None, SimpleNamespace(scoring_func="sigmoid")), "sigmoid"
+        )
+        self.assertEqual(_resolve_score_func(None, SimpleNamespace()), "softmax")
+
     def test_moe_config_build(self):
         """MoE.Config is built correctly from probed params."""
         model, config = _create_tiny_qwen3moe_model(num_hidden_layers=1)

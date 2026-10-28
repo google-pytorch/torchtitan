@@ -758,19 +758,31 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
 
 
 def raise_dynamo_recompile_limits(model_config) -> None:
+  """Size Dynamo's recompile limits from ``model_config.layers``.
+
+  Called by both TPU trainers before the first compiled forward. HF
+  transformers backend configs have no ``layers`` list; their TPU parallelize
+  calls ``raise_dynamo_recompile_limits_for_num_layers`` with the built model's
+  layer count instead.
+  """
+  raise_dynamo_recompile_limits_for_num_layers(
+      len(getattr(model_config, "layers", ()) or ())
+  )
+
+
+def raise_dynamo_recompile_limits_for_num_layers(num_layers: int) -> None:
   """Size Dynamo's recompile limits for per-layer compile under SimpleFSDP.
 
   Parametrization / AC wrapping gives every decoder layer its own module
   class, so Dynamo recompiles the shared checkpoint-wrapper ``forward`` once
-  per layer (a type guard miss, not a real recompile). torch's default
-  recompile_limit of 8 exactly fits the 8-layer debug models and fails hard
-  (fullgraph) at 52/80 layers. Called by both TPU trainers before the first
-  compiled forward.
+  per layer (a type guard miss, not a real recompile), and once more per layer
+  for validation, which runs under no_grad. torch's default recompile_limit of
+  8 exactly fits the 8-layer debug models and fails hard (fullgraph) at 52/80
+  layers.
   """
   import torch._dynamo.config as dynamo_config  # pylint: disable=g-import-not-at-top
 
-  n_layers = len(getattr(model_config, "layers", ()) or ())
-  wanted = max(64, 2 * n_layers + 16)
+  wanted = max(64, 2 * num_layers + 16)
   dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, wanted)
   dynamo_config.accumulated_recompile_limit = max(
       dynamo_config.accumulated_recompile_limit, 8 * wanted

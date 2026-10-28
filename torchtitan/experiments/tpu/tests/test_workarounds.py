@@ -1083,6 +1083,12 @@ class RaiseDynamoRecompileLimitsTest(parameterized.TestCase):
     dynamo_config.accumulated_recompile_limit = 256
     self.dynamo_config = dynamo_config
 
+  def test_num_layers_covers_train_and_validation_compiles(self):
+    workarounds.raise_dynamo_recompile_limits_for_num_layers(42)
+    self.assertEqual(self.dynamo_config.recompile_limit, 2 * 42 + 16)
+    self.assertEqual(self.dynamo_config.accumulated_recompile_limit,
+                     8 * (2 * 42 + 16))
+
   def test_config_without_layers_keeps_floor(self):
     import types  # pylint: disable=g-import-not-at-top
 

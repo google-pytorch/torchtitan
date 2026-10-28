@@ -397,14 +397,12 @@ def splash_attention_forward(
     if softcap is not None and softcap <= 0:
         softcap = None
     # Attention sinks (gpt-oss, Flint): one learned logit per head in the
-    # softmax denominator, handed over as ``s_aux``. The kernel cannot add it,
-    # so these models take the eager fallback below rather than silently
-    # training without their sinks.
+    # softmax denominator, handed over as ``s_aux``. The kernel adds it as an
+    # extra column (and returns its gradient); the eager fallback below keeps
+    # it too, so no path trains without the sinks.
     sinks = kwargs.pop("s_aux", None)
     window = _window(module, kwargs)
     reason = _unsupported(module, query, key, attention_mask, dropout, is_causal, window)
-    if reason is None and sinks is not None:
-        reason = "attention sinks (s_aux): the kernel has no sink term"
     if reason is not None:
         if not _tracing():
             _report(reason)
@@ -455,12 +453,12 @@ def splash_attention_forward(
     )
 
     out = _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                       dropout, kernel_kwargs, seg_desc, softcap=softcap)
+                       dropout, kernel_kwargs, seg_desc, softcap=softcap, sinks=sinks)
     return out, None
 
 
 def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                 dropout, kernel_kwargs, seg_desc, softcap=None):
+                 dropout, kernel_kwargs, seg_desc, softcap=None, sinks=None):
     """The kernel call: document-aware skipping, exact segment masking at
     token granularity, in-kernel PRNG dropout."""
     from torchtitan.experiments.tpu.kernels.splash_bias_dropout import (
@@ -517,14 +515,15 @@ def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
         # window of W keeps W (its FA2 path passes W - 1 the same way).
         local_window_size=None if window is None else window - 1,
         heads_first=True,
+        sinks=sinks,
     )
     if not _tracing():
         _log_once(
             "splash_tpu fired",
             "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d "
-            "causal=%s dropout=%s segment_ids=%s)",
+            "causal=%s dropout=%s segment_ids=%s sinks=%s)",
             query.shape[1], key.shape[1], query.shape[-2], query.shape[-1], is_causal,
-            dropout, seg_desc,
+            dropout, seg_desc, sinks is not None,
         )
     # HF's contract is (B, S, H, D) out (its own sdpa path transposes too),
     # while heads-first hands back (B, H, S, D) -- the same single transpose

@@ -212,7 +212,7 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
            # the arithmetic itself in fp32). Detection does not rest on grads:
            # with the cap dropped the LOSS is off by 6.2e-2 (tolerance 1e-2).
            grad_atol=2e-2, grad_rtol=5e-2),
-      # Flint: attention sinks (s_aux) take the eager fallback; the shrunk
+      # Flint: attention sinks (s_aux) go into the kernel; the shrunk
       # config keeps one dense and one MoE layer (sigmoid router + shared
       # expert, HF's own MoE block under this dense config), a sliding window,
       # and one RoPE / one no-RoPE layer.
@@ -223,7 +223,6 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
                  '"moe_intermediate_size": 64, "shared_expert_intermediate_size": 128, '
                  '"mlp_only_layers": [0], "no_rope_layer_indices": [0], "sliding_window": 33, '
                  '"layer_types": ["sliding_attention", "full_attention"]}'],
-           expected_fallbacks=("attention sinks (s_aux): the kernel has no sink term",),
            # At init the sinks are small (std 0.02): dropping them moves the
            # worst gradient by ~1.4e-3, inside the default 5e-3. The correct
            # path differs by ~1.5e-4, so a tighter bound catches a wrong sink term.
@@ -278,8 +277,8 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
     self.assertEqual(result["attn_impl"], "splash_tpu", "the device run did not select splash")
-    # A model the kernel cannot express (attention sinks) must take the
-    # adapter's eager fallback and say so; every other case must fire the kernel.
+    # A case the kernel cannot express must take the adapter's fallback and say
+    # so (expected_fallbacks); every other case must fire the kernel.
     self.assertEqual(result["fallbacks"], sorted(expected_fallbacks),
                      "unexpected splash adapter fallbacks")
     if not expected_fallbacks:

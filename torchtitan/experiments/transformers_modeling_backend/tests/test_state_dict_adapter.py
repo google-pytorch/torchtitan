@@ -41,10 +41,27 @@ _TEXT_MODEL_KEYS = (
     "model.lm_head.weight",
 )
 
+# TorchTitan FQNs of a tied-embedding HFTransformerModel wrapping a multimodal
+# ForConditionalGeneration as `model`.
+_MULTIMODAL_MODEL_KEYS = (
+    "model.model.language_model.embed_tokens.weight",
+    "model.model.language_model.layers.0.mlp.up_proj.weight",
+    "model.model.language_model.norm.weight",
+    "model.model.vision_tower.encoder.weight",
+    "model.lm_head.weight",
+)
+
 _TEXT_CHECKPOINT_KEYS = (
     "model.embed_tokens.weight",
     "model.layers.0.mlp.up_proj.weight",
     "model.norm.weight",
+)
+
+_MULTIMODAL_CHECKPOINT_KEYS = (
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.layers.0.mlp.up_proj.weight",
+    "model.language_model.norm.weight",
+    "model.vision_tower.encoder.weight",
 )
 
 
@@ -84,6 +101,27 @@ class TestHFTransformerStateDictAdapter(unittest.TestCase):
     def test_text_model_from_text_checkpoint(self):
         self._assert_round_trip(
             _TEXT_MODEL_KEYS, _TEXT_CHECKPOINT_KEYS, set(_TEXT_CHECKPOINT_KEYS)
+        )
+
+    def test_text_model_from_multimodal_checkpoint(self):
+        # The decoder is read from the checkpoint's language model; the vision
+        # tower is not requested.
+        expected = {k for k in _MULTIMODAL_CHECKPOINT_KEYS if "vision_tower" not in k}
+        for with_index in (False, True):
+            with self.subTest(with_index=with_index):
+                self._assert_round_trip(
+                    _TEXT_MODEL_KEYS,
+                    _MULTIMODAL_CHECKPOINT_KEYS,
+                    expected,
+                    with_index=with_index,
+                )
+
+    def test_multimodal_model_from_multimodal_checkpoint(self):
+        # Keys already match, so nothing is renamed and the tower is loaded.
+        self._assert_round_trip(
+            _MULTIMODAL_MODEL_KEYS,
+            _MULTIMODAL_CHECKPOINT_KEYS,
+            set(_MULTIMODAL_CHECKPOINT_KEYS),
         )
 
 

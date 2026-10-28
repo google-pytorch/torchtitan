@@ -46,6 +46,7 @@ from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
     TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
@@ -1207,6 +1208,15 @@ def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
       TpuGroupedExperts.Config
   ):
     experts.use_fp8_grouped_mm = True
+  # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2, so
+  # keep the score multiply after the experts, with its backward in one FP32
+  # fusion.
+  for _, routed, _, _ in cfg.model_spec.model.traverse(TpuRoutedExperts.Config):
+    routed.scale_before_down_proj = False
+  for _, dispatcher, _, _ in cfg.model_spec.model.traverse(
+      TpuAllToAllTokenDispatcher.Config
+  ):
+    dispatcher.fuse_route_score_backward = True
   return cfg
 
 

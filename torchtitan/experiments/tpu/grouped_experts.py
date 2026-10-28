@@ -380,6 +380,14 @@ class TpuGroupedExperts(GroupedExperts):
                     "FP8 grouped matmul does not support the transposed W2 RHS"
                     " used for uneven SimpleFSDP expert sharding"
                 )
+            if row_scale_R is not None:
+                # The fused SwiGLU + W2 op quantizes the hidden inside the
+                # kernel, so there is no BF16 hidden to scale before W2.
+                raise NotImplementedError(
+                    "FP8 grouped matmul does not support row_scale_R; keep the"
+                    " routing-score multiply after the experts"
+                    " (scale_before_down_proj=False)"
+                )
             return self._fp8_experts_forward(
                 x_bf16, w1_EKN, w2_EKN, w3_EKN, num_tokens_per_expert_E
             )[:num_rows].type_as(x_RD)

@@ -477,6 +477,59 @@ class TestFlattenedStacks(unittest.TestCase):
                 )
             torch.testing.assert_close(stack.to_local()[0], src.reshape(2, 3))
 
+    @unittest.mock.patch(
+        "torchtitan.distributed.parallel_dims.device_type", "cpu"
+    )
+    def test_ep_stacks_distribute_onto_sparse_mesh_and_gather_on_efsdp(self):
+        from torchtitan.distributed import ParallelDims  # pylint: disable=g-import-not-at-top
+
+        with _fake_pg(1024):
+            pdims = ParallelDims(
+                dp_replicate=1,
+                dp_shard=1024,
+                cp=1,
+                tp=1,
+                pp=1,
+                ep=8,
+                world_size=1024,
+            )
+            fsdp_mesh = pdims.get_mesh("fsdp")
+            holder = _holder()
+            holder.stash_expert_stacks_for_ep(pdims)
+            holder.flatten_for(1024)
+            data_parallel(
+                holder,
+                fsdp_mesh,
+                "fully_shard",
+                shard_dim=holder.plan_shard_dims(1024),
+            )
+            holder.build_split_meshes()
+
+            plan = plan_stacked_gathers(holder)
+            for name in Q235_STACKS:
+                param = holder._parameters[name]
+                if name.startswith("moe__experts__"):
+                    self.assertEqual(
+                        param.device_mesh.mesh_dim_names, ("efsdp", "ep")
+                    )
+                    self.assertEqual(
+                        tuple(param.placements), (Shard(2), Shard(1))
+                    )
+                    self.assertEqual(
+                        tuple(param.to_local().shape),
+                        (
+                            N_LAYERS,
+                            16,
+                            Q235_STACKS[name][2] // 128,
+                            Q235_STACKS[name][3],
+                        ),
+                    )
+                    self.assertTrue(plan[name].sharded)
+                    self.assertEqual(plan[name].gather_dim, 1)
+                elif name == "moe__router__gate__weight":
+                    self.assertIn(name, holder.layer_shapes)
+                    self.assertEqual(plan[name].gather_dim, 0)
+
 
 if __name__ == "__main__":
     absltest.main()

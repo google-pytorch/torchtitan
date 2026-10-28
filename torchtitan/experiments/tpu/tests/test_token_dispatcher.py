@@ -298,6 +298,8 @@ def test_converter_preserves_fields_and_is_idempotent():
     assert root.dispatcher.num_experts == 8
     assert root.dispatcher.top_k == 2
     assert not root.dispatcher.fuse_route_score_backward
+    # Drop-free unless a recipe opts into a capacity factor.
+    assert root.dispatcher.capacity_factor is None
 
     dispatcher = root.dispatcher
     converter.convert(root)
@@ -365,3 +367,43 @@ def test_scale_before_down_proj_matches_scaling_the_output():
         ),
         scale_before_down_proj=True,
     ).build()
+
+
+def test_ep_dispatch_uses_ring_of_experts_by_default():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=4, top_k=2, capacity_factor=1.5
+    ).build()
+    dispatcher.ep_mesh = mock.sentinel.ep_mesh
+    args = (torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+    target = "torchtitan.experiments.tpu.token_dispatcher.ring_of_experts_dispatch"
+
+    with mock.patch(target, return_value=mock.sentinel.out) as dispatch:
+        assert dispatcher.dispatch(*args) is mock.sentinel.out
+
+    dispatch.assert_called_once_with(
+        *args[:3],
+        num_experts=4,
+        ep_mesh=mock.sentinel.ep_mesh,
+        capacity_factor=1.5,
+    )
+
+
+def test_ep_dispatch_all_to_all_transport_delegates():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=4, top_k=2, ep_transport="all_to_all"
+    ).build()
+    dispatcher.ep_mesh = mock.sentinel.ep_mesh
+    args = (torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+
+    with mock.patch.object(
+        AllToAllTokenDispatcher, "dispatch", return_value=mock.sentinel.out
+    ) as dispatch:
+        assert dispatcher.dispatch(*args) is mock.sentinel.out
+    dispatch.assert_called_once()
+
+
+def test_rejects_unknown_ep_transport():
+    with pytest.raises(ValueError, match="ep_transport"):
+        TpuAllToAllTokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport="ragged"
+        ).build()

@@ -17,6 +17,10 @@ def _route_score_grad_tpu(
     grad_output_ND: jax.Array,
     routed_output_ND: jax.Array,
 ) -> jax.Array:
+  # Prevent XLA MultiOutputFusion from fusing the caller's cotangent scaling
+  # (grad_output * scores) with this reduction, which would otherwise force the
+  # backward MoE combine collective to wait on forward MoE rematerialization.
+  grad_output_ND = jax.lax.optimization_barrier(grad_output_ND)
   return jnp.sum(
       grad_output_ND.astype(jnp.float32)
       * routed_output_ND.astype(jnp.float32),

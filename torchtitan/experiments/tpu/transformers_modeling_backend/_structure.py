@@ -23,6 +23,8 @@ _LAYER_PATHS = (
     ("transformer", "h"),           # GPT-2, Falcon
     ("decoder", "layers"),
     ("model", "encoder", "layers"),
+    ("esmc", "layers"),             # ESMC (ESM Cambrian)
+    ("esm", "encoder", "layer"),    # ESM
     ("encoder", "layer"),           # BERT family
     ("layers",),
 )
@@ -32,6 +34,8 @@ _EMBED_PATHS = (
     ("transformer", "wte"),
     ("embeddings", "word_embeddings"),
     ("model", "embeddings", "word_embeddings"),
+    ("esmc", "embed_tokens"),       # ESMC (ESM Cambrian)
+    ("esm", "embeddings", "word_embeddings"),
     ("shared",),
 )
 _NORM_PATHS = (
@@ -41,6 +45,9 @@ _NORM_PATHS = (
     ("model", "final_layernorm"),
     ("model", "final_norm"),      # ModernBERT
     ("vit", "layernorm"),         # ViT
+    ("esmc", "norm"),             # ESMC (ESM Cambrian)
+    ("esm", "encoder", "emb_layer_norm_after"),  # ESM-1b / ESM-2
+    ("encoder", "emb_layer_norm_after"),
     ("encoder", "final_layer_norm"),
     ("norm",),
 )
@@ -203,6 +210,7 @@ _POS_EMBED_PATHS = (
     ("model", "embeddings", "position_embeddings"),
     ("bert", "embeddings", "position_embeddings"),
     ("roberta", "embeddings", "position_embeddings"),   # RoBERTa, XLM-R
+    ("esm", "embeddings", "position_embeddings"),       # ESM-1b / ESM-2
     ("distilbert", "embeddings", "position_embeddings"),
     ("electra", "embeddings", "position_embeddings"),
 )

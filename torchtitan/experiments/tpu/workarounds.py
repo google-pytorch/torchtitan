@@ -14,7 +14,8 @@ SPLASH_KEYS = {
     "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute",
     "block_q_dq", "block_kv_dq", "use_fused_bwd_kernel",
     "use_vmap_bwd", "use_document_aware_block_skipping",
-    "q_layout", "k_layout", "v_layout"
+    "q_layout", "k_layout", "v_layout",
+    "use_base2_exp", "use_experimental_scheduler",
 }
 
 

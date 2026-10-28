@@ -64,6 +64,8 @@ _SBD_KERNEL_KWARGS = {
     "block_kv_dkv": "block_kv_dkv",
     "block_kv_dkv_compute": "block_kv_dkv_compute",
     "use_document_aware_block_skipping": "document_aware_skipping",
+    "use_base2_exp": "use_base2_exp",
+    "use_experimental_scheduler": "use_experimental_scheduler",
 }
 # Keys in ``_reported`` that are informational (the kernel ran); everything
 # else in that set is a fallback reason. Tests read this.
@@ -362,6 +364,23 @@ def _document_masked(module) -> bool:
     return getattr(cfg, "attn_mask_type", "causal") == "block_causal"
 
 
+class ContiguousTranspose12(torch.autograd.Function):
+    """``x.transpose(1, 2).contiguous()`` whose backward is contiguous too.
+
+    Autograd's gradient of ``transpose(...).contiguous()`` is a strided view
+    of ``grad_output``; on TPU that view costs a relayout copy inside the
+    consumer (measured on ESM-C: ``native_layer_norm_backward`` on q/k).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return x.transpose(1, 2).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output.transpose(1, 2).contiguous()
+
+
 def splash_attention_forward(
     module,
     query: torch.Tensor,
@@ -466,17 +485,20 @@ def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
     # the same `manual_seed` agree bit-for-bit. A frozen draw would be
     # invisible otherwise: dropout would still *look* applied, with one mask
     # reused for the whole run.
-    dropout_seed = torch.randint(
-        -(2**31), 2**31 - 1, (query.shape[0], 2), dtype=torch.int32, device=query.device
-    )
-    # torchtitan seeds every rank identically (weights and data order depend
-    # on it), so without a rank-dependent salt every data-parallel rank would
-    # drop the same (position, head) entries -- the kernel's docstring asks
-    # the caller to fold the rank in for exactly this reason. The salt is a
-    # rank constant, so it costs nothing in a captured graph.
-    salt = _seed_salt()
-    if salt:
-        dropout_seed = dropout_seed ^ salt
+    if dropout:
+        dropout_seed = torch.randint(
+            -(2**31), 2**31 - 1, (query.shape[0], 2), dtype=torch.int32, device=query.device
+        )
+        # torchtitan seeds every rank identically (weights and data order depend
+        # on it), so without a rank-dependent salt every data-parallel rank would
+        # drop the same (position, head) entries -- the kernel's docstring asks
+        # the caller to fold the rank in for exactly this reason. The salt is a
+        # rank constant, so it costs nothing in a captured graph.
+        salt = _seed_salt()
+        if salt:
+            dropout_seed = dropout_seed ^ salt
+    else:
+        dropout_seed = 0
     SbdConfig.update(dropout_rate=float(dropout), **blocks)
     # Set explicitly, None included: ``update`` skips None values, which would
     # leak one model's soft-cap into the next call that has none. The kernel
@@ -510,7 +532,7 @@ def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
     # HF's contract is (B, S, H, D) out (its own sdpa path transposes too),
     # while heads-first hands back (B, H, S, D) -- the same single transpose
     # the splash path above does, with three input copies saved.
-    return out.transpose(1, 2).contiguous()
+    return ContiguousTranspose12.apply(out)
 
 
 def register() -> None:

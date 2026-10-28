@@ -9,16 +9,12 @@ import os
 from typing import Literal, cast
 from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
-from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import (
-    default_adamw,
-    OptimizersContainer,
-)
+from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -30,6 +26,18 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
+)
+from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    model_registry as graph_trainer_model_registry,
+    to_graph_trainer_model_spec,
+    with_maxtext_flops,
+)
+from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
 import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
@@ -37,13 +45,15 @@ from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.token_dispatcher import (
-    TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
+    TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
     SplashAttentionKernelConfig,
     TPUConfig,
+    TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader, TPUGrainDataLoader
@@ -141,9 +151,11 @@ def _use_maxtext_flops(config: TPUTrainerConfig) -> None:
   mask; torchtitan does not discount causal sparsity.
   """
   assert config.model_spec is not None
-  config.model_spec.model = MaxTextQwen3Config.from_qwen3(
-      config.model_spec.model
-  )
+  model = config.model_spec.model
+  if isinstance(model, GraphTrainerQwen3Model.Config):
+    config.model_spec.model = with_maxtext_flops(model)
+  else:
+    config.model_spec.model = MaxTextQwen3Config.from_qwen3(model)
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -208,6 +220,18 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           steps=10,
       ),
   )
+
+
+def graph_trainer_qwen3_debugmodel() -> TpuGraphTrainer.Config:
+  """Qwen3 debug model using TPU GraphTrainer."""
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      qwen3_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
+  return config
 
 
 def qwen3_moe_testmodel() -> TPUTrainerConfig:
@@ -281,15 +305,13 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
           use_jax_profiler=False,
-          compile_optimizer=False,
-          compile_mode="layer",
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
+          materialize_forward_before_backward=True,
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
@@ -356,15 +378,14 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
           use_jax_profiler=True,
-          compile_mode="layer",
-          compile_grad_norm=True,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
+          materialize_forward_before_backward=True,
+          compile_grad_norm=True,
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
@@ -463,7 +484,7 @@ def _qwen3_dense_model_spec(flavor: str) -> ModelSpec:
   return model_spec
 
 
-def qwen3_8b() -> TPUTrainerConfig:
+def qwen3_8b() -> TpuGraphTrainer.Config:
   """Qwen3 8B model configuration for TPU."""
   model_spec = _qwen3_dense_model_spec("8B")
 
@@ -501,25 +522,14 @@ def qwen3_8b() -> TPUTrainerConfig:
           last_save_model_only=False,
       ),
       # GraphTrainer does not apply this eager AC config; its graph
-      # rematerialization policy is selected in TPUConfig below.
+      # rematerialization policy is selected on the final compile config below.
       activation_checkpoint=SelectiveAC.Config(),
-      tpu_config=TPUConfig(
-          use_graph_trainer=True,
-          compile_mode="aot_fx_trace",
-          compile_optimizer=True,
-          optimizer_in_graph=True,
-          graph_trainer_memory_policy="default",
-      ),
+      tpu_config=TPUConfig(),
       # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
       # libtpu 0.0.48; see cl/979992733), which segfaults in
       # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
-      ),
-      compile=CompileConfig(
-          enable=True,
-          backend="tpu",
-          components=["model"],
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
@@ -547,22 +557,31 @@ def qwen3_8b() -> TPUTrainerConfig:
       ),
   )
   _enable_pallas_cross_entropy(config)
-  return config
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      config, graph_trainer_model_registry
+  )
+  graph_config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="default",
+      optimizer_compile="in_graph",
+  )
+  return graph_config
 
 
-def qwen3_8b_zero3() -> TPUTrainerConfig:
+def qwen3_8b_zero3() -> TpuGraphTrainer.Config:
   """Qwen3 8B GraphTrainer recipe retaining sharded parameters after forward."""
   cfg = qwen3_8b()
   cfg.parallelism.fsdp_reshard_after_forward = "always"
-  cfg.tpu_config.graph_trainer_memory_policy = "full"
-  cfg.tpu_config.enable_graph_trainer_remat_schedule = True
-  cfg.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+  cfg.compile.memory_policy = "full"
+  cfg.compile.enable_remat_barriers = True
+  cfg.compile.fsdp_barrier_policy = "interleave"
   cfg.splash_attention_kernel.use_vmap_bwd = True
   cfg.splash_attention_kernel.sa_use_document_aware_block_skipping = False
   return cfg
 
 
-def qwen3_8b_maxtext_parity() -> TPUTrainerConfig:
+def qwen3_8b_maxtext_parity() -> TpuGraphTrainer.Config:
   """Qwen3 8B recipe matching currently available MaxText policies.
 
   MaxText keeps parameters sharded across its FSDP axis and rematerializes the
@@ -587,14 +606,14 @@ _QWEN3_DENSE_4X4X4_FLAGS = tpu_flags.merge_flags(
 )
 
 
-def qwen3_32b() -> TPUTrainerConfig:
+def qwen3_32b() -> TpuGraphTrainer.Config:
   """Qwen3 32B recipe for a tpu7x-4x4x4 slice.
 
   Uses the tuned Qwen3-8B Zero-3 policy: Zero-2 would keep all ~61 GiB of
   gathered BF16 weights resident.
   """
   cfg = qwen3_8b_zero3()
-  cfg.model_spec = _qwen3_dense_model_spec("32B")
+  cfg.model_spec = to_graph_trainer_model_spec(_qwen3_dense_model_spec("32B"))
   # Packed QKV removes the fused projection's interleaved-output relayouts:
   # -3.5% step time and -19.7 GiB peak HBM at local batch 8.
   cfg.model_spec.model = (
@@ -607,14 +626,14 @@ def qwen3_32b() -> TPUTrainerConfig:
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 8 * 4096
   cfg.training.num_tokens_per_train_step = 1024 * 4096
   # Prefetch beats interleave by 0.3-0.6% here for ~4 GiB more peak HBM.
-  cfg.tpu_config.graph_trainer_fsdp_schedule = "prefetch"
+  cfg.compile.fsdp_barrier_policy = "prefetch"
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, _QWEN3_DENSE_4X4X4_FLAGS
   )
   return cfg
 
 
-def qwen3_32b_4x8x8() -> TPUTrainerConfig:
+def qwen3_32b_4x8x8() -> TpuGraphTrainer.Config:
   """Qwen3 32B recipe for a tpu7x-4x8x8 slice (512 devices).
 
   At world 512 the w1/w3 gradient shards are 25600 / 512 = 50 rows. That is
@@ -627,16 +646,16 @@ def qwen3_32b_4x8x8() -> TPUTrainerConfig:
   cfg.training.num_tokens_per_train_step = 4096 * 4096
   # Before the w1/w3 rewrite, interleave beat prefetch here by 2.3% step time
   # and 56 GiB peak HBM.
-  cfg.tpu_config.graph_trainer_fsdp_schedule = "interleave"
-  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = (
+  cfg.compile.fsdp_barrier_policy = "interleave"
+  cfg.compile.fsdp_allreduce_slice_parameter_patterns = (
       "layers.*.feed_forward.w1.weight",
       "layers.*.feed_forward.w3.weight",
   )
-  cfg.tpu_config.fsdp_allreduce_slice_max_input_bytes = 25600 * 5120 * 4
+  cfg.compile.fsdp_allreduce_slice_max_input_bytes = 25600 * 5120 * 4
   return cfg
 
 
-def qwen3_32b_maxtext_parity() -> TPUTrainerConfig:
+def qwen3_32b_maxtext_parity() -> TpuGraphTrainer.Config:
   """Qwen3 32B recipe with MaxText's BF16 reductions and BF16 RoPE."""
   cfg = qwen3_32b()
   cfg.training.mixed_precision_reduce = "bfloat16"
@@ -645,7 +664,7 @@ def qwen3_32b_maxtext_parity() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_30b() -> TPUTrainerConfig:
+def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   """TPU specialization of the global-aux Qwen3 30B recipe."""
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
   cfg.optimizer.implementation = "foreach"
@@ -656,6 +675,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
+          TpuRoutedExpertsConverter.Config(),
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
@@ -673,22 +693,13 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       data_parallel_shard_degree=-1,
       expert_parallel_degree=128,
   )
-  cfg.tpu_config = TPUConfig(
-      use_graph_trainer=True,
-      compile_mode="aot_fx_trace",
-      graph_trainer_memory_policy="full",
-  )
+  cfg.tpu_config = TPUConfig()
   # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
   # libtpu 0.0.48; see cl/979992733), which segfaults in
   # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
   cfg.xla_flags = tpu_flags.merge_flags(
       cfg.xla_flags,
       xla_enable_hlo_sharding_v3=False,
-  )
-  cfg.compile = CompileConfig(
-      enable=True,
-      backend="tpu",
-      components=["model"],
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
@@ -704,10 +715,18 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
   )
   cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
   cfg.validator = Validator.Config(enable=False)
-  return cfg
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      cfg, graph_trainer_model_registry
+  )
+  graph_config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full",
+  )
+  return graph_config
 
 
-def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
+def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
   """Batch-6 FSDP128 baseline with local dropless expert dispatch."""
   cfg = qwen3_moe_30b()
   _enable_pallas_cross_entropy(cfg)
@@ -730,19 +749,23 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     experts.use_kernel_native_weight_layout = True
+  _scale_routes_before_down_proj(cfg)
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.
   cfg.training.max_context_length = 2048
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 6 * 2048
   cfg.training.num_tokens_per_train_step = 768 * 2048
   cfg.training.steps = 8
-  cfg.tpu_config = TPUConfig(
-      use_graph_trainer=True,
-      compile_mode="aot_fx_trace",
-      graph_trainer_memory_policy="tpu_selective",
-      graph_trainer_save_regions=("moe.routing", "attention.inner_attention"),
-      enable_graph_trainer_remat_schedule=True,
+  cfg.tpu_config = TPUConfig()
+  cfg.optimizer.implementation = "fused"
+  cfg.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      backend="tpu",
+      components=["model"],
+      memory_policy="tpu_selective",
+      save_regions=("moe.routing", "attention.inner_attention"),
       compile_grad_norm=True,
+      enable_remat_barriers=True,
       fsdp_allreduce_slice_parameter_patterns=(
           "layers.*.attention.qkv_linear.wqkv_packed.weight",
           "layers.*.attention.wo.weight",
@@ -751,14 +774,6 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       # Larger reductions can lose to native reduce-scatter because all-reduce
       # sends roughly twice the ring traffic and materializes the full result.
       fsdp_allreduce_slice_max_input_bytes=40 * 1024**2,
-      compile_optimizer=False,
-      optimizer_in_graph=False,
-  )
-  cfg.optimizer.implementation = "fused"
-  cfg.compile = CompileConfig(
-      enable=True,
-      backend="tpu",
-      components=["model"],
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
@@ -794,7 +809,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
+def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TpuGraphTrainer.Config:
   """Profile the batch-6 FSDP128 baseline on rank zero."""
   cfg = _qwen3_moe_30b_fsdp_only_full_ac()
   cfg.profiler = Profiler.Config(
@@ -806,7 +821,7 @@ def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
+def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TpuGraphTrainer.Config:
   """Profiler-free bracket for the batch-6 FSDP128 comparison."""
   cfg = _qwen3_moe_30b_fsdp_only_full_ac()
   cfg.training.steps = 30
@@ -816,7 +831,7 @@ def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
+def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TpuGraphTrainer.Config:
   """Q30 benchmark adding MaxText's BF16 RoPE numerical policy.
 
   The base FSDP recipe already enables the correctness-preserving batch-native
@@ -830,21 +845,13 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   # policy choice, not a numerics-preserving optimization; keep it out of the
   # default recipe pending a longer convergence comparison.
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
   return cfg
 
 
-def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TPUTrainerConfig:
+def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TpuGraphTrainer.Config:
   """Q30 benchmark with MaxText's numerics and FLOP accounting.
 
-  The attention-parity benchmark (BF16 RoPE, fused route-score backward) plus
+  The attention-parity benchmark (BF16 RoPE) plus
   BF16 gradient reduction, matching the other ``*maxtext*`` recipes, and
   MaxText FLOPs, so its MFU is comparable with MaxText's published Q30 numbers.
   """
@@ -854,50 +861,45 @@ def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
-def _fuse_route_score_backward(cfg: TPUTrainerConfig) -> None:
-  """Compute dScore in one fusion instead of saving an FP32 expert output.
-
-  The multiply and hidden-dimension reduction stay FP32, as in native
-  autograd; only the reduction order changes. On Q235 at 512 ranks this
-  removes a per-layer ``f32[524288, 4096]`` copy and reduction (1.12 s/step).
-  """
+def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
+  """Apply routing scores before W2 so remat does not replay the W2 forward."""
   assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("Qwen3 MoE route-score fusion needs a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
+  routed = list(cfg.model_spec.model.traverse(TpuRoutedExperts.Config))
+  if not routed:
+    raise ValueError("Scaling routes before W2 needs TpuRoutedExperts")
+  for _, config, _, _ in routed:
+    config.scale_before_down_proj = True
 
 
-def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
+def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
   # Q30's rewrite is tuned for its full-world FP32 graph. Q235's explicit
   # FSDP-128, HSDP, and BF16 recipes violate that pass's current validator.
-  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
-  cfg.tpu_config.fsdp_allreduce_slice_max_input_bytes = 0
+  cfg.compile.fsdp_allreduce_slice_parameter_patterns = ()
+  cfg.compile.fsdp_allreduce_slice_max_input_bytes = 0
   # Likewise, the 30B tpu_selective saves were measured only on 30B, so
   # Q235 keeps plain full rematerialization unless a recipe picks another
   # policy.
-  cfg.tpu_config.graph_trainer_memory_policy = "full"
-  cfg.tpu_config.graph_trainer_save_regions = ()
-  cfg.model_spec = model_registry(
-      "235B-A22B",
-      attn_backend="sdpa",
-      converters=[
-          TpuTokenDispatcherConverter.Config(),
-          TpuGroupedExpertsConverter.Config(),
-      ],
+  cfg.compile.memory_policy = "full"
+  cfg.compile.save_regions = ()
+  cfg.model_spec = to_graph_trainer_model_spec(
+      model_registry(
+          "235B-A22B",
+          attn_backend="sdpa",
+          converters=[
+              TpuTokenDispatcherConverter.Config(),
+              TpuGroupedExpertsConverter.Config(),
+              TpuRoutedExpertsConverter.Config(),
+          ],
+      )
   )
-  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   # Replacing model_spec also replaces nested MoE policy inherited from the
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
-  _fuse_route_score_backward(cfg)
+  _scale_routes_before_down_proj(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
@@ -927,34 +929,47 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   cfg.training.num_tokens_per_train_step = 8192 * 4096
   cfg.training.steps = 15
   cfg.parallelism.fsdp_reshard_after_forward = "always"
-  cfg.tpu_config.use_graph_split = True
-  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
-  cfg.tpu_config.graph_split.forward_isolate_prefix = True
-  cfg.tpu_config.graph_split.backward_partition_mode = "fsdp_pipeline"
-  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
-  cfg.tpu_config.enable_graph_trainer_remat_schedule = False
-  cfg.tpu_config.graph_trainer_fsdp_schedule = "none"
-  cfg.tpu_config.compile_optimizer = False
-  cfg.tpu_config.optimizer_in_graph = False
+  cfg.compile.graph_split.enabled = True
+  cfg.compile.graph_split.forward_layers_per_executable = 1
+  cfg.compile.graph_split.forward_isolate_prefix = True
+  cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
+  cfg.compile.graph_split.backward_layers_per_executable = 1
+  # This measured Q235 split formed one remat region per backward executable
+  # and reduced the batch-16 allocator deficit by 9.30 GiB. Those executable
+  # boundaries already provide the layer-local lifetime ordering that remat
+  # barriers add to a multi-layer graph, so do not add redundant dependencies.
+  cfg.compile.enable_remat_barriers = False
+  cfg.compile.fsdp_barrier_policy = "none"
+  cfg.compile.optimizer_compile = "eager"
   cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
   cfg.metrics.log_freq = 1
   return cfg
 
 
-def _qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
+def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   """Add the common Q235 activation-offload execution policy."""
   cfg = _qwen3_moe_235b_fsdp_only()
-  cfg.tpu_config.graph_trainer_memory_policy = "full_and_offload"
-  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
+  # Offload the layer boundaries, and keep the Splash output and LSE of the
+  # last 36 layers in HBM so backward skips their forward recompute (~16 ms
+  # each). Split-boundary donation is what frees the HBM for these saves.
+  # Each saved layer costs ~1 GiB at the HBM peak. Measured at world 512: N=16,
+  # 24, 32, 36, 40 cut step time 1.0, 1.4, 1.9, 2.1, 2.3%; N=36 leaves ~6 GiB
+  # free and N=40 ~2 GiB. Lower N first if something else needs HBM (longer
+  # context, bigger batch).
+  cfg.compile.memory_policy = "tpu_selective_and_offload"
+  cfg.compile.save_last_n_layers = {
+      "attention.inner_attention": 36
+  }
+  cfg.compile.graph_split.forward_layers_per_executable = 1
   # Current ``by_layer`` is the direct successor of the ``sequential`` mode
   # used by the measured schedule: one complete backward layer per
   # independently compiled child.
-  cfg.tpu_config.graph_split.backward_partition_mode = "by_layer"
-  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
+  cfg.compile.graph_split.backward_partition_mode = "by_layer"
+  cfg.compile.graph_split.backward_layers_per_executable = 1
   # Issue each H2D pair in the child immediately before its consumer. This
   # removed 1.31 s of exposed H2D in the measured BF16 arm at a 0.96-GiB HBM
   # cost from carrying the completed activation across one child boundary.
-  cfg.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
+  cfg.compile.graph_split.cpu_offload_prefetch_executables = 1
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_COMPILED_OFFLOAD_FLAGS,
@@ -962,9 +977,16 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
+def _without_splash_saves(cfg: TpuGraphTrainer.Config) -> None:
+  """Fall back to plain offload; the Splash saves were measured only at w512."""
+  cfg.compile.memory_policy = "full_and_offload"
+  cfg.compile.save_last_n_layers = {}
+
+
+def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TpuGraphTrainer.Config:
   """MaxText-numerics variant of the Q235 activation-offload recipe."""
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
+  _without_splash_saves(cfg)
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
@@ -973,7 +995,7 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
 
 
 def _configure_qwen3_moe_235b_fsdp_128(
-    cfg: TPUTrainerConfig,
+    cfg: TpuGraphTrainer.Config,
     *,
     replicate_degree: int,
 ) -> None:
@@ -989,7 +1011,7 @@ def _configure_qwen3_moe_235b_fsdp_128(
   )
 
 
-def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
+def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TpuGraphTrainer.Config:
   """MaxText-numerics Q235 offload recipe using 4x128 HSDP.
 
   Matching the FSDP shard degree to the 128-expert dimension keeps expert
@@ -1000,13 +1022,14 @@ def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
+def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
   """FP32-reduction Q235 offload recipe for a 4x4x4 TPU7x slice.
 
   Pure FSDP over 128 ranks divides both the 128 experts and the 151,936-token
   vocabulary evenly. Keep local batch 16 and use one microbatch per step.
   """
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
+  _without_splash_saves(cfg)
   _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   # This topology's large FSDP reductions benefit from libtpu's hierarchical
   # n-D lowering. Keep the unvalidated HSDP and MaxText-numerics variants on
@@ -1019,14 +1042,14 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
 
 
 def qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(
-) -> TPUTrainerConfig:
+) -> TpuGraphTrainer.Config:
   """MaxText-numerics Q235 offload recipe for a 4x4x4 TPU7x slice."""
   cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
   _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   return cfg
 
 
-def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
+def qwen3_moe_235b_fsdp_smoke() -> TpuGraphTrainer.Config:
   """Four-layer FSDP512 smoke for the production 235B execution path."""
   cfg = _qwen3_moe_235b_fsdp_only()
   assert cfg.model_spec is not None
@@ -1047,7 +1070,7 @@ def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_scan() -> TPUTrainerConfig:
+def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   """Qwen3 235B-A22B on the graph trainer with its 94 layers scanned.
 
   Shaped after MaxText's published Ironwood recipe
@@ -1059,18 +1082,25 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   message that reads like a scan error.
   """
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
-  cfg.model_spec = model_registry(
-      "235B-A22B",
-      attn_backend="sdpa",
-      converters=[
-          TpuTokenDispatcherConverter.Config(),
-          TpuGroupedExpertsConverter.Config(),
-      ],
+  cfg.model_spec = to_graph_trainer_model_spec(
+      model_registry(
+          "235B-A22B",
+          attn_backend="sdpa",
+          converters=[
+              TpuTokenDispatcherConverter.Config(),
+              TpuGroupedExpertsConverter.Config(),
+              TpuRoutedExpertsConverter.Config(),
+          ],
+      )
   )
-  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  # Store the QKV weights as [all Q][all K][all V] rather than grouped per KV
+  # head, so attention reads Q, K and V without per-layer copies.
+  cfg.model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  )
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
-  _fuse_route_score_backward(cfg)
+  _scale_routes_before_down_proj(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
@@ -1101,14 +1131,14 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   # is also what MaxText does here (`remat_policy=custom`,
   # `decoder_layer_input=offload`).
   cfg.parallelism.fsdp_reshard_after_forward = "always"
-  cfg.tpu_config.use_scan_layers = True
-  cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  cfg.compile.use_scan_layers = True
+  cfg.compile.memory_policy = "full_and_scan_offload"
   # The 30B recipe's save regions apply only to tpu_selective.
-  cfg.tpu_config.graph_trainer_save_regions = ()
-  # The 30B chain coalesces its packed-QKV and `wo` reductions (commit
-  # 186bd3ba8c). This model packs no QKV and scan leaves no per-layer FQN to
-  # match, so the pass would find none of its targets and refuse to run.
-  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
+  cfg.compile.save_regions = ()
+  # The 30B recipe's reduce-scatter -> all-reduce pass picks weights by
+  # per-layer name (layers.*...). Scan stacks the layers into one tensor, so no
+  # name matches and the pass would raise; turn it off.
+  cfg.compile.fsdp_allreduce_slice_parameter_patterns = ()
   # The routing metrics stash tensors on the module, which a scan body cannot
   # do (https://github.com/google-pytorch/torchtitan/issues/28).
   cfg.metrics.enable_moe_routing = False
@@ -1122,7 +1152,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
+def qwen3_moe_235b_scan_proxy() -> TpuGraphTrainer.Config:
   """`qwen3_moe_235b_scan` cut to 12 of its 94 layers, so it fits a 32-chip slice.
 
   Every layer is a real 235B layer -- dim 4096, 128 experts, top-k 8 -- so the
@@ -1140,7 +1170,7 @@ def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
+def qwen3_moe_235b_scan_maxtext() -> TpuGraphTrainer.Config:
   """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
 
   Two changes, both bf16 where torchtitan keeps f32: the gradient reduce and
@@ -1155,7 +1185,7 @@ def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
+def qwen3_moe_30b_proxy() -> TpuGraphTrainer.Config:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()
   assert cfg.model_spec is not None

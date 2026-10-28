@@ -134,9 +134,9 @@ def _build(
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
     ``stacked``/``scan`` pick the converter, exactly as
-    ``to_tpu_graph_trainer_config`` does -- the model arrives from ``build()``
-    already stacked, and ``apply_simple_fsdp`` is given the same arguments in
-    every arm.
+    ``apply_tpu_graph_trainer_model_transforms`` does -- the model arrives
+    from ``build()`` already stacked, and ``apply_simple_fsdp`` is given the same
+    arguments in every arm.
 
     ``device`` and ``world_size`` exist for ``test_layer_stack_distributed``,
     which builds the same two models on a real mesh.

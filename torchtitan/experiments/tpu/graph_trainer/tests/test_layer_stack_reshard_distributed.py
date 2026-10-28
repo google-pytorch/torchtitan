@@ -65,8 +65,8 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         ep=1,
         world_size=world_size,
     )
-    # The rewrite `to_tpu_graph_trainer_config` applies. Both arms get one, so
-    # that stacking is the only difference between them; a stock `Decoder`
+    # The rewrite `apply_tpu_graph_trainer_model_transforms` applies.
+    # Both arms get one, so stacking is the only difference; a stock `Decoder`
     # loops over its layers directly and would ignore the stacks.
     convert = (
         functools.partial(with_tpu_stacked_layers, use_scan=False)
@@ -227,7 +227,7 @@ class OptimizerStateTest(unittest.TestCase):
     The consequence is silent rather than loud:
     ``_unflatten_optim_state_dict`` treats an FQN that is absent from the
     checkpoint as "this parameter has no state" rather than as an error. So
-    flipping ``--tpu-config.use-scan-layers`` between a save and a resume
+    flipping ``--compile.use-scan-layers`` between a save and a resume
     restores every weight correctly and restarts Adam from zero for every
     layer parameter, with nothing in the logs to say so. Parameters outside
     the layers (embeddings, output, the final norm) keep their moments,

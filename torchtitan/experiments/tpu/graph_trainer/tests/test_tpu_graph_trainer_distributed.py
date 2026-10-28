@@ -20,12 +20,12 @@ _MODELS = [
     dict(
         testcase_name="qwen3",
         module="torchtitan.experiments.tpu.qwen3",
-        config="qwen3_debugmodel",
+        config="graph_trainer_qwen3_debugmodel",
     ),
     dict(
         testcase_name="llama3",
         module="torchtitan.experiments.tpu.llama3",
-        config="llama3_debugmodel",
+        config="graph_trainer_llama3_debugmodel",
     ),
 ]
 
@@ -118,34 +118,34 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="qwen3_simple_fsdp",
           module="torchtitan.experiments.tpu.qwen3",
-          config="qwen3_debugmodel",
+          config="graph_trainer_qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
           ],
       ),
       dict(
           testcase_name="llama3_simple_fsdp",
           module="torchtitan.experiments.tpu.llama3",
-          config="llama3_debugmodel",
+          config="graph_trainer_llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
           ],
       ),
       dict(
           testcase_name="llama3_simple_fsdp_scan_layers_hsdp",
           module="torchtitan.experiments.tpu.llama3",
-          config="llama3_debugmodel",
+          config="graph_trainer_llama3_debugmodel",
           # Unset, so FSDP gets the remaining num_devices / 2.
           data_parallel_shard_degree=None,
           tensor_parallel_degree=1,
           data_parallel_replicate_degree=2,
           args=[
-              "--tpu_config.use_simple_fsdp",
-              "--tpu_config.use_scan_layers",
+              "--parallelism.use_simple_fsdp",
+              "--compile.use_scan_layers",
           ],
           # TODO(b/574966859): Broken by cl/1001117754 `RuntimeError:
           # traverse_and_compile(): expected Pallas kernels and scans in the
@@ -163,11 +163,11 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="muse_glimmer_simple_fsdp",
           module="torchtitan.experiments.tpu.muse_glimmer",
-          config="muse_glimmer_debugmodel",
+          config="graph_trainer_muse_glimmer_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -283,11 +283,11 @@ class TpuGraphTrainerDistributedTest(
     """
     tempdir = self.create_tempdir().full_path
     losses = {}
-    for arm, extra in (("loop", []), ("scan", ["--tpu_config.use_scan_layers"])):
+    for arm, extra in (("loop", []), ("scan", ["--compile.use_scan_layers"])):
       path = os.path.join(tempdir, f"{arm}.json")
       self._test_train_distributed(
           config_args=_train_args(module, config)
-          + ["--tpu_config.use_simple_fsdp"]
+          + ["--parallelism.use_simple_fsdp"]
           + extra,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,

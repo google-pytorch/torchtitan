@@ -6,19 +6,23 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
-from torchtitan.config.configs import CompileConfig
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
+from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import model_registry as graph_trainer_model_registry
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import LossKernelConfig
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
+from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 __all__ = [
+    "graph_trainer_muse_glimmer_debugmodel",
     "muse_glimmer_debugmodel",
     "muse_glimmer_debugmodel_fused_ce",
     "muse_glimmer_30b_full_logits",
@@ -125,6 +129,18 @@ def muse_glimmer_debugmodel_fused_ce() -> TPUTrainerConfig:
   return config
 
 
+def graph_trainer_muse_glimmer_debugmodel() -> TpuGraphTrainer.Config:
+  """Muse Glimmer debug model using TPU GraphTrainer."""
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      muse_glimmer_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
+  return config
+
+
 def _muse_glimmer_30b_base() -> TPUTrainerConfig:
   """Model, data, optimizer and kernels shared by every 30B recipe.
 
@@ -170,7 +186,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -202,7 +218,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
   return config
 
 
-def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
+def muse_glimmer_30b_full_logits() -> TpuGraphTrainer.Config:
   """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
 
   SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
@@ -227,20 +243,22 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
     HBM at step 1 with full logits), or whenever HBM headroom is needed
     elsewhere.
   """
-  config = _muse_glimmer_30b_base()
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      _muse_glimmer_30b_base(), graph_trainer_model_registry
+  )
   # Zero-3: Zero-2 would keep all ~60 GiB of gathered BF16 weights resident.
   config.parallelism.fsdp_reshard_after_forward = "always"
+  config.tpu_config = TPUConfig()
   # GraphTrainer ignores the eager AC config; its graph rematerialization
   # policy is selected here.
-  config.tpu_config = TPUConfig(
-      use_graph_trainer=True,
-      compile_mode="aot_fx_trace",
-      compile_optimizer=True,
-      optimizer_in_graph=True,
-      graph_trainer_memory_policy="tpu_selective",
-      graph_trainer_save_regions=("attention.inner_attention",),
-      enable_graph_trainer_remat_schedule=True,
-      graph_trainer_fsdp_schedule="prefetch",
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      optimizer_compile="in_graph",
+      memory_policy="tpu_selective",
+      save_regions=("attention.inner_attention",),
+      enable_remat_barriers=True,
+      fsdp_barrier_policy="prefetch",
   )
   # Fused AdamW traces into the optimizer-in-graph step and matches foreach
   # (2,924 vs 2,913 TPS, same HBM and loss).
@@ -248,7 +266,7 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
   return config
 
 
-def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
+def muse_glimmer_30b_fused_ce() -> TpuGraphTrainer.Config:
   """``muse_glimmer_30b_full_logits`` with the soft-capped fused loss.
 
   The LM-head matmul, soft cap and cross entropy run as one Pallas kernel, so
@@ -260,8 +278,8 @@ def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   _enable_pallas_cross_entropy(config)
   # This is the recipe to pick for HBM headroom, and the Splash saves were
   # measured only with full logits, so it keeps plain full rematerialization.
-  config.tpu_config.graph_trainer_memory_policy = "full"
-  config.tpu_config.graph_trainer_save_regions = ()
+  config.compile.memory_policy = "full"
+  config.compile.save_regions = ()
   return config
 
 
@@ -275,10 +293,12 @@ def reg_trainer_muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   at step 1 on tpu7x-4x4x4.
   """
   config = _muse_glimmer_30b_base()
-  config.tpu_config = TPUConfig(
-      eager_mode="DEFER_AND_FUSE",
-      use_graph_split=True,
-      compile_mode="layer",
+  config.tpu_config = TPUConfig(eager_mode="DEFER_AND_FUSE")
+  config.compile = TpuTrainerCompileConfig(
+      enable=True,
+      backend="tpu",
+      components=["model"],
+      materialize_forward_before_backward=True,
       compile_grad_norm=True,
   )
   _enable_pallas_cross_entropy(config)

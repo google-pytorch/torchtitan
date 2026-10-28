@@ -27,11 +27,13 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from torchtitan.config import derive
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.remat_regions import (
     annotate_region,
     MOE_ROUTING,
 )
+from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
@@ -289,6 +291,97 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     )
 
 
+class TpuRoutedExperts(RoutedExperts):
+  """Routed experts that can apply the routing scores before W2.
+
+  W2 is linear, so scaling its input rows gives the same result as scaling its
+  output rows. Scaling the input makes the score gradient
+  ``rowsum(hidden * dHidden)``, which does not read the W2 output, so a
+  rematerializing backward no longer recomputes the W2 forward. Only rounding
+  changes: each BF16 hidden row is scaled in FP32 and rounded before W2,
+  instead of each W2 output row after it.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(RoutedExperts.Config):
+    scale_before_down_proj: bool = False
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+    self.scale_before_down_proj = config.scale_before_down_proj
+    if not self.scale_before_down_proj:
+      return
+    if not isinstance(self.token_dispatcher, TpuAllToAllTokenDispatcher):
+      raise ValueError(
+          "scale_before_down_proj requires TpuAllToAllTokenDispatcher"
+      )
+    if self.token_dispatcher.fuse_route_score_backward:
+      raise ValueError(
+          "fuse_route_score_backward fuses the score multiply after W2, which"
+          " scale_before_down_proj removes; enable only one"
+      )
+
+  def forward(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+  ) -> torch.Tensor:
+    if not self.scale_before_down_proj:
+      return super().forward(
+          x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+      )
+    routed_input_RD, num_tokens_per_expert_e, metadata = (
+        self.token_dispatcher.dispatch(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+        )
+    )
+    if not isinstance(metadata, LocalDispatchMetadata):
+      raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
+    with maybe_set_sparse_mesh():
+      routed_output_RD = self.inner_experts(
+          routed_input_RD,
+          num_tokens_per_expert_e,
+          row_scale_R=metadata.topk_scores_experts_sorted_N,
+      )
+    return stable_grouped_reduce(
+        routed_output_RD,
+        metadata.token_indices_experts_sorted_N,
+        self.token_dispatcher.top_k,
+    )
+
+
+class TpuRoutedExpertsConverter(ModelConfigConverter):
+  """Select ``TpuRoutedExperts`` for the standard routed-experts block."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(ModelConfigConverter.Config):
+    pass
+
+  def __init__(self, config: Config):
+    pass
+
+  def convert(self, model_config):
+    matches = list(model_config.traverse(RoutedExperts.Config))
+    for _, config, parent, field_name in matches:
+      if type(config) is not RoutedExperts.Config:
+        continue
+      replacement = derive(config, TpuRoutedExperts.Config)
+      if parent is None:
+        model_config = replacement
+      elif isinstance(parent, list):
+        assert isinstance(field_name, int)
+        parent[field_name] = replacement
+      else:
+        assert isinstance(field_name, str)
+        setattr(parent, field_name, replacement)
+    return model_config
+
+
 class TpuTokenDispatcherConverter(ModelConfigConverter):
   """Select TPU local reorder and combine VJPs for the standard dispatcher."""
 
@@ -318,6 +411,8 @@ class TpuTokenDispatcherConverter(ModelConfigConverter):
 
 __all__ = [
     "TpuAllToAllTokenDispatcher",
+    "TpuRoutedExperts",
+    "TpuRoutedExpertsConverter",
     "TpuTokenDispatcherConverter",
     "local_reorder",
     "scale_route_weights",

@@ -168,13 +168,13 @@ class TpuGraphTrainer(GraphTrainer):
             )
             self.metrics_processor.lr_schedulers = self.lr_schedulers
 
-        for opt in self.optimizers.optimizers:
-            for group in opt.param_groups:
-                group["capturable"] = True
-
         self._optimizer_in_graph = (
             config.compile.optimizer_compile == "in_graph"
         )
+        if self._optimizer_in_graph:
+            for opt in self.optimizers.optimizers:
+                for group in opt.param_groups:
+                    group["capturable"] = True
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.compile.compile_grad_norm else None
         )

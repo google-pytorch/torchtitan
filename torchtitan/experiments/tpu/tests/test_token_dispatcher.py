@@ -14,7 +14,7 @@ from torchtitan.experiments.tpu.token_dispatcher import (
     scale_route_weights,
     stable_grouped_reduce,
 )
-from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.moe import GroupedExperts, RoutedExperts
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 
@@ -298,6 +298,8 @@ def test_converter_preserves_fields_and_is_idempotent():
     assert root.dispatcher.num_experts == 8
     assert root.dispatcher.top_k == 2
     assert not root.dispatcher.fuse_route_score_backward
+    # Drop-free unless a recipe opts into a capacity factor.
+    assert root.dispatcher.capacity_factor is None
 
     dispatcher = root.dispatcher
     converter.convert(root)
@@ -365,3 +367,182 @@ def test_scale_before_down_proj_matches_scaling_the_output():
         ),
         scale_before_down_proj=True,
     ).build()
+
+
+def test_converter_sets_capacity_factor():
+    class RootConfig:
+        def __init__(self):
+            self.dispatcher = AllToAllTokenDispatcher.Config(
+                num_experts=8, top_k=2
+            )
+
+        def traverse(self, config_type):
+            if isinstance(self.dispatcher, config_type):
+                yield "dispatcher", self.dispatcher, self, "dispatcher"
+
+    root = TpuTokenDispatcherConverter.Config(
+        moe_capacity_factor=1.125
+    ).build().convert(RootConfig())
+    assert root.dispatcher.capacity_factor == 1.125
+def test_ep_dispatch_uses_ring_of_experts_by_default():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=4, top_k=2, capacity_factor=1.5
+    ).build()
+    dispatcher.ep_mesh = mock.sentinel.ep_mesh
+    args = (torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+    target = "torchtitan.experiments.tpu.token_dispatcher.ring_of_experts_dispatch"
+
+    with mock.patch(target, return_value=mock.sentinel.out) as dispatch:
+        assert dispatcher.dispatch(*args) is mock.sentinel.out
+
+    dispatch.assert_called_once_with(
+        *args[:3],
+        num_experts=4,
+        ep_mesh=mock.sentinel.ep_mesh,
+        capacity_factor=1.5,
+    )
+
+
+def test_ep_dispatch_all_to_all_transport_delegates():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=4, top_k=2, ep_transport="all_to_all"
+    ).build()
+    dispatcher.ep_mesh = mock.sentinel.ep_mesh
+    args = (torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
+
+    with mock.patch.object(
+        AllToAllTokenDispatcher, "dispatch", return_value=mock.sentinel.out
+    ) as dispatch:
+        assert dispatcher.dispatch(*args) is mock.sentinel.out
+    dispatch.assert_called_once()
+
+
+def test_rejects_unknown_ep_transport():
+    with pytest.raises(ValueError, match="ep_transport"):
+        TpuAllToAllTokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport="ragged"
+        ).build()
+
+
+class _ScaleExperts(torch.nn.Module):
+    """Per-expert row scaling in place of grouped matmuls (CPU-friendly)."""
+
+    def __init__(self, scales_ED):
+        super().__init__()
+        self.scales_ED = torch.nn.Parameter(scales_ED)
+
+    def forward(self, x_RD, counts_e):
+        # Rows past `sum(counts_e)` belong to no expert; the grouped matmuls
+        # leave them unwritten, so poison them to check nothing reads them.
+        num_rows = int(counts_e.sum())
+        e_idx = torch.repeat_interleave(
+            torch.arange(counts_e.numel()),
+            counts_e.to(torch.int64),
+            output_size=num_rows,
+        )
+        tail = torch.full(
+            (x_RD.shape[0] - num_rows, x_RD.shape[1]), float("nan")
+        )
+        return torch.cat([x_RD[:num_rows] * self.scales_ED[e_idx], tail])
+
+
+def _run_routed_experts(num_moe_token_chunks, x, scores, ids, scales):
+    num_experts, dim = scales.shape
+    routed = TpuRoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(
+            dim=dim, hidden_dim=dim, num_experts=num_experts
+        ),
+        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+            num_experts=num_experts, top_k=ids.shape[1], capacity_factor=None
+        ),
+        num_moe_token_chunks=num_moe_token_chunks,
+    ).build()
+    routed.inner_experts = _ScaleExperts(scales.clone())
+    ep_mesh = mock.MagicMock()
+    ep_mesh.size.return_value = 1
+    ep_mesh.get_local_rank.return_value = 0
+    routed.token_dispatcher.ep_mesh = ep_mesh
+
+    x = x.detach().requires_grad_(True)
+    scores = scores.detach().requires_grad_(True)
+    counts = torch.bincount(ids.reshape(-1), minlength=num_experts)
+    with mock.patch.multiple(
+        "torchtitan.experiments.tpu.ring_of_experts.funcol",
+        all_gather_tensor=lambda t, gather_dim=0, group=None: t,
+        reduce_scatter_tensor=lambda t, op, scatter_dim=0, group=None: t,
+    ):
+        out = routed(x, scores, ids, counts)
+        grads = torch.autograd.grad(
+            out,
+            (x, scores, routed.inner_experts.scales_ED),
+            torch.ones_like(out),
+        )
+    return out.detach(), grads
+
+
+@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("num_moe_token_chunks", [2, 3])
+def test_chunked_routed_experts_matches_unchunked(num_moe_token_chunks, dim):
+    generator = torch.Generator().manual_seed(7)
+    num_tokens, top_k, num_experts = 12, 2, 4
+    x = torch.randn(num_tokens, dim, generator=generator)
+    scores = torch.rand(num_tokens, top_k, generator=generator)
+    ids = torch.stack([
+        torch.randperm(num_experts, generator=generator)[:top_k]
+        for _ in range(num_tokens)
+    ])
+    scales = torch.randn(num_experts, dim, generator=generator)
+
+    ref_out, ref_grads = _run_routed_experts(1, x, scores, ids, scales)
+    out, grads = _run_routed_experts(
+        num_moe_token_chunks, x, scores, ids, scales
+    )
+    torch.testing.assert_close(out, ref_out)
+    for grad, ref_grad in zip(grads, ref_grads):
+        torch.testing.assert_close(grad, ref_grad)
+
+
+def test_converter_swaps_routed_experts_only_when_chunking():
+    def routed_config():
+        return RoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(
+                dim=8, hidden_dim=8, num_experts=4
+            ),
+            token_dispatcher=AllToAllTokenDispatcher.Config(
+                num_experts=4, top_k=2
+            ),
+        )
+
+    class RootConfig:
+        def __init__(self):
+            self.routed = routed_config()
+
+        def traverse(self, config_type):
+            if isinstance(self.routed, config_type):
+                yield "routed", self.routed, self, "routed"
+            if isinstance(self.routed.token_dispatcher, config_type):
+                yield (
+                    "routed.token_dispatcher",
+                    self.routed.token_dispatcher,
+                    self.routed,
+                    "token_dispatcher",
+                )
+
+    unchunked = TpuTokenDispatcherConverter.Config().build().convert(
+        RootConfig()
+    )
+    assert type(unchunked.routed) is RoutedExperts.Config
+    assert isinstance(
+        unchunked.routed.token_dispatcher, TpuAllToAllTokenDispatcher.Config
+    )
+
+    chunked = (
+        TpuTokenDispatcherConverter.Config(num_moe_token_chunks=4)
+        .build()
+        .convert(RootConfig())
+    )
+    assert isinstance(chunked.routed, TpuRoutedExperts.Config)
+    assert chunked.routed.num_moe_token_chunks == 4
+    assert isinstance(
+        chunked.routed.token_dispatcher, TpuAllToAllTokenDispatcher.Config
+    )

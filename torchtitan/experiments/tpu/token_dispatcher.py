@@ -19,9 +19,13 @@ Ragged all-to-all is a separate transport choice that can call the same local
 reduction once its capacity and overflow semantics have been validated. The
 earlier bounded-ragged prototype did exactly that around ``combine_route``;
 the transport was omitted here while the reusable local VJPs were retained.
+
+For EP>1 the dispatcher defaults to the static-shape Ring-of-Experts transport
+in ``ring_of_experts.py``, which does its own fused gather and reduction.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -32,6 +36,11 @@ from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.remat_regions import (
     annotate_region,
     MOE_ROUTING,
+)
+from torchtitan.experiments.tpu.ring_of_experts import (
+    ring_of_experts_combine,
+    ring_of_experts_dispatch,
+    RingOfExpertsMetadata,
 )
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
@@ -233,23 +242,34 @@ def local_reorder(
 
 
 class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
-  """Standard dispatcher with TPU-local permutation VJPs.
+  """Standard dispatcher with TPU-local permutation VJPs and EP transports.
 
-  ``_local_reorder`` is shared by EP=1 and EP>1 and is optimized in both
-  cases. ``combine`` selects the fixed-K reduction only when ``ep_mesh`` is
-  absent. The standard dropless EP path should also admit fixed-K reduction,
-  but must retain its return all-to-all and separately handle SP-local rows in
-  the global output layout. It intentionally delegates until that path has its
-  own correctness and performance gate.
+  ``_local_reorder`` is shared by EP=1 and the upstream EP>1 path. With EP=1,
+  ``combine`` uses the fixed-K reduction. With EP>1, ``ep_transport`` selects
+  the static-shape Ring-of-Experts transport (``ring_of_experts.py``) or the
+  upstream dynamic-shape all-to-all.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(AllToAllTokenDispatcher.Config):
     fuse_route_score_backward: bool = False
+    ep_transport: Literal["ring_of_experts", "all_to_all"] = "ring_of_experts"
+    # Ring-of-Experts rows per EP rank as a multiple of the local routes. None
+    # (the default) is drop-free, like the upstream dispatcher; a factor such
+    # as MaxText's 1.125 bounds the buffer and drops routes past capacity.
+    capacity_factor: float | None = None
 
   def __init__(self, config: Config):
     super().__init__(config)
+    if config.ep_transport not in ("ring_of_experts", "all_to_all"):
+      raise ValueError(f"unknown ep_transport: {config.ep_transport!r}")
     self.fuse_route_score_backward = config.fuse_route_score_backward
+    self.ep_transport = config.ep_transport
+    self.capacity_factor = config.capacity_factor
+
+  @property
+  def uses_ring_of_experts(self) -> bool:
+    return self.ep_mesh is not None and self.ep_transport == "ring_of_experts"
 
   def _local_reorder(
       self,
@@ -264,12 +284,51 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         self.top_k,
     )
 
+  def dispatch(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      AllToAllDispatchMetadata | LocalDispatchMetadata | RingOfExpertsMetadata,
+  ]:
+    if not self.uses_ring_of_experts:
+      return super().dispatch(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+      )
+    # Ring-of-Experts counts routes from the gathered expert ids itself.
+    del num_local_tokens_per_expert_E
+    return ring_of_experts_dispatch(
+        x_TD,
+        topk_scores_TK,
+        topk_expert_ids_TK,
+        num_experts=self.num_experts,
+        ep_mesh=self.ep_mesh,
+        capacity_factor=self.capacity_factor,
+    )
+
   def combine(
       self,
       routed_output_RD: torch.Tensor,
-      metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+      metadata: (
+          AllToAllDispatchMetadata
+          | LocalDispatchMetadata
+          | RingOfExpertsMetadata
+      ),
       x_TD: torch.Tensor,
   ) -> torch.Tensor:
+    if isinstance(metadata, RingOfExpertsMetadata):
+      return ring_of_experts_combine(
+          routed_output_RD,
+          metadata,
+          fuse_route_score_backward=self.fuse_route_score_backward,
+      )
     if self.ep_mesh is not None:
       return super().combine(routed_output_RD, metadata, x_TD)
 
@@ -292,22 +351,32 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
 
 class TpuRoutedExperts(RoutedExperts):
-  """Routed experts that can apply the routing scores before W2.
+  """TPU `RoutedExperts` with pre-W2 score scaling and Ring-of-Experts chunking.
 
-  W2 is linear, so scaling its input rows gives the same result as scaling its
-  output rows. Scaling the input makes the score gradient
-  ``rowsum(hidden * dHidden)``, which does not read the W2 output, so a
-  rematerializing backward no longer recomputes the W2 forward. Only rounding
-  changes: each BF16 hidden row is scaled in FP32 and rounded before W2,
-  instead of each W2 output row after it.
+  * `scale_before_down_proj`: W2 is linear, so scaling its input rows gives the
+    same result as scaling its output rows. Scaling the input makes the score
+    gradient ``rowsum(hidden * dHidden)``, which does not read the W2 output, so
+    a rematerializing backward no longer recomputes the W2 forward.
+  * `num_moe_token_chunks`: For Ring-of-Experts EP, local tokens are split into
+    `num_moe_token_chunks` independent chunks that each run
+    dispatch -> experts -> combine. Chunks have no data dependencies, so XLA can
+    overlap chunk c+1's EP all-gather and chunk c-1's reduce-scatter with chunk
+    c's grouped matmuls (MaxText `num_moe_token_chunks`).
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(RoutedExperts.Config):
     scale_before_down_proj: bool = False
+    num_moe_token_chunks: int = 1
 
   def __init__(self, config: Config):
     super().__init__(config)
+    if config.num_moe_token_chunks < 1:
+      raise ValueError(
+          "num_moe_token_chunks must be >= 1, got"
+          f" {config.num_moe_token_chunks}"
+      )
+    self.num_moe_token_chunks = config.num_moe_token_chunks
     self.scale_before_down_proj = config.scale_before_down_proj
     if not self.scale_before_down_proj:
       return
@@ -328,31 +397,63 @@ class TpuRoutedExperts(RoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
-    if not self.scale_before_down_proj:
-      return super().forward(
-          x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+    if self.scale_before_down_proj:
+      routed_input_RD, num_tokens_per_expert_e, metadata = (
+          self.token_dispatcher.dispatch(
+              x_TD,
+              topk_scores_TK,
+              topk_expert_ids_TK,
+              num_local_tokens_per_expert_E,
+          )
       )
-    routed_input_RD, num_tokens_per_expert_e, metadata = (
-        self.token_dispatcher.dispatch(
-            x_TD,
-            topk_scores_TK,
-            topk_expert_ids_TK,
-            num_local_tokens_per_expert_E,
+      if not isinstance(metadata, LocalDispatchMetadata):
+        raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
+      with maybe_set_sparse_mesh():
+        routed_output_RD = self.inner_experts(
+            routed_input_RD,
+            num_tokens_per_expert_e,
+            row_scale_R=metadata.topk_scores_experts_sorted_N,
         )
-    )
-    if not isinstance(metadata, LocalDispatchMetadata):
-      raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
-    with maybe_set_sparse_mesh():
-      routed_output_RD = self.inner_experts(
-          routed_input_RD,
-          num_tokens_per_expert_e,
-          row_scale_R=metadata.topk_scores_experts_sorted_N,
+      return stable_grouped_reduce(
+          routed_output_RD,
+          metadata.token_indices_experts_sorted_N,
+          self.token_dispatcher.top_k,
       )
-    return stable_grouped_reduce(
-        routed_output_RD,
-        metadata.token_indices_experts_sorted_N,
-        self.token_dispatcher.top_k,
-    )
+
+    n = self.num_moe_token_chunks
+    num_tokens = int(x_TD.shape[0])
+    dispatcher = self.token_dispatcher
+    if (
+        n == 1
+        or not isinstance(dispatcher, TpuAllToAllTokenDispatcher)
+        or not dispatcher.uses_ring_of_experts
+    ):
+      return super().forward(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+      )
+    if num_tokens % n != 0:
+      raise ValueError(
+          f"{num_tokens} local tokens are not divisible into {n} chunks"
+      )
+
+    chunk = num_tokens // n
+    outs = []
+    for c in range(n):
+      rows = slice(c * chunk, (c + 1) * chunk)
+      # Ring-of-Experts counts each chunk's routes from its gathered expert
+      # ids, so the whole-batch counts are passed through unused.
+      outs.append(
+          super().forward(
+              x_TD[rows],
+              topk_scores_TK[rows],
+              topk_expert_ids_TK[rows],
+              num_local_tokens_per_expert_E,
+          )
+      )
+    return torch.cat(outs, dim=0)
 
 
 class TpuRoutedExpertsConverter(ModelConfigConverter):
@@ -387,25 +488,60 @@ class TpuTokenDispatcherConverter(ModelConfigConverter):
 
   @dataclass(kw_only=True, slots=True)
   class Config(ModelConfigConverter.Config):
-    pass
+    # >1 pipelines Ring-of-Experts EP over this many token chunks.
+    num_moe_token_chunks: int = 1
+    # Ring-of-Experts capacity factor; None is drop-free. See
+    # `TpuAllToAllTokenDispatcher.Config.capacity_factor`.
+    moe_capacity_factor: float | None = None
 
   def __init__(self, config: Config):
-    pass
+    self.num_moe_token_chunks = config.num_moe_token_chunks
+    self.moe_capacity_factor = config.moe_capacity_factor
+
+  @staticmethod
+  def _replace(model_config, parent, field_name, replacement):
+    if parent is None:
+      return replacement
+    if isinstance(parent, list):
+      assert isinstance(field_name, int)
+      parent[field_name] = replacement
+    else:
+      assert isinstance(field_name, str)
+      setattr(parent, field_name, replacement)
+    return model_config
 
   def convert(self, model_config):
-    matches = list(model_config.traverse(AllToAllTokenDispatcher.Config))
-    for _, config, parent, field_name in matches:
+    if self.num_moe_token_chunks > 1:
+      for _, config, parent, field_name in list(
+          model_config.traverse(RoutedExperts.Config)
+      ):
+        if type(config) not in (RoutedExperts.Config, TpuRoutedExperts.Config):
+          continue
+        model_config = self._replace(
+            model_config,
+            parent,
+            field_name,
+            derive(
+                config,
+                TpuRoutedExperts.Config,
+                num_moe_token_chunks=self.num_moe_token_chunks,
+            ),
+        )
+    for _, config, parent, field_name in list(
+        model_config.traverse(AllToAllTokenDispatcher.Config)
+    ):
       if type(config) is not AllToAllTokenDispatcher.Config:
         continue
-      replacement = derive(config, TpuAllToAllTokenDispatcher.Config)
-      if parent is None:
-        model_config = replacement
-      elif isinstance(parent, list):
-        assert isinstance(field_name, int)
-        parent[field_name] = replacement
-      else:
-        assert isinstance(field_name, str)
-        setattr(parent, field_name, replacement)
+      model_config = self._replace(
+          model_config,
+          parent,
+          field_name,
+          derive(
+              config,
+              TpuAllToAllTokenDispatcher.Config,
+              capacity_factor=self.moe_capacity_factor,
+          ),
+      )
     return model_config
 
 

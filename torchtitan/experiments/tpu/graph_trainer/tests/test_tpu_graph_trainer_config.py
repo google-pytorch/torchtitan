@@ -250,13 +250,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with torch.device("meta"):
       self._qwen3_graph_config(config).model_spec.model.build()
 
-  def test_scanning_refuses_expert_parallelism(self) -> None:
-    config = qwen3_8b()
-    config.compile.use_scan_layers = True
-    config.parallelism.expert_parallel_degree = 2
+  def test_scanning_allows_expert_parallelism(self) -> None:
+    config = qwen3_moe_235b_scan()
+    config.parallelism.expert_parallel_degree = 8
 
-    with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
-      self._qwen3_graph_config(config)
+    graph_config = self._qwen3_graph_config(config)
+    self.assertEqual(graph_config.parallelism.expert_parallel_degree, 8)
 
   def test_regular_recipe_has_no_graph_compile_controls(self) -> None:
     config = llama3_debugmodel()

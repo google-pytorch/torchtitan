@@ -1060,6 +1060,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     experts = list(model.traverse(TpuGroupedExperts.Config))
     self.assertLen(experts, 94)
     self.assertTrue(all(e.use_fp8_grouped_mm for _, e, _, _ in experts))
+    # The recipe targets v7x, so it turns on in-kernel W1/W3 quantization.
+    self.assertTrue(all(e.fp8_w13_fused_lhs_quant for _, e, _, _ in experts))
     routed = list(model.traverse(TpuRoutedExperts.Config))
     self.assertLen(routed, 94)
     self.assertFalse(any(r.scale_before_down_proj for _, r, _, _ in routed))

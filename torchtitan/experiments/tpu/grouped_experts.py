@@ -154,8 +154,9 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]
         ] = ((512, 0, 0), (512, 0, 0), (512, 768, 0))
         # Quantize the routed rows inside the W1/W3 forward GEMM (tokamax
-        # GMM v2) instead of in standalone XLA amax/cast passes.
-        fp8_w13_fused_lhs_quant: bool = True
+        # GMM v2) instead of in standalone XLA amax/cast passes. Needs an
+        # FP8 x FP8 MXU (v7x); GMM v2 rejects it on earlier TPUs.
+        fp8_w13_fused_lhs_quant: bool = False
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):

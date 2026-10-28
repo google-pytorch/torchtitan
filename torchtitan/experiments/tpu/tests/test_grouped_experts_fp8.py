@@ -32,6 +32,11 @@ class TpuGroupedExpertsFp8ConfigTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, "silu"):
       TpuGroupedExperts(_fp8_experts_config(activation="gelu_tanh"))
 
+  def test_in_kernel_lhs_quant_is_opt_in(self):
+    # GMM v2 in-kernel quantization needs an FP8 x FP8 MXU (v7x), so turning
+    # on FP8 experts alone must work on earlier TPUs too.
+    self.assertFalse(_fp8_experts_config().fp8_w13_fused_lhs_quant)
+
 
 if __name__ == "__main__":
   absltest.main()

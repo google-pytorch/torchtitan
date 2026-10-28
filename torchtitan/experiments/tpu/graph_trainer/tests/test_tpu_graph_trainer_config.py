@@ -57,6 +57,8 @@ from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     gemma4_debugmodel,
     gemma4_moe_debug,
     gemma4_moe_testmodel,
+    graph_trainer_gemma4_debugmodel,
+    graph_trainer_gemma4_moe_debug,
 )
 from torchtitan.experiments.tpu.layer_loop import (
     builds_layer_loop,
@@ -154,6 +156,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       (
           "torchtitan.experiments.tpu.muse_glimmer",
           "graph_trainer_muse_glimmer_debugmodel",
+      ),
+      (
+          "torchtitan.experiments.tpu.examples.gemma4",
+          "graph_trainer_gemma4_debugmodel",
+      ),
+      (
+          "torchtitan.experiments.tpu.examples.gemma4",
+          "graph_trainer_gemma4_moe_debug",
       ),
   )
   def test_graph_recipe_returns_final_config_type(
@@ -1600,6 +1610,8 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
       gemma4_debugmodel,
       gemma4_moe_debug,
       gemma4_moe_testmodel,
+      graph_trainer_gemma4_debugmodel,
+      graph_trainer_gemma4_moe_debug,
       gemma4_31b,
       gemma4_31b_graph_trainer,
       gemma4_31b_graph_split,
@@ -1634,8 +1646,8 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     assert config.model_spec is not None
     recipe_model_config = config.model_spec.model
 
-    graph_config = to_tpu_graph_trainer_config(
-        config, tpu_gemma4_graph_registry, target_cls=TpuGraphTrainer.Config
+    graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+        config, tpu_gemma4_graph_registry
     )
 
     assert graph_config.model_spec is not None
@@ -1678,10 +1690,7 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
       ("expert", dict(ep_enabled=True)),
   )
   def test_parallelize_rejects_unsupported_parallelism(self, enabled) -> None:
-    config = gemma4_debugmodel()
-    graph_config = to_tpu_graph_trainer_config(
-        config, tpu_gemma4_graph_registry, target_cls=TpuGraphTrainer.Config
-    )
+    graph_config = graph_trainer_gemma4_debugmodel()
     assert graph_config.model_spec is not None
     with torch.device("meta"):
       model = graph_config.model_spec.model.build()
@@ -1714,7 +1723,7 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         ep_enabled=False,
         dp_shard=8,
     )
-    config = gemma4_debugmodel()
+    config = graph_trainer_gemma4_debugmodel()
 
     with self.assertRaisesRegex(ValueError, "untied Gemma4 model"):
       graph_trainer_parallelize_gemma4(
@@ -1734,14 +1743,10 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     (``QKVLinearKeqV`` with a larger ``head_dim``), so ``check_layers_are_stackable``
     refuses the model when ``build()`` constructs the scan stack.
     """
-    config = gemma4_debugmodel()
-    config.tpu_config.use_graph_trainer = True
-    config.tpu_config.compile_mode = "aot_fx_trace"
-    config.tpu_config.use_scan_layers = True
+    graph_config = graph_trainer_gemma4_debugmodel()
+    graph_config.compile.use_scan_layers = True
+    apply_tpu_graph_trainer_model_transforms(graph_config)
 
-    graph_config = to_tpu_graph_trainer_config(
-        config, tpu_gemma4_graph_registry, target_cls=TpuGraphTrainer.Config
-    )
     assert graph_config.model_spec is not None
     with (
         torch.device("meta"),
@@ -1758,19 +1763,33 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
       gemma4_31b,
       gemma4_26b_a4b,
   )
-  def test_base_recipes_propagate_full_ac_to_graph_trainer(self, recipe) -> None:
-    """Base Gemma 4 recipes set ``FullAC``; GraphTrainer must match with ``full``."""
+  def test_base_recipes_stay_on_regular_tpu_trainer(self, recipe) -> None:
+    """Base Gemma 4 recipes return regular ``TPUTrainerConfig`` with Shardy off."""
     config = recipe()
 
-    self.assertFalse(config.tpu_config.use_graph_trainer)
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertIsInstance(config, TPUTrainerConfig)
+    self.assertNotIsInstance(config, TpuGraphTrainer.Config)
+    self.assertIsInstance(config.compile, TpuTrainerCompileConfig)
     self.assertEqual(
         config.xla_flags.get("xla_enable_hlo_sharding_v3"), "false"
     )
-    graph_config = to_tpu_graph_trainer_config(
-        config, tpu_gemma4_graph_registry, target_cls=TpuGraphTrainer.Config
+
+  @parameterized.parameters(
+      graph_trainer_gemma4_debugmodel,
+      graph_trainer_gemma4_moe_debug,
+  )
+  def test_debug_graph_recipes_match_full_ac(self, recipe) -> None:
+    """Debug GraphTrainer recipes match the base recipes' ``FullAC`` with ``full``."""
+    config = recipe()
+
+    self.assertIsInstance(config, TpuGraphTrainer.Config)
+    self.assertTrue(config.compile.enable)
+    self.assertEqual(config.compile.mode, "aot_fx_trace")
+    self.assertEqual(config.compile.memory_policy, "full")
+    self.assertEqual(
+        config.xla_flags.get("xla_enable_hlo_sharding_v3"), "false"
     )
-    self.assertEqual(graph_config.compile.memory_policy, "full")
+    apply_tpu_graph_trainer_model_transforms(config)
 
   @parameterized.named_parameters(
       ("31b", gemma4_31b_graph_trainer, frozenset()),
@@ -1781,24 +1800,19 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   ) -> None:
     config = recipe()
 
-    self.assertTrue(config.tpu_config.use_graph_trainer)
-    self.assertEqual(config.tpu_config.compile_mode, "aot_fx_trace")
-    self.assertFalse(config.tpu_config.use_graph_split)
+    self.assertIsInstance(config, TpuGraphTrainer.Config)
+    self.assertTrue(config.compile.enable)
+    self.assertEqual(config.compile.mode, "aot_fx_trace")
+    self.assertFalse(config.compile.graph_split.enabled)
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
-    self.assertTrue(config.tpu_config.enable_graph_trainer_remat_schedule)
-    self.assertEqual(
-        config.tpu_config.graph_trainer_fsdp_schedule, "interleave"
-    )
-
-    graph_config = to_tpu_graph_trainer_config(
-        config, tpu_gemma4_graph_registry, target_cls=TpuGraphTrainer.Config
-    )
-    self.assertEqual(graph_config.compile.memory_policy, "full")
+    self.assertEqual(config.compile.memory_policy, "full")
+    self.assertTrue(config.compile.enable_remat_barriers)
+    self.assertEqual(config.compile.fsdp_barrier_policy, "interleave")
+    apply_tpu_graph_trainer_model_transforms(config)
 
     passes = construct_tpu_pass_pipeline(
         typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
-        graph_config,
+        config,
     )
     pass_names = [
         getattr(graph_pass, "func", graph_pass).__name__ for graph_pass in passes
@@ -1833,23 +1847,22 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     config = recipe()
     expected_policy = "full_and_offload" if offload else "full"
 
-    self.assertTrue(config.tpu_config.use_graph_trainer)
-    self.assertEqual(config.tpu_config.compile_mode, "aot_fx_trace")
-    self.assertTrue(config.tpu_config.use_graph_split)
+    self.assertIsInstance(config, TpuGraphTrainer.Config)
+    self.assertTrue(config.compile.enable)
+    self.assertEqual(config.compile.mode, "aot_fx_trace")
+    self.assertTrue(config.compile.graph_split.enabled)
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(
-        config.tpu_config.graph_trainer_memory_policy, expected_policy
-    )
-    self.assertFalse(config.tpu_config.enable_graph_trainer_remat_schedule)
-    self.assertEqual(config.tpu_config.graph_trainer_fsdp_schedule, "none")
-    self.assertFalse(config.tpu_config.compile_optimizer)
-    self.assertFalse(config.tpu_config.optimizer_in_graph)
+    self.assertEqual(config.compile.memory_policy, expected_policy)
+    self.assertFalse(config.compile.enable_remat_barriers)
+    self.assertEqual(config.compile.fsdp_barrier_policy, "none")
+    self.assertEqual(config.compile.optimizer_compile, "eager")
 
-    split = config.tpu_config.graph_split
+    split = config.compile.graph_split
     self.assertEqual(split.forward_layers_per_executable, 1)
     self.assertTrue(split.forward_isolate_prefix)
     self.assertEqual(split.backward_partition_mode, "by_layer")
     self.assertEqual(split.backward_layers_per_executable, 1)
+    self.assertTrue(split.donate_internal_buffers)
     self.assertEqual(
         split.cpu_offload_prefetch_executables, 1 if offload else 0
     )
@@ -1873,22 +1886,57 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
           "1000",
       )
 
-    graph_config = to_tpu_graph_trainer_config(
-        config, tpu_gemma4_graph_registry, target_cls=TpuGraphTrainer.Config
-    )
-    self.assertEqual(graph_config.compile.memory_policy, expected_policy)
+    apply_tpu_graph_trainer_model_transforms(config)
     splitter = GraphSplitter.from_trainer_config(
-        graph_config,
-        optimizer_in_graph=config.tpu_config.optimizer_in_graph,
+        config,
+        optimizer_in_graph=(config.compile.optimizer_compile == "in_graph"),
     )
     self.assertTrue(splitter.enabled)
     self.assertEqual(
         splitter.n_layers,
-        len(graph_config.model_spec.model.layers),
+        len(config.model_spec.model.layers),
     )
     self.assertEqual(
         splitter.config.cpu_offload_prefetch_executables, 1 if offload else 0
     )
+
+  def test_distributed_cli_overrides_parse_and_validate(self) -> None:
+    """CLI overrides used by TpuGraphTrainerDistributedTest parse cleanly."""
+    for recipe in (
+        "graph_trainer_gemma4_debugmodel",
+        "graph_trainer_gemma4_moe_debug",
+    ):
+      cfg = ConfigManager().parse_args([
+          "--module=torchtitan.experiments.tpu.examples.gemma4",
+          f"--config={recipe}",
+          "--parallelism.use_simple_fsdp",
+          "--parallelism.fsdp_reshard_after_forward=always",
+          "--compile.enable_remat_barriers",
+          "--compile.fsdp_barrier_policy=interleave",
+      ])
+      self.assertIsInstance(cfg, TpuGraphTrainer.Config)
+      apply_tpu_graph_trainer_model_transforms(cfg)
+
+    split_cfg = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.examples.gemma4",
+        "--config=graph_trainer_gemma4_debugmodel",
+        "--parallelism.use_simple_fsdp",
+        "--parallelism.fsdp_reshard_after_forward=always",
+        "--compile.memory_policy=full_and_offload",
+        "--compile.graph_split.enabled",
+        "--compile.graph_split.forward_layers_per_executable=1",
+        "--compile.graph_split.forward_isolate_prefix",
+        "--compile.graph_split.backward_partition_mode=by_layer",
+        "--compile.graph_split.backward_layers_per_executable=1",
+        "--compile.graph_split.cpu_offload_prefetch_executables=1",
+    ])
+    self.assertIsInstance(split_cfg, TpuGraphTrainer.Config)
+    apply_tpu_graph_trainer_model_transforms(split_cfg)
+    splitter = GraphSplitter.from_trainer_config(
+        split_cfg,
+        optimizer_in_graph=(split_cfg.compile.optimizer_compile == "in_graph"),
+    )
+    self.assertTrue(splitter.enabled)
 
 
 if __name__ == "__main__":

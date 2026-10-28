@@ -38,15 +38,11 @@ def _train_args(
     dataset: str = "c4_test",
     *,
     use_splash_attention_kernel: bool = True,
-    use_graph_trainer: bool = True,
 ) -> list[str]:
   """The flags every case here shares, so the arms differ only in what they test.
 
   ``use_splash_attention_kernel=False`` keeps the model on its plain SDPA
   inner attention (models whose Splash parity is not yet established).
-  ``use_graph_trainer=False`` leaves the recipe on the regular TPU trainer with
-  per-block ``torch.compile``, which is the baseline the graph trainer is
-  compared against.
   """
   # Upstream replaced seq_len/local_batch_size with a token budget:
   # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
@@ -65,11 +61,6 @@ def _train_args(
   ]
   if use_splash_attention_kernel:
     args.append("--splash_attention_kernel.use_splash_attention_kernel")
-  if use_graph_trainer:
-    args += [
-        "--tpu_config.use_graph_trainer",
-        "--tpu_config.compile_mode=aot_fx_trace",
-    ]
   return args
 
 
@@ -181,15 +172,15 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="gemma4_simple_fsdp",
           module="torchtitan.experiments.tpu.examples.gemma4",
-          config="gemma4_debugmodel",
+          config="graph_trainer_gemma4_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           use_splash_attention_kernel=False,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
               "--parallelism.fsdp_reshard_after_forward=always",
-              "--tpu_config.enable_graph_trainer_remat_schedule",
-              "--tpu_config.graph_trainer_fsdp_schedule=interleave",
+              "--compile.enable_remat_barriers",
+              "--compile.fsdp_barrier_policy=interleave",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -197,15 +188,15 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="gemma4_moe_simple_fsdp",
           module="torchtitan.experiments.tpu.examples.gemma4",
-          config="gemma4_moe_debug",
+          config="graph_trainer_gemma4_moe_debug",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           use_splash_attention_kernel=False,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
               "--parallelism.fsdp_reshard_after_forward=always",
-              "--tpu_config.enable_graph_trainer_remat_schedule",
-              "--tpu_config.graph_trainer_fsdp_schedule=interleave",
+              "--compile.enable_remat_barriers",
+              "--compile.fsdp_barrier_policy=interleave",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -213,20 +204,20 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="gemma4_graph_split_offload",
           module="torchtitan.experiments.tpu.examples.gemma4",
-          config="gemma4_debugmodel",
+          config="graph_trainer_gemma4_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           use_splash_attention_kernel=False,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
               "--parallelism.fsdp_reshard_after_forward=always",
-              "--tpu_config.use_graph_split",
-              "--tpu_config.graph_trainer_memory_policy=full_and_offload",
-              "--tpu_config.graph_split.forward_layers_per_executable=1",
-              "--tpu_config.graph_split.forward_isolate_prefix",
-              "--tpu_config.graph_split.backward_partition_mode=by_layer",
-              "--tpu_config.graph_split.backward_layers_per_executable=1",
-              "--tpu_config.graph_split.cpu_offload_prefetch_executables=1",
+              "--compile.memory_policy=full_and_offload",
+              "--compile.graph_split.enabled",
+              "--compile.graph_split.forward_layers_per_executable=1",
+              "--compile.graph_split.forward_isolate_prefix",
+              "--compile.graph_split.backward_partition_mode=by_layer",
+              "--compile.graph_split.backward_layers_per_executable=1",
+              "--compile.graph_split.cpu_offload_prefetch_executables=1",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -317,7 +308,6 @@ class TpuGraphTrainerDistributedTest(
     has stepped.
     """
     module = "torchtitan.experiments.tpu.examples.gemma4"
-    config = "gemma4_debugmodel"
     # Context 256 > the 128-token sliding window, 4 sequences per rank.
     shape = [
         "--training.max_context_length=256",
@@ -325,12 +315,13 @@ class TpuGraphTrainerDistributedTest(
     ]
     layer_compile_args = _train_args(
         module,
-        config,
+        "gemma4_debugmodel",
         use_splash_attention_kernel=False,
-        use_graph_trainer=False,
     )
     graph_trainer_args = _train_args(
-        module, config, use_splash_attention_kernel=False
+        module,
+        "graph_trainer_gemma4_debugmodel",
+        use_splash_attention_kernel=False,
     )
     arms = {
         "layer_compile": [
@@ -340,12 +331,12 @@ class TpuGraphTrainerDistributedTest(
         ],
         "graph_trainer": [
             *graph_trainer_args,
-            "--tpu_config.use_simple_fsdp",
+            "--parallelism.use_simple_fsdp",
             *shape,
         ],
         "control": [
             *graph_trainer_args,
-            "--tpu_config.use_simple_fsdp",
+            "--parallelism.use_simple_fsdp",
             *shape,
             "--lr_scheduler.warmup_steps=3",
         ],

@@ -9,7 +9,6 @@ from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -20,13 +19,26 @@ from torchtitan.experiments.tpu.examples.gemma4 import (
     Gemma4Model,
     model_registry,
 )
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    GraphSplitterConfig,
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.gemma4 import (
+    model_registry as graph_trainer_model_registry,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
+)
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
 )
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    TpuTrainerCompileConfig,
+    TPUTrainerConfig,
+)
 
 
 # Host-offload copy-insertion flags shared with the Qwen3 235B graph-splitter
@@ -82,12 +94,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      # GraphTrainer ignores eager AC and reads TPUConfig.graph_trainer_memory_policy;
-      # set "full" there too so --tpu_config.use_graph_trainer matches FullAC.
       activation_checkpoint=FullAC.Config(),
-      tpu_config=TPUConfig(
-          graph_trainer_memory_policy="full",
-      ),
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
       ),
@@ -126,6 +133,33 @@ def gemma4_moe_debug() -> TPUTrainerConfig:
   return cfg
 
 
+def graph_trainer_gemma4_debugmodel() -> TpuGraphTrainer.Config:
+  """Gemma4 dense debug model configuration using TPU GraphTrainer."""
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      gemma4_debugmodel(), graph_trainer_model_registry
+  )
+  # Match gemma4_debugmodel's FullAC on the joint graph.
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full",
+  )
+  return config
+
+
+def graph_trainer_gemma4_moe_debug() -> TpuGraphTrainer.Config:
+  """Gemma4 MoE debug model configuration using TPU GraphTrainer."""
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      gemma4_moe_debug(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full",
+  )
+  return config
+
+
 def gemma4_31b() -> TPUTrainerConfig:
   """Gemma4 31B dense model configuration for TPU."""
   model_spec = model_registry(
@@ -161,18 +195,13 @@ def gemma4_31b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=False,
       ),
-      # GraphTrainer ignores eager AC and reads TPUConfig.graph_trainer_memory_policy;
-      # set "full" there too so --tpu_config.use_graph_trainer matches FullAC.
       activation_checkpoint=FullAC.Config(),
-      tpu_config=TPUConfig(
-          graph_trainer_memory_policy="full",
-      ),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # Qwen3 and Muse Glimmer recipes.
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -201,38 +230,49 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
   return cfg
 
 
-def _configure_graph_trainer_full_ac(cfg: TPUTrainerConfig) -> TPUTrainerConfig:
+def _configure_graph_trainer_full_ac(
+    base_cfg: TPUTrainerConfig,
+) -> TpuGraphTrainer.Config:
   """Configure unsplit GraphTrainer ZeRO-3 with full activation checkpointing."""
+  cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      base_cfg, graph_trainer_model_registry
+  )
   cfg.parallelism.fsdp_reshard_after_forward = "always"
-  cfg.tpu_config.use_graph_trainer = True
-  cfg.tpu_config.compile_mode = "aot_fx_trace"
-  cfg.tpu_config.graph_trainer_memory_policy = "full"
-  cfg.tpu_config.enable_graph_trainer_remat_schedule = True
-  cfg.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+  cfg.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full",
+      enable_remat_barriers=True,
+      fsdp_barrier_policy="interleave",
+  )
   return cfg
 
 
 def _configure_graph_split(
-    cfg: TPUTrainerConfig, *, offload: bool = False
-) -> TPUTrainerConfig:
+    base_cfg: TPUTrainerConfig, *, offload: bool = False
+) -> TpuGraphTrainer.Config:
   """Configure per-layer GraphTrainer splitting with full or host-offload AC."""
-  cfg.parallelism.fsdp_reshard_after_forward = "always"
-  cfg.tpu_config.use_graph_trainer = True
-  cfg.tpu_config.compile_mode = "aot_fx_trace"
-  cfg.tpu_config.use_graph_split = True
-  cfg.tpu_config.graph_trainer_memory_policy = (
-      "full_and_offload" if offload else "full"
+  cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      base_cfg, graph_trainer_model_registry
   )
-  cfg.tpu_config.enable_graph_trainer_remat_schedule = False
-  cfg.tpu_config.graph_trainer_fsdp_schedule = "none"
-  cfg.tpu_config.compile_optimizer = False
-  cfg.tpu_config.optimizer_in_graph = False
-  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
-  cfg.tpu_config.graph_split.forward_isolate_prefix = True
-  cfg.tpu_config.graph_split.backward_partition_mode = "by_layer"
-  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full_and_offload" if offload else "full",
+      optimizer_compile="eager",
+      enable_remat_barriers=False,
+      fsdp_barrier_policy="none",
+      graph_split=GraphSplitterConfig(
+          enabled=True,
+          forward_layers_per_executable=1,
+          forward_isolate_prefix=True,
+          backward_partition_mode="by_layer",
+          backward_layers_per_executable=1,
+          cpu_offload_prefetch_executables=1 if offload else 0,
+      ),
+  )
   if offload:
-    cfg.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
     cfg.libtpu_init_flags = tpu_flags.merge_flags(
         cfg.libtpu_init_flags,
         _GEMMA4_GRAPH_SPLIT_OFFLOAD_FLAGS,
@@ -240,31 +280,31 @@ def _configure_graph_split(
   return cfg
 
 
-def gemma4_31b_graph_trainer() -> TPUTrainerConfig:
+def gemma4_31b_graph_trainer() -> TpuGraphTrainer.Config:
   """Gemma4 31B unsplit GraphTrainer ZeRO-3 recipe with full AC."""
   return _configure_graph_trainer_full_ac(gemma4_31b())
 
 
-def gemma4_31b_graph_split() -> TPUTrainerConfig:
+def gemma4_31b_graph_split() -> TpuGraphTrainer.Config:
   """Gemma4 31B per-layer graph-split GraphTrainer recipe with full AC."""
   return _configure_graph_split(gemma4_31b(), offload=False)
 
 
-def gemma4_31b_graph_split_offload() -> TPUTrainerConfig:
+def gemma4_31b_graph_split_offload() -> TpuGraphTrainer.Config:
   """Gemma4 31B per-layer graph-split GraphTrainer recipe with full+offload AC."""
   return _configure_graph_split(gemma4_31b(), offload=True)
 
 
-def gemma4_26b_a4b_graph_trainer() -> TPUTrainerConfig:
+def gemma4_26b_a4b_graph_trainer() -> TpuGraphTrainer.Config:
   """Gemma4 26B-A4B unsplit GraphTrainer ZeRO-3 recipe with full AC."""
   return _configure_graph_trainer_full_ac(gemma4_26b_a4b())
 
 
-def gemma4_26b_a4b_graph_split() -> TPUTrainerConfig:
+def gemma4_26b_a4b_graph_split() -> TpuGraphTrainer.Config:
   """Gemma4 26B-A4B per-layer graph-split GraphTrainer recipe with full AC."""
   return _configure_graph_split(gemma4_26b_a4b(), offload=False)
 
 
-def gemma4_26b_a4b_graph_split_offload() -> TPUTrainerConfig:
+def gemma4_26b_a4b_graph_split_offload() -> TpuGraphTrainer.Config:
   """Gemma4 26B-A4B per-layer graph-split GraphTrainer recipe with full+offload AC."""
   return _configure_graph_split(gemma4_26b_a4b(), offload=True)

@@ -1,9 +1,11 @@
-"""Gemma 4 on the TPU GraphTrainer path (``--tpu_config.use_graph_trainer``).
+"""Gemma 4 on the TPU GraphTrainer path (``TpuGraphTrainer.Config``).
 
-``train.py`` needs a GraphTrainer registry per model. This one reuses
-``experiments.tpu.examples.gemma4``'s model config unchanged (with
-``enable_weight_tying=False``) and swaps in ``parallelize_gemma4``, which
-annotates module FQNs, configures uneven-dimension SimpleFSDP shard dims
+GraphTrainer recipes convert a base ``TPUTrainerConfig`` via
+``TpuGraphTrainer.Config.from_tpu_trainer_config`` using this module's
+``model_registry``. This registry reuses ``experiments.tpu.examples.gemma4``'s
+model config unchanged (with ``enable_weight_tying=False``) and swaps in
+``parallelize_gemma4``, which annotates module FQNs, configures
+uneven-dimension SimpleFSDP shard dims
 (``configure_gemma4_simple_fsdp_shard_dims``: the 262144-token vocabulary and
 the 128-expert banks switch to a divisible hidden axis when the FSDP degree
 does not divide dim 0), applies SimpleFSDP, and hands the model to
@@ -16,7 +18,7 @@ bypasses SimpleFSDP's parametrization.
 
 Only SimpleFSDP / HSDP is supported here.
 
-Scan (``--tpu_config.use_scan_layers``) is not supported without
+Scan (``--compile.use_scan_layers``) is not supported without
 homogeneous-group partitioning: the sliding and global layers have different
 ``head_dim`` / ``n_kv_heads`` and different QKV projections (``QKVLinear`` vs
 ``QKVLinearKeqV``), so ``check_layers_are_stackable`` refuses them. Graph split
@@ -61,8 +63,8 @@ def parallelize_gemma4(
   """Applies SimpleFSDP (TPU uneven-dim policy) and graph capture to Gemma 4.
 
   ``ac_config`` is accepted for the ``parallelize_fn`` protocol but unused: the
-  graph trainer rematerializes its joint graph with
-  ``tpu_config.graph_trainer_memory_policy`` instead of eager AC wrappers.
+  graph trainer rematerializes its joint graph with ``compile.memory_policy``
+  instead of eager AC wrappers.
   """
   del ac_config
   unsupported = [

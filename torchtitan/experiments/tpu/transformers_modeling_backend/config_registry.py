@@ -337,6 +337,15 @@ def hf_moe_auto() -> TPUTransformersBackendConfig:
                         compile=True, use_pallas_grouped_mm=True)
 
 
+def hf_moe_auto_max() -> TPUTransformersBackendConfig:
+  """``hf_moe_auto`` plus what ``hf_full_max`` adds: the fused CE (no full fp32
+  logits -- 18 GiB at 32k tokens for a 150k vocabulary) and selective AC that
+  keeps the attention output."""
+  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
+                        compile=True, use_pallas_grouped_mm=True, fused_loss=True,
+                        save_attention=True)
+
+
 def hf_moe_auto_eager() -> TPUTransformersBackendConfig:
   """hf_moe_auto without compile or use_pallas_grouped_mm (debugging baseline)."""
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu")

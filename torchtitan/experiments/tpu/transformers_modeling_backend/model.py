@@ -32,6 +32,7 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 import contextlib
 import copy
 import json
+import os
 from dataclasses import dataclass
 
 import torch
@@ -1022,3 +1023,22 @@ def _use_pallas_grouped_mm(moe_config) -> None:
     experts.pallas_grouped_mm_tile_n = tile
     experts.pallas_grouped_mm_tgmm_tiling = (256, tile, tile)
     experts.use_kernel_native_weight_layout = True
+    # TUNING ONLY (not for merge): TT_HF_GMM="key=value,..." overrides
+    # TpuGroupedExperts.Config fields; "a:b:c" is a tuple of ints, "none" None,
+    # "true"/"false" booleans (no quotes, so it survives a shell-in-YAML launch).
+    override = os.environ.get("TT_HF_GMM")
+    if override:
+      for item in override.split(","):
+        key, raw = item.split("=", 1)
+        if not hasattr(experts, key):
+          raise ValueError(f"TT_HF_GMM: TpuGroupedExperts.Config has no field {key!r}")
+        if raw.lower() in ("true", "false"):
+          value = raw.lower() == "true"
+        elif raw.lower() == "none":
+          value = None
+        elif ":" in raw:
+          value = tuple(int(x) for x in raw.split(":"))
+        else:
+          value = int(raw)
+        setattr(experts, key, value)
+      logger.info("TT_HF_GMM override applied: %s", override)

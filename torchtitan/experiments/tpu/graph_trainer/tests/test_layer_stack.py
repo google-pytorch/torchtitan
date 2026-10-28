@@ -324,11 +324,10 @@ class TestLayerStack(unittest.TestCase):
     def test_the_body_recomputes_its_gather_in_backward(self):
         """The in-body gather is worth nothing unless backward redoes it.
 
-        At the default budget the partitioner saves the gathered per-layer
-        weight across the cut: the gather runs inside the loop, but its result
-        is carried out of it. ``run`` opens an ``activation_memory_budget=0.0``
-        window to stop that. Two things are checked here -- that the window
-        reaches the body's partition, and that it closes again afterwards,
+        Left alone, the partitioner saves the gathered per-layer weight across
+        the cut: the gather runs inside the loop, but its result is carried
+        out of it. ``run`` tags the gather to stop that. Checked here: the tags
+        reach the body's partition, and the window closes again afterwards,
         since the config is process-global.
         """
         captured = []
@@ -349,7 +348,7 @@ class TestLayerStack(unittest.TestCase):
 
         self.assertTrue(captured, "the scan body was never partitioned")
         budget, backward = captured[0]
-        self.assertEqual(budget, 0.0)
+        self.assertEqual(budget, 1.0)
         self.assertTrue(
             any("all_gather" in str(n.target) for n in backward.graph.nodes),
             "the body's backward reuses a saved gather instead of redoing it",

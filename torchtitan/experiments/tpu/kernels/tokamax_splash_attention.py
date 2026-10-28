@@ -49,6 +49,10 @@ jaxtyping.jaxtyped = _real_jaxtyped
 import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.remat_regions import (  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
+    ATTENTION_INNER_ATTENTION,
+    annotate_region,
+)
 
 
 # Taken from tokamax._src.ops.splash_attention.base.DEFAULT_MASK_VALUE.
@@ -680,15 +684,17 @@ def splash_sdpa(
 
   local_window_size_val = local_window_size if local_window_size is not None else -1
 
-  out, _ = splash_op(
-      q,
-      k,
-      v,
-      segment_ids,
-      cp_rank,
-      is_causal,
-      local_window_size_val,
-      scale,
-      *_kernel_config_args(),
-  )
+  # The region lets a scan body's memory policy keep the output and LSE.
+  with annotate_region(ATTENTION_INNER_ATTENTION):
+    out, _ = splash_op(
+        q,
+        k,
+        v,
+        segment_ids,
+        cp_rank,
+        is_causal,
+        local_window_size_val,
+        scale,
+        *_kernel_config_args(),
+    )
   return out

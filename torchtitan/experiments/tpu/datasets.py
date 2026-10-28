@@ -18,9 +18,13 @@ from typing import Any
 from torchtitan.components.data.dataset import SingleDatasetConfig
 from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
+from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
 __all__ = [
+    "CHAT_DATASETS",
+    "FieldsToChat",
     "TPUGrainDataLoader",
     "c4_test_dataloader",
 ]
@@ -61,6 +65,104 @@ def _text_dataset(name: str, dataset_path: str | None) -> SingleDatasetConfig:
       ),
   )
 
+
+
+@dataclasses.dataclass(frozen=True)
+class FieldsToChat:
+  """Turns a record into a single-turn chat from two of its fields.
+
+  A `ChatProcessor` `messages_fn` that is set from field names, so single-turn
+  datasets need no Python code.
+  """
+
+  prompt_field: str
+  response_field: str
+
+  def __call__(self, sample: dict[str, Any]) -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": sample[self.prompt_field]},
+        {"role": "assistant", "content": sample[self.response_field]},
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChatDataset:
+  """A single-turn chat dataset: a Hugging Face source and its two fields."""
+
+  path: str
+  name: str | None = None
+  prompt_field: str = "prompt"
+  response_field: str = "response"
+
+
+CHAT_DATASETS: dict[str, _ChatDataset] = {
+    # Grade-school math word problems with worked solutions; train/test splits.
+    "gsm8k": _ChatDataset(
+        path="openai/gsm8k",
+        name="main",
+        prompt_field="question",
+        response_field="answer",
+    ),
+    # A local JSON or JSON Lines file, given by `dataset_path`.
+    "chat_json": _ChatDataset(path="json"),
+}
+"""Single-turn chat datasets for fine-tuning, by `--dataloader.dataset` name."""
+
+
+def _is_not_none(sample: Any) -> bool:
+  return sample is not None
+
+
+def _chat_dataset(
+    name: str,
+    *,
+    dataset_path: str | None,
+    split: str | None,
+    prompt_field: str | None,
+    response_field: str | None,
+) -> SingleDatasetConfig:
+  """Resolves a registered chat dataset, applying the loader's overrides.
+
+  Args:
+    name: Key in `CHAT_DATASETS`.
+    dataset_path: For `chat_json`, the JSON/JSON Lines file (required); for
+      other entries, replaces the Hugging Face path (e.g. a local mirror).
+    split: Dataset split; defaults to "train". Ignored for local JSON files
+      (`chat_json`): the file is the split, so point `dataset_path` at a
+      separate file for evaluation.
+    prompt_field: Overrides the entry's prompt field.
+    response_field: Overrides the entry's response field.
+
+  Returns:
+    The dataset config, tokenized with `ChatProcessor` so that the loss covers
+    the response only.
+  """
+  entry = CHAT_DATASETS[name]
+  path, load_dataset_kwargs = entry.path, {}
+  if entry.path == "json":
+    if not dataset_path:
+      raise ValueError(
+          f"--dataloader.dataset={name} needs --dataloader.dataset_path"
+      )
+    load_dataset_kwargs = {"data_files": dataset_path}
+  elif dataset_path:
+    path = dataset_path
+  return SingleDatasetConfig(
+      source=HuggingFaceRandomAccessSource.Config(
+          path=path,
+          name=entry.name,
+          # Hugging Face's json loader names a single file's rows "train".
+          split="train" if entry.path == "json" else (split or "train"),
+          load_dataset_kwargs=load_dataset_kwargs,
+      ),
+      processor=ChatProcessor.Config(
+          messages_fn=FieldsToChat(
+              prompt_field=prompt_field or entry.prompt_field,
+              response_field=response_field or entry.response_field,
+          )
+      ),
+      post_filters=(_is_not_none,),
+  )
 
 class TPUGrainDataLoader(GrainDataLoader):
   """GrainDataLoader wrapper preserving TPU CLI flags (`dataset`, `dataset_path`)."""

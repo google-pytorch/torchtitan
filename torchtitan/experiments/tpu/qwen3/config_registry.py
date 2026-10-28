@@ -22,6 +22,7 @@ from torchtitan.config.transform import apply_transforms, ContextParallelTransfo
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
+from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -1153,6 +1154,32 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
       cfg.libtpu_init_flags,
       _Q235_SCAN_FLAGS,
   )
+  return cfg
+
+
+def qwen3_moe_235b_scan_torchao_float8() -> TpuGraphTrainer.Config:
+  """`qwen3_moe_235b_scan` with torchao rowwise float8 dense linears.
+
+  A reference for the upstream float8 path on Qwen3, not a speed recipe. The
+  attention projections (wqkv/wo) become torchao `Float8Linear`s through
+  `TpuFloat8LinearConverter`, the converter `llama3_70b_float8` uses, so their
+  matmuls go through TorchTPU's `torch._scaled_mm`. The router gate and lm_head
+  stay BF16. So do the routed experts: they run in `TpuGroupedExperts`' Pallas
+  kernels, which torchao's converters do not target.
+  """
+  cfg = qwen3_moe_235b_scan()
+  assert cfg.model_spec is not None
+  # Convert only the attention projections (wqkv/wo); the routed experts are
+  # grouped matmuls, not linears. filter_fqns entries match as substrings of a
+  # linear's FQN and keep it in BF16:
+  # * router.gate: its logits pick each token's top-k experts, so FP8 error can
+  #   flip routing, and it is tiny (dim x num_experts). The converter also
+  #   rejects router gates that are not filtered out.
+  # * lm_head: its error lands directly on the vocab logits and the loss.
+  converter = TpuFloat8LinearConverter.Config(
+      recipe_name="rowwise", filter_fqns=["router.gate", "lm_head"]
+  ).build()
+  cfg.model_spec.model = converter.convert(cfg.model_spec.model)
   return cfg
 
 

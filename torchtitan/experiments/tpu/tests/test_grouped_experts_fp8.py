@@ -27,6 +27,11 @@ class TpuGroupedExpertsFp8ConfigTest(absltest.TestCase):
     with self.assertRaisesRegex(NotImplementedError, "row_scale_R"):
       experts(x, sizes, row_scale_R=torch.ones(512))
 
+  def test_fp8_requires_silu(self):
+    # The fused SwiGLU + W2 op always computes silu(gate) * up.
+    with self.assertRaisesRegex(ValueError, "silu"):
+      TpuGroupedExperts(_fp8_experts_config(activation="gelu_tanh"))
+
 
 if __name__ == "__main__":
   absltest.main()

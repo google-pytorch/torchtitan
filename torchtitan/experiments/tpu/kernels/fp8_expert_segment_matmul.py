@@ -30,7 +30,6 @@ meant for int8). FP8 residuals cross the torch boundary bitcast to int8.
 import jax
 import jax.numpy as jnp
 import jaxtyping
-import qwix
 
 # Workaround for https://github.com/openxla/tokamax/issues/240 (as in
 # tokamax_splash_attention.py): typeguard cannot parse the jaxtyping shape
@@ -106,8 +105,8 @@ def fp8_gmm_fwd_quantized(
     return call_named(
         tokamax_gmm.gmm,
         "fp8_moe_gmm_fwd",
-        qwix.QArray(qvalue=lhs_q, scale=lhs_scale),
-        qwix.QArray(qvalue=rhs_q, scale=rhs_scale),
+        tokamax_gmm.QArray(qvalue=lhs_q, scale=lhs_scale),
+        tokamax_gmm.QArray(qvalue=rhs_q, scale=rhs_scale),
         group_sizes,
         precision=_PRECISION,
         out_dtype=out_dtype,
@@ -138,7 +137,7 @@ def fp8_gmm_bwd_quantized(
     grad_lhs = call_named(
         tokamax_gmm.gmm,
         "fp8_moe_gmm_dlhs",
-        qwix.QArray(qvalue=dlhs_dout, scale=dlhs_dout_scale),  # scale [M, 1]
+        tokamax_gmm.QArray(qvalue=dlhs_dout, scale=dlhs_dout_scale),  # scale [M, 1]
         rhs_q,
         group_sizes,
         precision=_PRECISION,
@@ -155,7 +154,7 @@ def fp8_gmm_bwd_quantized(
         tokamax_gmm.tgmm,
         "fp8_moe_tgmm_drhs",
         jnp.swapaxes(lhs_q, 0, 1),  # [K, M], raw e4m3 values
-        qwix.QArray(qvalue=drhs_dout, scale=drhs_dout_scale),  # scale [1, N]
+        tokamax_gmm.QArray(qvalue=drhs_dout, scale=drhs_dout_scale),  # scale [1, N]
         group_sizes,
         precision=_PRECISION,
         # Store in the weight's dtype; autograd would cast to it anyway.

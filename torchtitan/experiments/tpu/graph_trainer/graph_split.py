@@ -801,6 +801,21 @@ def split_forward_graph_by_layer(
   return chunked
 
 
+def _is_parameter_ag_chain(
+    launch: torch.fx.Node,
+    chain: set[torch.fx.Node],
+) -> bool:
+  val = launch.meta.get("val")
+  if isinstance(val, torch.Tensor) and val.dtype in (torch.int32, torch.int64):
+    return False
+  external_inputs = {
+      inp for node in chain for inp in node.all_input_nodes if inp not in chain
+  }
+  return bool(external_inputs) and all(
+      inp.op == "placeholder" for inp in external_inputs
+  )
+
+
 def _collect_backward_fsdp_owners(
     gm: torch.fx.GraphModule,
     *,
@@ -815,6 +830,13 @@ def _collect_backward_fsdp_owners(
       and comm.kind in ("ag", "rs")
       and comm.logical_index is not None
       and comm.logical_index < n_layers
+      and (
+          comm.kind != "ag"
+          or _is_parameter_ag_chain(
+              comm.launch,
+              collective_chains.get(comm.launch, {comm.launch}),
+          )
+      )
   }
   missing_chains = [
       launch.name for launch in owners if launch not in collective_chains

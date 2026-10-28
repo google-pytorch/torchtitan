@@ -36,7 +36,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 Defaults from [`llama3_70b`](../../../../llama3/config_registry.py):
 - **Sequence Length**: 8192
 - **Torch Compile**: Layerwise, with the `tpu` backend. `compile.components=["model"]`
-  together with the default `tpu_config.compile_mode="layer"` compiles each
+  together with the default `compile.mode="layer"` compiles each
   TransformerBlock separately (`fullgraph=True`) rather than the model as one graph.
 - **Simple FSDP**: Enabled.
 - **Splash Attention**: Enabled with block size 2048.

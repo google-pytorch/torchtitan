@@ -452,9 +452,9 @@ def _selective_config(
     save_regions: tuple[str, ...], last_n_layers: dict[str, int] | None = None
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        tpu_config=SimpleNamespace(
-            graph_trainer_save_regions=save_regions,
-            graph_trainer_save_last_n_layers=last_n_layers or {},
+        compile=SimpleNamespace(
+            save_regions=save_regions,
+            save_last_n_layers=last_n_layers or {},
         ),
         parallelism=_parallelism("always"),
     )
@@ -647,9 +647,8 @@ class TestTpuSelectivePolicy(unittest.TestCase):
             traced, _ = _trace_toy(_MoEToy(_splash_cores()))
             remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
             config = _selective_config((), last_n_layers)
-            config.compile = SimpleNamespace(
-                cpu_offload_budget_gb=100.0, full_recompute_save_ops=""
-            )
+            config.compile.cpu_offload_budget_gb = 100.0
+            config.compile.full_recompute_save_ops = ""
             # The toy's tensors are below the offload size floor.
             with mock.patch.object(cpu_offload, "_MIN_OFFLOAD_BYTES", 0):
                 MEMORY_POLICY_REGISTRY[policy](traced.gm, config=config)

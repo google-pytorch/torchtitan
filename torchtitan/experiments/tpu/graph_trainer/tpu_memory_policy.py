@@ -44,7 +44,7 @@ class SaveRegion:
     """One kind of forward value that a TPU selective policy may keep.
 
     Attributes:
-        name: The name used in ``graph_trainer_save_regions``.
+        name: The name used in ``save_regions``.
         select: Returns this region's candidate forward nodes, in forward order.
     """
 
@@ -205,9 +205,10 @@ def _is_splash_output(value: object) -> bool:
 def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     """Return the Splash forward nodes, whose output and LSE backward reads.
 
-    Matched by op rather than by module FQN: the Splash patches install their
-    module or forward after ``annotate_module_fqns`` has run, so the op carries
-    its parent's ``layers.N.attention`` FQN, not
+    Matched by op rather than by module FQN, so the match does not depend on
+    whether the Splash patch replaced ``inner_attention`` before or after
+    ``annotate_module_fqns`` ran. ``TpuGraphTrainer`` applies the patches
+    before ``parallelize_fn``, so the replacement module is annotated with
     ``layers.N.attention.inner_attention``. Raises if a Splash op does not
     return the expected pair, so a kernel change fails loudly instead of
     silently saving the wrong thing.
@@ -228,7 +229,7 @@ def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 # Saving the output and LSE lets backward skip re-running the Splash forward.
 # It is large (and the LSE is padded on device), so recipes may save it only in
-# the last few layers with ``graph_trainer_save_last_n_layers``.
+# the last few layers with ``save_last_n_layers``.
 #
 # This is not the same as an eager ``RegionAC`` save region of the same name.
 # Here only what the Splash backward reads is saved (output and LSE); its
@@ -314,7 +315,7 @@ def _in_last_n_layers(
     layer_ids = {_get_layer_id(node) for node in nodes}
     if _NOT_IN_LAYERS in layer_ids:
         raise ValueError(
-            f"graph_trainer_save_last_n_layers limits {name!r}, but some of its "
+            f"save_last_n_layers limits {name!r}, but some of its "
             "values are outside the transformer layers."
         )
     kept_layer_ids = set(sorted(layer_ids)[-n_layers:])
@@ -363,8 +364,8 @@ def resolve_save_regions(
 ) -> list[SaveRegion]:
     """Check the save-region settings and return the regions they name.
 
-    ``save_regions`` (``graph_trainer_save_regions``) are saved in every
-    layer. ``last_n_layers`` (``graph_trainer_save_last_n_layers``) maps
+    ``save_regions`` (``compile.save_regions``) are saved in every
+    layer. ``last_n_layers`` (``compile.save_last_n_layers``) maps
     regions to save only in their last N layers. Each region goes in one of
     the two.
     """
@@ -372,8 +373,8 @@ def resolve_save_regions(
     names = [*save_regions, *last_n_layers]
     if not names:
         raise ValueError(
-            f"graph_trainer_memory_policy={policy!r} needs a region in "
-            "graph_trainer_save_regions or graph_trainer_save_last_n_layers; "
+            f"memory_policy={policy!r} needs a region in "
+            "save_regions or save_last_n_layers; "
             f"known regions: {known}."
         )
     unknown = [name for name in names if name not in SAVE_REGIONS]
@@ -381,20 +382,20 @@ def resolve_save_regions(
         raise ValueError(f"Unknown save regions {unknown}; known regions: {known}.")
     if len(set(save_regions)) != len(save_regions):
         raise ValueError(
-            f"Duplicate entries in graph_trainer_save_regions: {list(save_regions)}."
+            f"Duplicate entries in save_regions: {list(save_regions)}."
         )
     in_both = [name for name in last_n_layers if name in save_regions]
     if in_both:
         raise ValueError(
-            f"Save regions {in_both} are in both graph_trainer_save_regions and "
-            "graph_trainer_save_last_n_layers. List each region once: in "
-            "graph_trainer_save_regions to save it in every layer, or in "
-            "graph_trainer_save_last_n_layers to save it in its last N layers."
+            f"Save regions {in_both} are in both save_regions and "
+            "save_last_n_layers. List each region once: in "
+            "save_regions to save it in every layer, or in "
+            "save_last_n_layers to save it in its last N layers."
         )
     for name, n_layers in last_n_layers.items():
         if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers < 1:
             raise ValueError(
-                f"graph_trainer_save_last_n_layers[{name!r}] must be a positive "
+                f"save_last_n_layers[{name!r}] must be a positive "
                 f"integer, got {n_layers!r}."
             )
     return [SAVE_REGIONS[name] for name in names]
@@ -407,9 +408,8 @@ def _tpu_selective_memory_policy_pass(
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
     """Full recompute, except the configured save regions."""
-    tpu_config = config.tpu_config
-    last_n_layers = tpu_config.graph_trainer_save_last_n_layers
-    regions = resolve_save_regions(tpu_config.graph_trainer_save_regions, last_n_layers)
+    last_n_layers = config.compile.save_last_n_layers
+    regions = resolve_save_regions(config.compile.save_regions, last_n_layers)
     full_remat_with_saves(gm, config, select_saves(gm, regions, last_n_layers))
     return gm
 
@@ -432,10 +432,9 @@ def _tpu_selective_and_offload_memory_policy_pass(
     save-region values stay on device: backward reads them first, and
     offloading them too would add their bytes to the host link every layer.
     """
-    tpu_config = config.tpu_config
-    last_n_layers = tpu_config.graph_trainer_save_last_n_layers
+    last_n_layers = config.compile.save_last_n_layers
     regions = resolve_save_regions(
-        tpu_config.graph_trainer_save_regions,
+        config.compile.save_regions,
         last_n_layers,
         "tpu_selective_and_offload",
     )

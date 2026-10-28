@@ -23,7 +23,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Packed QKV**: Q/K/V projections run as one packed matmul
   (`TpuPackedQKVConverter`). Model checkpoint keys stay `wq`/`wk`/`wv`;
   optimizer state is layout-specific.
-- **Prefetch FSDP schedule**: `graph_trainer_fsdp_schedule="prefetch"`.
+- **Prefetch FSDP barriers**: `compile.fsdp_barrier_policy="prefetch"`.
 - **Config-carried flags**: libtpu init flags (p-state 7, scoped VMEM, SparseCore
   collective offload including hierarchical reduce-scatter) ride on the config
   and are exported before PJRT initialization, so the command below does not

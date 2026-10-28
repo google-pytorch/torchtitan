@@ -134,7 +134,7 @@ def _build(
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
     ``stacked``/``scan`` pick the converter, exactly as
-    ``TpuGraphTrainer.Config.from_tpu_trainer_config`` does -- the model arrives
+    ``apply_tpu_graph_trainer_model_transforms`` does -- the model arrives
     from ``build()`` already stacked, and ``apply_simple_fsdp`` is given the same
     arguments in every arm.
 

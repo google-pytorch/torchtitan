@@ -145,11 +145,11 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="muse_glimmer_simple_fsdp",
           module="torchtitan.experiments.tpu.muse_glimmer",
-          config="muse_glimmer_debugmodel",
+          config="graph_trainer_muse_glimmer_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],

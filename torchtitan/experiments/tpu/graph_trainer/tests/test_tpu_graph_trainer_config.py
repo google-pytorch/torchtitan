@@ -132,6 +132,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           "torchtitan.experiments.tpu.deepseek_v3",
           "graph_trainer_deepseek_v3_debugmodel",
       ),
+      (
+          "torchtitan.experiments.tpu.muse_glimmer",
+          "graph_trainer_muse_glimmer_debugmodel",
+      ),
   )
   def test_graph_recipe_returns_final_config_type(
       self, module: str, recipe: str

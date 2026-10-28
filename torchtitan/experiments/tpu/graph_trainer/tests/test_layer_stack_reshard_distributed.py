@@ -65,7 +65,7 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         ep=1,
         world_size=world_size,
     )
-    # The rewrite `TpuGraphTrainer.Config.from_tpu_trainer_config` applies.
+    # The rewrite `apply_tpu_graph_trainer_model_transforms` applies.
     # Both arms get one, so stacking is the only difference; a stock `Decoder`
     # loops over its layers directly and would ignore the stacks.
     convert = (

@@ -22,6 +22,7 @@ from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 __all__ = [
+    "graph_trainer_muse_glimmer_debugmodel",
     "muse_glimmer_debugmodel",
     "muse_glimmer_debugmodel_fused_ce",
     "muse_glimmer_30b_full_logits",
@@ -125,6 +126,18 @@ def muse_glimmer_debugmodel_fused_ce() -> TPUTrainerConfig:
   """
   config = muse_glimmer_debugmodel()
   _enable_pallas_cross_entropy(config)
+  return config
+
+
+def graph_trainer_muse_glimmer_debugmodel() -> TpuGraphTrainer.Config:
+  """Muse Glimmer debug model using TPU GraphTrainer."""
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      muse_glimmer_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
   return config
 
 

@@ -175,11 +175,6 @@ class TpuGraphTrainer(GraphTrainer):
         self._optimizer_in_graph = (
             config.compile.optimizer_compile == "in_graph"
         )
-        if self._optimizer_in_graph and config.compile.compile_grad_norm:
-            raise ValueError(
-                "compile.compile_grad_norm cannot be combined with "
-                "compile.optimizer_compile='in_graph'"
-            )
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.compile.compile_grad_norm else None
         )

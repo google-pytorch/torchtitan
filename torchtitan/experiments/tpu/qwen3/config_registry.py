@@ -39,6 +39,7 @@ from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     with_maxtext_flops,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+from torchtitan.experiments.tpu.kernels import fp8_linear
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
 import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
@@ -1226,14 +1227,28 @@ def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
 
 
 def qwen3_moe_235b_scan_fp8() -> TpuGraphTrainer.Config:
-  """`qwen3_moe_235b_scan` with FP8 expert GEMMs.
+  """`qwen3_moe_235b_scan` with FP8 expert GEMMs and FP8 attention projections.
 
   The expert W1/W3/W2 GEMMs and their backward run on FP8 operands through
   tokamax's Mosaic GMM/TGMM (e4m3 forward, e5m2 gradients, dynamic row-wise
-  scales; see `kernels/fp8_expert_segment_matmul.py`). Attention, router and
-  lm_head stay BF16.
+  scales; see `kernels/fp8_expert_segment_matmul.py`). wqkv/wo become
+  `TpuFp8Linear` with an FP8 forward and a BF16 backward: quantizing dy for an
+  FP8 dInput or dWeight costs more than the FP8 GEMM saves at these shapes. The
+  router gate (computed in FP32) and lm_head stay BF16.
   """
-  return _with_fp8_experts(qwen3_moe_235b_scan())
+  cfg = _with_fp8_experts(qwen3_moe_235b_scan())
+  assert cfg.model_spec is not None
+  # Same split as `qwen3_moe_235b_scan_torchao_float8`, so the two compare like
+  # for like: only wqkv/wo become FP8. The router gate (routing-sensitive, tiny,
+  # computed in FP32) and lm_head (its error lands on the logits) stay BF16.
+  # `convert_linears` skips `Linear.Config` subclasses such as the gate anyway;
+  # listing it keeps the exclusion explicit.
+  cfg.model_spec.model = fp8_linear.convert_linears(
+      cfg.model_spec.model,
+      filter_fqns=("router.gate", "lm_head"),
+      fp8_grad_input=False,
+  )
+  return cfg
 
 
 def qwen3_moe_235b_scan_maxtext() -> TpuGraphTrainer.Config:

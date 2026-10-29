@@ -50,6 +50,8 @@ __all__ = [
     "flint_40b_v008",
     "flint_40b_v009",
     "flint_40b_v009_gmm",
+    "flint_40b_v011",
+    "flint_40b_v011_n40",
     "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
@@ -388,4 +390,35 @@ def flint_40b_v009() -> TpuGraphTrainer.Config:
       TpuGroupedExperts.Config
   ):
     experts.use_kernel_native_weight_layout = True
+  return config
+
+
+def _save_attention_last_n_layers(config, num_layers: int) -> None:
+  """Keep the Splash output (and its LSE) of the last ``num_layers`` layers
+  for backward instead of recomputing it; every other value is still
+  recomputed (the full-remat policy otherwise)."""
+  config.compile.memory_policy = "tpu_selective"
+  config.compile.save_last_n_layers = {"attention.inner_attention": num_layers}
+
+
+def flint_40b_v011() -> TpuGraphTrainer.Config:
+  """``flint_40b_v009`` saving the attention output of the last 32 layers
+  (~0.5 GiB per layer per device at 32 x 2048 tokens; v009 peaks at 69 GiB)."""
+  config = flint_40b_v009()
+  _save_attention_last_n_layers(config, 32)
+  return config
+
+
+def flint_40b_v011_n40() -> TpuGraphTrainer.Config:
+  """``flint_40b_v011`` saving the last 40 layers (dose arm; ~20 GiB)."""
+  config = flint_40b_v009()
+  _save_attention_last_n_layers(config, 40)
+  return config
+
+
+def flint_40b_proxy_gt_split_save_attn() -> TpuGraphTrainer.Config:
+  """``flint_40b_proxy_gt_split`` saving attention in all 6 layers (local
+  pre-dispatch check of ``flint_40b_v011``)."""
+  config = flint_40b_proxy_gt_split()
+  _save_attention_last_n_layers(config, 6)
   return config

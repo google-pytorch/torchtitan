@@ -478,6 +478,69 @@ def qwen3_1_7b_ulysses_cp4() -> TPUTrainerConfig:
   return _qwen3_cp(_qwen3_1_7b_32k(), strategy="ulysses", cp_degree=4)
 
 
+def _qwen3_cp(
+    config: TPUTrainerConfig,
+    *,
+    strategy: Literal["ulysses", "all_gather"],
+    cp_degree: int,
+) -> TPUTrainerConfig:
+  """Enables TPU context parallelism, following pattern set by upstream torchtitan_recipes/muse_glimmer.py for CUDA.
+
+  Sets the CP degree, the SPMD backend and the load balancer, then applies
+  core ContextParallelTransform with the TPU CP inner attention for the
+  model's attention backend.
+  """
+  assert config.model_spec is not None
+  config.parallelism.context_parallel_degree = cp_degree
+  config.parallelism.spmd_backend = "spmd_types"
+  config.parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(
+      strategy
+  )
+  model = cast(Qwen3Model.Config, config.model_spec.model)
+  inner_attention = model.first_full_attention_backend
+  assert inner_attention is not None
+  cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
+  return apply_transforms(
+      config, [ContextParallelTransform(inner_attention=cp_inner_attention)]
+  )
+
+
+def qwen3_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3 debug model with load-balanced KV all-gather CP degree 2.
+
+  The debug model runs without the Splash kernel, so KV all-gather CP opts in
+  to its plain-PyTorch reference attention, which is fine at this size.
+  """
+  config = _qwen3_cp(qwen3_debugmodel(), strategy="all_gather", cp_degree=2)
+  assert config.model_spec is not None
+  for _, attn, _, _ in config.model_spec.model.traverse(BaseAttention.Config):
+    attn.inner_attention.allow_reference_attention = True
+  return config
+
+
+def qwen3_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3 debug model with Ulysses (all-to-all) CP degree 2."""
+  return _qwen3_cp(qwen3_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def _qwen3_1_7b_32k() -> TPUTrainerConfig:
+  """Qwen3 1.7B at 32k context, one sequence per data-parallel rank."""
+  config = qwen3_1_7b()
+  config.training.max_context_length = 32768
+  config.training.num_tokens_per_microbatch_per_dp_rank = 32768
+  return config
+
+
+def qwen3_1_7b_allgather_cp4() -> TPUTrainerConfig:
+  """Qwen3 1.7B at 32k context with load-balanced KV all-gather CP degree 4."""
+  return _qwen3_cp(_qwen3_1_7b_32k(), strategy="all_gather", cp_degree=4)
+
+
+def qwen3_1_7b_ulysses_cp4() -> TPUTrainerConfig:
+  """Qwen3 1.7B at 32k context with Ulysses (all-to-all) CP degree 4."""
+  return _qwen3_cp(_qwen3_1_7b_32k(), strategy="ulysses", cp_degree=4)
+
+
 def _qwen3_dense_model_spec(flavor: str) -> ModelSpec:
   model_spec = model_registry(flavor, attn_backend="sdpa")
   model_config = cast(Qwen3Model.Config, model_spec.model)

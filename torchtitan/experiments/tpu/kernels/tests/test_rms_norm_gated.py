@@ -75,6 +75,14 @@ class RmsNormGatedTest(
           w_dtype=torch.float32,
           tol=1e-5,
       ),
+      dict(
+          testcase_name="_all_fp32_max_dim512",
+          shape=(2048, 2, 512),
+          x_dtype=torch.float32,
+          gate_dtype=torch.float32,
+          w_dtype=torch.float32,
+          tol=1e-5,
+      ),
   )
   def test_matches_reference_forward_and_backward(
       self,

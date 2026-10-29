@@ -11,7 +11,10 @@ import math
 import spmd_types as spmd
 import torch
 from torch.autograd.function import once_differentiable
-from torch.distributed._functional_collectives import AsyncCollectiveTensor
+from torch.distributed._functional_collectives import (
+    AsyncCollectiveTensor,
+    all_gather_single,
+)
 from torch.fx.traceback import annotate_fn
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
@@ -87,6 +90,62 @@ def _wait(tensor: torch.Tensor) -> torch.Tensor:
   return tensor
 
 
+def _uniform_all_to_all_via_all_gather_impl(
+    x: torch.Tensor, ep_mesh, rank_idx: torch.Tensor
+) -> torch.Tensor:
+  """Uniform split-size all-to-all via ``all_gather_single`` + ``index_select``.
+
+  Eager ``torch_tpu`` lowers ``c10d_functional::all_to_all_single`` on
+  ``ep_mesh`` subgroups to ``stablehlo.all_to_all``, which exhibits
+  nondeterministic buffer corruption on multi-chip TPU runs. Gathering the
+  uniform ``(ep_size, chunk)`` send buffer across ``ep_mesh`` and selecting
+  column ``local_rank`` via a 1-element device index tensor produces identical
+  HLO across ranks with no ``stablehlo.all_to_all`` or scatter ops.
+  """
+  ep_size = ep_mesh.size()
+  if ep_size <= 1 or x.numel() == 0:
+    return x.clone()
+  orig_shape = x.shape
+  x_2d = x.reshape(ep_size, -1).contiguous()
+  gathered = _wait(all_gather_single(x_2d, gather_dim=0, group=ep_mesh))
+  selected = torch.index_select(
+      gathered.view(ep_size, ep_size, -1), 1, rank_idx
+  )
+  return selected.reshape(orig_shape).contiguous()
+
+
+class _UniformAllToAllViaAllGather(torch.autograd.Function):
+  """Autograd wrapper for ``_uniform_all_to_all_via_all_gather_impl``.
+
+  A uniform all-to-all is self-adjoint (``y_r[s] = x_s[r]`` implies
+  ``dx_s[r] = dy_r[s]``), so the backward pass executes the exact same
+  ``all_gather_single`` + ``index_select`` without generating scatter-adds.
+  """
+
+  @staticmethod
+  def forward(
+      ctx, x: torch.Tensor, ep_mesh, rank_idx: torch.Tensor
+  ) -> torch.Tensor:
+    ctx.set_materialize_grads(False)
+    ctx.ep_mesh = ep_mesh
+    ctx.save_for_backward(rank_idx)
+    return _uniform_all_to_all_via_all_gather_impl(x, ep_mesh, rank_idx)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_out: torch.Tensor | None):
+    if grad_out is None or not ctx.needs_input_grad[0]:
+      return None, None, None
+    (rank_idx,) = ctx.saved_tensors
+    return (
+        _uniform_all_to_all_via_all_gather_impl(
+            grad_out, ctx.ep_mesh, rank_idx
+        ),
+        None,
+        None,
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class TpuQwen35DispatchMetadata(LocalDispatchMetadata):
   """Static-shape EP dispatch metadata for ``TpuQwen35TokenDispatcher``."""
@@ -132,6 +191,100 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
   def __init__(self, config: Config):
     super().__init__(config)
     self.capacity_factor = config.capacity_factor
+    self._ep_local_rank_buf: torch.Tensor | None = None
+
+  def init_buffer(self) -> None:
+    super().init_buffer()
+    self._ep_local_rank_buf = None
+
+  def _use_eager_tpu_all_gather_exchange(self) -> bool:
+    """Whether to route uniform EP exchanges through ``all_gather_single``.
+
+    Active only on eager TPU ``ep_mesh`` execution. ``TpuGraphTrainer``
+    (``make_fx`` / ``StaticCompiler``) and ``torch.compile`` retain
+    ``all_to_all_single`` so FSDP graph-splitting and rematerialization passes
+    continue to distinguish FSDP parameter ``all_gather_into_tensor`` ops from
+    EP token exchanges, and ``spmd_types`` retains ``spmd.all_to_all``.
+    """
+    return (
+        self.ep_mesh is not None
+        and getattr(self.ep_mesh, "device_type", None) == "tpu"
+        and not torch.compiler.is_compiling()
+        and not torch.compiler._is_non_strict_tracing()  # pylint: disable=protected-access
+        and get_spmd_backend() != "spmd_types"
+    )
+
+  def _get_ep_local_rank_tensor(self, device: torch.device) -> torch.Tensor:
+    assert self.ep_mesh is not None
+    buf = self._ep_local_rank_buf
+    if buf is None or buf.device != device:
+      buf = torch.tensor([self.ep_mesh.get_local_rank()], dtype=torch.long).to(
+          device=device
+      )
+      self._ep_local_rank_buf = buf
+    return buf
+
+  def _token_count_exchange(
+      self,
+      num_local_tokens_per_expert_E: torch.Tensor,
+      pg,
+      ep_size: int,
+  ) -> torch.Tensor:
+    if self._use_eager_tpu_all_gather_exchange():
+      assert self.ep_mesh is not None
+      x_ep_e = num_local_tokens_per_expert_E.view(ep_size, -1)
+      return _uniform_all_to_all_via_all_gather_impl(
+          x_ep_e,
+          self.ep_mesh,
+          self._get_ep_local_rank_tensor(x_ep_e.device),
+      )
+    return super()._token_count_exchange(
+        num_local_tokens_per_expert_E, pg, ep_size
+    )
+
+  def _dispatch_token_exchange(
+      self,
+      routed_input_ND: torch.Tensor,
+      pg,
+      output_splits: list[int] | None,
+      input_splits: list[int] | None,
+  ) -> torch.Tensor:
+    if (
+        output_splits is None
+        and input_splits is None
+        and self._use_eager_tpu_all_gather_exchange()
+    ):
+      assert self.ep_mesh is not None
+      return _UniformAllToAllViaAllGather.apply(
+          routed_input_ND,
+          self.ep_mesh,
+          self._get_ep_local_rank_tensor(routed_input_ND.device),
+      )
+    return super()._dispatch_token_exchange(
+        routed_input_ND, pg, output_splits, input_splits
+    )
+
+  def _combine_token_exchange(
+      self,
+      routed_output_RD: torch.Tensor,
+      pg,
+      input_splits: list[int] | None,
+      output_splits: list[int] | None,
+  ) -> torch.Tensor:
+    if (
+        input_splits is None
+        and output_splits is None
+        and self._use_eager_tpu_all_gather_exchange()
+    ):
+      assert self.ep_mesh is not None
+      return _UniformAllToAllViaAllGather.apply(
+          routed_output_RD,
+          self.ep_mesh,
+          self._get_ep_local_rank_tensor(routed_output_RD.device),
+      )
+    return super()._combine_token_exchange(
+        routed_output_RD, pg, input_splits, output_splits
+    )
 
   @annotate_fn({"EP": "dispatch"})
   def dispatch(

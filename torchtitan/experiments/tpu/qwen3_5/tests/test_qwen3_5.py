@@ -1585,8 +1585,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           ep_enabled=False,
       )
       enabled[f"{name}_enabled"] = True
-      with self.subTest(name), self.assertRaisesRegex(
-          NotImplementedError, "TP, CP, or PP"
+      with (
+          self.subTest(name),
+          self.assertRaisesRegex(NotImplementedError, "TP, CP, or PP"),
       ):
         gt_qwen3_5.parallelize_qwen3_5(
             None,
@@ -2480,6 +2481,183 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       sd = opt_container.state_dict()
       self.assertTrue(any("dense" in k for k in sd))
       self.assertTrue(any("expert" in k for k in sd))
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_ep2", ep_size=2),
+      dict(testcase_name="_ep4", ep_size=4),
+  )
+  def test_uniform_all_to_all_via_all_gather_matches_transpose(
+      self, ep_size: int
+  ):
+    """Tests _UniformAllToAllViaAllGather parity and scatter-free VJP."""
+    torch.manual_seed(77 + ep_size)
+    dev = self.accelerator_device
+    cap, dim = 5, 8
+    xs_ref = [
+        torch.randn(ep_size * cap, dim, device=dev, requires_grad=True)
+        for _ in range(ep_size)
+    ]
+    grad_outs = [
+        torch.randn(ep_size * cap, dim, device=dev) for _ in range(ep_size)
+    ]
+
+    stacked_ref = torch.stack(
+        [x.view(ep_size, cap, dim) for x in xs_ref], dim=0
+    )
+    ys_ref = [
+        stacked_ref[:, r].contiguous().view(ep_size * cap, dim)
+        for r in range(ep_size)
+    ]
+    sum(
+        (y * dy).sum() for y, dy in zip(ys_ref, grad_outs, strict=True)
+    ).backward()
+
+    xs = [x.detach().clone().requires_grad_(True) for x in xs_ref]
+    rank_idxs = [
+        torch.tensor([r], dtype=torch.long, device=dev) for r in range(ep_size)
+    ]
+    fake_meshes = [
+        SimpleNamespace(
+            size=lambda sz=ep_size: sz,
+            get_local_rank=lambda rk=r: rk,
+            device_type="tpu",
+        )
+        for r in range(ep_size)
+    ]
+
+    all_sent = [x.reshape(ep_size, -1).contiguous() for x in xs]
+    gathered_fwd = torch.cat(all_sent, dim=0).detach()
+    ys_actual = []
+    for r in range(ep_size):
+      with mock.patch.object(
+          qwen35_token_dispatcher,
+          "all_gather_single",
+          return_value=gathered_fwd,
+      ):
+        ys_actual.append(
+            qwen35_token_dispatcher._UniformAllToAllViaAllGather.apply(  # pylint: disable=protected-access
+                xs[r], fake_meshes[r], rank_idxs[r]
+            )
+        )
+      torch.testing.assert_close(ys_actual[r].cpu(), ys_ref[r].detach().cpu())
+
+    gathered_bwd = torch.cat(
+        [dy.reshape(ep_size, -1).contiguous() for dy in grad_outs], dim=0
+    )
+    for r in range(ep_size):
+      with mock.patch.object(
+          qwen35_token_dispatcher,
+          "all_gather_single",
+          return_value=gathered_bwd,
+      ):
+        (dx_r,) = torch.autograd.grad(ys_actual[r], (xs[r],), grad_outs[r])
+      assert xs_ref[r].grad is not None
+      torch.testing.assert_close(dx_r.cpu(), xs_ref[r].grad.cpu())
+
+    # Verify traced backward uses index_select only (zero scatter/index_put).
+    scatter_ops = {
+        torch.ops.aten.slice_backward.default,
+        torch.ops.aten.slice_scatter.default,
+        torch.ops.aten.index_put.default,
+        torch.ops.aten.index_add.default,
+        torch.ops.aten.scatter_add.default,
+    }
+    x_cpu = torch.randn(ep_size * cap, dim, requires_grad=True)
+    dy_cpu = torch.randn(ep_size * cap, dim)
+    r_cpu = torch.tensor([0], dtype=torch.long)
+    with mock.patch.object(
+        qwen35_token_dispatcher,
+        "all_gather_single",
+        side_effect=lambda t, gather_dim, group: t.repeat(ep_size, 1),
+    ):
+
+      def _bwd_fn(x_in, dy_in):
+        y = qwen35_token_dispatcher._UniformAllToAllViaAllGather.apply(  # pylint: disable=protected-access
+            x_in, fake_meshes[0], r_cpu
+        )
+        return torch.autograd.grad(y, (x_in,), dy_in)[0]
+
+      gm = make_fx(_bwd_fn)(x_cpu, dy_cpu)
+    traced_targets = {
+        n.target for n in gm.graph.nodes if n.op == "call_function"
+    }
+    self.assertEmpty(traced_targets & scatter_ops)
+
+  def test_ep_token_dispatcher_eager_tpu_exchange_routing(self):
+    """Tests eager TPU exchange uses all_gather_single; make_fx/CPU use a2a."""
+    disp = qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config(
+        num_experts=4, top_k=2, capacity_factor=1.25
+    ).build()
+    tpu_mesh = SimpleNamespace(
+        size=lambda: 2,
+        get_local_rank=lambda: 1,
+        get_group=lambda: None,
+        device_type="tpu",
+    )
+    disp.wire_meshes(ep_mesh=tpu_mesh)  # pyrefly: ignore[bad-argument-type]
+    self.assertIsNone(disp._ep_local_rank_buf)  # pylint: disable=protected-access
+
+    counts = torch.tensor([2, 1, 3, 0], dtype=torch.int32)
+    tokens = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    with mock.patch.object(
+        qwen35_token_dispatcher,
+        "all_gather_single",
+        side_effect=lambda t, gather_dim, group: torch.cat([t + 10, t], dim=0),
+    ) as ag_mock:
+      out_counts = disp._token_count_exchange(counts, None, 2)  # pylint: disable=protected-access
+      out_disp = disp._dispatch_token_exchange(tokens, None, None, None)  # pylint: disable=protected-access
+      out_comb = disp._combine_token_exchange(tokens, None, None, None)  # pylint: disable=protected-access
+      self.assertEqual(ag_mock.call_count, 3)
+      cached_buf = disp._ep_local_rank_buf  # pylint: disable=protected-access
+      self.assertIsNotNone(cached_buf)
+      assert cached_buf is not None
+      self.assertEqual(int(cached_buf.item()), 1)
+      torch.testing.assert_close(
+          out_counts, torch.tensor([[13, 10], [3, 0]], dtype=torch.int32)
+      )
+      expected_tokens = torch.cat([tokens[2:] + 10, tokens[2:]], dim=0)
+      torch.testing.assert_close(out_disp, expected_tokens)
+      torch.testing.assert_close(out_comb, expected_tokens)
+
+    # Re-wiring ep_mesh invalidates the cached local-rank buffer.
+    tpu_mesh_r0 = SimpleNamespace(
+        size=lambda: 2,
+        get_local_rank=lambda: 0,
+        get_group=lambda: None,
+        device_type="tpu",
+    )
+    disp.wire_meshes(ep_mesh=tpu_mesh_r0)  # pyrefly: ignore[bad-argument-type]
+    self.assertIsNone(disp._ep_local_rank_buf)  # pylint: disable=protected-access
+
+    # Under make_fx (_is_non_strict_tracing=True) or CPU ep_mesh, delegates to
+    # AllToAllTokenDispatcher (all_to_all_single) so TpuGraphTrainer passes keep
+    # FSDP all_gather_into_tensor distinct from EP token exchanges.
+    with (
+        mock.patch.object(
+            qwen35_token_dispatcher, "all_gather_single"
+        ) as ag_spy,
+        mock.patch(
+            "torchtitan.models.common.token_dispatcher.all_to_all_single",
+            side_effect=lambda t, out_s, in_s, group=None: t.clone(),
+        ) as a2a_spy,
+    ):
+      _ = make_fx(lambda t: disp._dispatch_token_exchange(t, None, None, None))(  # pylint: disable=protected-access
+          tokens
+      )
+      self.assertEqual(ag_spy.call_count, 0)
+      self.assertGreaterEqual(a2a_spy.call_count, 1)
+
+      cpu_mesh = SimpleNamespace(
+          size=lambda: 2,
+          get_local_rank=lambda: 0,
+          get_group=lambda: None,
+          device_type="cpu",
+      )
+      disp.wire_meshes(ep_mesh=cpu_mesh)  # pyrefly: ignore[bad-argument-type]
+      a2a_spy.reset_mock()
+      _ = disp._dispatch_token_exchange(tokens, None, None, None)  # pylint: disable=protected-access
+      self.assertEqual(ag_spy.call_count, 0)
+      self.assertEqual(a2a_spy.call_count, 1)
 
 
 if __name__ == "__main__":

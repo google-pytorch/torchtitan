@@ -94,19 +94,18 @@ def _causal_conv(
 
 
 class _CausalConvSilu(torch.autograd.Function):
-  """``silu(_causal_conv(x, w))`` with a backward built from slices too.
+  """``silu(_causal_conv(x, w))`` with a backward that reads shifted slices.
 
-  Autograd of ``_causal_conv`` accumulates the ``W`` shifted input gradients
-  into the padded buffer with in-place adds at sublane-misaligned sequence
-  offsets, which XLA emits as ``dynamic-update-slice`` adds at ~0.19 TB/s on
-  TPU7x. The input gradient of a causal convolution is an anti-causal
-  convolution of the output gradient,
-  ``dx[t] = sum_k w[k] * dy[t + W - 1 - k]``, so it is computed from shifted
-  slices of the end-padded output gradient instead, like the forward. The
-  convolution output is recomputed for ``silu``'s derivative.
-  With ``segment_ids_BS``, ``x[t]`` only reaches outputs of its own document.
-  As in the forward, the taps of ``dx`` and the products and token sums of
-  ``dw`` run in (at least) fp32, and each is rounded once.
+  Autograd of the slice-based forward writes each tap's input gradient into a
+  zero buffer of the padded input (``slice_backward``) and sums the buffers.
+  The row offsets are not tile-aligned, so XLA emits slow
+  ``dynamic-update-slice`` adds (~0.19 TB/s on TPU7x). This backward reads
+  instead: ``dx[t] = sum_k w[k] * dy[t + W - 1 - k]`` is ``W`` shifted slices
+  of the end-padded output gradient, which XLA fuses into one pass.
+
+  The convolution is recomputed for ``silu``'s derivative, gradients stay
+  within ``segment_ids_BS`` documents, and the ``dx`` taps and ``dw`` token
+  sums accumulate in at least fp32 and are rounded once.
   """
 
   @staticmethod
@@ -132,9 +131,8 @@ class _CausalConvSilu(torch.autograd.Function):
         grad_BSC, _causal_conv(x_BSC, weight_C1W, segment_ids_BS)
     )
     grad_pad = F.pad(grad_y_BSC, (0, 0, 0, kernel_size - 1))
-    # At least fp32, like autograd of the forward's fp32 taps: dw sums over
-    # all B * S tokens, and torch_tpu disallows XLA excess precision by
-    # default, so a bf16 sum would round after every add.
+    # dw sums over all B * S tokens; torch_tpu disallows XLA excess precision,
+    # so bf16 sums would round after every add. Accumulate in at least fp32.
     acc_dtype = torch.promote_types(
         torch.promote_types(x_BSC.dtype, weight_C1W.dtype), torch.float32
     )
@@ -147,7 +145,8 @@ class _CausalConvSilu(torch.autograd.Function):
       if shift == 0:
         grad_shifted = grad_y_BSC
       else:
-        # grad_shifted[t] = dy[t + shift], the output that w[k] links to x[t].
+        # grad_shifted[t] = dy[t + shift], the output that w[k] links to x[t],
+        # zeroed where that output is in a later document.
         grad_shifted = grad_pad[:, shift : shift + seq_len, :].contiguous()
         if segment_ids_BS is not None:
           same_BS1 = _same_segment(segment_ids_BS, -shift).unsqueeze(-1)
@@ -162,6 +161,7 @@ class _CausalConvSilu(torch.autograd.Function):
       elif shift == 0 or segment_ids_BS is not None:
         grad_w.append((x_acc_BSC * grad_shifted).sum(dim=(0, 1)))
       else:
+        # Without documents, skip the zero padding: t < seq_len - shift.
         grad_w.append(
             (x_acc_BSC[:, : seq_len - shift, :] * grad_y_BSC[:, shift:, :]).sum(
                 dim=(0, 1)
@@ -180,6 +180,9 @@ def causal_conv_silu(
     segment_ids_BS: torch.Tensor | None = None,
 ) -> torch.Tensor:
   """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
+
+  The backward is ``_CausalConvSilu``'s: shifted slices of the output gradient
+  instead of autograd's scattered adds.
 
   Args:
     x_BSC: ``[B, S, C]`` input.

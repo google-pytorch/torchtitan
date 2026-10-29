@@ -123,8 +123,9 @@ def _use_graph_split(
   Args:
     cfg: The recipe to update in place.
     layers_per_executable: Transformer layers per forward and backward child. On
-      the 40-layer model at 32K tokens per rank, 2 layers per executable cut the
-      84-child launch overhead to 44 children: 3.51 vs 4.65 s/step.
+      the 40-layer model, 2 layers per executable cut the 84 children to 44; in
+      the A/B that chose it (32K tokens per rank, one tpu7x-2x2x1 host) that was
+      24% faster than 1.
   """
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.tpu_config.graph_trainer_memory_policy = "full"
@@ -143,7 +144,6 @@ def _use_graph_split(
   # torch_tpu's fused AdamW updates every parameter in one program, computing
   # in FP32 and storing in each buffer's (here BF16) dtype.
   cfg.optimizer.implementation = "fused"
-
 
 
 def qwen35_debugmodel() -> TPUTrainerConfig:

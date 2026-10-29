@@ -18,6 +18,7 @@ Covers:
 
 import copy
 import functools
+from types import SimpleNamespace
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -31,6 +32,9 @@ from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
+from torchtitan.experiments.tpu.graph_trainer.config import to_tpu_graph_trainer_config
+from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -1257,8 +1261,15 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with self.assertRaisesRegex(ValueError, "exceeds max context length"):
       qwen3_5_tpu.model_registry("debugmodel", seq_len=262145)
 
-  def _assert_uses_tpu_moe_kernels(self, model_config) -> None:
-    """Asserts that `_use_tpu_moe_kernels` reached every MoE layer."""
+  def _assert_uses_tpu_moe_kernels(
+      self, model_config, *, tile_m: int = 256
+  ) -> None:
+    """Asserts that `_use_tpu_moe_kernels` reached every MoE layer.
+
+    Args:
+      model_config: The model config to check.
+      tile_m: The expected grouped-matmul and dWeight row tile.
+    """
     num_moe = sum(layer.moe is not None for layer in model_config.layers)
     experts = [
         c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)
@@ -1277,9 +1288,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertTrue(experts_config.use_pallas_grouped_mm)
       self.assertTrue(experts_config.use_pallas_paired_grouped_mm)
       self.assertTrue(experts_config.use_kernel_native_weight_layout)
-      self.assertEqual(experts_config.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(experts_config.pallas_grouped_mm_tile_m, tile_m)
       self.assertEqual(
-          experts_config.pallas_grouped_mm_tgmm_tiling, (256, 0, 0)
+          experts_config.pallas_grouped_mm_tgmm_tiling, (tile_m, 0, 0)
       )
     for dispatcher in dispatchers:
       self.assertTrue(dispatcher.fuse_route_score_backward)
@@ -1336,30 +1347,49 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         parsed.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
     )
 
+  def test_35b_benchmark_graph_trainer_config(self):
+    """Tests the benchmark recipe as train.py hands it to TpuGraphTrainer."""
+    cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    gt_cfg = to_tpu_graph_trainer_config(
+        cfg, gt_qwen3_5.model_registry, target_cls=TpuGraphTrainer.Config
+    )
+    self.assertIs(
+        gt_cfg.model_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5
+    )
+    self.assertIsNone(gt_cfg.model_spec.pipelining_fn)
+    self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
+    self.assertEqual(gt_cfg.override.imports, cfg.override.imports)
+    # The conversion re-wraps the model config: the kernels must survive it.
+    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
+    splitter = GraphSplitter.from_trainer_config(
+        gt_cfg, optimizer_in_graph=cfg.tpu_config.optimizer_in_graph
+    )
+    self.assertTrue(splitter.enabled)
+    self.assertEqual(splitter.n_layers, 40)
+
+  def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
+    """Tests that TP, CP and PP fail before the model is touched."""
+    for name in ("tp", "cp", "pp"):
+      enabled = dict(tp_enabled=False, cp_enabled=False, pp_enabled=False)
+      enabled[f"{name}_enabled"] = True
+      with self.subTest(name), self.assertRaisesRegex(
+          NotImplementedError, "TP, CP or PP"
+      ):
+        gt_qwen3_5.parallelize_qwen3_5(
+            None,
+            parallel_dims=SimpleNamespace(**enabled),
+            training=None,
+            parallelism=None,
+            compile_config=None,
+            ac_config=None,
+            dump_folder="",
+        )
+
   def test_35b_recipes(self):
     """Tests the 35B-A3B recipes, their TPU kernels and MFU accounting."""
     gt_spec = gt_qwen3_5.model_registry("35B-A3B")
     self.assertEqual(gt_spec.name, "qwen3_5")
     self.assertIs(gt_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5)
-
-    def moe_kernels(cfg):
-      experts = [
-          (
-              e.use_pallas_grouped_mm,
-              e.use_pallas_paired_grouped_mm,
-              e.use_kernel_native_weight_layout,
-          )
-          for _, e, _, _ in cfg.model_spec.model.traverse(
-              TpuGroupedExperts.Config
-          )
-      ]
-      fused = [
-          d.fuse_route_score_backward
-          for _, d, _, _ in cfg.model_spec.model.traverse(
-              TpuAllToAllTokenDispatcher.Config
-          )
-      ]
-      return experts, fused
 
     self.assertNotIn(
         config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
@@ -1378,9 +1408,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
         ],
     )
-    self.assertEqual(
-        moe_kernels(bench_cfg), ([(True, True, True)] * 40, [True] * 40)
-    )
+    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model)
     self.assertEqual(bench_cfg.parallelism.fsdp_reshard_after_forward, "always")
     self.assertEqual(bench_cfg.parallelism.expert_parallel_degree, 1)
     self.assertTrue(bench_cfg.parallelism.enable_tpu_topo_mesh)

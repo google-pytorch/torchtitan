@@ -23,6 +23,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 from torchtitan.experiments.tpu.examples.flint.model import FlintSinkAttention
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
@@ -47,6 +48,8 @@ __all__ = [
     "flint_40b_v005_gt_split",
     "flint_40b_v007",
     "flint_40b_v008",
+    "flint_40b_v009",
+    "flint_40b_v009_gmm",
     "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
@@ -352,4 +355,37 @@ def flint_40b_v008() -> TpuGraphTrainer.Config:
   config.libtpu_init_flags = tpu_flags.merge_flags(
       config.libtpu_init_flags, tpu_flags.TPU7X_THROUGHPUT_P_STATE
   )
+  return config
+
+
+def _use_pallas_grouped_mm(config) -> None:
+  """Pallas grouped mm for the 256 experts, W1/W3 paired. Tiles are the HF
+  backend's Flint sweep winners on tpu7x-2x2x2 (2026-10-28, tile_m 512)."""
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 512
+    experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (512, 512, 0)
+    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (512, 0, 2048)
+
+
+def flint_40b_v009_gmm() -> TpuGraphTrainer.Config:
+  """``flint_40b_v008`` plus Pallas grouped mm (canonical weight layout)."""
+  config = flint_40b_v008()
+  _use_pallas_grouped_mm(config)
+  return config
+
+
+def flint_40b_v009() -> TpuGraphTrainer.Config:
+  """``flint_40b_v009_gmm`` with the expert weights stored in the grouped-mm
+  kernels' native [E, K, N] layout, so the forward does not transpose them
+  (checkpoints keep the canonical layout via the module's state-dict hooks)."""
+  config = flint_40b_v009_gmm()
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_kernel_native_weight_layout = True
   return config

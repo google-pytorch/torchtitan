@@ -106,10 +106,15 @@ def _no_gated_delta_document_resets(cfg: TPUTrainerConfig) -> None:
   recurrence to restart at each document (upstream does not without
   `cu_seqlens`), and the Tokamax kernels' restarts lay every document out
   from a 64-token chunk boundary. Full attention still masks documents.
+
+  Args:
+    cfg: The recipe to update in place.
   """
-  for _, delta_net, _, _ in cfg.model_spec.model.traverse(
-      TpuGatedDeltaNet.Config
-  ):
+  assert cfg.model_spec is not None
+  delta_nets = list(cfg.model_spec.model.traverse(TpuGatedDeltaNet.Config))
+  if not delta_nets:
+    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model_spec.model")
+  for _, delta_net, _, _ in delta_nets:
     delta_net.reset_at_documents = False
 
 
@@ -339,9 +344,9 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
   256 FSDP ranks (256 routed experts sharded on dim 0): bf16 parameters and
   AdamW state, ZeRO-3 with selective rematerialization, GraphTrainer with 2
   layers per forward and backward executable, Tokamax's Mosaic KDA kernels for
-  the 30 GatedDeltaNet layers, Pallas paired grouped matmuls for the experts,
-  Splash attention, and the Pallas fused linear cross-entropy. 32K tokens per
-  rank (16 sequences of 2048).
+  the 30 GatedDeltaNet layers (without packed-document resets), Pallas paired
+  grouped matmuls for the experts, Splash attention, and the Pallas fused
+  linear cross-entropy. 32K tokens per rank (16 sequences of 2048).
   """
   cfg = qwen35_moe_35b()
   # bf16 parameters and AdamW state (8 bytes per parameter) instead of

@@ -20,11 +20,12 @@ axis as one stream. This module provides the TPU replacements:
    do. The document boundaries are static-shape ``[B, S]`` segment-id masks.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
 
+from torchtitan.config.override import override
 from torchtitan.experiments.tpu import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
@@ -525,14 +526,14 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   convolution and the recurrence run over each ``[B, S]`` row as one stream,
   as upstream does without ``cu_seqlens`` (e.g. with SDPA). Pretraining
   recipes use it: the Tokamax kernels lay every document out from a 64-token
-  chunk boundary to restart at it, which costs time and HBM.
+  chunk boundary to restart at it, which costs time and memory.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(GatedDeltaNet.Config):
     # Restart the causal convolution and the recurrence at every packed
-    # document (`positions == 0`). RL needs it (verl packs one sequence per
-    # document); pretraining on packed text may turn it off.
+    # document (`positions == 0`). RL needs this when packing multiple rollouts
+    # into one `[B, S]` row; pretraining on packed text may turn it off.
     reset_at_documents: bool = True
 
   def __init__(self, config: Config):
@@ -585,3 +586,14 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     output_THV = self.norm(output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)
+
+
+@override(
+    target=TpuGatedDeltaNet.Config,
+    description="Set whether GatedDeltaNet resets at packed documents.",
+)
+def gated_delta_document_resets(
+    cfg: TpuGatedDeltaNet.Config, *, enabled: bool = True
+) -> TpuGatedDeltaNet.Config:
+  """Sets ``reset_at_documents`` on ``TpuGatedDeltaNet.Config``."""
+  return replace(cfg, reset_at_documents=enabled)

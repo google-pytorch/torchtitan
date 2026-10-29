@@ -8,7 +8,8 @@ Covers:
    plus the adapter round trip.
 2. ``chunked_gated_delta`` against the exact per-token recurrence, also with
    packed documents, and the slice-based causal convolution's backward against
-   autograd of ``conv1d``, also with packed documents.
+   autograd of ``conv1d``, also with packed documents, and in bf16 against the
+   accuracy of the autograd it replaces.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls), plus Splash parity on TPU.
@@ -16,10 +17,12 @@ Covers:
 """
 
 import copy
+import functools
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import OverrideConfig, apply_overrides
@@ -183,11 +186,22 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           flavor="debugmodel_moe",
           use_tpu_grouped_experts=True,
       ),
+      dict(
+          testcase_name="_moe_pallas_paired_grouped_mm",
+          flavor="debugmodel_moe",
+          use_tpu_grouped_experts=True,
+          use_pallas_paired_grouped_mm=True,
+      ),
   )
   def test_qwen3_5_hf_reference_parity(
-      self, flavor: str, use_tpu_grouped_experts: bool
+      self,
+      flavor: str,
+      use_tpu_grouped_experts: bool,
+      use_pallas_paired_grouped_mm: bool = False,
   ):
     """Tests forward logits, loss, and all gradients against HF Qwen3.5."""
+    if use_pallas_paired_grouped_mm and not self._is_tpu():
+      self.skipTest("Pallas grouped matmuls are TPU-only.")
     is_moe = flavor == "debugmodel_moe"
     hf_model = self._build_hf_reference(is_moe=is_moe)
     converters = (
@@ -196,6 +210,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     tt_config = qwen3_5_tpu.model_registry(
         flavor, seq_len=128, converters=converters
     ).model
+    if use_pallas_paired_grouped_mm:
+      # The expert kernels of `_use_tpu_moe_kernels`, on canonical weights so
+      # that the gradients compare by name.
+      for _, experts, _, _ in tt_config.traverse(TpuGroupedExperts.Config):
+        experts.use_pallas_grouped_mm = True
+        experts.use_pallas_paired_grouped_mm = True
+        experts.pallas_grouped_mm_tile_m = 256
+        experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     tt_config.vocab_size = 2048
     tt_config.tok_embeddings.num_embeddings = 2048
     tt_config.lm_head.out_features = 2048
@@ -463,6 +485,150 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     expected_grads = torch.autograd.grad(expected, (x, weight), grad)
     for actual_grad, expected_grad in zip(grads, expected_grads, strict=True):
       torch.testing.assert_close(actual_grad, expected_grad)
+
+  def test_causal_conv_silu_partial_input_grads(self):
+    """Tests the conv backward when only the input or the weight needs grad."""
+    torch.manual_seed(0)
+    channels, kernel_size = 8, 4
+    x = torch.randn(2, 11, channels, dtype=torch.float64)
+    weight = torch.randn(channels, 1, kernel_size, dtype=torch.float64)
+    grad = torch.randn(2, 11, channels, dtype=torch.float64)
+    for name, x_grad in (("x", True), ("weight", False)):
+      with self.subTest(grad_of=name):
+        x_in = x.clone().requires_grad_(x_grad)
+        w_in = weight.clone().requires_grad_(not x_grad)
+        leaf = x_in if x_grad else w_in
+        expected = F.silu(
+            F.conv1d(
+                F.pad(x_in.transpose(1, 2), (kernel_size - 1, 0)),
+                w_in,
+                groups=channels,
+            ).transpose(1, 2)
+        )
+        (actual_grad,) = torch.autograd.grad(
+            gated_delta.causal_conv_silu(x_in, w_in), leaf, grad
+        )
+        (expected_grad,) = torch.autograd.grad(expected, leaf, grad)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_rows", packed=False),
+      dict(testcase_name="_packed_documents", packed=True),
+  )
+  def test_causal_conv_silu_bf16_backward_accuracy(self, packed: bool):
+    """Tests the bf16 conv backward against fp64 over 16K-token dw sums.
+
+    The slice-based backward must be as accurate as the autograd it replaces,
+    which multiplies in fp32 and sums dw in fp32. Adding the dw products in
+    bf16 is not: torch_tpu disallows XLA excess precision, so a bf16 sum rounds
+    every add.
+    """
+    torch.manual_seed(0)
+    bs, seq_len, channels, kernel_size = 8, 2048, 128, 4
+    # Biased activations and gradients (correlated, as in the model) make the
+    # dw sums grow with the number of tokens.
+    x = (torch.randn(bs, seq_len, channels) + 0.5).bfloat16()
+    weight = (0.5 * torch.randn(channels, 1, kernel_size)).bfloat16()
+    grad = (torch.randn(bs, seq_len, channels) + 0.25).bfloat16()
+    segment_ids = None
+    if packed:
+      doc_lens = (700, 1, 3, 500, 844)
+      segment_ids = segment_ids_from_positions(_packed_positions(doc_lens))
+      segment_ids = segment_ids.expand(bs, -1)
+
+    def conv_grads(fn, device, dtype):
+      x_in = x.to(device, dtype).requires_grad_()
+      w_in = weight.to(device, dtype).requires_grad_()
+      seg = None if segment_ids is None else segment_ids.to(device)
+      return torch.autograd.grad(
+          fn(x_in, w_in, seg), (x_in, w_in), grad.to(device, dtype)
+      )
+
+    def autograd_conv_silu(x_in, w_in, seg):
+      return F.silu(gated_delta._causal_conv(x_in, w_in, seg))  # pylint: disable=protected-access
+
+    # fp64 on the bf16 values: only the backward's own rounding counts.
+    expected_grads = conv_grads(autograd_conv_silu, "cpu", torch.float64)
+    dev = self.accelerator_device
+    grads = conv_grads(gated_delta.causal_conv_silu, dev, torch.bfloat16)
+    autograd_grads = conv_grads(autograd_conv_silu, dev, torch.bfloat16)
+    for name, grad_bf16, autograd_bf16, expected_grad in zip(
+        ("x", "weight"), grads, autograd_grads, expected_grads, strict=True
+    ):
+      self.assertEqual(grad_bf16.dtype, torch.bfloat16)
+      err = _relative_l2_error(grad_bf16, expected_grad)
+      autograd_err = _relative_l2_error(autograd_bf16, expected_grad)
+      self.assertLessEqual(
+          err,
+          1.25 * autograd_err,
+          msg=f"d{name}: {err:.2e} vs autograd {autograd_err:.2e}",
+      )
+      self.assertLess(err, 1e-2, msg=f"d{name}: {err:.2e}")
+
+  def test_causal_conv_silu_backward_avoids_scatter_adds(self):
+    """Tests that the conv backward does not add slices into zero buffers.
+
+    Autograd of the slice-based forward adds every tap's input gradient into
+    a zero buffer of the padded input (``slice_backward``), which XLA emits as
+    slow ``dynamic-update-slice`` adds. The traced backward of
+    ``causal_conv_silu`` must have no such op, with or without documents.
+    """
+    scatter_ops = {
+        torch.ops.aten.slice_backward.default,
+        torch.ops.aten.slice_scatter.default,
+        torch.ops.aten.index_put.default,
+        torch.ops.aten.scatter_add.default,
+    }
+    x = torch.randn(2, 16, 8, requires_grad=True)
+    weight = torch.randn(8, 1, 4, requires_grad=True)
+    grad = torch.randn(2, 16, 8)
+    segment_ids = segment_ids_from_positions(_packed_positions((5, 11)))
+
+    def autograd_conv_silu(x_in, w_in, seg):
+      return F.silu(gated_delta._causal_conv(x_in, w_in, seg))  # pylint: disable=protected-access
+
+    def backward_ops(conv_silu, seg):
+      def grads(x_in, w_in, grad_in):
+        return torch.autograd.grad(
+            conv_silu(x_in, w_in, seg), (x_in, w_in), grad_in
+        )
+
+      graph = make_fx(grads)(x, weight, grad).graph
+      return {node.target for node in graph.nodes if node.op == "call_function"}
+
+    for seg in (None, segment_ids.expand(2, -1)):
+      with self.subTest(packed=seg is not None):
+        self.assertEmpty(
+            backward_ops(gated_delta.causal_conv_silu, seg) & scatter_ops
+        )
+        # Negative control: autograd of the forward does use them.
+        self.assertNotEmpty(backward_ops(autograd_conv_silu, seg) & scatter_ops)
+
+  def test_causal_conv_silu_compiles_fullgraph(self):
+    """Tests causal_conv_silu under torch.compile(fullgraph=True).
+
+    The per-layer compile mode compiles each transformer block with
+    ``fullgraph=True``, so the custom autograd.Function must trace without
+    graph breaks.
+    """
+    torch.manual_seed(0)
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    x = torch.randn(2, 16, 8, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(8, 1, 4, dtype=torch.float64, requires_grad=True)
+    grad = torch.randn(2, 16, 8, dtype=torch.float64)
+    segment_ids = segment_ids_from_positions(_packed_positions((5, 11)))
+    compiled = torch.compile(
+        gated_delta.causal_conv_silu, backend="aot_eager", fullgraph=True
+    )
+    for seg in (None, segment_ids.expand(2, -1)):
+      with self.subTest(packed=seg is not None):
+        out = compiled(x, weight, seg)
+        expected = gated_delta.causal_conv_silu(x, weight, seg)
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(out, (x, weight), grad),
+            torch.autograd.grad(expected, (x, weight), grad),
+        )
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token
@@ -747,6 +913,87 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         msg="Negative control failed: no GDN leak without positions",
     )
 
+  def test_per_row_segment_ids(self):
+    """Tests per-row 1-based document ids capped at max_num_segments."""
+    positions = torch.cat([
+        _packed_positions((2, 1, 3, 2)),  # row 0: 4 documents
+        _packed_positions((5, 3)),  # row 1: 2 documents
+    ])
+    stream_ids = segment_ids_from_positions(positions).reshape(2, 8)
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(stream_ids, 3),
+        torch.tensor(
+            [[1, 1, 2, 3, 3, 3, 3, 3], [1, 1, 1, 1, 1, 2, 2, 2]],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(stream_ids, 8)[0],
+        torch.tensor([1, 1, 2, 3, 3, 3, 4, 4], dtype=torch.int32),
+    )
+
+  def test_gated_delta_net_document_ids_reach_conv_and_recurrence(self):
+    """Tests that the kernel's document ids drive the conv and recurrence."""
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn = config.layers[0].delta_net.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    gdn = gdn.to(self.accelerator_device)
+    dev = self.accelerator_device
+    # One 80-token row of 4 documents; a kernel that keeps 2 apart must merge
+    # documents 2-4 in both the convolution and the recurrence, exactly as if
+    # they were one document.
+    seq_len, cap = 80, 2
+    x = torch.randn(seq_len, config.dim, device=dev)
+    positions = _packed_positions((20, 15, 25, 20)).to(dev)
+    merged = _packed_positions((20, 60)).to(dev)
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      expected = gdn(x, positions=merged)
+      uncapped = gdn(x, positions=positions)
+      gdn.inner_gated_delta_net.kernel.document_ids = functools.partial(
+          gated_delta.per_row_segment_ids, max_num_segments=cap
+      )
+      capped = gdn(x, positions=positions)
+
+    tol = 5e-3 if self._is_tpu() else 1e-5
+    test_utils.check_equivalence(
+        capped.cpu(),
+        expected.cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Capped Document Ids",
+    )
+    # Negative control: keeping every document apart differs at the merges.
+    self.assertGreater(
+        _relative_l2_error(uncapped[35:39], expected[35:39]),
+        0.1,
+        msg="Negative control failed: capping the documents changed nothing",
+    )
+
+  def test_use_tokamax_gated_delta(self):
+    """Tests the recipe helper that selects the Tokamax GatedDeltaNet."""
+    cfg = config_registry.qwen35_moe_35b()
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, cfg.override.imports
+    )
+    config_registry._use_tokamax_gated_delta(cfg)  # pylint: disable=protected-access
+    config_registry._use_tokamax_gated_delta(cfg)  # pylint: disable=protected-access
+    self.assertEqual(
+        cfg.override.imports.count(
+            config_registry.TOKAMAX_GATED_DELTA_OVERRIDE
+        ),
+        1,
+    )
+    module, _, factory = (
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE.rpartition(".")
+    )
+    self.assertEqual(
+        (module, factory),
+        (
+            "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta",
+            "tokamax_gated_delta_kernel",
+        ),
+    )
+
   def test_model_isolates_packed_documents(self):
     """Tests that documents packed into rows equal the documents run alone.
 
@@ -1010,6 +1257,38 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with self.assertRaisesRegex(ValueError, "exceeds max context length"):
       qwen3_5_tpu.model_registry("debugmodel", seq_len=262145)
 
+  def _assert_uses_tpu_moe_kernels(self, model_config) -> None:
+    """Asserts that `_use_tpu_moe_kernels` reached every MoE layer."""
+    num_moe = sum(layer.moe is not None for layer in model_config.layers)
+    experts = [
+        c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)
+    ]
+    dispatchers = [
+        c
+        for _, c, _, _ in model_config.traverse(
+            TpuAllToAllTokenDispatcher.Config
+        )
+    ]
+    # A traversal that stops matching would silently drop the kernels.
+    self.assertGreater(num_moe, 0)
+    self.assertLen(experts, num_moe)
+    self.assertLen(dispatchers, num_moe)
+    for experts_config in experts:
+      self.assertTrue(experts_config.use_pallas_grouped_mm)
+      self.assertTrue(experts_config.use_pallas_paired_grouped_mm)
+      self.assertTrue(experts_config.use_kernel_native_weight_layout)
+      self.assertEqual(experts_config.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(
+          experts_config.pallas_grouped_mm_tgmm_tiling, (256, 0, 0)
+      )
+    for dispatcher in dispatchers:
+      self.assertTrue(dispatcher.fuse_route_score_backward)
+
+  def test_tpu_moe_kernels_debug_recipe(self):
+    """Tests that the debug recipe selects the 35B recipe's expert kernels."""
+    cfg = config_registry.qwen35_moe_debugmodel_tpu_moe_kernels()
+    self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)
+
   def test_35b_recipe(self):
     """Tests the 35B-A3B recipe, also as parsed from the command line."""
     cfg = config_registry.qwen35_moe_35b()
@@ -1017,6 +1296,25 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(cfg.training.dtype, "bfloat16")
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
     self.assertEqual(cfg.parallelism.fsdp_reshard_after_forward, "always")
+    self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)
+    splash = cfg.splash_attention_kernel
+    self.assertTrue(splash.use_splash_attention_kernel)
+    self.assertEqual(
+        (
+            splash.sa_block_q,
+            splash.sa_block_kv,
+            splash.sa_block_q_dkv,
+            splash.sa_block_kv_dkv,
+            splash.sa_block_q_dq,
+            splash.sa_block_kv_dq,
+        ),
+        (1024,) * 6,
+    )
+    self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertIn(config_registry.FUSED_LOSS_OVERRIDE, cfg.override.imports)
+    self.assertEqual(
+        cfg.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
+    )
     with torch.device("meta"):
       model = cfg.model_spec.model.build()
     self.assertLen(model.layers, 40)
@@ -1032,6 +1330,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
     self.assertEqual(
         parsed.training.num_tokens_per_microbatch_per_dp_rank, 8192
+    )
+    self.assertIsInstance(parsed.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        parsed.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
     )
 
   def test_35b_recipes(self):

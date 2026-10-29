@@ -15,6 +15,7 @@ from torch.distributed._functional_collectives import (
     AsyncCollectiveTensor,
     all_gather_single,
 )
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.fx.traceback import annotate_fn
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
@@ -197,20 +198,23 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     super().init_buffer()
     self._ep_local_rank_buf = None
 
-  def _use_eager_tpu_all_gather_exchange(self) -> bool:
+  def _use_eager_tpu_all_gather_exchange(self, x: torch.Tensor) -> bool:
     """Whether to route uniform EP exchanges through ``all_gather_single``.
 
     Active only on eager TPU ``ep_mesh`` execution. ``TpuGraphTrainer``
-    (``make_fx`` / ``StaticCompiler``) and ``torch.compile`` retain
-    ``all_to_all_single`` so FSDP graph-splitting and rematerialization passes
-    continue to distinguish FSDP parameter ``all_gather_into_tensor`` ops from
-    EP token exchanges, and ``spmd_types`` retains ``spmd.all_to_all``.
+    (``make_fx`` / ``FakeTensorMode`` / ``StaticCompiler``) and
+    ``torch.compile``
+    retain ``all_to_all_single`` so FSDP graph-splitting and rematerialization
+    passes continue to distinguish FSDP parameter ``all_gather_into_tensor`` ops
+    from EP token exchanges, and ``spmd_types`` retains ``spmd.all_to_all``.
     """
     return (
         self.ep_mesh is not None
         and getattr(self.ep_mesh, "device_type", None) == "tpu"
         and not torch.compiler.is_compiling()
         and not torch.compiler._is_non_strict_tracing()  # pylint: disable=protected-access
+        and get_proxy_mode() is None
+        and not isinstance(x, torch._subclasses.FakeTensor)
         and get_spmd_backend() != "spmd_types"
     )
 
@@ -230,7 +234,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
       pg,
       ep_size: int,
   ) -> torch.Tensor:
-    if self._use_eager_tpu_all_gather_exchange():
+    if self._use_eager_tpu_all_gather_exchange(num_local_tokens_per_expert_E):
       assert self.ep_mesh is not None
       x_ep_e = num_local_tokens_per_expert_E.view(ep_size, -1)
       return _uniform_all_to_all_via_all_gather_impl(
@@ -252,7 +256,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     if (
         output_splits is None
         and input_splits is None
-        and self._use_eager_tpu_all_gather_exchange()
+        and self._use_eager_tpu_all_gather_exchange(routed_input_ND)
     ):
       assert self.ep_mesh is not None
       return _UniformAllToAllViaAllGather.apply(
@@ -274,7 +278,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     if (
         input_splits is None
         and output_splits is None
-        and self._use_eager_tpu_all_gather_exchange()
+        and self._use_eager_tpu_all_gather_exchange(routed_output_RD)
     ):
       assert self.ep_mesh is not None
       return _UniformAllToAllViaAllGather.apply(

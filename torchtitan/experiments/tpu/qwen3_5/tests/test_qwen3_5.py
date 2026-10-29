@@ -2629,9 +2629,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     disp.wire_meshes(ep_mesh=tpu_mesh_r0)  # pyrefly: ignore[bad-argument-type]
     self.assertIsNone(disp._ep_local_rank_buf)  # pylint: disable=protected-access
 
-    # Under make_fx (_is_non_strict_tracing=True) or CPU ep_mesh, delegates to
-    # AllToAllTokenDispatcher (all_to_all_single) so TpuGraphTrainer passes keep
-    # FSDP all_gather_into_tensor distinct from EP token exchanges.
+    # Under make_fx (get_proxy_mode() != None), FakeTensorMode, or CPU ep_mesh,
+    # delegates to AllToAllTokenDispatcher (all_to_all_single) so graph-trainer
+    # passes keep FSDP all_gather_into_tensor distinct from EP token exchanges.
     with (
         mock.patch.object(
             qwen35_token_dispatcher, "all_gather_single"
@@ -2641,11 +2641,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             side_effect=lambda t, out_s, in_s, group=None: t.clone(),
         ) as a2a_spy,
     ):
-      _ = make_fx(lambda t: disp._dispatch_token_exchange(t, None, None, None))(  # pylint: disable=protected-access
-          tokens
-      )
+      _ = make_fx(
+          lambda t: disp._dispatch_token_exchange(t, None, None, None)  # pylint: disable=protected-access
+      )(tokens)
       self.assertEqual(ag_spy.call_count, 0)
       self.assertGreaterEqual(a2a_spy.call_count, 1)
+
+      a2a_spy.reset_mock()
+      with torch._subclasses.FakeTensorMode():  # pylint: disable=protected-access
+        fake_tokens = torch.zeros(4, 4)
+        _ = disp._dispatch_token_exchange(fake_tokens, None, None, None)  # pylint: disable=protected-access
+      self.assertEqual(ag_spy.call_count, 0)
+      self.assertEqual(a2a_spy.call_count, 1)
 
       cpu_mesh = SimpleNamespace(
           size=lambda: 2,

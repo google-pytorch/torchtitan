@@ -46,7 +46,8 @@ jaxtyping.jaxtyped = _real_jaxtyped
 
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
 import torch
-from torch_tpu._internal.pallas import pallas
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:
@@ -204,15 +205,10 @@ def _get_loss_op_names(
   if cache_key in _loss_op_name_cache:
     return _loss_op_name_cache[cache_key]
 
-  compiled_fwd = pallas.custom_jax_kernel(
-      _my_fwd, static_argnums=(3, 4, 5, 6, 7, 8, 9)
-  )
-  compiled_bwd = pallas.custom_jax_kernel(
-      _my_bwd, static_argnums=(5, 6, 7, 8, 9, 10, 11)
-  )
-
-  def fwd_wrapped(x, labels, weights):
-    return compiled_fwd(
+  def fwd_wrapped(
+      x: jax.Array, labels: jax.Array, weights: jax.Array
+  ) -> tuple[jax.Array, jax.Array]:
+    return _my_fwd(
         x,
         labels,
         weights,
@@ -225,8 +221,14 @@ def _get_loss_op_names(
         output_multiplier,
     )
 
-  def bwd_wrapped(dout, lse, x, labels, weights):
-    return compiled_bwd(
+  def bwd_wrapped(
+      dout: jax.Array,
+      lse: jax.Array,
+      x: jax.Array,
+      labels: jax.Array,
+      weights: jax.Array,
+  ) -> tuple[jax.Array, jax.Array]:
+    return _my_bwd(
         dout,
         lse,
         x,
@@ -246,11 +248,9 @@ def _get_loss_op_names(
   op_fwd_name = f"linear_loss_fwd_{identifier}"
   op_bwd_name = f"linear_loss_bwd_{identifier}"
 
-  torch_fwd_fn = torch.library.custom_op(
+  torch_fwd_fn = pallas.jax_op(
       f"pallas::{op_fwd_name}",
       fwd_wrapped,
-      mutates_args=(),
-      schema="(Tensor x, Tensor labels, Tensor weights) -> (Tensor, Tensor)",
   )
   torch_fwd_fn.register_fake(
       lambda x, labels, weights: (
@@ -259,14 +259,9 @@ def _get_loss_op_names(
       )
   )
 
-  torch_bwd_fn = torch.library.custom_op(
+  torch_bwd_fn = pallas.jax_op(
       f"pallas::{op_bwd_name}",
       bwd_wrapped,
-      mutates_args=(),
-      schema=(
-          "(Tensor dout, Tensor lse, Tensor x, Tensor labels, Tensor weights)"
-          " -> (Tensor, Tensor)"
-      ),
   )
   torch_bwd_fn.register_fake(
       lambda dout, lse, x, labels, weights: (

@@ -4,7 +4,7 @@
 
 Wraps the vendored `sbd_splash/` kernel (a tokamax splash attention fork
 adding additive bias and in-kernel PRNG dropout) as a PyTorch custom op
-pair via `torch_tpu._internal.pallas.jax_op`, following the torch_tpu
+pair via `torch.tpu.pallas.jax_op`, following the torch_tpu
 pallas signature contract: tensor args are traced inputs, absent optional
 tensors are passed as None (never dummy sentinels, so no unused operand can
 be dead-code-eliminated out of the lowered kernel), and every configuration
@@ -53,7 +53,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import torch
-from torch_tpu._internal import pallas
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 from torchtitan.experiments.tpu.kernels.sbd_splash import (
     splash_attention_kernel as sbd_kernel,
 )

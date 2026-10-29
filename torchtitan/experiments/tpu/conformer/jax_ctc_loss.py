@@ -5,7 +5,8 @@ import jax
 import jax.numpy as jnp
 import optax
 import torch
-from torch_tpu._internal import pallas
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 
 def ctc_loss_forward_jax(logits: jax.Array, labels: jax.Array) -> jax.Array:

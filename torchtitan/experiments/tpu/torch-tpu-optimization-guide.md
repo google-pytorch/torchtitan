@@ -187,9 +187,9 @@ requiring a captured graph.
    context:
 
    ```python
-   from torch_tpu._internal import execution_mode as em
+   import torch
 
-   with em.set_eager_mode(em.EagerMode.DEFER_AND_FUSE):
+   with torch.tpu.set_eager_mode(torch.tpu.EagerMode.DEFER_AND_FUSE):
        train()
    ```
 

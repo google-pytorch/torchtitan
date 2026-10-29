@@ -1,11 +1,13 @@
 """Grouped Matrix Multiply (GMM) wrapped for TPU."""
 
+import hashlib
 from typing import Tuple, cast
 import jax
 from jax.experimental.pallas.ops.tpu.megablox import ops as jax_gmm_ops
 import jax.numpy as jnp
 import torch
-from torch_tpu._internal import pallas
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 # Caches compiled TPU kernels for each unique `group_sizes` configuration.
 # Used in place of static_argnums to prevent nested @jax.jit tracer collisions.
@@ -29,20 +31,22 @@ def _get_gmm_kernels(group_sizes_tpu: Tuple[int, ...]):
 
   Returns:
     A tuple `(fwd_kernel, bwd_kernel)` where each is a callable wrapped with
-    `pallas.custom_jax_kernel`, ready to be invoked inside a PyTorch
+    `pallas.jax_op`, ready to be invoked inside a PyTorch
     `autograd.Function`.
   """
   if group_sizes_tpu not in _gmm_fwd_cache:
     # Wrap the JAX kernels in a pure Python closure.
     @jax.jit
-    def fwd_fn(lhs_j, rhs_j):
+    def fwd_fn(lhs_j: jax.Array, rhs_j: jax.Array) -> jax.Array:
       gs = jnp.array(group_sizes_tpu, dtype=jnp.int32)
       return jax_gmm_ops.gmm(
           lhs_j, rhs_j, group_sizes=gs, tiling=(128, 128, 128), interpret=False
       )
 
     @jax.jit
-    def bwd_fn(dout_j, lhs_j, rhs_j):
+    def bwd_fn(
+        dout_j: jax.Array, lhs_j: jax.Array, rhs_j: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
       gs = jnp.array(group_sizes_tpu, dtype=jnp.int32)
       grad_lhs = jax_gmm_ops.gmm(
           dout_j,
@@ -62,11 +66,14 @@ def _get_gmm_kernels(group_sizes_tpu: Tuple[int, ...]):
       )
       return grad_lhs, grad_rhs
 
-    _gmm_fwd_cache[group_sizes_tpu] = pallas.custom_jax_kernel(
-        fwd_fn, name="gmm_fwd"
+    identifier = hashlib.sha256(
+        str(group_sizes_tpu).encode("utf-8")
+    ).hexdigest()[:16]
+    _gmm_fwd_cache[group_sizes_tpu] = pallas.jax_op(
+        f"pallas::gmm_fwd_{identifier}", fwd_fn
     )
-    _gmm_bwd_cache[group_sizes_tpu] = pallas.custom_jax_kernel(
-        bwd_fn, name="gmm_bwd"
+    _gmm_bwd_cache[group_sizes_tpu] = pallas.jax_op(
+        f"pallas::gmm_bwd_{identifier}", bwd_fn
     )
 
   return _gmm_fwd_cache[group_sizes_tpu], _gmm_bwd_cache[group_sizes_tpu]

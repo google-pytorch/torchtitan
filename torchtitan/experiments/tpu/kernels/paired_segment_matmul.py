@@ -22,8 +22,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox import ops as gmm_ops
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm as megablox_gmm
-from torch_tpu._internal import pallas
 from torchtitan.experiments.tpu.kernels.pallas_naming import call_named
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 
 # Keep the paired kernel on MegaBlox's exact metadata and boundary-mask

@@ -19,6 +19,7 @@ from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
+import torchtitan.experiments.tpu.examples.flint  # trigger model registration
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
@@ -290,6 +291,7 @@ def start_trainer(
           "qwen3",
           "qwen3_5",
           "gemma4",
+          "flint",
       ):
         kwargs["tpu_compile_mode"] = train_config.compile.mode
     return orig_parallelize(model, *args, **kwargs)

@@ -403,6 +403,31 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
       ),
+      # flint: no TP (the per-head sinks are replicated, as in HF Flint).
+      dict(
+          testcase_name="flint_fsdp",
+          module="torchtitan.experiments.tpu.examples.flint",
+          config="flint_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          # 512 > the debug flavor's 129-token window, so the window masks.
+          args=[
+              "--parallelism.no-use_simple_fsdp",
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
+          testcase_name="flint_simplefsdp",
+          module="torchtitan.experiments.tpu.examples.flint",
+          config="flint_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
       # muse_glimmer (text-only). TP is capped at 2: the debugmodel has 2 KV
       # heads (see muse_glimmer_fsdp_tp2).
       dict(

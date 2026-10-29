@@ -114,10 +114,13 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
 
 
 class TpuQwen35Model(Qwen35Model):
-  """``Qwen35Model`` whose config switches to the TPU EP token dispatcher.
+  """``Qwen35Model`` whose config and parallelization wire TPU EP execution.
 
   Under expert parallelism, ``Config.update_from_config`` switches the MoE
-  layers to ``TpuQwen35TokenDispatcher``.
+  layers to ``TpuQwen35TokenDispatcher`` and disables the ``EP == 1`` paired
+  Pallas kernel, and ``parallelize`` enables the unpaired Pallas grouped
+  matmuls on TPU so dynamic or empty expert segments under EP never hit
+  ``torch._grouped_mm``.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -149,3 +152,25 @@ class TpuQwen35Model(Qwen35Model):
               parent[field_name] = ep_dispatcher
             else:
               setattr(parent, field_name, ep_dispatcher)
+
+  def parallelize(self, parallel_dims) -> None:
+    ep_mesh = parallel_dims.get_optional_mesh("ep")
+    if ep_mesh is not None and getattr(ep_mesh, "device_type", None) == "tpu":
+      # Under EP > 1 on TPU, recipes without `_use_tpu_moe_kernels` leave
+      # `use_pallas_grouped_mm=False`, falling back to `torch._grouped_mm`
+      # (`chlo.ragged_dot`), whose backward reads uninitialized HBM on dynamic
+      # or empty expert segments (torch_tpu#2668). Switch tile-aligned expert
+      # layers to unpaired Pallas grouped matmuls while preserving any explicit
+      # tiling already configured by `_use_tpu_moe_kernels`.
+      for module in self.modules():
+        if (
+            isinstance(module, TpuGroupedExperts)
+            and not module.use_pallas_grouped_mm
+            and hasattr(module, "w1_EFD")
+            and module.w1_EFD.shape[-2] % 128 == 0
+            and module.w1_EFD.shape[-1] % 128 == 0
+        ):
+          module.use_pallas_grouped_mm = True
+          module.pallas_grouped_mm_tile_m = 256
+          module.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    super().parallelize(parallel_dims)

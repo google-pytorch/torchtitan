@@ -1614,6 +1614,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     # kernels, and Splash attention.
     bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
     self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+
     # Pretraining: no GatedDeltaNet packed-document resets (RL keeps them).
     def resets(cfg):
       return [
@@ -1834,6 +1835,58 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     ])
     self.assertEqual(parsed_ep.parallelism.expert_parallel_degree, 8)
     self.assertFalse(parsed_ep.tpu_config.compile_grad_norm)
+
+    # Under EP > 1 on TPU, TpuQwen35Model.parallelize upgrades unconfigured
+    # TpuGroupedExperts (use_pallas_grouped_mm=False) to unpaired Pallas
+    # (tile_m=256), leaves CPU EP meshes on GroupedExperts.forward, and
+    # preserves explicit tiling when use_pallas_grouped_mm is already True.
+    def _build_debug_ep_model(tile_m: int | None = None):
+      dbg_cfg = config_registry.qwen35_moe_debugmodel()
+      if tile_m is not None:
+        config_registry._use_tpu_moe_kernels(dbg_cfg, tile_m=tile_m)  # pylint: disable=protected-access
+      dbg_cfg.parallelism.expert_parallel_degree = 2
+      dbg_cfg.model_spec.model.layers = dbg_cfg.model_spec.model.layers[:1]
+      dbg_cfg.model_spec.model.update_from_config(
+          config=dbg_cfg, global_batch_size=4, local_global_batch_size=4
+      )
+      with torch.device("meta"):
+        return dbg_cfg.model_spec.model.build()
+
+    def _fake_parallel_dims(ep_device_type: str | None):
+      ep_mesh = (
+          None
+          if ep_device_type is None
+          else SimpleNamespace(device_type=ep_device_type)
+      )
+      return SimpleNamespace(
+          get_optional_mesh=lambda name: ep_mesh if name == "ep" else None
+      )
+
+    with mock.patch.object(tpu_model.Qwen35Model, "parallelize", autospec=True):
+      cpu_ep_model = _build_debug_ep_model()
+      cpu_ep_model.parallelize(_fake_parallel_dims("cpu"))
+      cpu_experts = cpu_ep_model.layers["0"].moe.routed_experts.inner_experts
+      self.assertFalse(cpu_experts.use_pallas_grouped_mm)
+
+      tpu_ep_model = _build_debug_ep_model()
+      tpu_ep_model.parallelize(_fake_parallel_dims("tpu"))
+      tpu_experts = tpu_ep_model.layers["0"].moe.routed_experts.inner_experts
+      self.assertTrue(tpu_experts.use_pallas_grouped_mm)
+      self.assertFalse(tpu_experts.use_pallas_paired_grouped_mm)
+      self.assertEqual(tpu_experts.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(tpu_experts.pallas_grouped_mm_tgmm_tiling, (256, 0, 0))
+
+      preset_ep_model = _build_debug_ep_model(tile_m=512)
+      preset_ep_model.parallelize(_fake_parallel_dims("tpu"))
+      preset_experts = preset_ep_model.layers[
+          "0"
+      ].moe.routed_experts.inner_experts
+      self.assertTrue(preset_experts.use_pallas_grouped_mm)
+      self.assertFalse(preset_experts.use_pallas_paired_grouped_mm)
+      self.assertEqual(preset_experts.pallas_grouped_mm_tile_m, 512)
+      self.assertEqual(
+          preset_experts.pallas_grouped_mm_tgmm_tiling, (512, 0, 0)
+      )
 
   @parameterized.named_parameters(
       dict(testcase_name="_dropless", capacity_factor=None),

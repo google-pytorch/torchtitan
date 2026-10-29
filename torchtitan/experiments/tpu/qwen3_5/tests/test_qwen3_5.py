@@ -1291,7 +1291,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     """Tests the 35B-A3B recipe, also as parsed from the command line."""
     cfg = config_registry.qwen35_moe_35b()
     self.assertEqual(cfg.model_spec.flavor, "35B-A3B")
-    self.assertEqual(cfg.training.dtype, "bfloat16")
+    self.assertEqual(cfg.training.dtype, "float32")
+    self.assertEqual(cfg.training.mixed_precision_param, "bfloat16")
+    self.assertEqual(cfg.training.mixed_precision_reduce, "float32")
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
     self.assertEqual(cfg.parallelism.fsdp_reshard_after_forward, "always")
     self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)

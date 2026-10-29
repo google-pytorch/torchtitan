@@ -150,9 +150,6 @@ def qwen35_moe_debugmodel() -> TPUTrainerConfig:
 def qwen35_moe_debugmodel_fused_ce() -> TPUTrainerConfig:
   """Debug config for 4-layer hybrid Qwen3.5 MoE with Pallas fused CE loss."""
   cfg = qwen35_moe_debugmodel()
-  cfg.training.dtype = "bfloat16"
-  cfg.training.mixed_precision_param = "bfloat16"
-  cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.training.max_context_length = 256
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 1024
   _enable_pallas_cross_entropy(
@@ -176,12 +173,13 @@ def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
 def qwen35_moe_35b() -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 
-  Fits one tpu7x-2x2x1 host (4 chips, 8 ranks) and up: bf16 parameters,
-  gradients and AdamW state (8 bytes per parameter), SimpleFSDP resharding
-  after forward (ZeRO-3), full activation checkpointing, Pallas paired grouped
-  matmuls for the experts, Splash attention, Pallas fused linear cross-entropy,
-  and torch_tpu's DEFER_AND_FUSE eager mode with a compiled gradient norm.
-  32K tokens per rank (16 sequences of 2048).
+  Fits one tpu7x-2x2x1 host (4 chips, 8 ranks) and up. As in the Qwen3 TPU
+  recipes, FP32 parameters, gradients and AdamW state (16 bytes per
+  parameter) with bf16 compute and FP32 gradient reduction. SimpleFSDP
+  resharding after forward (ZeRO-3), full activation checkpointing, Pallas
+  paired grouped matmuls for the experts, Splash attention, Pallas fused
+  linear cross-entropy, and torch_tpu's DEFER_AND_FUSE eager mode with a
+  compiled gradient norm. 32K tokens per rank (16 sequences of 2048).
   """
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
@@ -206,8 +204,6 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
           num_tokens_per_microbatch_per_dp_rank=16 * 2048,
           max_context_length=2048,
           steps=10,
-          dtype="bfloat16",
-          mixed_precision_param="bfloat16",
           mixed_precision_reduce="float32",
       ),
       dataloader=TPUGrainDataLoader.Config(dataset="c4"),

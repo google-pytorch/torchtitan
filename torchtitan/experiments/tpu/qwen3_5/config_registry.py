@@ -173,9 +173,11 @@ def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
 def qwen35_moe_35b() -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 
-  Fits one tpu7x-2x2x1 host (4 chips, 8 ranks) and up. As in the Qwen3 TPU
-  recipes, FP32 parameters, gradients and AdamW state (16 bytes per
-  parameter) with bf16 compute and FP32 gradient reduction. SimpleFSDP
+  As in the Qwen3 TPU recipes, FP32 parameters, gradients and AdamW state
+  (16 bytes per parameter) with bf16 compute and FP32 gradient reduction.
+  That is 65 GiB per rank on one tpu7x-2x2x1 host (4 chips, 8 ranks), which
+  then runs out of HBM in the second step: use two or more hosts, or
+  `--training.dtype=bfloat16` (8 bytes per parameter) on one. SimpleFSDP
   resharding after forward (ZeRO-3), full activation checkpointing, Pallas
   paired grouped matmuls for the experts, Splash attention, Pallas fused
   linear cross-entropy, and torch_tpu's DEFER_AND_FUSE eager mode with a

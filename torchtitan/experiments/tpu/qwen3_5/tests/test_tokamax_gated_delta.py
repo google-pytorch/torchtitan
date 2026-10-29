@@ -1,5 +1,7 @@
 """Tests Tokamax's Mosaic KDA GatedDeltaNet kernels against the XLA path."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
@@ -79,13 +81,15 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         ),
         g,
     )
+    clamped = g < min_log_decay
+    # The clamp passes no gradient to clamped decays.
+    self.assertTrue(bool((actual[4][clamped] == 0).all().item()))
     for name, a_t, e_t in zip(
         ("out", "dq", "dk", "dv", "dg", "dbeta"), actual, expected, strict=True
     ):
       if name == "dg":
-        # Clamped decays have no gradient through the clamp in either path.
-        mask = g > min_log_decay
-        a_t, e_t = a_t * mask, e_t * mask
+        # The reference's leaf is already clamped, so compare the others.
+        a_t, e_t = a_t * ~clamped, e_t * ~clamped
       self.assertTrue(torch.isfinite(a_t).all().item(), msg=f"{name}")
       # dg sums bf16-rounded terms over the key channels and time (TPU7x:
       # 1.7e-2 to 3.1e-2); the other outputs are at 3.7e-3 to 5.0e-3.
@@ -99,6 +103,73 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         gated_delta.chunked_gated_delta, 0.5 * g.clamp_min(min_log_decay)
     )
     self.assertGreater(_relative_l2_error(halved[0], expected[0]), 5e-2)
+    if init_gates:
+      # The clamp changes the function: compare with the unclamped one, which
+      # the XLA path computes (many of the initialization's decays are clamped;
+      # TPU7x: 7.2e-3).
+      unclamped = run(gated_delta.chunked_gated_delta, g)
+      deviation = _relative_l2_error(actual[0], unclamped[0])
+      self.assertLess(deviation, 2e-2, msg=f"clamp deviation {deviation:.2e}")
+
+  def test_override_arguments_and_validation(self):
+    """Tests the override's arguments and the Config checks."""
+    if tokamax_gated_delta is None:
+      self.skipTest(_TOKAMAX_IMPORT_ERROR)
+    kernel_cfg = tokamax_gated_delta.tokamax_gated_delta_kernel(
+        gated_delta.TpuGatedDeltaKernel.Config(chunk_size=32),
+        min_log_decay=-4.0,
+        max_num_segments=32,
+    )
+    self.assertIsInstance(
+        kernel_cfg, tokamax_gated_delta.TokamaxGatedDeltaKernel.Config
+    )
+    self.assertEqual(
+        (kernel_cfg.chunk_size, kernel_cfg.min_log_decay),
+        (32, -4.0),
+    )
+    self.assertEqual(kernel_cfg.max_num_segments, 32)
+    kernel = kernel_cfg.build()
+    self.assertEqual(kernel._num_segments(8192), 32)  # pylint: disable=protected-access
+    default = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config().build()
+    self.assertEqual(default._num_segments(512), 4)  # pylint: disable=protected-access
+    self.assertEqual(default._num_segments(8192), 16)  # pylint: disable=protected-access
+    for bad in (dict(min_log_decay=-6.0), dict(min_log_decay=0.0)):
+      with self.assertRaisesRegex(ValueError, "min_log_decay"):
+        tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(**bad).build()
+    with self.assertRaisesRegex(ValueError, "max_num_segments"):
+      tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
+          max_num_segments=0
+      ).build()
+
+  def test_unsupported_inputs_fall_back_to_xla(self):
+    """Tests that inputs the Mosaic kernels do not take run the XLA path."""
+    if tokamax_gated_delta is None:
+      self.skipTest(_TOKAMAX_IMPORT_ERROR)
+    kernel = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config().build()
+    devices = [torch.device("cpu")]
+    if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+      # 100-token rows without document ids: not a multiple of 64.
+      devices.append(self.accelerator_device)
+    torch.manual_seed(0)
+    for dev in devices:
+      with self.subTest(device=dev.type):
+        shape = (2, 100, 4)
+        q, k = (torch.randn(*shape, 128, device=dev) for _ in range(2))
+        v = torch.randn(*shape, 128, device=dev)
+        g = -F.softplus(torch.randn(*shape, device=dev))
+        beta = torch.sigmoid(torch.randn(*shape, device=dev))
+        with mock.patch.object(
+            tokamax_gated_delta,
+            "tokamax_gated_delta",
+            side_effect=AssertionError("ran the Mosaic kernels"),
+        ):
+          out = kernel.recurrence(q, k, v, g, beta)
+        # On TPU two evaluations of the same fp32 XLA computation differ
+        # slightly (up to 6.7e-5 here).
+        tolerances = dict(atol=2e-4, rtol=2e-3) if dev.type == "tpu" else {}
+        torch.testing.assert_close(
+            out, gated_delta.chunked_gated_delta(q, k, v, g, beta), **tolerances
+        )
 
   @parameterized.named_parameters(
       dict(testcase_name="_all_documents", max_num_segments=8),

@@ -1,13 +1,17 @@
 """Tests for TPU dataset selection in `experiments/tpu/datasets.py`."""
 
+import json
 import os
 import pickle
 import tempfile
 
 from absl.testing import absltest
 
+from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.experiments.tpu import datasets
 from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.tools.logging import logger
 
 
 class TextDatasetTest(absltest.TestCase):
@@ -120,6 +124,57 @@ class ChatDatasetTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, "dataset_path"):
       self._resolve("chat_json")
 
+
+
+class TPUGrainDataLoaderChatTest(absltest.TestCase):
+
+  _TOKENIZER_PATH = "tests/assets/tokenizer"
+  _SFT_DATA_PATH = "tests/assets/sft_test/data.json"
+
+  def _build(self, **config):
+    return datasets.TPUGrainDataLoader.Config(**config).build(
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=HuggingFaceTokenizer(tokenizer_path=self._TOKENIZER_PATH),
+        max_context_length=128,
+        num_tokens_per_batch=128,
+    )
+
+  def test_chat_json_trains_on_the_response_only(self) -> None:
+    loader = self._build(
+        dataset="chat_json",
+        dataset_path=self._SFT_DATA_PATH,
+        prompt_field="question",
+        response_field="answer",
+        shuffle=False,
+    )
+    labels = next(iter(loader))["labels"].flatten().tolist()
+    with open(self._SFT_DATA_PATH) as f:
+      first_answer = json.load(f)[0]["answer"]
+    tokenizer = HuggingFaceTokenizer(tokenizer_path=self._TOKENIZER_PATH)
+    answer = tokenizer.encode(first_answer, add_bos=False, add_eos=False)
+    # The first document's prompt is masked, so its answer is the first
+    # supervised span.
+    self.assertEqual(labels[0], IGNORE_INDEX)
+    trained = [t for t in labels if t != IGNORE_INDEX]
+    self.assertEqual(trained[: len(answer)], answer)
+
+  def test_split_warns_and_is_ignored_for_chat_json(self) -> None:
+    with self.assertLogs(logger, level="WARNING") as logs:
+      loader = self._build(
+          dataset="chat_json",
+          dataset_path=self._SFT_DATA_PATH,
+          dataset_split="test",
+          prompt_field="question",
+          response_field="answer",
+      )
+    self.assertIn("is ignored", "\n".join(logs.output))
+    self.assertIn("labels", next(iter(loader)))
+
+  def test_chat_options_warn_for_text_datasets(self) -> None:
+    with self.assertLogs(logger, level="WARNING") as logs:
+      self._build(dataset="c4_test", prompt_field="question")
+    self.assertIn("only apply to chat datasets", "\n".join(logs.output))
 
 if __name__ == "__main__":
   absltest.main()

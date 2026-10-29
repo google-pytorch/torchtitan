@@ -5,6 +5,10 @@ Upstream d771abb0 migrated the data stack to Grain and deleted
 `HuggingFaceTextDataLoader.Config(dataset="c4_test")`. `TPUGrainDataLoader`
 keeps that spelling (and the `--dataloader.dataset` /
 `--dataloader.dataset_path` flags) on top of upstream's `GrainDataLoader`.
+
+`--dataloader.dataset` also selects single-turn chat datasets for fine-tuning
+(`CHAT_DATASETS`), with `--dataloader.dataset_split`,
+`--dataloader.prompt_field` and `--dataloader.response_field`.
 """
 
 import dataclasses
@@ -18,9 +22,11 @@ from typing import Any
 from torchtitan.components.data.dataset import SingleDatasetConfig
 from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
+from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.tools.logging import logger
 
 __all__ = [
     "CHAT_DATASETS",
@@ -165,16 +171,56 @@ def _chat_dataset(
   )
 
 class TPUGrainDataLoader(GrainDataLoader):
-  """GrainDataLoader wrapper preserving TPU CLI flags (`dataset`, `dataset_path`)."""
+  """GrainDataLoader selecting its dataset by name from the CLI.
+
+  `dataset` is a key in `CHAT_DATASETS` (first-fit packed chats, loss on the
+  response only), in upstream `DATASETS` (text), or in the Flux datasets.
+  """
 
   @dataclasses.dataclass(kw_only=True, slots=True)
   class Config(GrainDataLoader.Config):
     dataset: str = "c4_test"  # pytype: disable=signature-mismatch
     dataset_path: str | None = None
+    dataset_split: str | None = None
+    """Chat datasets only: the split to read (default "train"); local JSON
+    files (`chat_json`) are a single split, so it is ignored for them."""
+    prompt_field: str | None = None
+    """Chat datasets only: overrides the field holding the prompt."""
+    response_field: str | None = None
+    """Chat datasets only: overrides the field holding the response."""
 
   def __init__(self, config: Config, **kwargs: Any) -> None:
     if isinstance(config.dataset, str):
-      if config.dataset in DATASETS:
+      chat_options = (
+          config.dataset_split, config.prompt_field, config.response_field
+      )
+      if config.dataset not in CHAT_DATASETS and any(
+          option is not None for option in chat_options
+      ):
+        logger.warning(
+            "dataset_split, prompt_field and response_field only apply to chat"
+            f" datasets {sorted(CHAT_DATASETS)}; ignored for {config.dataset!r}."
+        )
+      if (
+          config.dataset in CHAT_DATASETS
+          and CHAT_DATASETS[config.dataset].path == "json"
+          and config.dataset_split not in (None, "train")
+      ):
+        logger.warning(
+            f"dataset_split={config.dataset_split!r} is ignored for"
+            f" {config.dataset!r}: the whole file {config.dataset_path} is read."
+        )
+      if config.dataset in CHAT_DATASETS:
+        ds_cfg = FirstFitPackingConfig(
+            dataset=_chat_dataset(
+                config.dataset,
+                dataset_path=config.dataset_path,
+                split=config.dataset_split,
+                prompt_field=config.prompt_field,
+                response_field=config.response_field,
+            )
+        )
+      elif config.dataset in DATASETS:
         ds_cfg = ConcatThenSplitPackingConfig(
             dataset=_text_dataset(config.dataset, config.dataset_path)
         )

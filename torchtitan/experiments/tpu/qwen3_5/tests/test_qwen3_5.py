@@ -1393,12 +1393,17 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(splitter.n_layers, 40)
 
   def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
-    """Tests that TP, CP and PP fail before the model is touched."""
-    for name in ("tp", "cp", "pp"):
-      enabled = dict(tp_enabled=False, cp_enabled=False, pp_enabled=False)
+    """Tests that TP, CP, PP and EP fail before the model is touched."""
+    for name in ("tp", "cp", "pp", "ep"):
+      enabled = dict(
+          tp_enabled=False,
+          cp_enabled=False,
+          pp_enabled=False,
+          ep_enabled=False,
+      )
       enabled[f"{name}_enabled"] = True
       with self.subTest(name), self.assertRaisesRegex(
-          NotImplementedError, "TP, CP or PP"
+          NotImplementedError, "TP, CP, PP or EP"
       ):
         gt_qwen3_5.parallelize_qwen3_5(
             None,
@@ -1441,6 +1446,16 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         bench_cfg.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
     )
     self.assertEqual(bench_cfg.training.dtype, "bfloat16")
+    self.assertEqual(bench_cfg.training.mixed_precision_param, "bfloat16")
+    self.assertEqual(bench_cfg.training.mixed_precision_reduce, "float32")
+    self.assertEqual(bench_cfg.metrics.log_freq, 5)
+    self.assertEqual(
+        bench_cfg.xla_flags, {"xla_enable_hlo_sharding_v3": "false"}
+    )
+    self.assertEqual(
+        bench_cfg.libtpu_init_flags["xla_tpu_scoped_vmem_limit_kib"], "65472"
+    )
+    self.assertEqual(bench_cfg.libtpu_init_flags["xla_tpu_dvfs_p_state"], "7")
     tpu_config = bench_cfg.tpu_config
     self.assertTrue(tpu_config.use_graph_trainer)
     self.assertEqual(tpu_config.graph_trainer_memory_policy, "tpu_selective")
@@ -1449,6 +1464,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         ("moe.routing", "attention.inner_attention"),
     )
     self.assertTrue(tpu_config.use_graph_split)
+    self.assertTrue(tpu_config.graph_split.forward_isolate_prefix)
     self.assertEqual(tpu_config.graph_split.forward_layers_per_executable, 2)
     self.assertEqual(tpu_config.graph_split.backward_layers_per_executable, 2)
     self.assertEqual(
@@ -1462,10 +1478,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertIsInstance(bench_cfg.loss, PallasCrossEntropyLoss.Config)
 
-    # The fused loss override only: the Tokamax one needs Tokamax's KDA op.
-    apply_overrides(
-        OverrideConfig(imports=[config_registry.FUSED_LOSS_OVERRIDE]), bench_cfg
-    )
+    # Apply both recipe overrides (`tokamax_gated_delta` imports KDA lazily).
+    apply_overrides(bench_cfg.override, bench_cfg)
+    gdn_kernels = [
+        layer.delta_net.inner_gated_delta_net.kernel
+        for layer in bench_cfg.model_spec.model.layers
+        if layer.delta_net is not None
+    ]
+    self.assertLen(gdn_kernels, 30)
+    for kernel_cfg in gdn_kernels:
+      self.assertEqual(
+          type(kernel_cfg).__qualname__, "TokamaxGatedDeltaKernel.Config"
+      )
     with torch.device("meta"):
       meta_model = bench_cfg.model_spec.model.build()
     workarounds._check_fused_loss_logit_transform(meta_model, bench_cfg)  # pylint: disable=protected-access

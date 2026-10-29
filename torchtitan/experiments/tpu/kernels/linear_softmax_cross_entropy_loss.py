@@ -23,6 +23,7 @@ applies the transform to each logits tile in-kernel (see that module's doc).
 """
 
 import hashlib
+import inspect
 
 # Workaround for https://github.com/openxla/tokamax/issues/240
 import jaxtyping
@@ -51,6 +52,32 @@ from torch_tpu._internal.pallas import pallas
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:
   return soft_cap is not None or output_multiplier != 1.0
+
+
+def _bwd_vmem_exceeds_capacity(
+    kernel,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    dtype,
+) -> bool:
+  """Whether default (2, 2) grad buffering exceeds physical VMEM capacity."""
+  calc_fn = getattr(kernel, "_calculate_bwd_vmem_bytes", None)
+  if calc_fn is None:
+    return False
+  try:
+    from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
+
+    vmem_22 = calc_fn(
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        dtype=dtype,
+        buffer_count=(2, 2),
+    )
+    return vmem_22 > int(0.95 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return False
 
 
 def _my_fwd(
@@ -158,18 +185,28 @@ def _my_bwd(
 
   from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel  # pylint: disable=g-import-not-at-top
 
-  grad_x, grad_w = (
-      kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
-          dout,
-          lse,
-          x,
-          labels,
-          weights,
-          b_block_size=b_block_size,
-          h_block_size=h_block_size,
-          v_block_size=v_block_size,
-          reduction=reduction,
-      )
+  bwd_fn = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
+  bwd_kwargs = {}
+  if "buffer_count" in inspect.signature(
+      bwd_fn
+  ).parameters and _bwd_vmem_exceeds_capacity(
+      kernel, b_block_size, h_block_size, v_block_size, x.dtype
+  ):
+    # Large single-H tiles such as (1024, 2048, 640) fit TPU7x VMEM at 51.9 MiB
+    # with single-buffered grad accumulators, whereas jax >= 0.12's (2, 2)
+    # triple-buffering reaches 77.9 MiB and OOMs VMEM at compile time.
+    bwd_kwargs["buffer_count"] = 1
+  grad_x, grad_w = bwd_fn(
+      dout,
+      lse,
+      x,
+      labels,
+      weights,
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
+      reduction=reduction,
+      **bwd_kwargs,
   )
   # Keep the Pallas and reference implementations on the same autograd dtype
   # contract. The pinned Tokamax revision separately fixes where dout is

@@ -9,7 +9,17 @@ from torchtitan.components.validate import Validator
 from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
-from torchtitan.experiments.tpu.examples.flint import model_registry
+from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.examples.flint import (
+    graph_trainer_model_registry,
+    model_registry,
+)
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
+)
 from torchtitan.experiments.tpu.examples.flint.model import FlintSinkAttention
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.grouped_experts import (
@@ -31,6 +41,11 @@ __all__ = [
     "flint_40b_v003",
     "flint_40b_v004_mb16",
     "flint_40b_v004_mb32",
+    "flint_40b_v005_gt",
+    "flint_40b_v005_gt_mb16",
+    "flint_40b_v005_gt_rb",
+    "flint_40b_v005_gt_split",
+    "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
 ]
@@ -221,4 +236,90 @@ def flint_40b_v004_mb32() -> TPUTrainerConfig:
   microbatch: no gradient accumulation."""
   config = flint_40b_v003()
   config.training.num_tokens_per_microbatch_per_dp_rank = 32 * _40B_CONTEXT_LENGTH
+  return config
+
+
+def _to_graph_trainer(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
+  """The same recipe on TPU GraphTrainer: forward, loss and backward traced
+  into one program per step with SimpleFSDP collectives inside it, so XLA can
+  schedule parameter all-gathers and gradient reduce-scatters across layers.
+  Full remat matches the per-layer recipe's full AC."""
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      config, graph_trainer_model_registry
+  )
+  graph_config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full",
+  )
+  # Shardy HLO sharding v3 (default in libtpu 0.0.48) segfaults in
+  # buildTensorFactorShardings on GraphTrainer.
+  graph_config.xla_flags = tpu_flags.merge_flags(
+      graph_config.xla_flags, xla_enable_hlo_sharding_v3=False
+  )
+  return graph_config
+
+
+def graph_trainer_flint_debugmodel() -> TpuGraphTrainer.Config:
+  return _to_graph_trainer(flint_debugmodel())
+
+
+def flint_40b_v005_gt() -> TpuGraphTrainer.Config:
+  """``flint_40b_v004_mb32`` (no gradient accumulation) on TPU GraphTrainer."""
+  return _to_graph_trainer(flint_40b_v004_mb32())
+
+
+def flint_40b_v005_gt_mb16() -> TpuGraphTrainer.Config:
+  """``flint_40b_v004_mb16`` on TPU GraphTrainer (fallback if mb32 does not
+  fit the whole-step program)."""
+  return _to_graph_trainer(flint_40b_v004_mb16())
+
+
+def flint_40b_proxy_gt() -> TpuGraphTrainer.Config:
+  """``flint_40b_proxy_v003`` on GraphTrainer (local pre-dispatch check)."""
+  config = flint_40b_proxy_v003()
+  config.tpu_config.mfu_benchmark_start_step = 3
+  return _to_graph_trainer(config)
+
+
+def flint_40b_v005_gt_rb() -> TpuGraphTrainer.Config:
+  """``flint_40b_v005_gt`` with remat barriers: each layer's recompute waits
+  for the previous layer's parameter gradients, so XLA cannot hoist all
+  recomputes and keep their workspaces live at once (the unbarriered
+  whole-step program needed 388.7 GiB of temporaries at mb32)."""
+  config = flint_40b_v005_gt()
+  config.compile.enable_remat_barriers = True
+  return config
+
+
+def flint_40b_v005_gt_split() -> TpuGraphTrainer.Config:
+  """``flint_40b_v005_gt`` split into one executable per layer (forward) and
+  an FSDP-pipelined per-layer backward, the Qwen3-235B recipe's layout: the
+  executable boundaries bound activation lifetimes."""
+  config = flint_40b_v005_gt()
+  split = config.compile.graph_split
+  split.enabled = True
+  split.forward_layers_per_executable = 1
+  split.forward_isolate_prefix = True
+  split.backward_partition_mode = "fsdp_pipeline"
+  split.backward_layers_per_executable = 1
+  config.parallelism.fsdp_reshard_after_forward = "always"
+  return config
+
+
+def flint_40b_proxy_gt_rb() -> TpuGraphTrainer.Config:
+  config = flint_40b_proxy_gt()
+  config.compile.enable_remat_barriers = True
+  return config
+
+
+def flint_40b_proxy_gt_split() -> TpuGraphTrainer.Config:
+  config = flint_40b_proxy_gt()
+  split = config.compile.graph_split
+  split.enabled = True
+  split.forward_layers_per_executable = 1
+  split.forward_isolate_prefix = True
+  split.backward_partition_mode = "fsdp_pipeline"
+  split.backward_layers_per_executable = 1
+  config.parallelism.fsdp_reshard_after_forward = "always"
   return config

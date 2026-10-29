@@ -45,6 +45,8 @@ __all__ = [
     "flint_40b_v005_gt_mb16",
     "flint_40b_v005_gt_rb",
     "flint_40b_v005_gt_split",
+    "flint_40b_v007",
+    "flint_40b_v008",
     "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
@@ -322,4 +324,32 @@ def flint_40b_proxy_gt_split() -> TpuGraphTrainer.Config:
   split.backward_partition_mode = "fsdp_pipeline"
   split.backward_layers_per_executable = 1
   config.parallelism.fsdp_reshard_after_forward = "always"
+  return config
+
+
+# The graph-splitter flag set of the Qwen3-235B recipe: latency-hiding layer
+# scheduling of SparseCore-aggregated FSDP collectives, both SparseCores for
+# reduce-scatter, and async all-gathers kept as all-gathers.
+_GRAPH_SPLIT_COLLECTIVE_FLAGS = tpu_flags.merge_flags(
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    {"xla_tpu_prefer_async_allgather_to_allreduce": True},
+)
+
+
+def flint_40b_v007() -> TpuGraphTrainer.Config:
+  """``flint_40b_v005_gt_split`` with the graph-split collective flags."""
+  config = flint_40b_v005_gt_split()
+  config.libtpu_init_flags = tpu_flags.merge_flags(
+      config.libtpu_init_flags, _GRAPH_SPLIT_COLLECTIVE_FLAGS
+  )
+  return config
+
+
+def flint_40b_v008() -> TpuGraphTrainer.Config:
+  """``flint_40b_v007`` at TPU7x performance state 7."""
+  config = flint_40b_v007()
+  config.libtpu_init_flags = tpu_flags.merge_flags(
+      config.libtpu_init_flags, tpu_flags.TPU7X_THROUGHPUT_P_STATE
+  )
   return config

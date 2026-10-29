@@ -105,6 +105,8 @@ class _CausalConvSilu(torch.autograd.Function):
   slices of the end-padded output gradient instead, like the forward. The
   convolution output is recomputed for ``silu``'s derivative.
   With ``segment_ids_BS``, ``x[t]`` only reaches outputs of its own document.
+  As in the forward, the taps of ``dx`` and the products and token sums of
+  ``dw`` run in (at least) fp32, and each is rounded once.
   """
 
   @staticmethod
@@ -114,11 +116,15 @@ class _CausalConvSilu(torch.autograd.Function):
       weight_C1W: torch.Tensor,
       segment_ids_BS: torch.Tensor | None,
   ):
+    ctx.set_materialize_grads(False)
     ctx.save_for_backward(x_BSC, weight_C1W, segment_ids_BS)
     return F.silu(_causal_conv(x_BSC, weight_C1W, segment_ids_BS))
 
   @staticmethod
-  def backward(ctx, grad_BSC: torch.Tensor):
+  def backward(ctx, grad_BSC: torch.Tensor | None):
+    need_dx, need_dw, _ = ctx.needs_input_grad
+    if grad_BSC is None or not (need_dx or need_dw):
+      return None, None, None
     x_BSC, weight_C1W, segment_ids_BS = ctx.saved_tensors
     seq_len = x_BSC.shape[1]
     kernel_size = weight_C1W.shape[-1]
@@ -126,33 +132,46 @@ class _CausalConvSilu(torch.autograd.Function):
         grad_BSC, _causal_conv(x_BSC, weight_C1W, segment_ids_BS)
     )
     grad_pad = F.pad(grad_y_BSC, (0, 0, 0, kernel_size - 1))
-    acc_dtype = torch.promote_types(weight_C1W.dtype, torch.float32)
+    # At least fp32, like autograd of the forward's fp32 taps: dw sums over
+    # all B * S tokens, and torch_tpu disallows XLA excess precision by
+    # default, so a bf16 sum would round after every add.
+    acc_dtype = torch.promote_types(
+        torch.promote_types(x_BSC.dtype, weight_C1W.dtype), torch.float32
+    )
     weight_CW = weight_C1W[:, 0, :].to(acc_dtype)
+    x_acc_BSC = x_BSC.to(acc_dtype) if need_dw else None
     grad_x_BSC = None
     grad_w = []
     for k in range(kernel_size):
       shift = kernel_size - 1 - k
-      # grad_shifted[t] = dy[t + shift], the output that w[k] links to x[t].
-      grad_shifted = grad_pad[:, shift : shift + seq_len, :].contiguous()
-      if segment_ids_BS is not None and shift > 0:
-        same_BS1 = _same_segment(segment_ids_BS, -shift).unsqueeze(-1)
-        grad_shifted = torch.where(same_BS1, grad_shifted, 0.0)
-      term = grad_shifted * weight_CW[:, k]
-      grad_x_BSC = term if grad_x_BSC is None else grad_x_BSC + term
       if shift == 0:
-        grad_w.append((x_BSC * grad_y_BSC).sum(dim=(0, 1)))
-      elif segment_ids_BS is not None:
-        grad_w.append((x_BSC * grad_shifted).sum(dim=(0, 1)))
-      elif shift < seq_len:
+        grad_shifted = grad_y_BSC
+      else:
+        # grad_shifted[t] = dy[t + shift], the output that w[k] links to x[t].
+        grad_shifted = grad_pad[:, shift : shift + seq_len, :].contiguous()
+        if segment_ids_BS is not None:
+          same_BS1 = _same_segment(segment_ids_BS, -shift).unsqueeze(-1)
+          grad_shifted = torch.where(same_BS1, grad_shifted, 0.0)
+      if need_dx:
+        term = grad_shifted * weight_CW[:, k]
+        grad_x_BSC = term if grad_x_BSC is None else grad_x_BSC + term
+      if not need_dw:
+        continue
+      if shift >= seq_len:
+        grad_w.append(x_acc_BSC.new_zeros(weight_C1W.shape[0]))
+      elif shift == 0 or segment_ids_BS is not None:
+        grad_w.append((x_acc_BSC * grad_shifted).sum(dim=(0, 1)))
+      else:
         grad_w.append(
-            (x_BSC[:, : seq_len - shift, :] * grad_y_BSC[:, shift:, :]).sum(
+            (x_acc_BSC[:, : seq_len - shift, :] * grad_y_BSC[:, shift:, :]).sum(
                 dim=(0, 1)
             )
         )
-      else:
-        grad_w.append(grad_y_BSC.new_zeros(weight_C1W.shape[0]))
-    grad_w_C1W = torch.stack(grad_w, dim=-1).unsqueeze(1)
-    return grad_x_BSC.to(x_BSC.dtype), grad_w_C1W.to(weight_C1W.dtype), None
+    grad_x = grad_x_BSC.to(x_BSC.dtype) if need_dx else None
+    grad_w_C1W = None
+    if need_dw:
+      grad_w_C1W = torch.stack(grad_w, dim=-1).unsqueeze(1).to(weight_C1W.dtype)
+    return grad_x, grad_w_C1W, None
 
 
 def causal_conv_silu(
@@ -299,6 +318,26 @@ def chunked_gated_delta(
   return out.transpose(1, 2).contiguous().to(out_dtype)
 
 
+def per_row_segment_ids(
+    segment_ids_BS: torch.Tensor, max_num_segments: int
+) -> torch.Tensor:
+  """Per-row document ids, keeping at most ``max_num_segments`` apart.
+
+  Args:
+    segment_ids_BS: ``[B, S]`` document index of each token, non-decreasing
+      along each row in steps of one (``segment_ids_from_positions``, possibly
+      counting on from earlier rows).
+    max_num_segments: Documents per row kept apart.
+
+  Returns:
+    ``[B, S]`` int32 ids that start at 1 in every row. Documents beyond
+    ``max_num_segments`` share the last id, so they run as one sequence, as
+    without document ids.
+  """
+  ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
+  return ids.clamp(max=max_num_segments).to(torch.int32)
+
+
 class TpuGatedDeltaKernel(GatedDeltaKernel):
   """``GatedDeltaKernel`` running ``chunked_gated_delta`` on ``[B, S]`` rows."""
 
@@ -309,6 +348,21 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
   def __init__(self, config: Config):
     super().__init__(config)
     self.chunk_size = config.chunk_size
+
+  def document_ids(self, segment_ids_BS: torch.Tensor) -> torch.Tensor:
+    """The document ids that the causal convolution and the recurrence use.
+
+    ``TpuInnerGatedDeltaNet`` passes the same ids to both, so a kernel that
+    keeps only some documents apart (``TokamaxGatedDeltaKernel``) merges the
+    others in the convolution too. This one keeps every document apart.
+
+    Args:
+      segment_ids_BS: ``[B, S]`` document index of each token.
+
+    Returns:
+      ``[B, S]`` document ids.
+    """
+    return segment_ids_BS
 
   def recurrence(
       self,
@@ -429,9 +483,11 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
             f" {num_tokens} tokens."
         )
       # Document index of each token: documents start at positions == 0.
-      segment_ids_BS = segment_ids_from_positions(
-          positions.reshape(-1)
-      ).reshape(query_BSC.shape[:2])
+      segment_ids_BS = self.kernel.document_ids(
+          segment_ids_from_positions(positions.reshape(-1)).reshape(
+              query_BSC.shape[:2]
+          )
+      )
 
     def causal_conv(
         x_BSC: torch.Tensor,

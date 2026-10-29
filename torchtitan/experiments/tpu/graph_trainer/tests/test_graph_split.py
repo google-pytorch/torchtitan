@@ -821,6 +821,65 @@ class GraphSplitTest(absltest.TestCase):
           chunked_view.partition_map[cast], chunked_view.partition_map[wait]
       )
 
+  def test_reduce_scatter_chain_stops_at_resizing_views_and_compute(self):
+    """Only casts and size-preserving views after an RS wait join its chain."""
+    gm = self._trace_simple_fsdp(
+        n_layers=2,
+        reduce_dtype=torch.bfloat16,
+    ).backward_graph
+    graph = gm.graph
+    reduce_casts = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.aten._to_copy.default
+        and len(node.all_input_nodes) == 1
+        and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+    ]
+    self.assertLen(reduce_casts, 2)
+    waits = [cast.all_input_nodes[0] for cast in reduce_casts]
+
+    def insert_before(cast, target, args, shape):
+      """Makes ``target(<cast's input>, *args)`` the cast's input."""
+      source = cast.all_input_nodes[0]
+      with graph.inserting_before(cast):
+        node = graph.call_function(target, (source, *args))
+      node.meta["val"] = torch.empty(
+          shape, dtype=source.meta["val"].dtype, device="meta"
+      )
+      cast.replace_input_with(source, node)
+      return node
+
+    # Layer 0: wait -> view -> expand (more elements) -> cast.
+    shape = list(waits[0].meta["val"].shape)
+    view = insert_before(
+        reduce_casts[0], torch.ops.aten.view.default, (shape,), shape
+    )
+    expand = insert_before(
+        reduce_casts[0],
+        torch.ops.aten.expand.default,
+        ([2, *shape],),
+        [2, *shape],
+    )
+    # Layer 1: wait -> mul (compute) -> cast.
+    mul = insert_before(
+        reduce_casts[1],
+        torch.ops.aten.mul.Tensor,
+        (2.0,),
+        list(waits[1].meta["val"].shape),
+    )
+    gm.recompile()
+
+    chains = graph_split_lib._collect_collective_chains(gm)
+    chain0, chain1 = (
+        next(chain for chain in chains.values() if wait in chain)
+        for wait in waits
+    )
+    self.assertIn(view, chain0)
+    self.assertNotIn(expand, chain0)
+    self.assertNotIn(reduce_casts[0], chain0)
+    self.assertNotIn(mul, chain1)
+    self.assertNotIn(reduce_casts[1], chain1)
 
 
 if __name__ == "__main__":

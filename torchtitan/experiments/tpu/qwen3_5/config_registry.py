@@ -302,6 +302,11 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
   cross-entropy. 32K tokens per rank (16 sequences of 2048).
   """
   cfg = qwen35_moe_35b()
+  # bf16 parameters and AdamW state (8 bytes per parameter) instead of
+  # qwen35_moe_35b's FP32 master weights, so that the benchmark fits one
+  # tpu7x-2x2x1 host: with FP32 master weights its second step runs out of
+  # HBM there (0.6 GiB short at 32K tokens per rank, 13 GiB at 64K).
+  cfg.training.dtype = "bfloat16"
   cfg.dataloader = c4_test_dataloader()
   cfg.hf_assets_path = "./tests/assets/tokenizer"
   cfg.parallelism = ParallelismConfig(

@@ -59,6 +59,9 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
 * **Precision and sharding**: bf16 parameters, gradients and AdamW moments (8
   bytes per parameter, 258 GiB in total), ZeRO-3 SimpleFSDP
   (`fsdp_reshard_after_forward=always`) with `mixed_precision_reduce="float32"`.
+  The regular-trainer recipe `qwen35_moe_35b` keeps FP32 master weights, as
+  the Qwen3 recipes do; at 16 bytes per parameter they run out of HBM on one
+  `tpu7x-2x2x1` host, so the benchmark sets `training.dtype="bfloat16"`.
 * **Selective activation checkpointing (`tpu_selective`)**: saves
   `moe.routing` (each router's top-k expert ids and the route sort
   permutation) and `attention.inner_attention` (the Splash Attention output

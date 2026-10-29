@@ -9,8 +9,7 @@ gated shared expert in every layer; 34.66B parameters, 2.95B active per token.
 
 ## Launch
 
-One `tpu7x-2x2x1` host, at the recipe's context 2048 and 32K tokens per rank
-(the first row of the results below):
+One `tpu7x-2x2x1` host, at the recipe's context 2048 and 32K tokens per rank:
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
@@ -25,7 +24,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
 
 Add `--training.max_context_length=8192
 --training.num_tokens_per_microbatch_per_dp_rank=65536` for context 8192 and
-64K tokens per rank (the second row).
+64K tokens per rank, as in the results below.
 
 `tpu7x-4x4x4` (16 hosts; see the TPU [README](../../../../README.md) for
 cluster setup), at context 8192 and 64K tokens per rank:
@@ -64,6 +63,13 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   permutation) and `attention.inner_attention` (the Splash Attention output
   and its log-sum-exp) across forward and backward executables, so backward
   does not re-run the MoE top-k and sort or the Splash Attention forward.
+  Without document resets, this cut step-1 compile time by 35–36% (`303 s ->
+  198 s` at 64K tokens per rank, `355 s -> 228 s` at 96K) and step time from
+  6.94 to 6.86 s (`18.21% MFU`) at 64K; at 96K with one layer per executable
+  it took 10.50 to 10.01 s (`18.73% MFU`) with Splash saved in the last two
+  full-attention layers only (`--tpu_config.graph_trainer_save_regions
+  moe.routing --tpu_config.graph_trainer_save_last_n_layers
+  attention.inner_attention 2`).
 * **GraphTrainer with graph split**: as one step graph, the 40-layer model
   neither compiles within an hour on 8 host CPUs nor fits in HBM on one host
   (XLA keeps most layers' unsharded expert gradients alive until late in the
@@ -74,7 +80,10 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   `backward_partition_mode=fsdp_pipeline` cut the step from 84 to 44 child
   executables; in the A/B that chose it (an earlier build of this recipe at
   32K tokens per rank on one host), `split=2` was 24% faster than one layer
-  per executable (`split=1`).
+  per executable (`split=1`). `split=1` halves the peak per-executable
+  unsharded parameter and gradient buffers for 96K–128K tokens per rank
+  (without document resets: `10.01 s/step`, `18.73% MFU` at 96K on `2x2x1`;
+  `13.56 s/step`, `18.43% MFU` at 128K on `4x4x4`).
 * **AdamW**: torch_tpu's fused AdamW outside the step graph
   (`optimizer_in_graph=False`, `compile_grad_norm=True`).
 * **`GatedDeltaNet`**: Tokamax's Mosaic TPU KDA kernels

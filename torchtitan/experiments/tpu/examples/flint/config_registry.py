@@ -43,6 +43,8 @@ __all__ = [
     "flint_40b_v004_mb32",
     "flint_40b_v005_gt",
     "flint_40b_v005_gt_mb16",
+    "flint_40b_v005_gt_rb",
+    "flint_40b_v005_gt_split",
     "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
@@ -278,3 +280,46 @@ def flint_40b_proxy_gt() -> TpuGraphTrainer.Config:
   config = flint_40b_proxy_v003()
   config.tpu_config.mfu_benchmark_start_step = 3
   return _to_graph_trainer(config)
+
+
+def flint_40b_v005_gt_rb() -> TpuGraphTrainer.Config:
+  """``flint_40b_v005_gt`` with remat barriers: each layer's recompute waits
+  for the previous layer's parameter gradients, so XLA cannot hoist all
+  recomputes and keep their workspaces live at once (the unbarriered
+  whole-step program needed 388.7 GiB of temporaries at mb32)."""
+  config = flint_40b_v005_gt()
+  config.compile.enable_remat_barriers = True
+  return config
+
+
+def flint_40b_v005_gt_split() -> TpuGraphTrainer.Config:
+  """``flint_40b_v005_gt`` split into one executable per layer (forward) and
+  an FSDP-pipelined per-layer backward, the Qwen3-235B recipe's layout: the
+  executable boundaries bound activation lifetimes."""
+  config = flint_40b_v005_gt()
+  split = config.compile.graph_split
+  split.enabled = True
+  split.forward_layers_per_executable = 1
+  split.forward_isolate_prefix = True
+  split.backward_partition_mode = "fsdp_pipeline"
+  split.backward_layers_per_executable = 1
+  config.parallelism.fsdp_reshard_after_forward = "always"
+  return config
+
+
+def flint_40b_proxy_gt_rb() -> TpuGraphTrainer.Config:
+  config = flint_40b_proxy_gt()
+  config.compile.enable_remat_barriers = True
+  return config
+
+
+def flint_40b_proxy_gt_split() -> TpuGraphTrainer.Config:
+  config = flint_40b_proxy_gt()
+  split = config.compile.graph_split
+  split.enabled = True
+  split.forward_layers_per_executable = 1
+  split.forward_isolate_prefix = True
+  split.backward_partition_mode = "fsdp_pipeline"
+  split.backward_layers_per_executable = 1
+  config.parallelism.fsdp_reshard_after_forward = "always"
+  return config

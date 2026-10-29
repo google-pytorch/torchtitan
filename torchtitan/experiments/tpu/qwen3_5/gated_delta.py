@@ -20,17 +20,28 @@ axis as one stream. This module provides the TPU replacements:
    do. The document boundaries are static-shape ``[B, S]`` segment-id masks.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
 
+from torchtitan.config.override import override
 from torchtitan.experiments.tpu import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
+
+try:
+  from torchtitan.experiments.tpu.kernels import causal_conv1d
+except ImportError:
+  causal_conv1d = None
+
+try:
+  from torchtitan.experiments.tpu.kernels import rms_norm_gated
+except ImportError:
+  rms_norm_gated = None
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -181,8 +192,9 @@ def causal_conv_silu(
 ) -> torch.Tensor:
   """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
 
-  The backward is ``_CausalConvSilu``'s: shifted slices of the output gradient
-  instead of autograd's scattered adds.
+  Whole-row TPU inputs within ``causal_conv1d.supports`` run the fused Pallas
+  kernels; packed documents or unsupported shapes/devices use
+  ``_CausalConvSilu``'s shifted slices.
 
   Args:
     x_BSC: ``[B, S, C]`` input.
@@ -193,12 +205,12 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
-  if segment_ids_BS is None and x_BSC.device.type == "tpu":
-    # Whole rows on TPU: fused Pallas kernels (~2x faster than the slices).
-    from torchtitan.experiments.tpu.kernels import causal_conv1d  # pylint: disable=g-import-not-at-top
-
-    if causal_conv1d.supports(x_BSC):
-      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+  if (
+      segment_ids_BS is None
+      and causal_conv1d is not None
+      and causal_conv1d.supports(x_BSC, weight_C1W)
+  ):
+    return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 
@@ -338,7 +350,7 @@ def per_row_segment_ids(
     without document ids.
   """
   ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
-  return ids.clamp(max=max_num_segments).to(torch.int32)
+  return ids.clamp(min=1, max=max_num_segments).to(torch.int32)
 
 
 class TpuGatedDeltaKernel(GatedDeltaKernel):
@@ -517,18 +529,19 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
 
 
-def _rms_norm_gated(
-    norm: torch.nn.Module, x_THV: torch.Tensor, gate_THV: torch.Tensor
-) -> torch.Tensor:
-  """``norm(x, gate)`` (``RMSNormGated``), as one Pallas kernel pass on TPU."""
-  if x_THV.device.type == "tpu":
-    from torchtitan.experiments.tpu.kernels import rms_norm_gated  # pylint: disable=g-import-not-at-top
+class TpuRMSNormGated(RMSNormGated):
+  """``RMSNormGated`` that dispatches to Pallas on supported TPU shapes."""
 
-    if rms_norm_gated.supports(x_THV):
-      return rms_norm_gated.rms_norm_gated(
-          x_THV, gate_THV, norm.weight, norm.eps
-      )
-  return norm(x_THV, gate_THV)
+  @dataclass(kw_only=True, slots=True)
+  class Config(RMSNormGated.Config):
+    pass
+
+  def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    if rms_norm_gated is not None and rms_norm_gated.supports(
+        x, gate, self.weight
+    ):
+      return rms_norm_gated.rms_norm_gated(x, gate, self.weight, self.eps)
+    return super().forward(x, gate)
 
 
 class TpuGatedDeltaNet(GatedDeltaNet):
@@ -545,14 +558,14 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   convolution and the recurrence run over each ``[B, S]`` row as one stream,
   as upstream does without ``cu_seqlens`` (e.g. with SDPA). Pretraining
   recipes use it: the Tokamax kernels lay every document out from a 64-token
-  chunk boundary to restart at it, which costs time and HBM.
+  chunk boundary to restart at it, which costs time and memory.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(GatedDeltaNet.Config):
     # Restart the causal convolution and the recurrence at every packed
-    # document (`positions == 0`). RL needs it (verl packs one sequence per
-    # document); pretraining on packed text may turn it off.
+    # document (`positions == 0`). RL needs this when packing multiple rollouts
+    # into one `[B, S]` row; pretraining on packed text may turn it off.
     reset_at_documents: bool = True
 
   def __init__(self, config: Config):
@@ -602,6 +615,17 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         positions=positions if self.reset_at_documents else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
-    output_THV = _rms_norm_gated(self.norm, output_THV, gate_THV)
+    output_THV = self.norm(output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)
+
+
+@override(
+    target=TpuGatedDeltaNet.Config,
+    description="Set whether GatedDeltaNet resets at packed documents.",
+)
+def gated_delta_document_resets(
+    cfg: TpuGatedDeltaNet.Config, *, enabled: bool = True
+) -> TpuGatedDeltaNet.Config:
+  """Sets ``reset_at_documents`` on ``TpuGatedDeltaNet.Config``."""
+  return replace(cfg, reset_at_documents=enabled)

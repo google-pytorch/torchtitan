@@ -3,13 +3,13 @@
 import os
 import pathlib
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
-
-import torch
 
 from absl.testing import absltest
 import jax
-
+import torch
+from torchtitan.experiments.tpu import jax_profiler
 import torchtitan.experiments.tpu.base_device_test as base_device_test
 import torchtitan.tools.profiler as torchtitan_profiler
 
@@ -97,6 +97,47 @@ class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):
       # 6. Clean up temporary directory if fallback was used.
       if temp_dir_ctx:
         temp_dir_ctx.cleanup()
+
+  def test_jax_profiler_waits_for_device_before_start_and_stop(self):
+    """JaxProfiler syncs the accelerator before start_trace and stop_trace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      fake_prof = SimpleNamespace(
+          _config=SimpleNamespace(save_traces_folder="traces"),
+          _base_folder=tmpdir,
+          _leaf_folder="leaf",
+          tpu_step_num=10,
+      )
+      wrapper = jax_profiler.JaxProfiler(fake_prof)
+
+      for rank, is_avail, expected in (
+          (0, True, ["sync", "start_trace", "sync", "stop_trace"]),
+          (1, True, []),
+          (0, False, ["start_trace", "stop_trace"]),
+      ):
+        events: list[str] = []
+        with (
+            self.subTest(rank=rank, is_avail=is_avail),
+            mock.patch.dict(os.environ, {"RANK": str(rank)}),
+            mock.patch("torch.distributed.get_rank", return_value=rank),
+            mock.patch("torch.accelerator.is_available", return_value=is_avail),
+            mock.patch(
+                "torch.accelerator.synchronize",
+                side_effect=lambda ev=events: ev.append("sync"),
+            ),
+            mock.patch.object(
+                jax.profiler,
+                "start_trace",
+                side_effect=lambda _p, ev=events: ev.append("start_trace"),
+            ),
+            mock.patch.object(
+                jax.profiler,
+                "stop_trace",
+                side_effect=lambda ev=events: ev.append("stop_trace"),
+            ),
+        ):
+          wrapper.start()
+          wrapper.stop()
+        self.assertEqual(events, expected)
 
 
 if __name__ == "__main__":

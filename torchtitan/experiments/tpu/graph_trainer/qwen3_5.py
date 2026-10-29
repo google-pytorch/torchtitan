@@ -30,25 +30,26 @@ def parallelize_qwen3_5(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
-  """Apply FQN annotation, SimpleFSDP, and GraphTrainer compilation to Qwen3.5."""
+  """Applies FQN annotation, SimpleFSDP, and GraphTrainer compile to Qwen3.5."""
   del ac_config
   # Upstream's eager parallelize_qwen3_5 rejects CP too (the GatedDeltaNet
-  # needs the whole sequence); TP is untested on TPU, and the TPU
-  # model_registry has no pipelining_fn.
+  # needs the whole sequence); TP is untested on TPU, the TPU model_registry
+  # has no pipelining_fn, and EP requires mesh-split optimizer support.
   if (
       parallel_dims.tp_enabled
       or parallel_dims.cp_enabled
       or parallel_dims.pp_enabled
+      or parallel_dims.ep_enabled
   ):
     raise NotImplementedError(
-        "TPU GraphTrainer Qwen3.5 does not support TP, CP or PP."
+        "TPU GraphTrainer Qwen3.5 does not support TP, CP, PP or EP."
     )
 
   if any(layer.moe is not None for layer in model.config.layers):
     annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
-  if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
+  if parallelism.spmd_backend == "spmd_types":
     model.parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)

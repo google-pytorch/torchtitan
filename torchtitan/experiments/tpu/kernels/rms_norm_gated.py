@@ -14,9 +14,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import torch
+from torch.distributed.tensor import DTensor
 from torch_tpu._internal import pallas
 
 _BLOCK_ROWS = 2048
+_BLOCK_DIM = 128
+_MAX_DIM = 512
+_SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
 def _silu_and_grad(g: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -42,7 +46,12 @@ def _bwd_kernel(eps, x_ref, g_ref, w_ref, dy_ref, dx_ref, dg_ref, dw_ref):
   dy = dy_ref[...].astype(jnp.float32)
   dg_ref[...] = (dy * scaled * dsilu).astype(dg_ref.dtype)
   d_scaled = dy * silu
-  dw_ref[...] = jnp.sum(d_scaled * n, axis=0, keepdims=True)[None]
+
+  @pl.when(pl.program_id(0) == 0)
+  def _():
+    dw_ref[...] = jnp.zeros_like(dw_ref)
+
+  dw_ref[...] += jnp.sum(d_scaled * n, axis=0, keepdims=True)
   dn = d_scaled * w
   dx = rstd * (dn - n * jnp.mean(dn * n, axis=-1, keepdims=True))
   dx_ref[...] = dx.astype(dx_ref.dtype)
@@ -74,11 +83,11 @@ def rms_norm_gated_fwd_jax(
 def rms_norm_gated_bwd_jax(
     x: jax.Array, gate: jax.Array, w: jax.Array, dy: jax.Array, eps: float
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Returns ``(dx, dg, dw_1D)`` accumulated in FP32 across row blocks."""
   rows, dim = x.shape
-  blocks = rows // _BLOCK_ROWS
-  dx, dg, dw_parts = pl.pallas_call(
+  return pl.pallas_call(
       lambda *refs: _bwd_kernel(eps, *refs),
-      grid=(blocks,),
+      grid=(rows // _BLOCK_ROWS,),
       in_specs=[
           _row_spec(dim),
           _row_spec(dim),
@@ -88,17 +97,16 @@ def rms_norm_gated_bwd_jax(
       out_specs=[
           _row_spec(dim),
           _row_spec(dim),
-          pl.BlockSpec((1, 1, dim), lambda i: (i, 0, 0)),
+          pl.BlockSpec((1, dim), lambda i: (0, 0)),
       ],
       out_shape=[
           jax.ShapeDtypeStruct(x.shape, x.dtype),
           jax.ShapeDtypeStruct(gate.shape, gate.dtype),
-          jax.ShapeDtypeStruct((blocks, 1, dim), jnp.float32),
+          jax.ShapeDtypeStruct((1, dim), jnp.float32),
       ],
-      compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+      compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
       name="rms_norm_gated_bwd",
   )(x, gate, w, dy)
-  return dx, dg, jnp.sum(dw_parts, axis=(0, 1))
 
 
 @pallas.jax_op("tt_qwen35::rms_norm_gated_fwd")
@@ -117,39 +125,78 @@ def _bwd_op(
 
 def _setup_context(ctx, inputs, output):
   del output
+  ctx.set_materialize_grads(False)
   x, gate, w, eps = inputs
   ctx.save_for_backward(x, gate, w)
   ctx.eps = eps
 
 
 def _backward(ctx, dy):
+  need_dx, need_dg, need_dw, _ = ctx.needs_input_grad
+  if dy is None or not (need_dx or need_dg or need_dw):
+    return None, None, None, None
   x, gate, w = ctx.saved_tensors
   dx, dg, dw = _bwd_op(x, gate, w, dy.contiguous(), ctx.eps)
-  return dx, dg, dw.reshape(w.shape), None
+  return (
+      dx if need_dx else None,
+      dg if need_dg else None,
+      dw.reshape(w.shape) if need_dw else None,
+      None,
+  )
 
 
 _fwd_op.register_autograd(_backward, setup_context=_setup_context)
 
 
-def supports(x: torch.Tensor) -> bool:
-  """Whether the kernels take ``x`` (TPU, 128-wide rows, whole row blocks)."""
-  rows = x.numel() // x.shape[-1] if x.ndim else 0
-  return (
-      x.device.type == "tpu"
-      and x.shape[-1] % 128 == 0
-      and rows % _BLOCK_ROWS == 0
-  )
+def supports(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor) -> bool:
+  """Whether ``(x, gate, weight)`` satisfy the Pallas kernel limits."""
+  if (
+      isinstance(x, DTensor)
+      or isinstance(gate, DTensor)
+      or isinstance(weight, DTensor)
+  ):
+    return False
+  if (
+      x.device.type != "tpu"
+      or gate.device != x.device
+      or weight.device != x.device
+  ):
+    return False
+  if (
+      x.dtype not in _SUPPORTED_DTYPES
+      or gate.dtype not in _SUPPORTED_DTYPES
+      or weight.dtype not in _SUPPORTED_DTYPES
+  ):
+    return False
+  if x.ndim < 2 or gate.shape != x.shape:
+    return False
+  dim = x.shape[-1]
+  if dim <= 0 or dim > _MAX_DIM or dim % _BLOCK_DIM != 0:
+    return False
+  if weight.shape != (dim,):
+    return False
+  rows = x.numel() // dim
+  return rows > 0 and rows % _BLOCK_ROWS == 0
 
 
 def rms_norm_gated(
     x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
   """``RMSNormGated`` over the last dim of ``x``; ``gate`` has ``x``'s shape."""
+  if not supports(x, gate, weight):
+    raise ValueError(
+        "Unsupported inputs for Pallas rms_norm_gated:"
+        f" x={tuple(x.shape)} ({x.dtype}, {x.device}),"
+        f" gate={tuple(gate.shape)} ({gate.dtype}, {gate.device}),"
+        f" weight={tuple(weight.shape)} ({weight.dtype}, {weight.device})"
+    )
+  if eps < 0:
+    raise ValueError(f"eps must be non-negative, got {eps}")
   dim = x.shape[-1]
-  w = weight.to(torch.float32).reshape(1, dim)
+  w = weight.to(torch.float32).reshape(1, dim).contiguous()
   out = _fwd_op(
       x.reshape(-1, dim).contiguous(),
-      gate.reshape(-1, dim).to(x.dtype).contiguous(),
+      gate.reshape(-1, dim).contiguous(),
       w,
       float(eps),
   )

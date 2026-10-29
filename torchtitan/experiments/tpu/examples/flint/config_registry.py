@@ -271,3 +271,10 @@ def flint_40b_v005_gt_mb16() -> TpuGraphTrainer.Config:
   """``flint_40b_v004_mb16`` on TPU GraphTrainer (fallback if mb32 does not
   fit the whole-step program)."""
   return _to_graph_trainer(flint_40b_v004_mb16())
+
+
+def flint_40b_proxy_gt() -> TpuGraphTrainer.Config:
+  """``flint_40b_proxy_v003`` on GraphTrainer (local pre-dispatch check)."""
+  config = flint_40b_proxy_v003()
+  config.tpu_config.mfu_benchmark_start_step = 3
+  return _to_graph_trainer(config)

@@ -48,6 +48,10 @@ from torchtitan.config.override import derive, override
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, per_row_segment_ids
 from torchtitan.tools.logging import logger
 
+# Tokamax's private modules (`tokamax._src`), kept for now on purpose: the
+# public `tokamax.ops.kimi_delta_attention` is the same function, but only
+# newer Tokamax builds have the public `tokamax.ops` namespace, and no released
+# wheel has the KDA op. Move to the public API once the pinned Tokamax does.
 try:
   from tokamax._src.ops.kda import api as kda_api
   # Registers the Mosaic TPU backend with `kda_api`; without it the

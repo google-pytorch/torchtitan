@@ -528,13 +528,16 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
       ),
+      # The routed experts of qwen35_moe_35b: Pallas paired grouped matmuls on
+      # kernel-native weights and the fused route-score backward, which needs
+      # bf16 expert outputs (as in the recipe).
       dict(
-          testcase_name="qwen3_5_moe_use_gmm_kernel",
+          testcase_name="qwen3_5_moe_tpu_moe_kernels",
           module="torchtitan.experiments.tpu.qwen3_5",
-          config="qwen35_moe_debugmodel",
+          config="qwen35_moe_debugmodel_tpu_moe_kernels",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          args=["--qwen3.use_gmm_kernel"],
+          args=["--training.mixed_precision_param=bfloat16"],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,

@@ -80,17 +80,22 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
     cfg: The recipe to update in place.
   """
   assert cfg.model_spec is not None
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
-      TpuGroupedExperts.Config
-  ):
-    experts.use_pallas_grouped_mm = True
-    experts.use_pallas_paired_grouped_mm = True
-    experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
-    experts.use_kernel_native_weight_layout = True
-  for _, dispatcher, _, _ in cfg.model_spec.model.traverse(
-      TpuAllToAllTokenDispatcher.Config
-  ):
+  experts = list(cfg.model_spec.model.traverse(TpuGroupedExperts.Config))
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not experts or not dispatchers:
+    raise ValueError(
+        "The TPU MoE kernels need TpuGroupedExperts and a TPU token "
+        "dispatcher (_TPU_MOE_CONVERTERS)"
+    )
+  for _, experts_config, _, _ in experts:
+    experts_config.use_pallas_grouped_mm = True
+    experts_config.use_pallas_paired_grouped_mm = True
+    experts_config.pallas_grouped_mm_tile_m = 256
+    experts_config.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    experts_config.use_kernel_native_weight_layout = True
+  for _, dispatcher, _, _ in dispatchers:
     dispatcher.fuse_route_score_backward = True
 
 
@@ -133,8 +138,9 @@ def _use_graph_split(
   Args:
     cfg: The recipe to update in place.
     layers_per_executable: Transformer layers per forward and backward child. On
-      the 40-layer model at 32K tokens per rank, 2 layers per executable cut the
-      84-child launch overhead to 44 children: 3.51 vs 4.65 s/step.
+      the 40-layer model, 2 layers per executable cut the 84 children to 44; in
+      the A/B that chose it (32K tokens per rank, one tpu7x-2x2x1 host) that was
+      24% faster than 1.
   """
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.tpu_config.graph_trainer_memory_policy = "full"
@@ -153,7 +159,6 @@ def _use_graph_split(
   # torch_tpu's fused AdamW updates every parameter in one program, computing
   # in FP32 and storing in each buffer's (here BF16) dtype.
   cfg.optimizer.implementation = "fused"
-
 
 
 def qwen35_debugmodel() -> TPUTrainerConfig:
@@ -213,6 +218,18 @@ def qwen35_moe_debugmodel_fused_ce() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
+  """Debug config for 4-layer hybrid Qwen3.5 MoE with the TPU MoE kernels.
+
+  The routed experts of `qwen35_moe_35b` (`_use_tpu_moe_kernels`): Pallas
+  paired grouped matmuls on kernel-native expert weights, and the fused
+  route-score backward.
+  """
+  cfg = qwen35_moe_debugmodel()
+  _use_tpu_moe_kernels(cfg)
+  return cfg
+
+
 def qwen35_moe_35b() -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 
@@ -260,8 +277,9 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(preserve_rng_state=False),
       compile=CompileConfig(enable=False, backend="tpu"),
       validator=Validator.Config(enable=False),
-      # Full attention in Qwen3.5 35B-A3B has head_dim=256 (2x Qwen3's 128), so
-      # 1024 block sizes keep scoped VMEM well below the 33 MiB hardware limit.
+      # Full attention in Qwen3.5 35B-A3B has head_dim=256 (2x Qwen3's 128):
+      # Splash's backward overflows the default 32 MiB of scoped VMEM with
+      # 2048 blocks, so use 1024.
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
           sa_block_q=1024,
@@ -274,9 +292,11 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
           sa_block_q_dq=1024,
           sa_block_kv_dq=1024,
       ),
-      libtpu_init_flags={
-          "xla_tpu_scoped_vmem_limit_kib": "65472",
-      },
+      # The largest scoped VMEM limit TPU7x accepts (65536 is rejected); the
+      # default is 32 MiB.
+      libtpu_init_flags=tpu_flags.merge_flags(
+          {"xla_tpu_scoped_vmem_limit_kib": 65472}
+      ),
       tpu_config=TPUConfig(
           enable_amp=False,
           eager_mode="DEFER_AND_FUSE",
@@ -350,4 +370,3 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TPUTrainerConfig:
       },
   )
   return cfg
-

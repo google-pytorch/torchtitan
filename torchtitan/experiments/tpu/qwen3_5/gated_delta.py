@@ -38,11 +38,15 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def _same_segment(segment_ids_BS: torch.Tensor, shift: int) -> torch.Tensor:
   """``[B, S]``: whether token ``s - shift`` is in the document of token ``s``.
 
-  For ``s < shift`` the result is arbitrary; callers read zero padding there.
+  ``shift`` may be negative (a later token). Where ``s - shift`` is outside the
+  row, the result is arbitrary; callers read zero padding there.
   """
   seq_len = segment_ids_BS.shape[1]
-  earlier_BS = F.pad(segment_ids_BS, (shift, 0), value=-1)[:, :seq_len]
-  return earlier_BS == segment_ids_BS
+  if shift >= 0:
+    other_BS = F.pad(segment_ids_BS, (shift, 0), value=-1)[:, :seq_len]
+  else:
+    other_BS = F.pad(segment_ids_BS, (0, -shift), value=-1)[:, -shift:]
+  return other_BS == segment_ids_BS
 
 
 def _causal_conv(
@@ -85,6 +89,109 @@ def _causal_conv(
     term = x_shifted * weight_CW[:, k]
     out_BSC = term if out_BSC is None else out_BSC + term
   return out_BSC.to(x_BSC.dtype)
+
+
+class _CausalConvSilu(torch.autograd.Function):
+  """``silu(_causal_conv(x, w))`` with a backward that reads shifted slices.
+
+  Autograd of the slice-based forward writes each tap's input gradient into a
+  zero buffer of the padded input (``slice_backward``) and sums the buffers.
+  The row offsets are not tile-aligned, so XLA emits slow
+  ``dynamic-update-slice`` adds (~0.19 TB/s on TPU7x). This backward reads
+  instead: ``dx[t] = sum_k w[k] * dy[t + W - 1 - k]`` is ``W`` shifted slices
+  of the end-padded output gradient, which XLA fuses into one pass.
+
+  The convolution is recomputed for ``silu``'s derivative, gradients stay
+  within ``segment_ids_BS`` documents, and the ``dx`` taps and ``dw`` token
+  sums accumulate in at least fp32 and are rounded once.
+  """
+
+  @staticmethod
+  def forward(
+      ctx,
+      x_BSC: torch.Tensor,
+      weight_C1W: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None,
+  ):
+    ctx.set_materialize_grads(False)
+    ctx.save_for_backward(x_BSC, weight_C1W, segment_ids_BS)
+    return F.silu(_causal_conv(x_BSC, weight_C1W, segment_ids_BS))
+
+  @staticmethod
+  def backward(ctx, grad_BSC: torch.Tensor | None):
+    need_dx, need_dw, _ = ctx.needs_input_grad
+    if grad_BSC is None or not (need_dx or need_dw):
+      return None, None, None
+    x_BSC, weight_C1W, segment_ids_BS = ctx.saved_tensors
+    seq_len = x_BSC.shape[1]
+    kernel_size = weight_C1W.shape[-1]
+    grad_y_BSC = torch.ops.aten.silu_backward(
+        grad_BSC, _causal_conv(x_BSC, weight_C1W, segment_ids_BS)
+    )
+    grad_pad = F.pad(grad_y_BSC, (0, 0, 0, kernel_size - 1))
+    # dw sums over all B * S tokens; torch_tpu disallows XLA excess precision,
+    # so bf16 sums would round after every add. Accumulate in at least fp32.
+    acc_dtype = torch.promote_types(
+        torch.promote_types(x_BSC.dtype, weight_C1W.dtype), torch.float32
+    )
+    weight_CW = weight_C1W[:, 0, :].to(acc_dtype)
+    x_acc_BSC = x_BSC.to(acc_dtype) if need_dw else None
+    grad_x_BSC = None
+    grad_w = []
+    for k in range(kernel_size):
+      shift = kernel_size - 1 - k
+      if shift == 0:
+        grad_shifted = grad_y_BSC
+      else:
+        # grad_shifted[t] = dy[t + shift], the output that w[k] links to x[t],
+        # zeroed where that output is in a later document.
+        grad_shifted = grad_pad[:, shift : shift + seq_len, :].contiguous()
+        if segment_ids_BS is not None:
+          same_BS1 = _same_segment(segment_ids_BS, -shift).unsqueeze(-1)
+          grad_shifted = torch.where(same_BS1, grad_shifted, 0.0)
+      if need_dx:
+        term = grad_shifted * weight_CW[:, k]
+        grad_x_BSC = term if grad_x_BSC is None else grad_x_BSC + term
+      if not need_dw:
+        continue
+      if shift >= seq_len:
+        grad_w.append(x_acc_BSC.new_zeros(weight_C1W.shape[0]))
+      elif shift == 0 or segment_ids_BS is not None:
+        grad_w.append((x_acc_BSC * grad_shifted).sum(dim=(0, 1)))
+      else:
+        # Without documents, skip the zero padding: t < seq_len - shift.
+        grad_w.append(
+            (x_acc_BSC[:, : seq_len - shift, :] * grad_y_BSC[:, shift:, :]).sum(
+                dim=(0, 1)
+            )
+        )
+    grad_x = grad_x_BSC.to(x_BSC.dtype) if need_dx else None
+    grad_w_C1W = None
+    if need_dw:
+      grad_w_C1W = torch.stack(grad_w, dim=-1).unsqueeze(1).to(weight_C1W.dtype)
+    return grad_x, grad_w_C1W, None
+
+
+def causal_conv_silu(
+    x_BSC: torch.Tensor,
+    weight_C1W: torch.Tensor,
+    segment_ids_BS: torch.Tensor | None = None,
+) -> torch.Tensor:
+  """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
+
+  The backward is ``_CausalConvSilu``'s: shifted slices of the output gradient
+  instead of autograd's scattered adds.
+
+  Args:
+    x_BSC: ``[B, S, C]`` input.
+    weight_C1W: ``[C, 1, W]`` depthwise ``Conv1d`` weight.
+    segment_ids_BS: Optional ``[B, S]`` document index of each token; the
+      convolution restarts at every document, as at the start of the row.
+
+  Returns:
+    ``[B, S, C]`` output.
+  """
+  return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 
 def chunked_gated_delta(
@@ -313,7 +420,7 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
         weight_C1W: torch.Tensor,
         head_dim: int,
     ) -> torch.Tensor:
-      return F.silu(_causal_conv(x_BSC, weight_C1W, segment_ids_BS)).unflatten(
+      return causal_conv_silu(x_BSC, weight_C1W, segment_ids_BS).unflatten(
           -1, (-1, head_dim)
       )
 

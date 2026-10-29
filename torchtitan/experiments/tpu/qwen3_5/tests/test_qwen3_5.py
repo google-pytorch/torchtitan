@@ -1659,7 +1659,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertEqual(
         parsed_96k.tpu_config.graph_trainer_save_last_n_layers,
-        (("attention.inner_attention", 2),),
+        {"attention.inner_attention": 2},
     )
 
 

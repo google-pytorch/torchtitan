@@ -61,7 +61,7 @@ def _bwd_vmem_exceeds_capacity(
     v_block_size: int,
     dtype,
 ) -> bool:
-  """Whether default (2, 2) grad buffering exceeds physical VMEM capacity."""
+  """Whether default (2, 2) grad buffering exceeds the kernel's VMEM budget."""
   calc_fn = getattr(kernel, "_calculate_bwd_vmem_bytes", None)
   if calc_fn is None:
     return False
@@ -75,7 +75,13 @@ def _bwd_vmem_exceeds_capacity(
         dtype=dtype,
         buffer_count=(2, 2),
     )
-    return vmem_22 > int(0.95 * pltpu.get_tpu_info().vmem_capacity_bytes)
+    limit_fn = getattr(kernel, "_get_vmem_limit_bytes", None)
+    vmem_limit = (
+        limit_fn()
+        if limit_fn is not None
+        else int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
+    )
+    return vmem_22 > vmem_limit
   except Exception:  # pylint: disable=broad-exception-caught
     return False
 
@@ -188,13 +194,13 @@ def _my_bwd(
   bwd_fn = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
   bwd_kwargs = {}
   if "buffer_count" in inspect.signature(
-      bwd_fn
+      inspect.unwrap(bwd_fn)
   ).parameters and _bwd_vmem_exceeds_capacity(
       kernel, b_block_size, h_block_size, v_block_size, x.dtype
   ):
-    # Large single-H tiles such as (1024, 2048, 640) fit TPU7x VMEM at 51.9 MiB
-    # with single-buffered grad accumulators, whereas jax >= 0.12's (2, 2)
-    # triple-buffering reaches 77.9 MiB and OOMs VMEM at compile time.
+    # Large single-H tiles such as (1024, 2048, 640) fit TPU7x's 57.6 MiB
+    # kernel VMEM budget at 51.9 MiB with single-buffered grad accumulators,
+    # whereas jax >= 0.12's (2, 2) triple-buffering reaches 77.9 MiB and OOMs.
     bwd_kwargs["buffer_count"] = 1
   grad_x, grad_w = bwd_fn(
       dout,

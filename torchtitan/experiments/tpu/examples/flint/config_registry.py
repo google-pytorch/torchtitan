@@ -42,6 +42,7 @@ __all__ = [
     "flint_40b_v004_mb16",
     "flint_40b_v004_mb32",
     "flint_40b_v005_gt",
+    "flint_40b_v005_gt_mb16",
     "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
@@ -262,5 +263,11 @@ def graph_trainer_flint_debugmodel() -> TpuGraphTrainer.Config:
 
 
 def flint_40b_v005_gt() -> TpuGraphTrainer.Config:
-  """``flint_40b_v004_mb16`` on TPU GraphTrainer."""
+  """``flint_40b_v004_mb32`` (no gradient accumulation) on TPU GraphTrainer."""
+  return _to_graph_trainer(flint_40b_v004_mb32())
+
+
+def flint_40b_v005_gt_mb16() -> TpuGraphTrainer.Config:
+  """``flint_40b_v004_mb16`` on TPU GraphTrainer (fallback if mb32 does not
+  fit the whole-step program)."""
   return _to_graph_trainer(flint_40b_v004_mb16())

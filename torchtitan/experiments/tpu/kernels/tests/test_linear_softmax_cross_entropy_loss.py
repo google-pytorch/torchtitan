@@ -1,6 +1,8 @@
 """Tests for linear_softmax_cross_entropy_loss."""
 
+import functools
 import importlib
+import inspect
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -59,25 +61,37 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
         "tokamax._src.ops.linear_softmax_cross_entropy_loss."
         "pallas_mosaic_tpu_kernel"
     )
-    if not hasattr(kernel, "_calculate_bwd_vmem_bytes"):
-      self.skipTest("Installed tokamax does not expose VMEM estimator.")
+    orig_bwd = inspect.unwrap(
+        kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
+    )
+    if (
+        not hasattr(kernel, "_calculate_bwd_vmem_bytes")
+        or "buffer_count" not in inspect.signature(orig_bwd).parameters
+    ):
+      self.skipTest("Installed tokamax does not expose buffer_count.")
     from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
 
     fake_info = SimpleNamespace(vmem_capacity_bytes=64 * 1024 * 1024)
+    calls = []
+
+    @functools.wraps(orig_bwd)
+    def spy_bwd(*args, **kwargs):
+      calls.append((args, kwargs))
+      return jnp.zeros_like(args[2]), jnp.zeros_like(args[4])
+
     with (
         mock.patch.object(pltpu, "get_tpu_info", return_value=fake_info),
         mock.patch.object(
             kernel,
             "linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu",
-            autospec=True,
-            return_value=(jnp.zeros_like(x), jnp.zeros_like(weights)),
-        ) as backward,
+            new=spy_bwd,
+        ),
     ):
       # pylint: disable=protected-access
       linear_softmax_cross_entropy_loss._my_bwd(
           dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
       )
-      self.assertEqual(backward.call_args.kwargs.get("buffer_count"), 1)
+      self.assertEqual(calls[-1][1].get("buffer_count"), 1)
       linear_softmax_cross_entropy_loss._my_bwd(
           dout[:1],
           lse[:128],
@@ -90,7 +104,7 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
           128,
           128,
       )
-      self.assertNotIn("buffer_count", backward.call_args.kwargs)
+      self.assertNotIn("buffer_count", calls[-1][1])
 
 
 class LinearSoftmaxCrossEntropyLossTest(

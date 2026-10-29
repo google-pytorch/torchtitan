@@ -363,7 +363,10 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         [torch.cat([torch.arange(n) for n in lens]) for lens in doc_lens]
     ).to(dev)
     x_base = torch.randn(
-        batch * seq_len, xla_cfg.dim, dtype=torch.bfloat16, device=dev
+        batch * seq_len,
+        xla_cfg.in_proj_q.in_features,
+        dtype=torch.bfloat16,
+        device=dev,
     )
     grad_out = torch.randn_like(x_base)
 

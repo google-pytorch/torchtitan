@@ -114,6 +114,58 @@ class TestFlintSinkAttention(parameterized.TestCase):
     self.assertEqual(attn.sliding_window_size, 512)  # splash LocalMask: keys back
 
 
+class TestFlintSplashKernel(BaseDeviceTest):
+  """The sbd Splash path vs the float32 reference on a packed batch (TPU)."""
+
+  @parameterized.named_parameters(("sliding", 129), ("full", None))
+  def test_kernel_matches_reference(self, window):
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Pallas kernel: TPU only")
+    g = torch.Generator().manual_seed(1)
+    b, s, h, kv, d = 2, 1024, 8, 2, 128
+    q, k, v = (
+        torch.randn(b, s, n, d, generator=g).to(torch.bfloat16)
+        for n in (h, kv, kv)
+    )
+    sinks = torch.randn(h, generator=g) * 2.0
+    cot = torch.randn(b, s, h, d, generator=g)
+    # Three documents per row, boundaries inside the window.
+    positions = torch.cat([
+        torch.arange(300), torch.arange(500), torch.arange(224),
+        torch.arange(1024),
+    ])
+
+    def run(kernel, use_sinks):
+      attn = FlintSinkAttention(
+          FlintSinkAttention.Config(window_size=window, use_splash_kernel=kernel)
+      )
+      dev = self.accelerator_device
+      qd, kd, vd, sd = (
+          t.clone().to(dev).requires_grad_(True) for t in (q, k, v, sinks)
+      )
+      out = attn(
+          qd, kd, vd, sinks=sd if use_sinks else None,
+          positions=positions.to(dev), scale=d**-0.5,
+      )
+      (out.float() * cot.to(dev)).sum().backward()
+      grads = [t.grad.float().cpu() for t in (qd, kd, vd)]
+      grads.append(sd.grad.float().cpu() if use_sinks else None)
+      return out.float().cpu(), grads
+
+    ref, ref_g = run(False, True)
+    out, out_g = run(True, True)
+
+    def rel(a, b):
+      return float((a - b).norm() / b.norm())
+
+    self.assertLess(rel(out, ref), 1e-2)
+    for name, a, r in zip(("dq", "dk", "dv", "dsinks"), out_g, ref_g):
+      self.assertLess(rel(a, r), 2.5e-2, name)
+    # Control: without the sinks the kernel output moves well past the bound.
+    no_sink, _ = run(True, False)
+    self.assertGreater(rel(no_sink, ref), 1e-1)
+
+
 class TestFlintFlavors(absltest.TestCase):
 
   def test_40b_matches_checkpoint(self):

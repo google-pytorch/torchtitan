@@ -94,6 +94,9 @@ class FlintSinkAttention(InnerAttention):
   @dataclass(kw_only=True, slots=True)
   class Config(InnerAttention.Config):
     window_size: int | None = None
+    # Run the sbd Splash Pallas kernel, which takes the sinks as an extra
+    # softmax column and returns their gradient (TPU only).
+    use_splash_kernel: bool = False
 
   def __init__(self, config: Config) -> None:
     super().__init__()
@@ -102,6 +105,7 @@ class FlintSinkAttention(InnerAttention):
           f"window_size must be >= 1 or None, got {config.window_size}"
       )
     self.window_size = config.window_size
+    self.use_splash_kernel = config.use_splash_kernel
 
   @property
   def sliding_window_size(self) -> int | None:
@@ -134,6 +138,25 @@ class FlintSinkAttention(InnerAttention):
     n_kv_heads = k_BLHK.shape[2]
     if scale is None:
       scale = head_dim**-0.5
+
+    if self.use_splash_kernel:
+      from torchtitan.experiments.tpu.kernels.splash_bias_dropout import sbd_splash_attention  # pylint: disable=g-import-not-at-top
+
+      out_BLHV = sbd_splash_attention(
+          q_BLHK.contiguous(),
+          k_BLHK.contiguous(),
+          v_BLHV.contiguous(),
+          segment_ids=None
+          if segment_ids is None
+          else segment_ids.reshape(batch_size, seq_len),
+          is_causal=True,
+          scale=scale,
+          local_window_size=self.sliding_window_size,
+          sinks=None if sinks is None else sinks.float(),
+      )
+      if was_3d:
+        return out_BLHV.reshape(-1, *out_BLHV.shape[2:])
+      return out_BLHV
 
     # [B, H, L, D]; KV heads repeated for GQA.
     q = q_BLHK.transpose(1, 2)

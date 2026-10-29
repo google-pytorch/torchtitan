@@ -25,6 +25,8 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
+from torchtitan.config.override import apply_overrides
+from torchtitan.config.override import OverrideConfig
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
@@ -968,7 +970,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_use_tokamax_gated_delta(self):
-    """Tests the recipe helper that selects the Tokamax GatedDeltaNet."""
+    """Tests the recipe helper and override resolution for Tokamax GDN."""
     cfg = config_registry.qwen35_moe_35b()
     self.assertNotIn(
         config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, cfg.override.imports
@@ -981,16 +983,38 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         ),
         1,
     )
-    module, _, factory = (
-        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE.rpartition(".")
+    # Explicit kwargs replace a bare entry, and a bare call preserves existing
+    # kwargs rather than appending a second entry that resets them.
+    config_registry._use_tokamax_gated_delta(  # pylint: disable=protected-access
+        cfg, min_log_decay=-4.0, max_num_segments=24
     )
+    config_registry._use_tokamax_gated_delta(cfg)  # pylint: disable=protected-access
     self.assertEqual(
-        (module, factory),
-        (
-            "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta",
-            "tokamax_gated_delta_kernel",
-        ),
+        cfg.override.imports,
+        [
+            config_registry.FUSED_LOSS_OVERRIDE,
+            (
+                config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
+                {"min_log_decay": -4.0, "max_num_segments": 24},
+            ),
+        ],
     )
+    apply_overrides(
+        OverrideConfig(imports=[cfg.override.imports[-1]]),
+        cfg,
+    )
+    kernels = [
+        layer.delta_net.inner_gated_delta_net.kernel
+        for layer in cfg.model_spec.model.layers
+        if layer.delta_net is not None
+    ]
+    self.assertLen(kernels, 30)
+    for kernel_cfg in kernels:
+      self.assertEqual(
+          type(kernel_cfg).__qualname__, "TokamaxGatedDeltaKernel.Config"
+      )
+      self.assertEqual(kernel_cfg.min_log_decay, -4.0)
+      self.assertEqual(kernel_cfg.max_num_segments, 24)
 
   def test_model_isolates_packed_documents(self):
     """Tests that documents packed into rows equal the documents run alone.

@@ -42,8 +42,8 @@ _TPU_MOE_CONVERTERS = [
 FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
 )
-# The override is imported only when the recipe is built: the module needs a
-# Tokamax build with the KDA op.
+# Applied via override resolution so recipes can pass `min_log_decay` /
+# `max_num_segments` kwargs (`tokamax_gated_delta` imports KDA lazily).
 TOKAMAX_GATED_DELTA_OVERRIDE = (
     "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta."
     "tokamax_gated_delta_kernel"
@@ -98,10 +98,28 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
     dispatcher.fuse_route_score_backward = True
 
 
-def _use_tokamax_gated_delta(cfg: TPUTrainerConfig) -> None:
+def _use_tokamax_gated_delta(
+    cfg: TPUTrainerConfig, **override_kwargs: float | int | None
+) -> None:
   """Runs every GatedDeltaNet with Tokamax's Mosaic TPU KDA kernels."""
-  if TOKAMAX_GATED_DELTA_OVERRIDE not in cfg.override.imports:
-    cfg.override.imports.append(TOKAMAX_GATED_DELTA_OVERRIDE)
+  has_existing = any(
+      (entry if isinstance(entry, str) else entry[0])
+      == TOKAMAX_GATED_DELTA_OVERRIDE
+      for entry in cfg.override.imports
+  )
+  if has_existing and not override_kwargs:
+    return
+  cfg.override.imports = [
+      entry
+      for entry in cfg.override.imports
+      if (entry if isinstance(entry, str) else entry[0])
+      != TOKAMAX_GATED_DELTA_OVERRIDE
+  ]
+  cfg.override.imports.append(
+      (TOKAMAX_GATED_DELTA_OVERRIDE, override_kwargs)
+      if override_kwargs
+      else TOKAMAX_GATED_DELTA_OVERRIDE
+  )
 
 
 def qwen35_debugmodel() -> TPUTrainerConfig:

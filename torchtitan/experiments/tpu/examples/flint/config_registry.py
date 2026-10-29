@@ -11,6 +11,7 @@ from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.examples.flint import model_registry
 from torchtitan.experiments.tpu.examples.flint.model import FlintSinkAttention
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
@@ -27,9 +28,14 @@ __all__ = [
     "flint_40b",
     "flint_40b_proxy",
     "flint_40b_v002",
+    "flint_40b_v003",
     "flint_debugmodel",
     "flint_moe_testmodel",
 ]
+
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+)
 
 # Longer than the debug flavor's 129-token window, so the window masks.
 _DEBUGMODEL_CONTEXT_LENGTH = 512
@@ -177,4 +183,25 @@ def flint_40b_proxy_v002() -> TPUTrainerConfig:
   """``flint_40b_proxy`` with the Splash kernel (local pre-dispatch check)."""
   config = flint_40b_proxy()
   _use_splash_kernel(config)
+  return config
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Fused linear + cross entropy: the LM head hands (hidden, weight.T) to the
+  loss, which never materializes the [tokens, 150144] logits."""
+  config.loss = PallasCrossEntropyLoss.Config()
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
+
+def flint_40b_v003() -> TPUTrainerConfig:
+  """``flint_40b_v002`` plus the fused (Pallas) cross entropy."""
+  config = flint_40b_v002()
+  _enable_pallas_cross_entropy(config)
+  return config
+
+
+def flint_40b_proxy_v003() -> TPUTrainerConfig:
+  config = flint_40b_proxy_v002()
+  _enable_pallas_cross_entropy(config)
   return config

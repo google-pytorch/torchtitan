@@ -1372,7 +1372,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
     self.assertEqual(gt_cfg.override.imports, cfg.override.imports)
     # The conversion re-wraps the model config: the kernels must survive it.
-    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
+    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model, tile_m=512)
     splitter = GraphSplitter.from_trainer_config(
         gt_cfg, optimizer_in_graph=cfg.tpu_config.optimizer_in_graph
     )
@@ -1431,7 +1431,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
         ],
     )
-    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model)
+    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model, tile_m=512)
     self.assertEqual(bench_cfg.parallelism.fsdp_reshard_after_forward, "always")
     self.assertEqual(bench_cfg.parallelism.expert_parallel_degree, 1)
     self.assertTrue(bench_cfg.parallelism.enable_tpu_topo_mesh)

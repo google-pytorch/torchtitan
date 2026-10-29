@@ -48,7 +48,7 @@ class _MaskedRowGatherWithInverse(torch.autograd.Function):
     if x_MD.shape[0] == 0 or fwd_idx_K.shape[0] == 0:
       return x_MD.new_zeros((fwd_idx_K.shape[0], x_MD.shape[1]))
     gathered = torch.index_select(x_MD, 0, fwd_idx_K)
-    return gathered * fwd_mask_K1.to(gathered.dtype)
+    return torch.where(fwd_mask_K1, gathered, 0)
 
   @staticmethod
   @once_differentiable
@@ -64,9 +64,9 @@ class _MaskedRowGatherWithInverse(torch.autograd.Function):
           None,
           None,
       )
-    masked_grad_KD = grad_out_KD * fwd_mask_K1.to(grad_out_KD.dtype)
+    masked_grad_KD = torch.where(fwd_mask_K1, grad_out_KD, 0)
     grad_x_MD = torch.index_select(masked_grad_KD, 0, bwd_idx_M)
-    grad_x_MD = grad_x_MD * bwd_mask_M1.to(grad_x_MD.dtype)
+    grad_x_MD = torch.where(bwd_mask_M1, grad_x_MD, 0)
     return grad_x_MD, None, None, None, None
 
 
@@ -266,6 +266,9 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
         total_valid = local_expert_counts_e.sum()
         q_R = torch.arange(r_static, device=device, dtype=torch.int32)
         expert_valid_flat = (q_R < total_valid).unsqueeze(1)
+        # Assign the zeroed trailing slack rows (`q_R >= total_valid`) to the
+        # last local expert so `sum(group_sizes) == r_static` stays static;
+        # zero input rows add nothing to dW and `combine` masks them out.
         pad_rows = r_static - total_valid
         num_global_tokens_per_local_expert_e = torch.cat([
             local_expert_counts_e[:-1],

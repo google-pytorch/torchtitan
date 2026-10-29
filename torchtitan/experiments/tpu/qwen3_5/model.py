@@ -11,6 +11,7 @@ from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=
 from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
 from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
 
@@ -127,14 +128,18 @@ class TpuQwen35Model(Qwen35Model):
       # 3.12 (the class is re-created); call the parent explicitly.
       Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
       if config.parallelism.expert_parallel_degree > 1:
-        # `ExpertParallel` shards the expert weights on dim 0, which the
-        # paired (w1 + w3) Pallas kernel's fused weight layout does not allow.
+        # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
+        # for the paired (w1 + w3) Pallas kernel; fall back to unpaired Pallas
+        # grouped matmuls under EP > 1.
         for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
           experts.use_pallas_paired_grouped_mm = False
         for _, dispatcher, parent, field_name in list(
-            self.traverse(TpuAllToAllTokenDispatcher.Config)
+            self.traverse(AllToAllTokenDispatcher.Config)
         ):
-          if type(dispatcher) is TpuAllToAllTokenDispatcher.Config:  # pylint: disable=unidiomatic-typecheck
+          if type(dispatcher) in (  # pylint: disable=unidiomatic-typecheck
+              AllToAllTokenDispatcher.Config,
+              TpuAllToAllTokenDispatcher.Config,
+          ):
             ep_dispatcher = torchtitan.config.derive(
                 dispatcher,
                 token_dispatcher.TpuQwen35TokenDispatcher.Config,

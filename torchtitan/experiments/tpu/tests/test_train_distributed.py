@@ -555,6 +555,22 @@ class TrainDistributedTest(
           ],
       ),
       dict(
+          testcase_name="qwen3_5_moe_ep2_tpu_moe_kernels",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_tpu_moe_kernels",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.mixed_precision_param=bfloat16",
+              "--parallelism.expert_parallel_degree=2",
+              "--optimizer.implementation=fused",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
           testcase_name="qwen3_5_moe_use_splash_attention_kernel",
           module="torchtitan.experiments.tpu.qwen3_5",
           config="qwen35_moe_debugmodel",

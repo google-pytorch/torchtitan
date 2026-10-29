@@ -30,7 +30,7 @@ def parallelize_qwen3_5(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> nn.Module:
-  """Apply FQN annotation, SimpleFSDP, and GraphTrainer compilation to Qwen3.5."""
+  """Applies FQN annotation, SimpleFSDP, and GraphTrainer compile to Qwen3.5."""
   del ac_config
   # Upstream's eager parallelize_qwen3_5 rejects CP too (the GatedDeltaNet
   # needs the whole sequence); TP is untested on TPU, and the TPU
@@ -41,7 +41,7 @@ def parallelize_qwen3_5(
       or parallel_dims.pp_enabled
   ):
     raise NotImplementedError(
-        "TPU GraphTrainer Qwen3.5 does not support TP, CP or PP."
+        "TPU GraphTrainer Qwen3.5 does not support TP, CP, or PP."
     )
 
   if any(layer.moe is not None for layer in model.config.layers):

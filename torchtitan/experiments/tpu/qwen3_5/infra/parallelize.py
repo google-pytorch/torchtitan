@@ -25,7 +25,7 @@ def apply_qwen3_5_simple_fsdp(
     parallel_dims: torchtitan.distributed.ParallelDims,
     training: torchtitan.config.TrainingConfig,
 ) -> nn.Module:
-  """Applies SimpleFSDP to Qwen3.5, wrapping routed experts on ``edp_mesh`` under EP.
+  """Applies SimpleFSDP to Qwen3.5, using ``edp_mesh`` for routed experts.
 
   Upstream ``apply_simple_fsdp`` checks ``isinstance(block, TransformerBlock)``
   before wrapping ``moe.routed_experts.inner_experts`` on ``edp_mesh``. Since

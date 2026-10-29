@@ -26,16 +26,22 @@ import dataclasses
 from functools import partial
 import math
 
+import torch
 from torch import nn
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import derive
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
-from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, TpuGatedDeltaNet, TpuInnerGatedDeltaNet
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
+    TpuGatedDeltaKernel,
+    TpuGatedDeltaNet,
+    TpuInnerGatedDeltaNet,
+    TpuRMSNormGated,
+)
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35Model, TpuQwen35TransformerBlock
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
 from torchtitan.protocols.model import ModelConfigConverter
@@ -43,6 +49,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
     "model_registry",
+    "post_optimizer_build_qwen3_5",
     "qwen3_5_configs",
     "use_tpu_modules",
 ]
@@ -75,6 +82,7 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
           inner_gated_delta_net=TpuInnerGatedDeltaNet.Config(
               kernel=TpuGatedDeltaKernel.Config()
           ),
+          norm=derive(layer.delta_net.norm, TpuRMSNormGated.Config),
       )
       # TPU: SimpleFSDP-safe init; reset_parameters() inits a gathered copy.
       for conv in (
@@ -87,6 +95,7 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
       layer.moe.load_balance_coeff = None
     config.layers[i] = derive(layer, TpuQwen35TransformerBlock.Config)
   return derive(config, TpuQwen35Model.Config, vision_encoder=None)
+
 
 def _split_optimizer_groups_by_mesh(optimizers_container) -> None:
   """Splits every optimizer param group into one group per DeviceMesh.
@@ -106,12 +115,18 @@ def _split_optimizer_groups_by_mesh(optimizers_container) -> None:
   for opt in optimizers_container.optimizers:
     new_groups = []
     for group in opt.param_groups:
+      params = list(group["params"])
       names = group.get("param_names")
+      if names is not None and len(names) != len(params):
+        raise ValueError(
+            f"param_names length ({len(names)}) != params length"
+            f" ({len(params)})"
+        )
       options = {
           k: v for k, v in group.items() if k not in ("params", "param_names")
       }
       buckets: dict[int | None, dict[str, list]] = {}
-      for i, param in enumerate(group["params"]):
+      for i, param in enumerate(params):
         bucket = buckets.setdefault(
             mesh_key(param), {"params": [], "param_names": []}
         )
@@ -136,7 +151,6 @@ def post_optimizer_build_qwen3_5(
   """Splits multi-mesh optimizer param groups, then registers the MoE hook."""
   _split_optimizer_groups_by_mesh(optimizers)
   register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
-
 
 
 def model_registry(
@@ -175,6 +189,7 @@ def model_registry(
       model=use_tpu_modules(model_spec.model),
       parallelize_fn=parallelize_qwen3_5,
       pipelining_fn=None,
+      post_optimizer_build_fn=post_optimizer_build_qwen3_5,
   )
 
 

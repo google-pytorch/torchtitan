@@ -33,6 +33,10 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
+
+# Importing `scan_fsdp` installs `_movedim_reduce_scatter_tensor` on `funcol`,
+# matching real `TpuGraphTrainer` runs.
+import torchtitan.experiments.tpu.graph_trainer.scan_fsdp  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
     split_forward_graph_by_layer,
@@ -96,6 +100,30 @@ class _ViewOutputLayer(nn.Module):
 
   def forward(self, inputs: torch.Tensor) -> torch.Tensor:
     return torch.relu(self.linear(inputs.view(4, -1, 8))).view(-1, 8)
+
+
+class _RowFoldedToyTransformer(nn.Module):
+  """2D weights (`[8, 256]`) that trigger `_movedim_reduce_scatter_tensor` fold.
+
+  On 2 FSDP ranks, `shard_rows = 4` (`4 % 8 != 0`, `k = 2`, `256 % 256 == 0`),
+  as Qwen3.5 35B `in_proj_a`/`in_proj_b` (`[32, 2048]` across 8 ranks) do.
+  """
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__()
+    self.layers = nn.ModuleList(
+        nn.Sequential(
+            nn.Linear(256, 8, bias=False),
+            nn.ReLU(),
+            nn.Linear(8, 256, bias=False),
+        )
+        for _ in range(n_layers)
+    )
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    for layer in self.layers:
+      inputs = layer(inputs)
+    return inputs
 
 
 class GraphSplitTest(absltest.TestCase):
@@ -821,65 +849,130 @@ class GraphSplitTest(absltest.TestCase):
           chunked_view.partition_map[cast], chunked_view.partition_map[wait]
       )
 
+  def test_backward_fsdp_pipeline_keeps_row_folded_rs_view_and_cast_with_wait(
+      self,
+  ):
+    """Real `_movedim_reduce_scatter_tensor` fold + bf16 cast stays atomic."""
+    self.assertFalse(dist.is_initialized())
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+    try:
+      mesh = DeviceMesh("cpu", [0, 1])
+      with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
+        model = _RowFoldedToyTransformer(n_layers=2)
+        annotate_module_fqns(model)
+        model = data_parallel(
+            model,
+            device_mesh=mesh,
+            mode="fully_shard",
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            ),
+        )
+        inputs = torch.randn(2, 256, dtype=torch.bfloat16, requires_grad=True)
+        traced = self._trace_toy_model(model=model, inputs=inputs)
+    finally:
+      dist.destroy_process_group()
+
+    gm = self._apply_passes_and_split(
+        traced, fsdp_reshard_after_forward="always"
+    ).backward_graph
+    folded_epilogues = []
+    for node in gm.graph.nodes:
+      if (
+          node.op == "call_function"
+          and node.target is torch.ops.aten._to_copy.default
+          and len(node.all_input_nodes) == 1
+          and _is_view(node.all_input_nodes[0])
+      ):
+        view = node.all_input_nodes[0]
+        if len(view.all_input_nodes) == 1 and graph_split_lib.is_wait_tensor(
+            view.all_input_nodes[0]
+        ):
+          folded_epilogues.append((view.all_input_nodes[0], view, node))
+    self.assertLen(folded_epilogues, 2)
+
+    chunked = split_backward_graph_by_layer(
+        gm, n_layers=2, pipeline_collectives=True
+    )
+    for wait, view, cast in folded_epilogues:
+      self.assertEqual(chunked.partition_map[view], chunked.partition_map[wait])
+      self.assertEqual(chunked.partition_map[cast], chunked.partition_map[wait])
+
   def test_reduce_scatter_chain_stops_at_resizing_views_and_compute(self):
     """Only casts and size-preserving views after an RS wait join its chain."""
-    gm = self._trace_simple_fsdp(
-        n_layers=2,
-        reduce_dtype=torch.bfloat16,
-    ).backward_graph
-    graph = gm.graph
-    reduce_casts = [
-        node
-        for node in graph.nodes
-        if node.op == "call_function"
-        and node.target is torch.ops.aten._to_copy.default
-        and len(node.all_input_nodes) == 1
-        and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
-    ]
-    self.assertLen(reduce_casts, 2)
-    waits = [cast.all_input_nodes[0] for cast in reduce_casts]
+    for resize_kind in ("expand", "slice"):
+      with self.subTest(resize_kind=resize_kind):
+        gm = self._trace_simple_fsdp(
+            n_layers=2,
+            reduce_dtype=torch.bfloat16,
+        ).backward_graph
+        graph = gm.graph
+        reduce_casts = [
+            node
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target is torch.ops.aten._to_copy.default
+            and len(node.all_input_nodes) == 1
+            and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+        ]
+        self.assertLen(reduce_casts, 2)
+        waits = [cast.all_input_nodes[0] for cast in reduce_casts]
 
-    def insert_before(cast, target, args, shape):
-      """Makes ``target(<cast's input>, *args)`` the cast's input."""
-      source = cast.all_input_nodes[0]
-      with graph.inserting_before(cast):
-        node = graph.call_function(target, (source, *args))
-      node.meta["val"] = torch.empty(
-          shape, dtype=source.meta["val"].dtype, device="meta"
-      )
-      cast.replace_input_with(source, node)
-      return node
+        def insert_before(cast, target, args, shape, *, g=graph):
+          """Makes ``target(<cast's input>, *args)`` the cast's input."""
+          source = cast.all_input_nodes[0]
+          with g.inserting_before(cast):
+            node = g.call_function(target, (source, *args))
+          node.meta["val"] = torch.empty(
+              shape, dtype=source.meta["val"].dtype, device="meta"
+          )
+          cast.replace_input_with(source, node)
+          return node
 
-    # Layer 0: wait -> view -> expand (more elements) -> cast.
-    shape = list(waits[0].meta["val"].shape)
-    view = insert_before(
-        reduce_casts[0], torch.ops.aten.view.default, (shape,), shape
-    )
-    expand = insert_before(
-        reduce_casts[0],
-        torch.ops.aten.expand.default,
-        ([2, *shape],),
-        [2, *shape],
-    )
-    # Layer 1: wait -> mul (compute) -> cast.
-    mul = insert_before(
-        reduce_casts[1],
-        torch.ops.aten.mul.Tensor,
-        (2.0,),
-        list(waits[1].meta["val"].shape),
-    )
-    gm.recompile()
+        # Layer 1 (pipelined RS): wait -> view -> resizing view -> cast.
+        shape = list(waits[1].meta["val"].shape)
+        view = insert_before(
+            reduce_casts[1], torch.ops.aten.view.default, (shape,), shape
+        )
+        if resize_kind == "expand":
+          resized = insert_before(
+              reduce_casts[1],
+              torch.ops.aten.expand.default,
+              ([2, *shape],),
+              [2, *shape],
+          )
+        else:
+          half = max(1, shape[0] // 2)
+          resized = insert_before(
+              reduce_casts[1],
+              torch.ops.aten.slice.Tensor,
+              (0, 0, half),
+              [half, *shape[1:]],
+          )
+        # Layer 0: wait -> mul (compute) -> cast.
+        mul = insert_before(
+            reduce_casts[0],
+            torch.ops.aten.mul.Tensor,
+            (2.0,),
+            list(waits[0].meta["val"].shape),
+        )
+        gm.recompile()
 
-    chains = graph_split_lib._collect_collective_chains(gm)
-    chain0, chain1 = (
-        next(chain for chain in chains.values() if wait in chain)
-        for wait in waits
-    )
-    self.assertIn(view, chain0)
-    self.assertNotIn(expand, chain0)
-    self.assertNotIn(reduce_casts[0], chain0)
-    self.assertNotIn(mul, chain1)
-    self.assertNotIn(reduce_casts[1], chain1)
+        chains = graph_split_lib._collect_collective_chains(gm)
+        chain0, chain1 = (
+            next(chain for chain in chains.values() if wait in chain)
+            for wait in waits
+        )
+        self.assertIn(view, chain1)
+        self.assertNotIn(resized, chain1)
+        self.assertNotIn(reduce_casts[1], chain1)
+        self.assertNotIn(mul, chain0)
+        self.assertNotIn(reduce_casts[0], chain0)
+        with self.assertRaisesRegex(ValueError, "reverse dependency"):
+          split_backward_graph_by_layer(
+              gm, n_layers=2, pipeline_collectives=True
+          )
 
 
 if __name__ == "__main__":

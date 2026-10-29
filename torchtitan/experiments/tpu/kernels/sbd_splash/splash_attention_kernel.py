@@ -1047,6 +1047,16 @@ def flash_attention_kernel(
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
+  # Tried 2026-10-28 on Flint's op-point (32 q / 4 kv heads, head_dim 128,
+  # sinks, window 513 + causal, packed documents; v6e), both bit-identical,
+  # neither kept:
+  # - Software-pipelining the grid step (QK^T of sub-step i+1 issued before
+  #   sub-step i's softmax, m/l/o carried as values): no gain. With >= 2
+  #   compute sub-steps the unrolled loop is one basic block and the LLO
+  #   scheduler already co-issues the MXU with VALU work; the forward is bound
+  #   by VALU work per tile (softmax + mask), not by missing overlap.
+  # - Skipping the segment-id compare on tiles whose q and kv blocks lie in one
+  #   segment (a block_mask bit set by the wrapper): -0.8% fwd+bwd.
   @pl.when(_and(should_not_mask, should_run))
   def _():
     lax.fori_loop(0, num_iters, body, None, unroll=True)

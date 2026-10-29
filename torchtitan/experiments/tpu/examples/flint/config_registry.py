@@ -29,6 +29,8 @@ __all__ = [
     "flint_40b_proxy",
     "flint_40b_v002",
     "flint_40b_v003",
+    "flint_40b_v004_mb16",
+    "flint_40b_v004_mb32",
     "flint_debugmodel",
     "flint_moe_testmodel",
 ]
@@ -204,4 +206,19 @@ def flint_40b_v003() -> TPUTrainerConfig:
 def flint_40b_proxy_v003() -> TPUTrainerConfig:
   config = flint_40b_proxy_v002()
   _enable_pallas_cross_entropy(config)
+  return config
+
+
+def flint_40b_v004_mb16() -> TPUTrainerConfig:
+  """``flint_40b_v003`` with 16-sequence microbatches (2 per optimizer step)."""
+  config = flint_40b_v003()
+  config.training.num_tokens_per_microbatch_per_dp_rank = 16 * _40B_CONTEXT_LENGTH
+  return config
+
+
+def flint_40b_v004_mb32() -> TPUTrainerConfig:
+  """``flint_40b_v003`` with the whole per-rank batch (32 sequences) in one
+  microbatch: no gradient accumulation."""
+  config = flint_40b_v003()
+  config.training.num_tokens_per_microbatch_per_dp_rank = 32 * _40B_CONTEXT_LENGTH
   return config

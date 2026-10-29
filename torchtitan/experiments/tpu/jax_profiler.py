@@ -11,21 +11,17 @@ except ImportError:
 logger = torchtitan_logging.logger
 
 
-
 def _wait_for_device() -> None:
-  """Waits for the TPU work dispatched so far.
+  """Waits for accelerator work dispatched so far.
 
   Steps run asynchronously: without a host sync (e.g. with
   ``metrics.log_freq > 1``) the host reaches the profiler's stop step while the
   device is still running earlier steps, and the trace misses most of the
   profiled steps.
   """
-  try:
-    from torch_tpu._internal import sync  # pylint: disable=g-import-not-at-top
+  if hasattr(torch, "accelerator") and torch.accelerator.is_available():
+    torch.accelerator.synchronize()
 
-    sync.synchronize(wait=True)
-  except ImportError:
-    pass
 
 class JaxProfiler:
   """Wrapper for JAX profiler."""

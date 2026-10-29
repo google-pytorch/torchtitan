@@ -10,36 +10,34 @@ import argparse
 import contextlib
 import functools
 import json
+import os
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple, cast
 
+from absl import app
 from absl import flags
 from absl.flags import argparse_flags
-import os
 import torch
 import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
-import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
-import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
+import torchtitan.experiments.tpu.flux  # trigger model registration
+from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
-import torchtitan.experiments.tpu.qwen3   # trigger model registration
-from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as qwen3_5_graph_trainer
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+import torchtitan.experiments.tpu.qwen3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
-
-from absl import app
 
 
 class TPUTrainer(torchtitan.train.Trainer):
@@ -290,7 +288,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           model_registry as gt_registry,
       )
     elif model_name == "qwen3_5":
-      gt_registry = qwen3_5_graph_trainer.model_registry
+      from torchtitan.experiments.tpu.graph_trainer.qwen3_5 import (
+          model_registry as gt_registry,
+      )
     else:
       raise ValueError(
           f"Model {model_name} is not currently supported with GraphTrainer."

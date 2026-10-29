@@ -39,55 +39,105 @@ proportional to ``exp(g)`` < 0.7%). At initialization many gates are below -5.
 from collections.abc import Sequence
 from dataclasses import dataclass
 import functools
+import re
 
 import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from torchtitan.config.override import derive, override
-from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, per_row_segment_ids
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import per_row_segment_ids
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel
 from torchtitan.tools.logging import logger
 
 # Tokamax's private modules (`tokamax._src`), kept for now on purpose: the
 # public `tokamax.ops.kimi_delta_attention` is the same function, but only
 # newer Tokamax builds have the public `tokamax.ops` namespace, and no released
 # wheel has the KDA op. Move to the public API once the pinned Tokamax does.
+# Imported lazily so config validation, override resolution and CPU fallback
+# tests can run without KDA.
 try:
   from tokamax._src.ops.kda import api as kda_api
-  # Registers the Mosaic TPU backend with `kda_api`; without it the
-  # `implementation="mosaic"` calls below raise.
+  # Explicitly check that the Mosaic TPU backend imports: `kda_api` catches a
+  # missing Pallas/Mosaic dependency at import time and leaves only `"xla"`.
   from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
+
+  _TOKAMAX_KDA_IMPORT_ERROR: Exception | None = None
 except (ImportError, SyntaxError) as e:
   # The Tokamax wheels up to 0.1.0 have no KDA op, and under typeguard >= 3 they
   # do not import at all (SyntaxError, openxla/tokamax#240).
-  raise ImportError(
-      "TokamaxGatedDeltaKernel needs a Tokamax build with the Kimi Delta"
-      " Attention op (tokamax._src.ops.kda): github.com/openxla/tokamax HEAD."
-  ) from e
+  kda_api = None
+  _TOKAMAX_KDA_IMPORT_ERROR = e
 
-# Default lower bound on the per-token log decay. The Mosaic kernel factors the
-# decay of each 16-token sub-block around the sub-block's midpoint (its
-# "safe gate"), so intermediates grow like ``exp(-8 * g)`` and overflow fp32
-# below about -5.9 (the model's initialization reaches -34 and beyond, which
-# gave NaN gradients). Tokamax's own tests and its sigmoid gate's
-# ``lower_bound`` use ``[-5, 0)``. Faster decays are clamped: a decay of
-# ``exp(-5)`` = 0.7% per token already discards the state within two tokens.
-DEFAULT_MIN_LOG_DECAY = -5.0
+# Lower bound on the per-token log decay required by the per-channel Mosaic KDA
+# backward kernel: it re-centers each 16-token sub-block on the sub-block's
+# maximum cumulative decay, so intermediates grow over up to 15 steps like
+# ``exp(-15 * g)`` and overflow fp32 (~3.4e38) below about ``-88.7 / 15 = -5.9``
+# (the model's initialization reaches -70 and beyond, which gave NaN gradients).
+# Tokamax's own tests and its sigmoid gate's ``lower_bound`` use ``[-5, 0)``.
+# Faster decays are clamped: ``exp(-5)`` = 0.7% per token already discards the
+# state within two tokens.
+MIN_SUPPORTED_LOG_DECAY = -5.0
+DEFAULT_MIN_LOG_DECAY = MIN_SUPPORTED_LOG_DECAY
 
 # Default packed-document budget (``TokamaxGatedDeltaKernel.Config.
 # max_num_segments``): one document per this many tokens of a row, with at
 # least ``MIN_NUM_SEGMENTS`` per row.
 # Tokamax pads each document to a 64-token chunk boundary, so at >= 2K context
-# this costs 63 / 512 = 12% more kernel tokens, while short packed rows (< 2K,
-# such as RL micro-batches) still keep multiple documents apart instead of
-# collapsing to ``max_num_segments = 1`` (no resets).
+# this costs 63 / 512 = 12% more kernel tokens (and ~20-31% longer step time
+# end-to-end when resets are enabled), while short packed rows (< 2K, such as RL
+# micro-batches) still keep multiple documents apart instead of collapsing to
+# ``max_num_segments = 1`` (no resets).
 TOKENS_PER_SEGMENT = 512
 MIN_NUM_SEGMENTS = 4
 
 # The Mosaic kernels' limits (tokamax/_src/ops/kda/pallas_mosaic_tpu.py).
 _KERNEL_CHUNK = 64
 _MAX_KERNEL_HEAD_DIM = 256
+_MIN_TPU_GENERATION = 6
 _KERNEL_DTYPES = (torch.bfloat16, torch.float32)
+
+
+def has_tokamax_kda() -> bool:
+  """Whether a Tokamax build with the Mosaic TPU KDA op is installed."""
+  return kda_api is not None
+
+
+def tokamax_kda_import_error() -> str | None:
+  """Reason the Mosaic TPU KDA op failed to import, or None."""
+  if _TOKAMAX_KDA_IMPORT_ERROR is None:
+    return None
+  return str(_TOKAMAX_KDA_IMPORT_ERROR)
+
+
+def _require_tokamax_kda() -> None:
+  if kda_api is None:
+    raise ImportError(
+        "TokamaxGatedDeltaKernel needs a Tokamax build with the Kimi Delta"
+        " Attention op (tokamax._src.ops.kda): github.com/openxla/tokamax HEAD."
+    ) from _TOKAMAX_KDA_IMPORT_ERROR
+
+
+@functools.lru_cache(maxsize=1)
+def _tpu_generation() -> int | None:
+  """Attached TPU generation (e.g. 5 for v5e/v5p, 6 for v6e, 7 for TPU7x)."""
+  get_props = getattr(
+      getattr(torch, "tpu", None), "get_device_properties", None
+  )
+  if get_props is None:
+    return None
+  try:
+    name = get_props().name.lower()
+  except RuntimeError:
+    return None
+  match = re.search(r"(?:v|tpu[- ])(\d+)", name)
+  return int(match.group(1)) if match else None
+
+
+def supports_current_tpu() -> bool:
+  """Whether the attached TPU meets Mosaic KDA's generation >= 6 requirement."""
+  gen = _tpu_generation()
+  return gen is not None and gen >= _MIN_TPU_GENERATION
 
 
 def _heads_first(x: jax.Array) -> jax.Array:
@@ -374,9 +424,10 @@ def tokamax_gated_delta(
     beta: ``(bs, seq_len, n_heads)`` update gate in ``(0, 1)``.
     min_log_decay: ``g`` is clamped to at least this value (see
       ``DEFAULT_MIN_LOG_DECAY``).
-    segment_ids: Optional ``(bs, seq_len)`` int32 document ids in Tokamax's
-      convention (see ``tokamax_segment_ids``); the recurrence restarts at every
-      document.
+    segment_ids: Optional ``(bs, seq_len)`` non-decreasing document ids (such as
+      ``segment_ids_from_positions`` or ``tokamax_segment_ids``); normalized per
+      row and capped at ``max_num_segments`` so the recurrence restarts at every
+      document up to that budget.
     max_num_segments: Upper bound on the documents per row; required with
       ``segment_ids``.
 
@@ -386,21 +437,27 @@ def tokamax_gated_delta(
     ``gated_delta.chunked_gated_delta`` does. Without ``segment_ids``,
     ``seq_len`` must be a multiple of 64 (the kernel's chunk size).
   """
+  _require_tokamax_kda()
   # `jax_op` reads its operands by shape alone, so they must be dense.
   q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
   if segment_ids is None:
     return _gated_delta_fwd_res(q, k, v, g, beta, float(min_log_decay))[0]
-  if max_num_segments is None:
-    raise ValueError("tokamax_gated_delta: segment_ids need max_num_segments.")
+  if max_num_segments is None or max_num_segments < 1:
+    raise ValueError(
+        "tokamax_gated_delta: segment_ids require max_num_segments >= 1,"
+        f" got {max_num_segments}."
+    )
+  max_segments = min(int(max_num_segments), max(1, q.shape[1]))
+  normalized_ids = tokamax_segment_ids(segment_ids, max_segments).contiguous()
   return _gated_delta_segments_fwd_res(
       q,
       k,
       v,
       g,
       beta,
-      segment_ids.contiguous(),
+      normalized_ids,
       float(min_log_decay),
-      int(max_num_segments),
+      max_segments,
   )[0]
 
 
@@ -424,15 +481,15 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
   recurrence restart at each of the first ``max_num_segments`` documents of
   every row (see ``document_ids``). Log decays are clamped to at least
   ``min_log_decay`` (see the module docstring). Inputs the kernels do not take
-  (not on TPU, not bf16/fp32, head dims above 256, or rows without document
-  ids that are not a multiple of 64 tokens) run the parent's XLA recurrence,
-  unclamped.
+  (not on TPU >= v6, empty batch/sequence, not bf16/fp32, head dims above 256,
+  or rows without document ids that are not a multiple of 64 tokens) run the
+  parent's XLA recurrence, unclamped.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(TpuGatedDeltaKernel.Config):
-    # Per-token log decays below this are clamped to it, in [-5, 0) (see
-    # `DEFAULT_MIN_LOG_DECAY`).
+    # Per-token log decays below this are clamped to it, in
+    # [MIN_SUPPORTED_LOG_DECAY, 0) (see `MIN_SUPPORTED_LOG_DECAY`).
     min_log_decay: float = DEFAULT_MIN_LOG_DECAY
     # Packed documents per row kept apart (Tokamax's `max_num_segments`);
     # later documents of a row share one sequence in the convolution and the
@@ -446,9 +503,9 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
 
   def __init__(self, config: Config):
     super().__init__(config)
-    if not DEFAULT_MIN_LOG_DECAY <= config.min_log_decay < 0:
+    if not MIN_SUPPORTED_LOG_DECAY <= config.min_log_decay < 0:
       raise ValueError(
-          f"min_log_decay must be in [{DEFAULT_MIN_LOG_DECAY}, 0), got"
+          f"min_log_decay must be in [{MIN_SUPPORTED_LOG_DECAY}, 0), got"
           f" {config.min_log_decay}: the kernels overflow below it."
       )
     if config.max_num_segments is not None and config.max_num_segments < 1:
@@ -459,9 +516,10 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
     self.max_num_segments = config.max_num_segments
 
   def _num_segments(self, seq_len: int) -> int:
+    upper = max(1, seq_len)
     if self.max_num_segments is not None:
-      return self.max_num_segments
-    return max(MIN_NUM_SEGMENTS, seq_len // TOKENS_PER_SEGMENT)
+      return min(self.max_num_segments, upper)
+    return min(max(MIN_NUM_SEGMENTS, seq_len // TOKENS_PER_SEGMENT), upper)
 
   def document_ids(self, segment_ids_BS: torch.Tensor) -> torch.Tensor:
     """Tokamax's per-row ids: documents beyond the budget share the last."""
@@ -475,6 +533,11 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
     """Why the Mosaic kernels cannot run these inputs, or None."""
     if q_BSHK.device.type != "tpu":
       return f"device {q_BSHK.device.type}"
+    gen = _tpu_generation()
+    if gen is not None and gen < _MIN_TPU_GENERATION:
+      return f"TPU v{gen} (needs >= v{_MIN_TPU_GENERATION})"
+    if q_BSHK.shape[0] == 0 or q_BSHK.shape[1] == 0:
+      return f"empty shape {tuple(q_BSHK.shape)}"
     if q_BSHK.dtype not in _KERNEL_DTYPES:
       return f"dtype {q_BSHK.dtype}"
     if q_BSHK.shape[-1] > _MAX_KERNEL_HEAD_DIM:
@@ -515,7 +578,7 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
         g_BSH,
         beta_BSH,
         min_log_decay=self.min_log_decay,
-        segment_ids=tokamax_segment_ids(segment_ids_BS, max_num_segments),
+        segment_ids=segment_ids_BS,
         max_num_segments=max_num_segments,
     )
 

@@ -13,7 +13,6 @@ Only whole rows are supported (no packed-document resets); see
 ``qwen3_5.gated_delta.causal_conv_silu`` for the dispatch.
 """
 
-import functools
 import re
 
 import jax
@@ -32,20 +31,27 @@ _MAX_WIDTH = 8
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
-@functools.lru_cache(maxsize=1)
+_tpu_gen_cache: list[int | None] = []
+
+
+@torch._dynamo.assume_constant_result
 def _tpu_generation() -> int | None:
   """Attached TPU generation (e.g. 5 for v5e/v5p, 6 for v6e, 7 for TPU7x)."""
+  if _tpu_gen_cache:
+    return _tpu_gen_cache[0]
+  gen: int | None = None
   get_props = getattr(
       getattr(torch, "tpu", None), "get_device_properties", None
   )
-  if get_props is None:
-    return None
-  try:
-    name = get_props().name.lower()
-  except RuntimeError:
-    return None
-  match = re.search(r"(?:v|tpu[- ])(\d+)", name)
-  return int(match.group(1)) if match else None
+  if get_props is not None:
+    try:
+      name = get_props().name.lower()
+      match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
+      gen = int(match.group(1)) if match else None
+    except RuntimeError:
+      gen = None
+  _tpu_gen_cache.append(gen)
+  return gen
 
 
 def _max_supported_seq_len(dtype: torch.dtype) -> int:

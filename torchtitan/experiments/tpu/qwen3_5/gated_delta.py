@@ -33,6 +33,11 @@ from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
 from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
 
+try:
+  from torchtitan.experiments.tpu.kernels import causal_conv1d
+except ImportError:
+  causal_conv1d = None
+
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
   return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
@@ -182,8 +187,9 @@ def causal_conv_silu(
 ) -> torch.Tensor:
   """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
 
-  The backward is ``_CausalConvSilu``'s: shifted slices of the output gradient
-  instead of autograd's scattered adds.
+  Whole-row TPU inputs within ``causal_conv1d.supports`` run the fused Pallas
+  kernels; packed documents or unsupported shapes/devices use
+  ``_CausalConvSilu``'s shifted slices.
 
   Args:
     x_BSC: ``[B, S, C]`` input.
@@ -194,12 +200,12 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
-  if segment_ids_BS is None and x_BSC.device.type == "tpu":
-    # Whole rows on TPU: fused Pallas kernels (~2x faster than the slices).
-    from torchtitan.experiments.tpu.kernels import causal_conv1d  # pylint: disable=g-import-not-at-top
-
-    if causal_conv1d.supports(x_BSC):
-      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+  if (
+      segment_ids_BS is None
+      and causal_conv1d is not None
+      and causal_conv1d.supports(x_BSC, weight_C1W)
+  ):
+    return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 

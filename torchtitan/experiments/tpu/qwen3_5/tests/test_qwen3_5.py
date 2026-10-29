@@ -21,6 +21,7 @@ import copy
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
@@ -491,9 +492,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
   def test_causal_conv_silu_bf16_backward_accuracy(self, packed: bool):
     """Tests the bf16 conv backward against fp64 over 16K-token dw sums.
 
-    The slice-based backward must be as accurate as the autograd it replaces
-    (fp32 tap and dw products and sums). Adding the dw products in bf16 is not:
-    torch_tpu disallows XLA excess precision, so a bf16 sum rounds every add.
+    The slice-based backward must be as accurate as the autograd it replaces,
+    which multiplies in fp32 and sums dw in fp32. Adding the dw products in
+    bf16 is not: torch_tpu disallows XLA excess precision, so a bf16 sum rounds
+    every add.
     """
     torch.manual_seed(0)
     bs, seq_len, channels, kernel_size = 8, 2048, 128, 4
@@ -536,6 +538,71 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           msg=f"d{name}: {err:.2e} vs autograd {autograd_err:.2e}",
       )
       self.assertLess(err, 1e-2, msg=f"d{name}: {err:.2e}")
+
+  def test_causal_conv_silu_backward_avoids_scatter_adds(self):
+    """Tests that the conv backward does not add slices into zero buffers.
+
+    Autograd of the slice-based forward adds every tap's input gradient into
+    a zero buffer of the padded input (``slice_backward``), which XLA emits as
+    slow ``dynamic-update-slice`` adds. The traced backward of
+    ``causal_conv_silu`` must have no such op, with or without documents.
+    """
+    scatter_ops = {
+        torch.ops.aten.slice_backward.default,
+        torch.ops.aten.slice_scatter.default,
+        torch.ops.aten.index_put.default,
+        torch.ops.aten.scatter_add.default,
+    }
+    x = torch.randn(2, 16, 8, requires_grad=True)
+    weight = torch.randn(8, 1, 4, requires_grad=True)
+    grad = torch.randn(2, 16, 8)
+    segment_ids = segment_ids_from_positions(_packed_positions((5, 11)))
+
+    def autograd_conv_silu(x_in, w_in, seg):
+      return F.silu(gated_delta._causal_conv(x_in, w_in, seg))  # pylint: disable=protected-access
+
+    def backward_ops(conv_silu, seg):
+      def grads(x_in, w_in, grad_in):
+        return torch.autograd.grad(
+            conv_silu(x_in, w_in, seg), (x_in, w_in), grad_in
+        )
+
+      graph = make_fx(grads)(x, weight, grad).graph
+      return {node.target for node in graph.nodes if node.op == "call_function"}
+
+    for seg in (None, segment_ids.expand(2, -1)):
+      with self.subTest(packed=seg is not None):
+        self.assertEmpty(
+            backward_ops(gated_delta.causal_conv_silu, seg) & scatter_ops
+        )
+        # Negative control: autograd of the forward does use them.
+        self.assertNotEmpty(backward_ops(autograd_conv_silu, seg) & scatter_ops)
+
+  def test_causal_conv_silu_compiles_fullgraph(self):
+    """Tests causal_conv_silu under torch.compile(fullgraph=True).
+
+    The per-layer compile mode compiles each transformer block with
+    ``fullgraph=True``, so the custom autograd.Function must trace without
+    graph breaks.
+    """
+    torch.manual_seed(0)
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    x = torch.randn(2, 16, 8, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(8, 1, 4, dtype=torch.float64, requires_grad=True)
+    grad = torch.randn(2, 16, 8, dtype=torch.float64)
+    segment_ids = segment_ids_from_positions(_packed_positions((5, 11)))
+    compiled = torch.compile(
+        gated_delta.causal_conv_silu, backend="aot_eager", fullgraph=True
+    )
+    for seg in (None, segment_ids.expand(2, -1)):
+      with self.subTest(packed=seg is not None):
+        out = compiled(x, weight, seg)
+        expected = gated_delta.causal_conv_silu(x, weight, seg)
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(out, (x, weight), grad),
+            torch.autograd.grad(expected, (x, weight), grad),
+        )
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token

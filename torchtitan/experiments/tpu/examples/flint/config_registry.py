@@ -171,3 +171,10 @@ def flint_40b_v002() -> TPUTrainerConfig:
   config = flint_40b()
   _use_splash_kernel(config)
   return config
+
+
+def flint_40b_proxy_v002() -> TPUTrainerConfig:
+  """``flint_40b_proxy`` with the Splash kernel (local pre-dispatch check)."""
+  config = flint_40b_proxy()
+  _use_splash_kernel(config)
+  return config

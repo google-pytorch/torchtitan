@@ -19,10 +19,21 @@ layer.
 
 Packed documents: given ``segment_ids``, the recurrence restarts at every
 document through Tokamax's own ``segment_ids`` / ``max_num_segments`` API. The
-kernels then lay every document out from a 64-token chunk boundary (up to
-``seq_len + 63 * max_num_segments`` tokens per row) instead of masking within
-chunks, so ``max_num_segments`` bounds both the documents per row and the
-extra work; ``tokamax_segment_ids`` merges documents beyond it into the last.
+kernels then lay every document out from a 64-token chunk boundary (always
+``seq_len + 63 * max_num_segments`` tokens per row, however many documents the
+row has) instead of masking within chunks, so ``max_num_segments`` bounds both
+the documents per row and the extra work. Documents beyond it share the last
+document id in the causal convolution too (``TokamaxGatedDeltaKernel.
+document_ids``): they run as one sequence, as without document resets. Set
+``max_num_segments`` (an override argument) to the most documents a row holds.
+
+Decay clamp: the per-token log decay ``g`` is clamped to at least
+``min_log_decay`` (-5 by default; see ``DEFAULT_MIN_LOG_DECAY``), so this
+kernel computes a slightly different function from the unclamped XLA
+``chunked_gated_delta`` wherever ``g < -5``. Such a token keeps
+``exp(-5)`` = 0.7% of the state instead of less, and passes no gradient to
+``A_log``, ``dt_bias`` and ``in_proj_a`` (the unclamped gradient there is
+proportional to ``exp(g)`` < 0.7%). At initialization many gates are below -5.
 """
 
 from collections.abc import Sequence
@@ -34,12 +45,13 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from torchtitan.config.override import derive, override
-from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, per_row_segment_ids
+from torchtitan.tools.logging import logger
 
 try:
   from tokamax._src.ops.kda import api as kda_api
-  # Registers the Mosaic TPU backend with `kda_api` (`api.py` imports it behind
-  # a `try`, so without this dependency the call fails over to XLA).
+  # Registers the Mosaic TPU backend with `kda_api`; without it the
+  # `implementation="mosaic"` calls below raise.
   from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
 except (ImportError, SyntaxError) as e:
   # The Tokamax wheels up to 0.1.0 have no KDA op, and under typeguard >= 3 they
@@ -51,20 +63,27 @@ except (ImportError, SyntaxError) as e:
 
 # Default lower bound on the per-token log decay. The Mosaic kernel factors the
 # decay of each 16-token sub-block around the sub-block's midpoint (its
-# "safe gate"), so intermediates grow like ``exp(-8 * g)``; Tokamax validates
-# it for log decays in ``[-5, 0)`` (KDA's own ``lower_bound`` range). Faster
-# decays are clamped: a decay of ``exp(-5)`` = 0.7% per token already discards
-# the state within two tokens.
+# "safe gate"), so intermediates grow like ``exp(-8 * g)`` and overflow fp32
+# below about -5.9 (the model's initialization reaches -34 and beyond, which
+# gave NaN gradients). Tokamax's own tests and its sigmoid gate's
+# ``lower_bound`` use ``[-5, 0)``. Faster decays are clamped: a decay of
+# ``exp(-5)`` = 0.7% per token already discards the state within two tokens.
 DEFAULT_MIN_LOG_DECAY = -5.0
 
-# Default packed-document budget: one document per this many tokens of a row,
-# with at least ``MIN_NUM_SEGMENTS`` per row (`TokamaxGatedDeltaKernel.Config.max_num_segments`).
+# Default packed-document budget (``TokamaxGatedDeltaKernel.Config.
+# max_num_segments``): one document per this many tokens of a row, with at
+# least ``MIN_NUM_SEGMENTS`` per row.
 # Tokamax pads each document to a 64-token chunk boundary, so at >= 2K context
-# this bounds the extra kernel tokens at 63 / 512 = 12%, while short packed
-# rows (< 2K, such as RL micro-batches) still keep multiple documents apart
-# instead of collapsing to ``max_num_segments = 1`` (no resets).
+# this costs 63 / 512 = 12% more kernel tokens, while short packed rows (< 2K,
+# such as RL micro-batches) still keep multiple documents apart instead of
+# collapsing to ``max_num_segments = 1`` (no resets).
 TOKENS_PER_SEGMENT = 512
 MIN_NUM_SEGMENTS = 4
+
+# The Mosaic kernels' limits (tokamax/_src/ops/kda/pallas_mosaic_tpu.py).
+_KERNEL_CHUNK = 64
+_MAX_KERNEL_HEAD_DIM = 256
+_KERNEL_DTYPES = (torch.bfloat16, torch.float32)
 
 
 def _heads_first(x: jax.Array) -> jax.Array:
@@ -151,6 +170,21 @@ def _parse_input_spec(spec: str) -> list[jax.ShapeDtypeStruct]:
   return structs
 
 
+def _rebuild_vjp(vjp_struct, residuals: Sequence[jax.Array]):
+  """Fills the VJP closure's structure with the saved residuals."""
+  leaves = jax.tree_util.tree_leaves(vjp_struct)
+  expected = [(tuple(l.shape), l.dtype) for l in leaves]
+  actual = [(tuple(r.shape), r.dtype) for r in residuals]
+  if expected != actual:
+    raise ValueError(
+        "Tokamax KDA residuals do not match the VJP's structure:"
+        f" expected {expected}, got {actual}"
+    )
+  return jax.tree_util.tree_unflatten(
+      jax.tree_util.tree_structure(vjp_struct), list(residuals)
+  )
+
+
 @pallas.jax_op("tt_qwen35::gated_delta_fwd_res")
 def _gated_delta_fwd_res(
     q: jax.Array,
@@ -180,9 +214,7 @@ def _gated_delta_bwd_res(
       functools.partial(_gated_delta_vjp, min_log_decay=min_log_decay),
       *structs,
   )
-  vjp = jax.tree_util.tree_unflatten(
-      jax.tree_util.tree_structure(vjp_struct), list(residuals)
-  )
+  vjp = _rebuild_vjp(vjp_struct, residuals)
   return vjp(grad_out.astype(structs[0].dtype))
 
 
@@ -201,7 +233,10 @@ def _backward_res(ctx, grad_outputs):
   if grad_out is None:
     return (None,) * 6
   grads = _gated_delta_bwd_res(
-      list(ctx.saved_tensors), grad_out, ctx.input_spec, ctx.min_log_decay
+      list(ctx.saved_tensors),
+      grad_out.contiguous(),
+      ctx.input_spec,
+      ctx.min_log_decay,
   )
   return (*grads, None)
 
@@ -222,7 +257,7 @@ def _gated_delta_segments_fwd_res(
     min_log_decay: float,
     max_num_segments: int,
 ) -> list[jax.Array]:
-  """``_gated_delta_fwd_res`` restarting at every document of ``segment_ids``."""
+  """``_gated_delta_fwd_res``, restarting at every ``segment_ids`` document."""
   out, vjp = _gated_delta_vjp(
       q,
       k,
@@ -244,7 +279,7 @@ def _gated_delta_segments_bwd_res(
     min_log_decay: float,
     max_num_segments: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-  """Runs the backward kernels on ``_gated_delta_segments_fwd_res``'s residuals."""
+  """Runs the backward on ``_gated_delta_segments_fwd_res``'s residuals."""
   structs = _parse_input_spec(input_spec)
 
   def vjp_of(q, k, v, g, beta, segment_ids):
@@ -260,9 +295,7 @@ def _gated_delta_segments_bwd_res(
     )
 
   _, vjp_struct = jax.eval_shape(vjp_of, *structs)
-  vjp = jax.tree_util.tree_unflatten(
-      jax.tree_util.tree_structure(vjp_struct), list(residuals)
-  )
+  vjp = _rebuild_vjp(vjp_struct, residuals)
   return vjp(grad_out.astype(structs[0].dtype))
 
 
@@ -283,7 +316,7 @@ def _backward_segments_res(ctx, grad_outputs):
     return (None,) * 8
   grads = _gated_delta_segments_bwd_res(
       list(ctx.saved_tensors),
-      grad_out,
+      grad_out.contiguous(),
       ctx.input_spec,
       ctx.min_log_decay,
       ctx.max_num_segments,
@@ -301,20 +334,20 @@ def tokamax_segment_ids(
 ) -> torch.Tensor:
   """Converts ``segment_ids_from_positions`` ids to Tokamax's ``segment_ids``.
 
+  Tokamax reserves 0 for padding (whose output it zeroes) and keeps only the
+  first ``max_num_segments`` runs of ids per row apart, dropping the others:
+  ``gated_delta.per_row_segment_ids`` starts every row at 1 and merges the
+  documents beyond the budget into the last one instead.
+
   Args:
-    segment_ids_BS: ``[B, S]`` document index of each token, non-decreasing
-      along each row in steps of one (``segment_ids_from_positions``, possibly
-      counting on from earlier rows).
+    segment_ids_BS: ``[B, S]`` document index of each token (see
+      ``gated_delta.per_row_segment_ids``).
     max_num_segments: Documents per row that Tokamax keeps apart.
 
   Returns:
-    ``[B, S]`` int32 ids that start at 1 in every row (Tokamax reserves 0 for
-    padding, whose output it zeroes). Documents beyond ``max_num_segments``
-    share the last id, so they run as one sequence, as without segment ids,
-    instead of being dropped.
+    ``[B, S]`` int32 ids in ``[1, max_num_segments]``.
   """
-  ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
-  return ids.clamp(max=max_num_segments).to(torch.int32)
+  return per_row_segment_ids(segment_ids_BS, max_num_segments)
 
 
 def tokamax_gated_delta(
@@ -349,6 +382,8 @@ def tokamax_gated_delta(
     ``gated_delta.chunked_gated_delta`` does. Without ``segment_ids``,
     ``seq_len`` must be a multiple of 64 (the kernel's chunk size).
   """
+  # `jax_op` reads its operands by shape alone, so they must be dense.
+  q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
   if segment_ids is None:
     return _gated_delta_fwd_res(q, k, v, g, beta, float(min_log_decay))[0]
   if max_num_segments is None:
@@ -359,39 +394,90 @@ def tokamax_gated_delta(
       v,
       g,
       beta,
-      segment_ids,
+      segment_ids.contiguous(),
       float(min_log_decay),
       int(max_num_segments),
   )[0]
+
+
+_FALLBACK_REASONS_LOGGED: set[str] = set()
+
+
+def _log_fallback_once(reason: str) -> None:
+  if reason not in _FALLBACK_REASONS_LOGGED:
+    _FALLBACK_REASONS_LOGGED.add(reason)
+    logger.warning(
+        "TokamaxGatedDeltaKernel: running the XLA chunked_gated_delta (%s).",
+        reason,
+    )
 
 
 class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
   """``TpuGatedDeltaKernel`` with Tokamax's Mosaic KDA kernels on TPU.
 
   The kernels keep each 64-token chunk in VMEM, so ``chunk_size`` does not
-  apply. With packed documents (``segment_ids_BS``), the recurrence restarts at
-  each of the first ``max_num_segments`` documents of every row.
+  apply. With packed documents (``segment_ids_BS``), the convolution and the
+  recurrence restart at each of the first ``max_num_segments`` documents of
+  every row (see ``document_ids``). Log decays are clamped to at least
+  ``min_log_decay`` (see the module docstring). Inputs the kernels do not take
+  (not on TPU, not bf16/fp32, head dims above 256, or rows without document
+  ids that are not a multiple of 64 tokens) run the parent's XLA recurrence,
+  unclamped.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(TpuGatedDeltaKernel.Config):
-    # Per-token log decays below this are clamped to it (see
+    # Per-token log decays below this are clamped to it, in [-5, 0) (see
     # `DEFAULT_MIN_LOG_DECAY`).
     min_log_decay: float = DEFAULT_MIN_LOG_DECAY
     # Packed documents per row kept apart (Tokamax's `max_num_segments`);
-    # later documents of a row share one recurrence. Tokamax lays every
-    # document out from a 64-token chunk boundary, so the kernels run up to
-    # `seq_len + 63 * max_num_segments` tokens per row. None: one document per
-    # `TOKENS_PER_SEGMENT` tokens of the row (at most 12% more kernel tokens;
-    # 16 per 8K row, which covers every row of `c4_test` packed at 8K, at
-    # most 13 documents). `dataloader.max_num_documents` (plus one for a
-    # padded row's tail) bounds the documents per row.
+    # later documents of a row share one sequence in the convolution and the
+    # recurrence. Tokamax lays every document out from a 64-token chunk
+    # boundary, so the kernels always run `seq_len + 63 * max_num_segments`
+    # tokens per row. None: one document per `TOKENS_PER_SEGMENT` tokens of the
+    # row, at least `MIN_NUM_SEGMENTS` (12% more kernel tokens at >= 2K; 16 per
+    # 8K row covers every row of `c4_test` with the test tokenizer, at most 13
+    # documents). Rows of many short documents (e.g. RL) need more.
     max_num_segments: int | None = None
 
   def __init__(self, config: Config):
     super().__init__(config)
+    if not DEFAULT_MIN_LOG_DECAY <= config.min_log_decay < 0:
+      raise ValueError(
+          f"min_log_decay must be in [{DEFAULT_MIN_LOG_DECAY}, 0), got"
+          f" {config.min_log_decay}: the kernels overflow below it."
+      )
+    if config.max_num_segments is not None and config.max_num_segments < 1:
+      raise ValueError(
+          f"max_num_segments must be positive, got {config.max_num_segments}"
+      )
     self.min_log_decay = config.min_log_decay
     self.max_num_segments = config.max_num_segments
+
+  def _num_segments(self, seq_len: int) -> int:
+    if self.max_num_segments is not None:
+      return self.max_num_segments
+    return max(MIN_NUM_SEGMENTS, seq_len // TOKENS_PER_SEGMENT)
+
+  def document_ids(self, segment_ids_BS: torch.Tensor) -> torch.Tensor:
+    """Tokamax's per-row ids: documents beyond the budget share the last."""
+    return tokamax_segment_ids(
+        segment_ids_BS, self._num_segments(segment_ids_BS.shape[1])
+    )
+
+  def _unsupported(
+      self, q_BSHK: torch.Tensor, segment_ids_BS: torch.Tensor | None
+  ) -> str | None:
+    """Why the Mosaic kernels cannot run these inputs, or None."""
+    if q_BSHK.device.type != "tpu":
+      return f"device {q_BSHK.device.type}"
+    if q_BSHK.dtype not in _KERNEL_DTYPES:
+      return f"dtype {q_BSHK.dtype}"
+    if q_BSHK.shape[-1] > _MAX_KERNEL_HEAD_DIM:
+      return f"head dim {q_BSHK.shape[-1]}"
+    if segment_ids_BS is None and q_BSHK.shape[1] % _KERNEL_CHUNK:
+      return f"{q_BSHK.shape[1]}-token rows"
+    return None
 
   def recurrence(
       self,
@@ -402,6 +488,12 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
       beta_BSH: torch.Tensor,
       segment_ids_BS: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    reason = self._unsupported(q_BSHK, segment_ids_BS)
+    if reason is not None:
+      _log_fallback_once(reason)
+      return super().recurrence(
+          q_BSHK, k_BSHK, v_BSHV, g_BSH, beta_BSH, segment_ids_BS
+      )
     if segment_ids_BS is None:
       return tokamax_gated_delta(
           q_BSHK,
@@ -411,9 +503,7 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
           beta_BSH,
           min_log_decay=self.min_log_decay,
       )
-    max_num_segments = self.max_num_segments or max(
-        MIN_NUM_SEGMENTS, q_BSHK.shape[1] // TOKENS_PER_SEGMENT
-    )
+    max_num_segments = self._num_segments(q_BSHK.shape[1])
     return tokamax_gated_delta(
         q_BSHK,
         k_BSHK,
@@ -433,5 +523,26 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
 )
 def tokamax_gated_delta_kernel(
     cfg: TpuGatedDeltaKernel.Config,
+    *,
+    min_log_decay: float = DEFAULT_MIN_LOG_DECAY,
+    max_num_segments: int | None = None,
 ) -> TokamaxGatedDeltaKernel.Config:
-  return derive(cfg, TokamaxGatedDeltaKernel.Config)
+  """``TokamaxGatedDeltaKernel.Config`` with the override's arguments.
+
+  For example ``(TOKAMAX_GATED_DELTA_OVERRIDE, {"max_num_segments": 32})`` in
+  ``override.imports`` keeps up to 32 packed documents per row apart.
+
+  Args:
+    cfg: The ``TpuGatedDeltaKernel.Config`` to replace.
+    min_log_decay: See ``TokamaxGatedDeltaKernel.Config``.
+    max_num_segments: See ``TokamaxGatedDeltaKernel.Config``.
+
+  Returns:
+    The Tokamax kernel's config.
+  """
+  return derive(
+      cfg,
+      TokamaxGatedDeltaKernel.Config,
+      min_log_decay=min_log_decay,
+      max_num_segments=max_num_segments,
+  )

@@ -157,13 +157,16 @@ def select_routing(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 # save them in every layer.
 ROUTING_REGION = SaveRegion(name=MOE_ROUTING, select=select_routing)
 
-# The forward ops of both TPU Splash kernels. Stock Splash
+# The forward ops of the TPU Splash kernels. Stock Splash
 # (``kernels/splash_attention.py``) registers one op per kernel configuration,
 # ``pallas::splash_attn_fwd_<16 hex digits>``; Tokamax Splash
 # (``kernels/tokamax_splash_attention.py``) registers
-# ``pallas::tokamax_splash_attn_fwd``.
+# ``pallas::tokamax_splash_attn_fwd``; the bias/dropout/sinks Splash
+# (``kernels/splash_bias_dropout.py``) registers ``pallas::sbd_splash_attn_fwd``.
+# All return the (output, LSE) pair their backward reads.
 _SPLASH_FORWARD_OP_NAME = re.compile(
-    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd)"
+    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd"
+    r"|sbd_splash_attn_fwd)"
 )
 
 

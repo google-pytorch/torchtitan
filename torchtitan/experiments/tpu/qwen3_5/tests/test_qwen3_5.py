@@ -8,7 +8,8 @@ Covers:
    plus the adapter round trip.
 2. ``chunked_gated_delta`` against the exact per-token recurrence, also with
    packed documents, and the slice-based causal convolution's backward against
-   autograd of ``conv1d``, also with packed documents.
+   autograd of ``conv1d``, also with packed documents, and in bf16 against the
+   accuracy of the autograd it replaces.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls).
@@ -457,6 +458,84 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     expected_grads = torch.autograd.grad(expected, (x, weight), grad)
     for actual_grad, expected_grad in zip(grads, expected_grads, strict=True):
       torch.testing.assert_close(actual_grad, expected_grad)
+
+  def test_causal_conv_silu_partial_input_grads(self):
+    """Tests the conv backward when only the input or the weight needs grad."""
+    torch.manual_seed(0)
+    channels, kernel_size = 8, 4
+    x = torch.randn(2, 11, channels, dtype=torch.float64)
+    weight = torch.randn(channels, 1, kernel_size, dtype=torch.float64)
+    grad = torch.randn(2, 11, channels, dtype=torch.float64)
+    for name, x_grad in (("x", True), ("weight", False)):
+      with self.subTest(grad_of=name):
+        x_in = x.clone().requires_grad_(x_grad)
+        w_in = weight.clone().requires_grad_(not x_grad)
+        leaf = x_in if x_grad else w_in
+        expected = F.silu(
+            F.conv1d(
+                F.pad(x_in.transpose(1, 2), (kernel_size - 1, 0)),
+                w_in,
+                groups=channels,
+            ).transpose(1, 2)
+        )
+        (actual_grad,) = torch.autograd.grad(
+            gated_delta.causal_conv_silu(x_in, w_in), leaf, grad
+        )
+        (expected_grad,) = torch.autograd.grad(expected, leaf, grad)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_rows", packed=False),
+      dict(testcase_name="_packed_documents", packed=True),
+  )
+  def test_causal_conv_silu_bf16_backward_accuracy(self, packed: bool):
+    """Tests the bf16 conv backward against fp64 over 16K-token dw sums.
+
+    The slice-based backward must be as accurate as the autograd it replaces
+    (fp32 tap and dw products and sums). Adding the dw products in bf16 is not:
+    torch_tpu disallows XLA excess precision, so a bf16 sum rounds every add.
+    """
+    torch.manual_seed(0)
+    bs, seq_len, channels, kernel_size = 8, 2048, 128, 4
+    # Biased activations and gradients (correlated, as in the model) make the
+    # dw sums grow with the number of tokens.
+    x = (torch.randn(bs, seq_len, channels) + 0.5).bfloat16()
+    weight = (0.5 * torch.randn(channels, 1, kernel_size)).bfloat16()
+    grad = (torch.randn(bs, seq_len, channels) + 0.25).bfloat16()
+    segment_ids = None
+    if packed:
+      doc_lens = (700, 1, 3, 500, 844)
+      segment_ids = segment_ids_from_positions(_packed_positions(doc_lens))
+      segment_ids = segment_ids.expand(bs, -1)
+
+    def conv_grads(fn, device, dtype):
+      x_in = x.to(device, dtype).requires_grad_()
+      w_in = weight.to(device, dtype).requires_grad_()
+      seg = None if segment_ids is None else segment_ids.to(device)
+      return torch.autograd.grad(
+          fn(x_in, w_in, seg), (x_in, w_in), grad.to(device, dtype)
+      )
+
+    def autograd_conv_silu(x_in, w_in, seg):
+      return F.silu(gated_delta._causal_conv(x_in, w_in, seg))  # pylint: disable=protected-access
+
+    # fp64 on the bf16 values: only the backward's own rounding counts.
+    expected_grads = conv_grads(autograd_conv_silu, "cpu", torch.float64)
+    dev = self.accelerator_device
+    grads = conv_grads(gated_delta.causal_conv_silu, dev, torch.bfloat16)
+    autograd_grads = conv_grads(autograd_conv_silu, dev, torch.bfloat16)
+    for name, grad_bf16, autograd_bf16, expected_grad in zip(
+        ("x", "weight"), grads, autograd_grads, expected_grads, strict=True
+    ):
+      self.assertEqual(grad_bf16.dtype, torch.bfloat16)
+      err = _relative_l2_error(grad_bf16, expected_grad)
+      autograd_err = _relative_l2_error(autograd_bf16, expected_grad)
+      self.assertLessEqual(
+          err,
+          1.25 * autograd_err,
+          msg=f"d{name}: {err:.2e} vs autograd {autograd_err:.2e}",
+      )
+      self.assertLess(err, 1e-2, msg=f"d{name}: {err:.2e}")
 
   @parameterized.named_parameters(
       # Documents start mid-chunk and at chunk starts (16 and 48 with 16-token

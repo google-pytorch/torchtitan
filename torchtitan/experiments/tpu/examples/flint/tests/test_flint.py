@@ -254,6 +254,14 @@ class TestFlintStateDictAdapter(absltest.TestCase):
 class TestFlintHFReferenceParity(BaseDeviceTest):
   """One forward + backward of TorchTitan Flint vs HF FlintForCausalLM."""
 
+  # Keyed by on_tpu: CPU runs at "highest", TPU at "high". The floor is the
+  # common GroupedExperts, which casts expert matmuls to bf16 on every device
+  # (measured 2026-10-29: logits 3.8e-4 / loss 7e-6 / worst expert-gradient
+  # relative L2 5.8e-3 on CPU; worst gradient 6.4e-3 on a v6e chip).
+  LOGIT_ATOL = {False: 2e-3, True: 2e-2}
+  LOSS_ATOL = {False: 1e-4, True: 2e-3}
+  GRAD_REL_L2 = {False: 2e-2, True: 2e-2}
+
   def setUp(self):
     super().setUp()
     if not hasattr(transformers, "FlintForCausalLM"):
@@ -335,16 +343,25 @@ class TestFlintHFReferenceParity(BaseDeviceTest):
     positions = torch.arange(seq_len, device=self.accelerator_device).repeat(batch_size)
     num_tokens = labels_cpu.numel()
 
-    with set_unflatten_seq_len(seq_len):
-      tt_logits = tt_model(
-          tokens_cpu.view(-1).to(self.accelerator_device), positions=positions
-      ).view(batch_size, seq_len, -1)
-    tt_loss = cross_entropy_loss(tt_logits, labels_cpu.to(self.accelerator_device)) / num_tokens
-    tt_loss.backward()
-
-    hf_logits = hf_model(input_ids=tokens_cpu).logits
-    hf_loss = cross_entropy_loss(hf_logits, labels_cpu) / num_tokens
-    hf_loss.backward()
+    # "highest" fp32 matmul precision keeps the comparison at fp32 round-off;
+    # torch_tpu's default is one bf16 pass (~1e-2). libtpu 0.0.48 rejects
+    # HIGHEST for the ragged dot behind torch._grouped_mm, so the TPU run of
+    # an MoE model uses "high".
+    on_tpu = self.accelerator_device.type == "tpu"
+    prev_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high" if on_tpu else "highest")
+    try:
+      with set_unflatten_seq_len(seq_len):
+        tt_logits = tt_model(
+            tokens_cpu.view(-1).to(self.accelerator_device), positions=positions
+        ).view(batch_size, seq_len, -1)
+      tt_loss = cross_entropy_loss(tt_logits, labels_cpu.to(self.accelerator_device)) / num_tokens
+      tt_loss.backward()
+      hf_logits = hf_model(input_ids=tokens_cpu).logits
+      hf_loss = cross_entropy_loss(hf_logits, labels_cpu) / num_tokens
+      hf_loss.backward()
+    finally:
+      torch.set_float32_matmul_precision(prev_precision)
 
     labels = dict(
         test_label=f"TorchTitan Flint ({self.accelerator_device.type})",
@@ -352,11 +369,13 @@ class TestFlintHFReferenceParity(BaseDeviceTest):
     )
     test_utils.check_equivalence(
         tt_logits.detach().float().cpu(), hf_logits.detach().float(),
-        atol=1e-1, rtol=2e-2, check_name="Logits", **labels,
+        atol=self.LOGIT_ATOL[on_tpu], rtol=self.LOGIT_ATOL[on_tpu],
+        check_name="Logits", **labels,
     )
     test_utils.check_equivalence(
         tt_loss.detach().float().cpu(), hf_loss.detach().float(),
-        atol=5e-3, rtol=2e-3, check_name="Loss", **labels,
+        atol=self.LOSS_ATOL[on_tpu], rtol=self.LOSS_ATOL[on_tpu],
+        check_name="Loss", **labels,
     )
     tt_grads = {
         n: p.grad.detach().float().cpu()
@@ -367,12 +386,17 @@ class TestFlintHFReferenceParity(BaseDeviceTest):
         for n, p in hf_model.named_parameters() if p.grad is not None
     })
     self.assertEqual(set(tt_grads), set(hf_grads))
+    worst = 0.0
     for name in sorted(tt_grads):
-      test_utils.check_equivalence(
-          tt_grads[name], hf_grads[name], atol=8e-2, rtol=2e-2,
-          check_name=f"Gradient ({name})", **labels,
-      )
-
+      ref = hf_grads[name]
+      err = float((tt_grads[name] - ref).norm())
+      ref_norm = float(ref.norm())
+      # Relative L2 per tensor (an elementwise atol passes a zeroed gradient
+      # whose entries are small); absolute floor only for tiny gradients.
+      rel = err / ref_norm if ref_norm >= 1e-4 else err / 1e-4
+      worst = max(worst, rel)
+      self.assertLess(rel, self.GRAD_REL_L2[on_tpu], f"gradient {name}: rel L2 {rel:.3e}")
+    print(f"worst gradient relative L2 ({self.accelerator_device.type}): {worst:.3e}")
 
 if __name__ == "__main__":
   absltest.main()

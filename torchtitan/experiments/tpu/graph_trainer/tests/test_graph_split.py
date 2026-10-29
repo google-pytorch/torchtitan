@@ -858,7 +858,7 @@ class GraphSplitTest(absltest.TestCase):
     try:
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
-        model = _RowFoldedToyTransformer(n_layers=2)
+        model = _RowFoldedToyTransformer(n_layers=2).to(torch.bfloat16)
         annotate_module_fqns(model)
         model = data_parallel(
             model,

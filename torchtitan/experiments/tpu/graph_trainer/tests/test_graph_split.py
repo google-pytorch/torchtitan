@@ -109,13 +109,15 @@ class _RowFoldedToyTransformer(nn.Module):
   as Qwen3.5 35B `in_proj_a`/`in_proj_b` (`[32, 2048]` across 8 ranks) do.
   """
 
-  def __init__(self, n_layers: int) -> None:
+  def __init__(
+      self, n_layers: int, dtype: torch.dtype = torch.bfloat16
+  ) -> None:
     super().__init__()
     self.layers = nn.ModuleList(
         nn.Sequential(
-            nn.Linear(256, 8, bias=False),
+            nn.Linear(256, 8, bias=False, dtype=dtype),
             nn.ReLU(),
-            nn.Linear(8, 256, bias=False),
+            nn.Linear(8, 256, bias=False, dtype=dtype),
         )
         for _ in range(n_layers)
     )
@@ -189,9 +191,7 @@ class GraphSplitTest(absltest.TestCase):
     """Trace the shared model through real SimpleFSDP with fake collectives."""
 
     self.assertFalse(dist.is_initialized())
-    dist.init_process_group(
-        "fake", store=FakeStore(), rank=0, world_size=2
-    )
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
     try:
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
@@ -205,9 +205,7 @@ class GraphSplitTest(absltest.TestCase):
                 reduce_dtype=reduce_dtype,
             ),
         )
-        inputs = torch.randn(
-            2, 8, dtype=torch.bfloat16, requires_grad=True
-        )
+        inputs = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
 
         traced = self._trace_toy_model(model=model, inputs=inputs)
     finally:
@@ -254,13 +252,11 @@ class GraphSplitTest(absltest.TestCase):
             for node in split.forward_graph.graph.nodes
         )
     )
-    self.assertNotEmpty(
-        [
-            node
-            for node in split.backward_graph.graph.nodes
-            if node.meta.get("autograd_backward", False)
-        ]
-    )
+    self.assertNotEmpty([
+        node
+        for node in split.backward_graph.graph.nodes
+        if node.meta.get("autograd_backward", False)
+    ])
     backward = split_backward_graph_by_layer(
         split.backward_graph,
         n_layers=2,
@@ -362,9 +358,7 @@ class GraphSplitTest(absltest.TestCase):
           if node.op == "call_function"
           and node.target is torch.ops.aten.alias.default
       ]
-      backward_names = {
-          node.name for node in split.backward_graph.graph.nodes
-      }
+      backward_names = {node.name for node in split.backward_graph.graph.nodes}
       self.assertNotEmpty(aliases)
       self.assertTrue(
           all(alias.name in backward_names for alias in aliases),
@@ -433,9 +427,7 @@ class GraphSplitTest(absltest.TestCase):
   def test_cpu_offload_ops_are_compiled_inside_layer_children(self):
     """Keep each AO copy and wait together instead of in the eager parent."""
     traced = self._trace_cpu_offload_graph()
-    split = split_forward_backward_graph(
-        traced.gm, traced.example_inputs
-    )
+    split = split_forward_backward_graph(traced.gm, traced.example_inputs)
     donor_specs, donor_output_positions, donor_examples = (
         thread_host_offload_donors(split.forward_graph)
     )
@@ -511,16 +503,14 @@ class GraphSplitTest(absltest.TestCase):
     parent_donors = [
         node
         for node in forward.module.graph.nodes
-        if node.op == "placeholder"
-        and node.meta.get("tpu_force_donate", False)
+        if node.op == "placeholder" and node.meta.get("tpu_force_donate", False)
     ]
     self.assertLen(parent_donors, 1)
     child_donors = [
         node
         for child in forward.module.children()
         for node in child.graph.nodes
-        if node.op == "placeholder"
-        and node.meta.get("tpu_force_donate", False)
+        if node.op == "placeholder" and node.meta.get("tpu_force_donate", False)
     ]
     self.assertLen(child_donors, 1)
     donor_waits = [
@@ -577,9 +567,7 @@ class GraphSplitTest(absltest.TestCase):
     for distance in (0, 1):
       with self.subTest(distance=distance):
         traced = self._trace_cpu_offload_graph()
-        split = split_forward_backward_graph(
-            traced.gm, traced.example_inputs
-        )
+        split = split_forward_backward_graph(traced.gm, traced.example_inputs)
         backward = split_backward_graph_by_layer(
             split.backward_graph,
             n_layers=3,
@@ -806,9 +794,7 @@ class GraphSplitTest(absltest.TestCase):
     self.assertLen(reduce_casts, 2)
     for cast in reduce_casts:
       wait = cast.all_input_nodes[0]
-      self.assertEqual(
-          chunked.partition_map[cast], chunked.partition_map[wait]
-      )
+      self.assertEqual(chunked.partition_map[cast], chunked.partition_map[wait])
 
     # Also verify that when `_movedim_reduce_scatter_tensor` inserts a post-RS
     # view (`reshape` / `movedim`) between `wait_tensor` and the post-RS
@@ -858,7 +844,7 @@ class GraphSplitTest(absltest.TestCase):
     try:
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
-        model = _RowFoldedToyTransformer(n_layers=2).to(torch.bfloat16)
+        model = _RowFoldedToyTransformer(n_layers=2, dtype=torch.bfloat16)
         annotate_module_fqns(model)
         model = data_parallel(
             model,

@@ -129,6 +129,39 @@ The recipe is tuned on `2x2x1` and run unchanged on the larger slices. Above
 64K tokens per rank, `2x2x1` runs out of HBM with 2 layers per executable;
 with 1 layer per executable, 96K tokens per rank gives the same MFU as 64K.
 
+## Expert Parallelism
+
+`qwen35_moe_35b_split_tokamax_ep_benchmark` (EP=4; set another degree with
+`--parallelism.expert_parallel_degree=<EP>`) shards the routed experts over
+`EP` ranks and FSDP-shards them over the remaining `efsdp` ranks; all other
+parameters stay sharded over `fsdp`:
+
+* `TpuQwen35TokenDispatcher` dispatches and combines tokens with static-shape
+  all-to-alls (no host syncs), which `TpuGraphTrainer` can trace. Each rank
+  sends at most `ceil(1.25 * T * top_k / EP)` tokens to each other rank;
+  tokens beyond that are dropped (zero expert output), unlike the dropless
+  `EP=1` path.
+* The experts use the unpaired Pallas grouped matmuls (`ExpertParallel` shards
+  the expert weights on dim 0).
+* The optimizer gets one param group per device mesh, and the gradient norm
+  is computed eagerly over both meshes (`compile_grad_norm=False`).
+* Graph split uses one layer per executable with `by_layer` backward
+  executables (3 distinct backward executables to compile instead of 6).
+
+Full 40-layer model, `4x4x4` (128 ranks), 32K tokens per rank:
+
+| EP | Step time | Tokens/s/rank | MFU | Memory (XLA reservation) |
+| --- | --- | --- | --- | --- |
+| 1 | 4.25 s | 7,707 | 12.7% | 20.8 GiB |
+| 4 | 9.61 s | 3,410 | 5.6% | 17.3 GiB |
+| 8 | 8.61 s | 3,808 | 6.3% | 17.2 GiB |
+| 16 | 10.46 s | 3,134 | 5.2% | 17.1 GiB |
+
+At this model size EP is about 2x slower than `EP=1`: the all-to-alls, the
+unpaired grouped matmuls on smaller per-expert groups and the one-layer
+executables cost more than the smaller expert all-gathers save. It is meant
+for scaling beyond what FSDP alone fits.
+
 ## Notes
 
 * With `reset_at_documents=False` (this recipe), `GatedDeltaNet` runs one

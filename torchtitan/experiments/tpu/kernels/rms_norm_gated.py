@@ -57,23 +57,37 @@ def _bwd_kernel(eps, x_ref, g_ref, w_ref, dy_ref, dx_ref, dg_ref, dw_ref):
   dx_ref[...] = dx.astype(dx_ref.dtype)
 
 
-def _row_spec(dim: int) -> pl.BlockSpec:
-  return pl.BlockSpec((_BLOCK_ROWS, dim), lambda i: (i, 0))
+def _block_rows(dim: int, *dtypes) -> int:
+  """Row block size (``<= 2048``, power of 2) keeping tile buffers <= 1 MiB."""
+  elem_bytes = max(jnp.dtype(dt).itemsize for dt in dtypes)
+  # Keep each (block_rows, dim) buffer <= 1 MiB so 5 double-buffered backward
+  # arrays (x, gate, dy, dx, dg = 10 buffers) stay <= 10 MiB, fitting TPU
+  # v5e/v6e's 16 MiB default scoped VMEM while keeping 2048 rows at dim=128.
+  block = _BLOCK_ROWS
+  while block > 128 and block * dim * elem_bytes > 1024 * 1024:
+    block //= 2
+  return block
+
+
+def _row_spec(block_rows: int, dim: int) -> pl.BlockSpec:
+  return pl.BlockSpec((block_rows, dim), lambda i: (i, 0))
 
 
 def rms_norm_gated_fwd_jax(
     x: jax.Array, gate: jax.Array, w: jax.Array, eps: float
 ) -> jax.Array:
   rows, dim = x.shape
+  block_rows = _block_rows(dim, x.dtype, gate.dtype)
+  row_spec = _row_spec(block_rows, dim)
   return pl.pallas_call(
       lambda *refs: _fwd_kernel(eps, *refs),
-      grid=(rows // _BLOCK_ROWS,),
+      grid=(rows // block_rows,),
       in_specs=[
-          _row_spec(dim),
-          _row_spec(dim),
+          row_spec,
+          row_spec,
           pl.BlockSpec((1, dim), lambda i: (0, 0)),
       ],
-      out_specs=_row_spec(dim),
+      out_specs=row_spec,
       out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
       compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
       name="rms_norm_gated_fwd",
@@ -85,18 +99,20 @@ def rms_norm_gated_bwd_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Returns ``(dx, dg, dw_1D)`` accumulated in FP32 across row blocks."""
   rows, dim = x.shape
+  block_rows = _block_rows(dim, x.dtype, gate.dtype, dy.dtype)
+  row_spec = _row_spec(block_rows, dim)
   return pl.pallas_call(
       lambda *refs: _bwd_kernel(eps, *refs),
-      grid=(rows // _BLOCK_ROWS,),
+      grid=(rows // block_rows,),
       in_specs=[
-          _row_spec(dim),
-          _row_spec(dim),
+          row_spec,
+          row_spec,
           pl.BlockSpec((1, dim), lambda i: (0, 0)),
-          _row_spec(dim),
+          row_spec,
       ],
       out_specs=[
-          _row_spec(dim),
-          _row_spec(dim),
+          row_spec,
+          row_spec,
           pl.BlockSpec((1, dim), lambda i: (0, 0)),
       ],
       out_shape=[

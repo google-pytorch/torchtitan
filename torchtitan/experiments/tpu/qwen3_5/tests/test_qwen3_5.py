@@ -17,6 +17,7 @@ Covers:
 """
 
 import copy
+import functools
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -908,6 +909,87 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         _relative_l2_error(out_leaky[inner_starts], expected[inner_starts]),
         0.1,
         msg="Negative control failed: no GDN leak without positions",
+    )
+
+  def test_per_row_segment_ids(self):
+    """Tests per-row 1-based document ids capped at max_num_segments."""
+    positions = torch.cat([
+        _packed_positions((2, 1, 3, 2)),  # row 0: 4 documents
+        _packed_positions((5, 3)),  # row 1: 2 documents
+    ])
+    stream_ids = segment_ids_from_positions(positions).reshape(2, 8)
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(stream_ids, 3),
+        torch.tensor(
+            [[1, 1, 2, 3, 3, 3, 3, 3], [1, 1, 1, 1, 1, 2, 2, 2]],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(stream_ids, 8)[0],
+        torch.tensor([1, 1, 2, 3, 3, 3, 4, 4], dtype=torch.int32),
+    )
+
+  def test_gated_delta_net_document_ids_reach_conv_and_recurrence(self):
+    """Tests that the kernel's document ids drive the conv and recurrence."""
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn = config.layers[0].delta_net.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    gdn = gdn.to(self.accelerator_device)
+    dev = self.accelerator_device
+    # One 80-token row of 4 documents; a kernel that keeps 2 apart must merge
+    # documents 2-4 in both the convolution and the recurrence, exactly as if
+    # they were one document.
+    seq_len, cap = 80, 2
+    x = torch.randn(seq_len, config.dim, device=dev)
+    positions = _packed_positions((20, 15, 25, 20)).to(dev)
+    merged = _packed_positions((20, 60)).to(dev)
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      expected = gdn(x, positions=merged)
+      uncapped = gdn(x, positions=positions)
+      gdn.inner_gated_delta_net.kernel.document_ids = functools.partial(
+          gated_delta.per_row_segment_ids, max_num_segments=cap
+      )
+      capped = gdn(x, positions=positions)
+
+    tol = 5e-3 if self._is_tpu() else 1e-5
+    test_utils.check_equivalence(
+        capped.cpu(),
+        expected.cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Capped Document Ids",
+    )
+    # Negative control: keeping every document apart differs at the merges.
+    self.assertGreater(
+        _relative_l2_error(uncapped[35:39], expected[35:39]),
+        0.1,
+        msg="Negative control failed: capping the documents changed nothing",
+    )
+
+  def test_use_tokamax_gated_delta(self):
+    """Tests the recipe helper that selects the Tokamax GatedDeltaNet."""
+    cfg = config_registry.qwen35_moe_35b()
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, cfg.override.imports
+    )
+    config_registry._use_tokamax_gated_delta(cfg)  # pylint: disable=protected-access
+    config_registry._use_tokamax_gated_delta(cfg)  # pylint: disable=protected-access
+    self.assertEqual(
+        cfg.override.imports.count(
+            config_registry.TOKAMAX_GATED_DELTA_OVERRIDE
+        ),
+        1,
+    )
+    module, _, factory = (
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE.rpartition(".")
+    )
+    self.assertEqual(
+        (module, factory),
+        (
+            "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta",
+            "tokamax_gated_delta_kernel",
+        ),
     )
 
   def test_model_isolates_packed_documents(self):

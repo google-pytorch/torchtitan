@@ -10,6 +10,7 @@ from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.examples.flint import model_registry
+from torchtitan.experiments.tpu.examples.flint.model import FlintSinkAttention
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
@@ -25,6 +26,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 __all__ = [
     "flint_40b",
     "flint_40b_proxy",
+    "flint_40b_v002",
     "flint_debugmodel",
     "flint_moe_testmodel",
 ]
@@ -154,4 +156,18 @@ def flint_40b_proxy() -> TPUTrainerConfig:
   )
   config.training.num_tokens_per_train_step = -1
   config.training.num_tokens_per_microbatch_per_dp_rank = 2 * _40B_CONTEXT_LENGTH
+  return config
+
+
+def _use_splash_kernel(config: TPUTrainerConfig) -> None:
+  for _, attention, _, _ in config.model_spec.model.traverse(
+      FlintSinkAttention.Config
+  ):
+    attention.use_splash_kernel = True
+
+
+def flint_40b_v002() -> TPUTrainerConfig:
+  """``flint_40b`` with attention on the sbd Splash kernel (sinks in-kernel)."""
+  config = flint_40b()
+  _use_splash_kernel(config)
   return config

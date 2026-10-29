@@ -332,7 +332,7 @@ def per_row_segment_ids(
     without document ids.
   """
   ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
-  return ids.clamp(max=max_num_segments).to(torch.int32)
+  return ids.clamp(min=1, max=max_num_segments).to(torch.int32)
 
 
 class TpuGatedDeltaKernel(GatedDeltaKernel):

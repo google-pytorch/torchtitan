@@ -6,6 +6,7 @@ Architecture constants are from the HF checkpoint's ``config.json``
 
 from collections.abc import Callable, Sequence
 import copy
+import dataclasses
 from functools import partial
 
 import torch.nn as nn
@@ -37,6 +38,7 @@ __all__ = [
     "FlintSinkAttention",
     "FlintStateDictAdapter",
     "flint_layer_types",
+    "graph_trainer_model_registry",
     "model_registry",
 ]
 
@@ -339,4 +341,15 @@ def model_registry(
       pipelining_fn=None,
       post_optimizer_build_fn=register_moe_load_balancing_hook,
       state_dict_adapter=FlintStateDictAdapter,
+  )
+
+
+def graph_trainer_model_registry(flavor: str) -> ModelSpec:
+  """GraphTrainer spec: the regular Flint spec with the TPU GraphTrainer
+  SimpleFSDP parallelization (``tpu/graph_trainer/qwen3.py``, which is
+  model-agnostic for a Qwen3-block MoE decoder)."""
+  from torchtitan.experiments.tpu.graph_trainer.qwen3 import parallelize_qwen3 as graph_parallelize  # pylint: disable=g-import-not-at-top
+
+  return dataclasses.replace(
+      model_registry(flavor), parallelize_fn=graph_parallelize, pipelining_fn=None
   )

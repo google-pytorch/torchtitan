@@ -9,7 +9,17 @@ from torchtitan.components.validate import Validator
 from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
-from torchtitan.experiments.tpu.examples.flint import model_registry
+from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.examples.flint import (
+    graph_trainer_model_registry,
+    model_registry,
+)
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
+)
 from torchtitan.experiments.tpu.examples.flint.model import FlintSinkAttention
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.grouped_experts import (
@@ -31,6 +41,8 @@ __all__ = [
     "flint_40b_v003",
     "flint_40b_v004_mb16",
     "flint_40b_v004_mb32",
+    "flint_40b_v005_gt",
+    "graph_trainer_flint_debugmodel",
     "flint_debugmodel",
     "flint_moe_testmodel",
 ]
@@ -222,3 +234,33 @@ def flint_40b_v004_mb32() -> TPUTrainerConfig:
   config = flint_40b_v003()
   config.training.num_tokens_per_microbatch_per_dp_rank = 32 * _40B_CONTEXT_LENGTH
   return config
+
+
+def _to_graph_trainer(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
+  """The same recipe on TPU GraphTrainer: forward, loss and backward traced
+  into one program per step with SimpleFSDP collectives inside it, so XLA can
+  schedule parameter all-gathers and gradient reduce-scatters across layers.
+  Full remat matches the per-layer recipe's full AC."""
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      config, graph_trainer_model_registry
+  )
+  graph_config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full",
+  )
+  # Shardy HLO sharding v3 (default in libtpu 0.0.48) segfaults in
+  # buildTensorFactorShardings on GraphTrainer.
+  graph_config.xla_flags = tpu_flags.merge_flags(
+      graph_config.xla_flags, xla_enable_hlo_sharding_v3=False
+  )
+  return graph_config
+
+
+def graph_trainer_flint_debugmodel() -> TpuGraphTrainer.Config:
+  return _to_graph_trainer(flint_debugmodel())
+
+
+def flint_40b_v005_gt() -> TpuGraphTrainer.Config:
+  """``flint_40b_v004_mb16`` on TPU GraphTrainer."""
+  return _to_graph_trainer(flint_40b_v004_mb16())

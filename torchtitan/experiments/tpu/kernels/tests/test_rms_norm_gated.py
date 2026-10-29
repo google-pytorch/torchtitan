@@ -1,11 +1,14 @@
 """Accelerator tests for the Pallas gated RMSNorm kernels."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torch.distributed.tensor import DTensor
 import torch.nn.functional as F
+from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import device_type
 from torchtitan.experiments.tpu.kernels import rms_norm_gated
 
 
@@ -139,6 +142,7 @@ class RmsNormGatedTest(
 
   def test_non_contiguous_partial_grads_and_fullgraph_compile(self):
     self._require_tpu()
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
     torch.manual_seed(11)
     dev = self.accelerator_device
     full = torch.randn(2048, 2, 256, device=dev, dtype=torch.bfloat16)
@@ -213,6 +217,11 @@ class RmsNormGatedTest(
 
     with self.assertRaisesRegex(ValueError, "eps must be non-negative"):
       rms_norm_gated.rms_norm_gated(x_ok, x_ok, w_ok, -1e-6)
+
+    fake_dtensor = mock.MagicMock(spec=DTensor)
+    self.assertFalse(rms_norm_gated.supports(fake_dtensor, x_ok, w_ok))
+    self.assertFalse(rms_norm_gated.supports(x_ok, fake_dtensor, w_ok))
+    self.assertFalse(rms_norm_gated.supports(x_ok, x_ok, fake_dtensor))
 
 
 if __name__ == "__main__":

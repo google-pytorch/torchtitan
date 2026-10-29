@@ -275,6 +275,12 @@ def select_ffn_down_projection(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     return [node for node in _forward_call_nodes(gm) if node in chosen]
 
 
+# Saving the w2 output lets backward skip re-running the down-projection
+# matmul. Only blocks whose backward reads that output gain from it, i.e. a
+# norm after the FFN as in Muse Glimmer. In a pre-norm block the output only
+# feeds the residual add, so backward never reads it and the save is a no-op.
+# Under tensor parallelism the matmul output is a partial sum, and backward
+# would still redo the reduction that follows it.
 FFN_W2_REGION = SaveRegion(name=FEED_FORWARD_W2, select=select_ffn_down_projection)
 
 SAVE_REGIONS: dict[str, SaveRegion] = {

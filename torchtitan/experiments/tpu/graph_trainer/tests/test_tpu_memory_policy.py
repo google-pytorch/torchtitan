@@ -55,10 +55,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     resolve_save_regions,
     ROUTING_REGION,
     SaveRegion,
+    select_ffn_down_projection,
     select_route_permutations,
     select_routing,
     select_routing_decisions,
-    select_ffn_down_projection,
     select_saves,
     select_splash_attention,
     SPLASH_ATTENTION_REGION,
@@ -770,7 +770,6 @@ class TestTpuSelectivePolicy(unittest.TestCase):
                     and node.name.endswith("_recomputed")
                 ]
                 self.assertEqual(len(recomputed), recomputed_topks)
-
 
     def test_saved_w2_skips_the_down_projection_recompute(self) -> None:
         # Each layer's post-norm backward reads its w2 output; unless it is

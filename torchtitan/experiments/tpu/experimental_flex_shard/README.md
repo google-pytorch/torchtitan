@@ -109,6 +109,12 @@ average.
 
 ## Running
 
+The pinned executor is an optional experiment dependency, not a new dependency
+of existing TorchTitan recipes. CI discovers these CPU test modules normally.
+Dependency-free contract tests always run; executor-dependent tests explicitly
+skip when `TORCHTITAN_FLEX_SHARD_EXECUTOR` is unset. A skip is not graph or TPU
+validation. With the pinned dependency configured, all seven tests run.
+
 From the TorchTitan repo root in a compatible runtime:
 
 ```bash

@@ -96,6 +96,11 @@ def trainer_worker(rank, store, output):
 
 class TrainerParityTest(unittest.TestCase):
     def test_bitwise_loss_norm_and_repeat(self):
+        from torchtitan.experiments.tpu.experimental_flex_shard.tests.common import (
+            require_executor,
+        )
+
+        require_executor(self)
         with tempfile.TemporaryDirectory() as temporary:
             output = os.environ.get("TORCHTITAN_FLEX_SHARD_RESULTS", temporary)
             mp.start_processes(

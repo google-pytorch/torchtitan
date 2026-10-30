@@ -12,6 +12,9 @@ from torchtitan.experiments.tpu.experimental_flex_shard.dependency import (
     CORE_FILES,
     verify_core,
 )
+from torchtitan.experiments.tpu.experimental_flex_shard.tests.common import (
+    require_executor,
+)
 from torchtitan.experiments.tpu.experimental_flex_shard.trace import capture_sgd_step
 
 
@@ -29,6 +32,7 @@ class HelperContractTest(unittest.TestCase):
             capture_sgd_step(model, None, None, None, None, None)
 
     def test_modified_private_core_rejected(self):
+        require_executor(self)
         identity = verify_core()
         source = Path(identity["path"])
         with tempfile.TemporaryDirectory() as temporary:

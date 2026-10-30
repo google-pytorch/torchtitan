@@ -94,6 +94,11 @@ class SetupContractTest(unittest.TestCase):
             validate_config(config)
 
     def test_deferred_setup_and_global_norm(self):
+        from torchtitan.experiments.tpu.experimental_flex_shard.tests.common import (
+            require_executor,
+        )
+
+        require_executor(self)
         with tempfile.TemporaryDirectory() as temporary:
             mp.start_processes(
                 setup_worker,

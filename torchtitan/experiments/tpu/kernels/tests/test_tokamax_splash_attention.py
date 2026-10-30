@@ -444,6 +444,8 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       ("gqa_vmap_bwd_stacked", 2, dict(use_vmap_bwd=True, num_stacked_q_heads=4)),
       ("gqa_loop_fwd_stacked", 2, dict(use_vmap_bwd=True, use_batch_loop_fwd=True, num_stacked_q_heads=4)),
       ("mqa_loop_fwd", 1, dict(use_vmap_bwd=True, use_batch_loop_fwd=True)),
+      ("gqa_loop_fwd_bwd_stacked", 2, dict(use_batch_loop_fwd=True, use_batch_loop_bwd=True, num_stacked_q_heads=4)),
+      ("mqa_loop_bwd", 1, dict(use_batch_loop_bwd=True)),
   )
   def test_segment_ids_parity(self, n_kv_heads, config):
     """Packed-document forward and gradients match a block-causal SDPA reference."""

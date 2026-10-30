@@ -1044,6 +1044,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
             (128, 512, 512),
         )
+        self.assertTrue(splash.use_batch_loop_bwd)
+        self.assertEqual(
+            (
+                splash.sa_block_q_dkv,
+                splash.sa_block_kv_dkv,
+                splash.sa_block_kv_dkv_compute,
+            ),
+            (512, 512, 512),
+        )
 
   def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()

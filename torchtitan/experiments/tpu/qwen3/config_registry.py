@@ -949,6 +949,10 @@ def _use_q235_tokamax_attention(cfg: TPUTrainerConfig) -> None:
   splash.sa_block_q = 128
   splash.sa_block_kv = 512
   splash.sa_block_kv_compute = 512
+  splash.use_batch_loop_bwd = True
+  splash.sa_block_q_dkv = 512
+  splash.sa_block_kv_dkv = 512
+  splash.sa_block_kv_dkv_compute = 512
 
 
 def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:

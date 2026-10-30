@@ -122,6 +122,8 @@ class SplashAttentionKernelConfig:
   # Tokamax skips tiles with no same-document pair, but a vmapped call must keep
   # every tile that any example in the batch needs.
   use_batch_loop_fwd: bool = False
+  # Tokamax only. The same for the backward; takes precedence over use_vmap_bwd.
+  use_batch_loop_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

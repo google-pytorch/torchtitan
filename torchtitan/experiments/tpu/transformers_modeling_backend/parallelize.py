@@ -100,6 +100,12 @@ def parallelize_hf_transformers_tpu(
   if effective_compile_config.enable:
     for layer in model.layers.values():
       apply_spmd_safe(layer)
+    # HF backend configs have no layers list, so the trainer could not size
+    # Dynamo's recompile limits from the config; size them from the layers that
+    # are compiled here.
+    from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
+
+    workarounds.raise_dynamo_recompile_limits_for_num_layers(len(model.layers))
 
   # The shared parallelize builds and swaps the Titan MoE (phase 2) from the
   # configs probed at construction; rewrite those first so it builds the TPU

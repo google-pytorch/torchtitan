@@ -1064,5 +1064,37 @@ class WorkaroundsTest(parameterized.TestCase):
       cp_attention.validate_tpu_context_parallel(model, parallelism)
 
 
+class RaiseDynamoRecompileLimitsTest(parameterized.TestCase):
+  """The recompile limit covers train + validation compiles of every layer."""
+
+  def setUp(self):
+    super().setUp()
+    import torch._dynamo.config as dynamo_config  # pylint: disable=g-import-not-at-top
+
+    saved = (dynamo_config.recompile_limit,
+             dynamo_config.accumulated_recompile_limit)
+
+    def restore():
+      (dynamo_config.recompile_limit,
+       dynamo_config.accumulated_recompile_limit) = saved
+
+    self.addCleanup(restore)
+    dynamo_config.recompile_limit = 8
+    dynamo_config.accumulated_recompile_limit = 256
+    self.dynamo_config = dynamo_config
+
+  def test_num_layers_covers_train_and_validation_compiles(self):
+    workarounds.raise_dynamo_recompile_limits_for_num_layers(42)
+    self.assertEqual(self.dynamo_config.recompile_limit, 2 * 42 + 16)
+    self.assertEqual(self.dynamo_config.accumulated_recompile_limit,
+                     8 * (2 * 42 + 16))
+
+  def test_config_without_layers_keeps_floor(self):
+    import types  # pylint: disable=g-import-not-at-top
+
+    workarounds.raise_dynamo_recompile_limits(types.SimpleNamespace())
+    self.assertEqual(self.dynamo_config.recompile_limit, 64)
+
+
 if __name__ == "__main__":
   absltest.main()

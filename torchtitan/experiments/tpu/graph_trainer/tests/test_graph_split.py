@@ -1,9 +1,11 @@
+import itertools
 from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -34,8 +36,10 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
+    ReplicateComputation,
 )
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
+from torchtitan.experiments.tpu.graph_trainer import simple_fsdp as tpu_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.passes import (
     expert_all_gather_deadline as deadline_lib,
 )
@@ -54,6 +58,39 @@ from torchtitan.experiments.tpu.graph_trainer.tests.test_tpu_memory_policy impor
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
     thread_host_offload_donors,
 )
+
+
+if not hasattr(torch.ops.tpu, "_all_gather_dim"):
+  # CPU stand-ins with TorchTPU's schemas, so SimpleFSDP traces its dim-d
+  # collectives off TPU.
+  def _all_gather_dim(
+      shard: torch.Tensor, dim: int, group_size: int, group_name: str
+  ) -> torch.Tensor:
+    return torch.cat([shard] * group_size, dim)
+
+  def _reduce_scatter_dim(
+      grad: torch.Tensor,
+      reduce_op: str,
+      dim: int,
+      group_size: int,
+      group_name: str,
+  ) -> torch.Tensor:
+    return grad.chunk(group_size, dim)[0].clone()
+
+  for _impl in (_all_gather_dim, _reduce_scatter_dim):
+    torch.library.custom_op(
+        f"tpu::{_impl.__name__}", mutates_args=()
+    )(_impl).register_fake(_impl)
+
+
+def _tpu_dim_replicate_compute(self, x):
+  return tpu_simple_fsdp.replicate_sharded_tensor(
+      x.to_local(),
+      group_name=self.device_mesh.get_group().group_name,
+      shard_dim=0,
+      param_dtype=self.param_dtype,
+      reduce_dtype=self.reduce_dtype,
+  )
 
 
 class _ToyTransformer(nn.Module):
@@ -197,8 +234,42 @@ class GraphSplitTest(absltest.TestCase):
       fsdp_reshard_after_forward: str = "always",
       model_cls: type[nn.Module] = _ToyTransformer,
       before_split=None,
+      dim_collectives: bool = False,
   ):
-    """Trace the shared model through real SimpleFSDP with fake collectives."""
+    """Trace the shared model through real SimpleFSDP with fake collectives.
+
+    ``dim_collectives`` routes the gathers and reductions through TorchTPU's
+    dim-d collective ops, as at world 512.
+    """
+    if dim_collectives:
+      with (
+          mock.patch.object(
+              ReplicateComputation,
+              "replicate_compute",
+              _tpu_dim_replicate_compute,
+          ),
+          mock.patch.object(
+              tpu_simple_fsdp,
+              "_all_gather_on_dim",
+              lambda shard, dim, group: torch.ops.tpu._all_gather_dim(
+                  shard, dim, c10d._get_group_size_by_name(group), group
+              ),
+          ),
+          mock.patch.object(
+              tpu_simple_fsdp,
+              "_reduce_scatter_on_dim",
+              lambda grad, dim, group: torch.ops.tpu._reduce_scatter_dim(
+                  grad, "sum", dim, c10d._get_group_size_by_name(group), group
+              ),
+          ),
+      ):
+        return self._trace_simple_fsdp(
+            n_layers=n_layers,
+            reduce_dtype=reduce_dtype,
+            fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+            model_cls=model_cls,
+            before_split=before_split,
+        )
 
     self.assertFalse(dist.is_initialized())
     dist.init_process_group(
@@ -730,6 +801,9 @@ class GraphSplitTest(absltest.TestCase):
     split = self._trace_simple_fsdp(n_layers=4)
     forward = split.forward_graph
     backward = split.backward_graph
+    # TorchTPU's dim-d collectives have no wait nodes; they must take the same
+    # places as SimpleFSDP's functional collectives.
+    dim_split = self._trace_simple_fsdp(n_layers=4, dim_collectives=True)
     self.assertFalse(
         any("fsdp_bucket" in node.meta for node in backward.graph.nodes)
     )
@@ -740,14 +814,16 @@ class GraphSplitTest(absltest.TestCase):
         # [prefix] [L0] [L1] [L2] [L3]
         (1, True, {0: 1, 1: 2, 2: 3, 3: 4}),
     )
-    for layers_per_executable, isolate_prefix, expected in forward_scenarios:
+    for graph, (layers_per_executable, isolate_prefix, expected) in (
+        itertools.product((forward, dim_split.forward_graph), forward_scenarios)
+    ):
       with self.subTest(
           direction="forward",
           layers_per_executable=layers_per_executable,
           isolate_prefix=isolate_prefix,
       ):
         chunked = split_forward_graph_by_layer(
-            forward,
+            graph,
             layers_per_executable,
             isolate_prefix=isolate_prefix,
         )
@@ -793,10 +869,13 @@ class GraphSplitTest(absltest.TestCase):
             by_layer_three,
         ),
     )
-    for name, width, pipeline, compute, ag, rs in backward_scenarios:
-      with self.subTest(name):
+    graphs = {"functional": backward, "dim": dim_split.backward_graph}
+    for (collectives, graph), (name, width, pipeline, compute, ag, rs) in (
+        itertools.product(graphs.items(), backward_scenarios)
+    ):
+      with self.subTest(name, collectives=collectives):
         chunked = split_backward_graph_by_layer(
-            backward,
+            graph,
             n_layers=4,
             layers_per_executable=width,
             pipeline_collectives=pipeline,
@@ -815,8 +894,20 @@ class GraphSplitTest(absltest.TestCase):
             dict(zip(layer_ids, rs, strict=True)),
         )
         self._assert_collective_chains_are_atomic(
-            backward, chunked.partition_map
+            graph, chunked.partition_map
         )
+        # An FP32 reduction carries the BF16 gradient across the boundary and
+        # casts it in the RS executable.
+        for node in graph.graph.nodes:
+          if graph_split_lib._is_reduce_scatter(node):
+            cast = node.args[0]
+            self.assertEqual(cast.meta["val"].dtype, torch.float32)
+            self.assertEqual(
+                cast.all_input_nodes[0].meta["val"].dtype, torch.bfloat16
+            )
+            self.assertEqual(
+                chunked.partition_map[cast], chunked.partition_map[node]
+            )
 
     # A real Zero2-like trace has RS but no backward AG ownership.
     zero2_backward = self._trace_simple_fsdp(

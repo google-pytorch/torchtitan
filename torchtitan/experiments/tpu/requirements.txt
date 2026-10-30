@@ -1,7 +1,7 @@
 jax==0.11.1
 jaxlib==0.11.1
 libtpu==0.0.50
-tokamax==0.0.14
+tokamax==0.0.17
 torchao==0.17.0
 portpicker
 absl-py

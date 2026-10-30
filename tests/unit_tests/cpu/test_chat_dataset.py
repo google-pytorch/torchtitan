@@ -56,9 +56,9 @@ def _load_dataset():
     return Dataset.from_json(_DATA_PATH)
 
 
-def _runtime(max_context_length):
+def _runtime(max_context_length, *, tokenizer=None):
     return DatasetBuildContext(
-        tokenizer=_load_tokenizer(),
+        tokenizer=tokenizer or _load_tokenizer(),
         max_context_length=max_context_length,
         num_tokens_per_batch=max_context_length,
         read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
@@ -179,6 +179,31 @@ class TestChatDatasetShiftedTokens(unittest.TestCase):
             full_tokens[1:][response_start:],
         )
         self.assertEqual(labels[len(full_tokens) - 1], IGNORE_INDEX)
+
+
+class TestHFBackendTokenizerChatLabels(unittest.TestCase):
+    """HFBackendTokenizer chat samples get one BOS and supervise only the answer."""
+
+    def test_single_bos_and_answer_only_labels(self):
+        from torchtitan.experiments.transformers_modeling_backend.tokenizer import (
+            HFBackendTokenizer,
+        )
+
+        tokenizer = HFBackendTokenizer(tokenizer_path=_TOKENIZER_PATH)
+        sample = _load_dataset()[0]
+        processor = ChatProcessor.Config(messages_fn=_process_sample).build(
+            context=_runtime(2048, tokenizer=tokenizer)
+        )
+        sequence = processor(sample, np.random.default_rng(0))
+
+        # The template renders bos_token and ChatProcessor also passes add_bos=True.
+        self.assertEqual(sequence.input_ids[0], tokenizer.bos_id)
+        self.assertEqual(sequence.input_ids.tolist().count(tokenizer.bos_id), 1)
+        answer = tokenizer.encode(sample["answer"], add_bos=False, add_eos=False)
+        self.assertEqual(
+            sequence.labels[sequence.labels != IGNORE_INDEX].tolist(),
+            answer + [tokenizer.eos_id],
+        )
 
 
 class TestChatDatasetGreedyPacking(unittest.TestCase):

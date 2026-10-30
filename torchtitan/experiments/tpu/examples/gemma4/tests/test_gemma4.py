@@ -231,6 +231,49 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
           dump_folder="",
       )
 
+  def test_moe_spmd_safe_applied_when_ep_disabled(self):
+    from types import SimpleNamespace
+    from unittest import mock
+    from torchtitan.experiments.tpu.examples.gemma4.infra import (
+        parallelize as gemma4_parallelize,
+    )
+
+    cfg = gemma4_moe_testmodel()
+    cfg.compile.enable = True
+    cfg.parallelism.use_simple_fsdp = False
+
+    for ep_enabled, expected_calls in ((False, 2), (True, 0)):
+      with torch.device("meta"):
+        model = cfg.model_spec.model.build()
+      pdims = SimpleNamespace(
+          cp_enabled=False,
+          ep_enabled=ep_enabled,
+          tp_enabled=False,
+          dp_shard=1,
+          ep=2 if ep_enabled else 1,
+      )
+      with (
+          mock.patch.object(
+              gemma4_parallelize, "apply_spmd_safe"
+          ) as mock_spmd_safe,
+          mock.patch.object(
+              gemma4_parallelize,
+              "_parallelize_gemma4",
+              side_effect=lambda m, **kw: m,
+          ),
+      ):
+        gemma4_parallelize.parallelize_gemma4(
+            model,
+            parallel_dims=pdims,
+            training=cfg.training,
+            parallelism=cfg.parallelism,
+            compile_config=cfg.compile,
+            ac_config=None,
+            dump_folder="",
+            skip_dp=True,
+        )
+      self.assertEqual(mock_spmd_safe.call_count, expected_calls)
+
 
 class TestGemma4StateDictAdapter(absltest.TestCase):
   """Tests HF <-> TorchTitan state_dict conversion for Gemma 4."""

@@ -73,4 +73,5 @@ def model_registry(flavor: str) -> ModelSpec:
   return dataclasses.replace(
       tpu_qwen3_5.model_registry(flavor),
       parallelize_fn=parallelize_qwen3_5,
+      pipelining_fn=None,
   )

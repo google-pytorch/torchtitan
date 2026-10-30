@@ -18,7 +18,7 @@ from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Mo
 from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import LayerStackHolder
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
-from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
+from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
 

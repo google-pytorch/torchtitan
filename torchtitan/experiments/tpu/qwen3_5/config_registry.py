@@ -77,7 +77,7 @@ def _enable_pallas_cross_entropy(
     cfg.override.imports.append(FUSED_LOSS_OVERRIDE)
 
 
-def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
+def _use_tpu_moe_kernels(cfg: TPUTrainerConfig, *, tile_m: int = 256) -> None:
   """Selects the Qwen3-30B-A3B TPU recipe's MoE kernels.
 
   Pallas paired grouped matmuls with kernel-native expert weights, and dScore
@@ -87,6 +87,7 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
 
   Args:
     cfg: The recipe to update in place.
+    tile_m: Forward and dWeight row tile size for the Pallas grouped matmuls.
   """
   assert cfg.model_spec is not None
   experts = list(cfg.model_spec.model.traverse(TpuGroupedExperts.Config))
@@ -101,8 +102,8 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
   for _, experts_config, _, _ in experts:
     experts_config.use_pallas_grouped_mm = True
     experts_config.use_pallas_paired_grouped_mm = True
-    experts_config.pallas_grouped_mm_tile_m = 256
-    experts_config.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    experts_config.pallas_grouped_mm_tile_m = tile_m
+    experts_config.pallas_grouped_mm_tgmm_tiling = (tile_m, 0, 0)
     experts_config.use_kernel_native_weight_layout = True
   for _, dispatcher, _, _ in dispatchers:
     dispatcher.fuse_route_score_backward = True
@@ -424,6 +425,10 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
       memory_policy="tpu_selective",
       save_regions=("moe.routing", "attention.inner_attention"),
   )
+  # 512-row expert tiles for EP=1 at 64K tokens per rank (~2K routed rows per
+  # expert on average): the routed-expert MLP's forward + backward takes 22.9
+  # vs 26.8 ms per layer on one TPU7x core with the Qwen3-30B tiles (256).
+  _use_tpu_moe_kernels(cfg, tile_m=512)
   # Throughput DVFS operating point (p_state=7) and SparseCore collective
   # offload (async AG, dual-SC RS, latency-hiding scheduler), merged onto
   # qwen35_moe_35b's 65472 KiB scoped VMEM limit.

@@ -198,6 +198,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           flavor="debugmodel_moe",
           use_tpu_grouped_experts=True,
           use_pallas_paired_grouped_mm=True,
+          tile_m=256,
+      ),
+      dict(
+          testcase_name="_moe_pallas_paired_grouped_mm_tile512",
+          flavor="debugmodel_moe",
+          use_tpu_grouped_experts=True,
+          use_pallas_paired_grouped_mm=True,
+          tile_m=512,
       ),
   )
   def test_qwen3_5_hf_reference_parity(
@@ -205,6 +213,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       flavor: str,
       use_tpu_grouped_experts: bool,
       use_pallas_paired_grouped_mm: bool = False,
+      tile_m: int = 256,
   ):
     """Tests forward logits, loss, and all gradients against HF Qwen3.5."""
     if use_pallas_paired_grouped_mm and not self._is_tpu():
@@ -223,8 +232,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       for _, experts, _, _ in tt_config.traverse(TpuGroupedExperts.Config):
         experts.use_pallas_grouped_mm = True
         experts.use_pallas_paired_grouped_mm = True
-        experts.pallas_grouped_mm_tile_m = 256
-        experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+        experts.pallas_grouped_mm_tile_m = tile_m
+        experts.pallas_grouped_mm_tgmm_tiling = (tile_m, 0, 0)
     tt_config.vocab_size = 2048
     tt_config.tok_embeddings.num_embeddings = 2048
     tt_config.lm_head.out_features = 2048
@@ -1473,7 +1482,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     # The conversion re-wraps the model config: the kernels and GDN reset
     # setting must survive it.
-    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
+    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model, tile_m=512)
     self.assertEqual(
         [
             d.reset_at_documents
@@ -1560,7 +1569,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
         ],
     )
-    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model)
+    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model, tile_m=512)
     self.assertEqual(bench_cfg.parallelism.fsdp_reshard_after_forward, "always")
     self.assertEqual(bench_cfg.parallelism.expert_parallel_degree, 1)
     self.assertTrue(bench_cfg.parallelism.enable_tpu_topo_mesh)
@@ -1674,6 +1683,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         ),
         (1024, 2048, 640),
     )
+    self._assert_uses_tpu_moe_kernels(parsed.model_spec.model, tile_m=512)
 
     # The README's 96K split=1 + selective save_last_n_layers flags also parse.
     parsed_96k = ConfigManager().parse_args([

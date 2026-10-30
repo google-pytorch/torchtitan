@@ -10,6 +10,9 @@ from absl.testing import absltest
 import torch
 
 from torchtitan.experiments.tpu.examples.gemma4 import gemma4_configs
+from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    MaxTextTpuGraphTrainerQwen3Model,
+)
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
@@ -82,7 +85,10 @@ class FlopsConventionTest(absltest.TestCase):
     for name, recipe in recipes.items():
       with self.subTest(recipe=name):
         self.assertEqual(
-            isinstance(recipe().model_spec.model, MaxTextQwen3Config),
+            isinstance(
+                recipe().model_spec.model,
+                (MaxTextQwen3Config, MaxTextTpuGraphTrainerQwen3Model.Config),
+            ),
             "maxtext" in name,
         )
 

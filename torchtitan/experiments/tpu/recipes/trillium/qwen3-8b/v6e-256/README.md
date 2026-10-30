@@ -32,7 +32,7 @@ We are running with the following key optimizations built into the configuration
   2048 tokens).
 - **Parallelism**: Simple FSDP with Topology Aware Mesh (`enable_tpu_topo_mesh=True`) mapped to the physical layout.
 - **Activation Checkpointing**: FullAC (`SelectiveAC` causes OOM on v6e due to XLA activation limits).
-- **Compile Mode**: Layer-by-layer compilation (`compile_mode="layer"`).
+- **Compile Mode**: Layer-by-layer compilation (`compile.mode="layer"`).
 - **Precision**: `float32` reduction precision.
 - **Loss Kernel & Splash Attention**: Both enabled (SA block sizes updated to 1024 for all blocks).
 
@@ -79,8 +79,8 @@ gcluster job submit \
     --splash_attention_kernel.sa_block_kv_dq=1024 \
     --loss_kernel.use_loss_kernel \
     --tpu_config.eager_mode=DEFER_AND_FUSE \
-    --tpu_config.use_graph_split \
-    --tpu_config.compile_mode=layer \
+    --compile.materialize_forward_before_backward \
+    --compile.mode=layer \
     --libtpu-init-flags='xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536'"
 ```
 

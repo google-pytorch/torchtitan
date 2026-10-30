@@ -6,9 +6,9 @@
 
 """Split a GraphTrainer joint FX graph into independently compiled modules.
 
-``use_graph_split`` first divides the mandatory joint graph into forward and
-backward GraphModules connected by explicit residual tensors. The forward graph
-can then be divided into sequential layer ranges. The backward graph can remain
+``compile.graph_split.enabled`` divides the mandatory joint graph into forward
+and backward GraphModules connected by explicit residual tensors. The forward
+graph can then be divided into sequential layer ranges. The backward graph can remain
 whole, group adjacent layer computations with their FSDP collectives, or form
 staggered all-gather/compute/reduce-scatter pipeline stages. These subdivisions
 are therefore always nested under the forward/backward split.
@@ -70,9 +70,11 @@ from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
   from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
-  from torchtitan.experiments.tpu.tpu_job_config import (
+  from torchtitan.experiments.tpu.graph_trainer.config import (
       GraphSplitterConfig,
-      TPUTrainerConfig,
+  )
+  from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+      TpuGraphTrainer,
   )
 
 
@@ -259,12 +261,12 @@ class GraphSplitter:
   @classmethod
   def from_trainer_config(
       cls,
-      config: "TPUTrainerConfig",
+      config: "TpuGraphTrainer.Config",
       *,
       optimizer_in_graph: bool,
   ) -> "GraphSplitter":
-    enabled = bool(config.tpu_config.use_graph_split)
-    split_config = config.tpu_config.graph_split
+    split_config = config.compile.graph_split
+    enabled = split_config.enabled
     if split_config.forward_layers_per_executable == 0 or (
         split_config.forward_layers_per_executable < -1
     ):
@@ -284,7 +286,9 @@ class GraphSplitter:
           "backward_layers_per_executable must be at least 1"
       )
     if split_config.backward_partition_mode != "none" and not enabled:
-      raise ValueError("backward_partition_mode requires use_graph_split")
+      raise ValueError(
+          "backward_partition_mode requires compile.graph_split.enabled"
+      )
     if split_config.cpu_offload_prefetch_executables < 0:
       raise ValueError(
           "cpu_offload_prefetch_executables must be nonnegative"
@@ -295,16 +299,18 @@ class GraphSplitter:
       raise ValueError(
           "cpu_offload_prefetch_executables requires a split backward graph"
       )
-    if enabled and config.tpu_config.graph_trainer_fsdp_schedule != "none":
+    if enabled and config.compile.fsdp_barrier_policy != "none":
       raise ValueError(
           "Graph splitting does not currently compose with "
-          "graph_trainer_fsdp_schedule"
+          "compile.fsdp_barrier_policy because the whole-graph collective "
+          "placement pass is not partition-boundary aware"
       )
     # Optimizer-in-graph needs a third explicit phase rather than treating its
     # state reads, mutations, and parameter updates as backward.
     if enabled and optimizer_in_graph:
       raise ValueError(
-          "TPU GraphTrainer graph split does not support optimizer_in_graph"
+          "TPU GraphTrainer graph split does not support "
+          "optimizer_compile='in_graph'"
       )
     # This artifact format stores one transformed FX graph. TorchTPU's XLA and
     # Tier-2 executable caches remain supported for every compiled child.
@@ -538,6 +544,63 @@ def _assign_partition(
   partition_map.update(dict.fromkeys(nodes, partition))
 
 
+def _order_child_boundaries(parent: torch.fx.GraphModule) -> None:
+  """Order each child's inputs by last read and outputs by first availability.
+
+  ``split_module`` numbers a child's inputs and outputs in discovery order, and
+  only ``parent`` calls the child, so the order carries no meaning. It does
+  matter to donation: XLA aliases donated inputs to equal-size outputs pairwise
+  in that order, and an output cannot be written before its donor's last read.
+  Sorting both sides lets the earliest-freed input back the earliest-ready
+  output, e.g. a host-to-device reload that depends on nothing else.
+
+  TODO: drop this ordering once TorchTPU can pass explicit input->output
+  aliases to XLA; today it only marks donatable inputs (``jax.buffer_donor``)
+  and XLA picks the pairs. To check the pairs XLA picked, dump HLO with
+  ``XLA_FLAGS=--xla_dump_to=<dir>`` and read each module's
+  ``input_output_alias``.
+  """
+  calls = parent.graph.find_nodes(op="call_module")
+  # Each child is rewritten together with its one call site.
+  assert len({call.target for call in calls}) == len(calls), (
+      "a split child is called more than once"
+  )
+  for call in calls:
+    child = parent.get_submodule(call.target)
+    nodes = list(child.graph.nodes)
+    position = {node: index for index, node in enumerate(nodes)}
+    depth: dict[torch.fx.Node, int] = {}
+    for node in nodes:
+      depth[node] = 1 + max(map(depth.get, node.all_input_nodes), default=-1)
+
+    inputs = [node for node in nodes if node.op == "placeholder"]
+    assert all(node.op == "placeholder" for node in nodes[: len(inputs)])
+    last_read = {
+        node: max((position[user] for user in node.users), default=-1)
+        for node in inputs
+    }
+    inputs_by_read = sorted(inputs, key=last_read.__getitem__)
+    first_op = nodes[len(inputs)]
+    for node in inputs_by_read:
+      first_op.prepend(node)
+    call.args = tuple(call.args[inputs.index(node)] for node in inputs_by_read)
+
+    output = child.graph.output_node()
+    values = output.args[0]
+    if isinstance(values, (tuple, list)):
+      order = sorted(
+          range(len(values)),
+          key=lambda i: (depth[values[i]], position[values[i]]),
+      )
+      output.args = (tuple(values[i] for i in order),)
+      new_index = {old: new for new, old in enumerate(order)}
+      assert all(_is_getitem(user) for user in call.users)
+      for user in list(call.users):
+        user.args = (call, new_index[user.args[1]])
+    child.recompile()
+  parent.recompile()
+
+
 def _materialize_partitioned_graph(
     gm: torch.fx.GraphModule,
     partition_map: dict[torch.fx.Node, int],
@@ -571,6 +634,7 @@ def _materialize_partitioned_graph(
       ).items()
   }
   chunked_gm = split_module(gm, None, lambda node: partition_map[node])
+  _order_child_boundaries(chunked_gm)
   chunked_gm.graph.lint()
   chunked_gm.recompile()
   return PartitionedGraph(

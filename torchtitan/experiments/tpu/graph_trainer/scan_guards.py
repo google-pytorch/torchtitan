@@ -1,4 +1,4 @@
-"""Refuse to run when ``--tpu-config.use-scan-layers`` cannot be honoured.
+"""Refuse to run when ``--compile.use-scan-layers`` cannot be honoured.
 
 Every failure mode in here is otherwise silent. The run succeeds, either
 unrolled or stacked from layer 0, and the log looks like a correct scan run. So
@@ -41,7 +41,7 @@ def check_scan_parallelism(parallelism: ParallelismConfig) -> None:
     ]
     if conflicts:
         raise ValueError(
-            "--tpu-config.use-scan-layers supports 1-D data parallelism only, "
+            "--compile.use-scan-layers supports 1-D data parallelism only, "
             f"but this run sets {', '.join(conflicts)}. Drop the flag, or set "
             "those degrees to 1."
         )
@@ -62,8 +62,7 @@ def check_scan_was_applied(model: nn.Module, *, use_scan_layers: bool) -> None:
     if any(isinstance(m, StackedLayers) and m.use_scan for m in model.modules()):
         return
     raise ValueError(
-        "--tpu-config.use-scan-layers was set, but nothing in this run "
+        "--compile.use-scan-layers was set, but nothing in this run "
         "consulted it: the decoder layers ran one at a time. Scan is wired up "
-        "for the graph trainer's llama3 lane; check that "
-        "--tpu-config.use-graph-trainer is set."
+        "only for recipes that return TpuGraphTrainer.Config."
     )

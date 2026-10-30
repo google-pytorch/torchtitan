@@ -32,6 +32,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
     TPUTrainerConfig,
+    TpuTrainerCompileConfig,
 )
 
 _TPU_MOE_CONVERTERS = [
@@ -204,7 +205,9 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       ),
       comm=CommConfig(train_timeout_seconds=600),
       activation_checkpoint=FullAC.Config(preserve_rng_state=False),
-      compile=CompileConfig(enable=False, backend="tpu"),
+      compile=TpuTrainerCompileConfig(
+          enable=False, backend="tpu", compile_grad_norm=True
+      ),
       validator=Validator.Config(enable=False),
       # Full attention in Qwen3.5 35B-A3B has head_dim=256 (2x Qwen3's 128):
       # Splash's backward overflows the default 32 MiB of scoped VMEM with
@@ -229,7 +232,6 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       tpu_config=TPUConfig(
           enable_amp=False,
           eager_mode="DEFER_AND_FUSE",
-          compile_grad_norm=True,
       ),
   )
   _use_tpu_moe_kernels(cfg)

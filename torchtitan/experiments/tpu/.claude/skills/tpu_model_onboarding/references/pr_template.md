@@ -13,7 +13,7 @@ deliberately left for later.
 Rung | Feature / flag                  | Commit | Parity test (bounds, measured) | Numerics class | Run (target, steps, result)   | Status
 -----|---------------------------------|--------|--------------------------------|----------------|-------------------------------|---------------------
 1    | SDPA + per-block compile        | <sha>  | Test<Model>ReferenceParity ... | oracle         | A, v6e-4, 10 steps, det OK    | merged
-2    | GraphTrainer (use_graph_trainer)| <sha>  | 3-step loss vs compile ...     | bit-identical  | A, v6e-4, 10 steps            | done
+2    | GraphTrainer recipe             | <sha>  | 3-step loss vs compile ...     | bit-identical  | A, v6e-4, 10 steps            | done
 3    | splash (use_splash_attention)   | <sha>  | vs SDPA packed ...             | rounding-order | A, v6e-4                      | in progress: <open item>
 ```
 

@@ -376,6 +376,7 @@ class GraphSplitter:
           n_layers=self.n_layers,
           layers_per_executable=self.config.backward_layers_per_executable,
           pipeline_collectives=mode == "fsdp_pipeline",
+          pipeline_kinds=self.config.pipeline_kinds,
           cpu_offload_prefetch_executables=(
               self.config.cpu_offload_prefetch_executables
           ),
@@ -1058,14 +1059,16 @@ def split_backward_graph_by_layer(
     n_layers: int,
     layers_per_executable: int = 1,
     pipeline_collectives: bool = False,
+    pipeline_kinds: tuple[str, ...] = ("ag", "rs"),
     cpu_offload_prefetch_executables: int = 0,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
 
   The default keeps attributable FSDP collective chains with their layer and
-  also supports backward graphs with no FSDP collectives. Pipelining requires
-  both AG and RS ownership for every layer so it can safely form fill, overlap,
-  and drain stages. CPU-offload reload pairs may be placed a configured number
+  also supports backward graphs with no FSDP collectives. Pipelining moves the
+  collectives of ``pipeline_kinds`` and requires their ownership for every
+  layer so it can safely form fill, overlap, and drain stages; the rest stay
+  with their layer. CPU-offload reload pairs may be placed a configured number
   of complete child executables before their first consumer; zero keeps the
   pair in the consumer child.
   """
@@ -1124,7 +1127,7 @@ def split_backward_graph_by_layer(
     for layer_id in layer_ids:
       missing = tuple(
           kind
-          for kind in ("ag", "rs")
+          for kind in pipeline_kinds
           if (kind, layer_id) not in owned_collectives
       )
       if missing:
@@ -1136,7 +1139,7 @@ def split_backward_graph_by_layer(
       )
 
   def collective_partition(kind: str, layer_id: int) -> int:
-    if not pipeline_collectives:
+    if not pipeline_collectives or kind not in pipeline_kinds:
       return raw_layer_to_partition[layer_id]
     index = layer_indices[layer_id]
     if kind == "ag":

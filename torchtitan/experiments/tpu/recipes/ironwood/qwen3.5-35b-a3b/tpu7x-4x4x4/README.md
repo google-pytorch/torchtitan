@@ -79,10 +79,10 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   step time from 6.94 to 6.86 s (`18.21% MFU`) at 64K; at 96K with one layer per
   executable it took 10.50 to 10.01 s (`18.73% MFU`) with Splash saved in the
   last two full-attention layers only
-  (`--tpu_config.graph_split.forward_layers_per_executable=1
-  --tpu_config.graph_split.backward_layers_per_executable=1
-  --tpu_config.graph_trainer_save_regions moe.routing
-  --tpu_config.graph_trainer_save_last_n_layers attention.inner_attention 2`).
+  (`--compile.graph_split.forward_layers_per_executable=1
+  --compile.graph_split.backward_layers_per_executable=1
+  --compile.save_regions moe.routing
+  --compile.save_last_n_layers attention.inner_attention 2`).
 * **GraphTrainer with graph split**: as one step graph, the 40-layer model
   neither compiles within an hour on 8 host CPUs nor fits in HBM on one host
   (XLA keeps most layers' unsharded `3 x 1 GiB` fp32 expert gradients alive
@@ -98,7 +98,7 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   `10.01 s/step`, `18.73% MFU` at 96K on `2x2x1`; `13.56 s/step`, `18.43% MFU`
   at 128K on `4x4x4`).
 * **AdamW**: torch_tpu's fused AdamW outside the step graph
-  (`optimizer_in_graph=False`, `compile_grad_norm=True`).
+  (`optimizer_compile="eager"`, `compile_grad_norm=True`).
 * **`GatedDeltaNet`**: Tokamax's Mosaic TPU KDA kernels
   (`TokamaxGatedDeltaKernel`, through the `tokamax_gated_delta_kernel`
   override), with the forward returning the backward kernels' residuals.

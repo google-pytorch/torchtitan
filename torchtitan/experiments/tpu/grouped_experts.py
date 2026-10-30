@@ -289,11 +289,19 @@ class TpuGroupedExperts(GroupedExperts):
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
+        row_scale_R: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run the experts on expert-sorted rows.
+
+        ``row_scale_R``, if given, multiplies each row's hidden activation
+        before the down projection (W2).
+        """
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
+            if row_scale_R is not None:
+                raise ValueError("row_scale_R requires Pallas grouped matmul")
             if self.activation == "silu":
                 return super().forward(x_RD, num_tokens_per_expert_E)
             return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
@@ -367,6 +375,12 @@ class TpuGroupedExperts(GroupedExperts):
                 tgmm_tiling=tgmm_tiling,
             )
         hidden_RF = self._activation_fn(gate_RF) * up_RF
+        if row_scale_R is not None:
+            if pad_rows:
+                row_scale_R = F.pad(row_scale_R, (0, pad_rows))
+            hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
+                hidden_RF.dtype
+            )
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),

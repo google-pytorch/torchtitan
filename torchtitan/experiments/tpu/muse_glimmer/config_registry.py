@@ -222,26 +222,30 @@ def muse_glimmer_30b_full_logits() -> TpuGraphTrainer.Config:
   """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
 
   SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
-  graph rematerialization except each layer's Splash output and LSE, JAX
-  Pallas Splash attention and plain cross entropy over the full logits. The
-  4x4x4 libtpu flags ride on the config.
+  graph rematerialization except each layer's Splash output and LSE and its
+  FFN down-projection (``w2``) output, JAX Pallas Splash attention and plain
+  cross entropy over the full logits. The 4x4x4 libtpu flags ride on the
+  config.
 
   Full logits vs fused cross entropy, measured on tpu7x-4x4x4 with fp32
   weights and optimizer state (the default ``training.dtype``) and bf16
-  compute:
+  compute, with full recompute (with the two saves the fused loss is ~3%
+  slower):
 
   * Why full logits here: with 16384 tokens per device the logits are not
     what sets peak HBM (46.18 GiB full vs 46.12 GiB fused, both measured
     with plain ``full`` rematerialization), so the fused
     kernel saves nothing, while XLA's plain LM-head matmul + cross entropy
     runs ~2% faster than the vocab-tiled Pallas kernel (2,913 vs 2,851 TPS,
-    43.8% vs 42.9% MFU).
+    43.8% vs 42.9% MFU). With the two saves the fused loss does lower peak
+    HBM (59.77 vs 78.70 GiB) but is still slower (5.19 vs 5.05 s per step).
   * When to use the fused loss: once the logits dominate memory. They scale
     with tokens per microbatch, so at 2 x 16384 tokens per device peak HBM is
     87.62 GiB with full logits vs 51.84 GiB fused. Use it for larger local
     batches or longer sequences, on the regular trainer (which runs out of
     HBM at step 1 with full logits), or whenever HBM headroom is needed
-    elsewhere.
+    elsewhere. The saves scale with tokens too: at 2 x 16384 tokens per device
+    the fused recipe with both saves runs out of HBM at compile time.
   """
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       _muse_glimmer_30b_base(), graph_trainer_model_registry
@@ -256,7 +260,7 @@ def muse_glimmer_30b_full_logits() -> TpuGraphTrainer.Config:
       components=["model"],
       optimizer_compile="in_graph",
       memory_policy="tpu_selective",
-      save_regions=("attention.inner_attention",),
+      save_regions=("attention.inner_attention", "feed_forward.w2"),
       enable_remat_barriers=True,
       fsdp_barrier_policy="prefetch",
   )
@@ -270,16 +274,16 @@ def muse_glimmer_30b_fused_ce() -> TpuGraphTrainer.Config:
   """``muse_glimmer_30b_full_logits`` with the soft-capped fused loss.
 
   The LM-head matmul, soft cap and cross entropy run as one Pallas kernel, so
-  the [tokens, 202048] logits are never materialized. ~2% slower than
-  full logits at 16384 tokens per device, but needed once the logits dominate
-  memory; see ``muse_glimmer_30b_full_logits`` for when to use which.
+  the [tokens, 202048] logits are never materialized. ~3% slower than
+  full logits at 16384 tokens per device with the same Splash and w2 saves,
+  but needed once the logits dominate memory; see
+  ``muse_glimmer_30b_full_logits`` for when to use which.
   """
   config = muse_glimmer_30b_full_logits()
   _enable_pallas_cross_entropy(config)
-  # This is the recipe to pick for HBM headroom, and the Splash saves were
-  # measured only with full logits, so it keeps plain full rematerialization.
-  config.compile.memory_policy = "full"
-  config.compile.save_regions = ()
+  # Keeps full_logits' Splash and w2 save regions. Their HBM grows with tokens
+  # per microbatch; --compile.memory_policy=full --compile.save_regions drops
+  # them for more headroom.
   return config
 
 

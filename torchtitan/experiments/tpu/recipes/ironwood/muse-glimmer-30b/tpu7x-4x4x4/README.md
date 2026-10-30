@@ -18,15 +18,15 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Model**: upstream `muse_glimmer_30b` settings (sequence 16384, local batch
   1, AdamW lr 3e-4, 200 warmup steps).
 - **Parallelism**: GraphTrainer with SimpleFSDP Zero-3, the `prefetch` FSDP
-  schedule, full rematerialization except each layer's Splash output (see
-  [Memory policy](#memory-policy)), and the optimizer compiled into the
-  graph.
+  schedule, full rematerialization except each layer's Splash output and FFN
+  down-projection (`w2`) output (see [Memory policy](#memory-policy)), and the
+  optimizer compiled into the graph.
 - **Precision**: fp32 weights and optimizer state, bf16 compute.
 - **Kernels**: JAX Pallas Splash attention (1024 tiles) with a local mask for
   the sliding-window layers, and plain cross entropy over the full logits.
   `muse_glimmer_30b_fused_ce` swaps in the fused soft-capped cross-entropy
-  kernel, which is ~2% slower here but saves memory when raising tokens per
-  microbatch.
+  kernel and keeps the same save regions. It is ~3% slower here but saves
+  memory when raising tokens per microbatch.
 - **Flags**: the tpu7x-4x4x4 libtpu flags (p-state 7, scoped VMEM, SparseCore
   latency-hiding scheduler and hierarchical reduce-scatter) are carried on the
   config, the same set as `qwen3_32b`.
@@ -65,35 +65,65 @@ gcluster job submit \
 
 With this configuration (local batch 1, global batch 128, sequence 16384), you
 should observe the following per-device metrics averaged over steps 10-30 (as
-of 10/14/2026, measured with the command above, i.e. on the default `c4_test`
-dataset and test tokenizer):
+of 10/29/2026, measured with the command above on an image built from the
+2026-10-28 nightly, i.e. on the default `c4_test` dataset and test tokenizer):
 
-- **TPS (Tokens per second)**: ~3,082
-- **TFLOPS**: ~534.6
-- **MFU**: ~46.3%
-- **Step Time**: ~5.32s
-- **Physical peak HBM**: 63.77GiB
+- **TPS (Tokens per second)**: ~3,245
+- **TFLOPS**: ~562.8
+- **MFU**: ~48.8%
+- **Step Time**: ~5.05s
+- **Physical peak HBM**: 78.70GiB
+
+Peak HBM depends on the image: with only the Splash save, the same command
+measured 63.78GiB on an image built from the 2026-10-15 nightly and 76.11GiB
+on ones built from the 2026-10-26 and 2026-10-28 nightlies, so compare peak HBM
+only between runs on the same image.
 
 `grad_norm` is logged as 0.0 because the optimizer runs inside the compiled
 graph; gradient clipping is still applied there.
 
 ## Memory policy
 
-The recipe uses the `tpu_selective` memory policy: backward recomputes
-everything that `full` would, except each layer's Splash output and LSE (the
-`attention.inner_attention` save region), so backward doesn't rerun the
-forward Splash kernel. Measured on 10/14/2026 with the command above (c4_test
-dataset and test tokenizer, averaged over steps 10-30):
+The recipe (and `muse_glimmer_30b_fused_ce`) uses the `tpu_selective` memory
+policy: backward recomputes everything that `full` would, except two values
+per layer:
+
+- the Splash output and LSE (the `attention.inner_attention` save region), so
+  backward doesn't rerun the forward Splash kernel;
+- the FFN down-projection (`w2`) output (the `feed_forward.w2` save region),
+  which the post-FFN norm's backward reads, so backward doesn't rerun the `w2`
+  matmul.
+
+Measured on 10/29/2026 with the command above (2026-10-28 nightly, one image
+for every row; c4_test dataset and test tokenizer, averaged over steps 10-30):
+
+| Recipe | Save regions | Step time | MFU | Physical peak HBM |
+|---|---|---|---|---|
+| `muse_glimmer_30b_full_logits` | Splash only | ~5.30s | ~46.5% | 76.11GiB |
+| `muse_glimmer_30b_full_logits` | Splash + `w2` (default) | ~5.05s (-4.8%) | ~48.8% | 78.70GiB |
+| `muse_glimmer_30b_fused_ce` | none (`full`) | ~5.72s | ~43.0% | 46.12GiB |
+| `muse_glimmer_30b_fused_ce` | Splash + `w2` (default) | ~5.19s (-9.3%) | ~47.5% | 59.77GiB |
+
+Step 1 loss is identical with and without the `w2` save (12.22412); later steps
+differ only at rounding level. The saves grow with tokens per microbatch: at
+2 x 16384 tokens per device, `muse_glimmer_30b_fused_ce` with both saves runs
+out of HBM at compile time (96.29G of HLO temporaries vs 94.74G available), so
+drop the saves (`--compile.memory_policy=full --compile.save_regions`) for
+larger batches.
+
+The Splash save itself, measured on 10/14/2026 (before the `w2` region existed):
 
 | Memory policy | Step time | MFU | Physical peak HBM |
 |---|---|---|---|
 | `full` | ~5.60s | ~44.0% | 46.18GiB |
 | Splash saved in the last 26 layers | ~5.45s (-2.6%) | ~45.2% | 46.18GiB |
-| Splash saved in all 52 layers (default) | ~5.32s (-5.1%) | ~46.3% | 63.77GiB |
+| Splash saved in all 52 layers | ~5.32s (-5.1%) | ~46.3% | 63.77GiB |
 
 Losses match `full`. To opt out, add
 `--compile.memory_policy=full --compile.save_regions`
 (the second flag, with no values, clears the save regions, which only apply
-to `tpu_selective`). To get about half the speedup with no extra peak HBM,
-save Splash in the last 26 layers only:
+to `tpu_selective`). To save only Splash, add
+`--compile.save_regions attention.inner_attention`. To get
+about half of the Splash speedup with no extra peak HBM over `full`, save
+Splash in the last 26 layers only:
 `--compile.save_regions --compile.save_last_n_layers attention.inner_attention 26`.

@@ -122,8 +122,8 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"
   # ``tpu_selective`` and ``tpu_selective_and_offload`` only: full recompute,
   # except these save regions, whose values are saved for backward in every
-  # layer: "moe.routing" and "attention.inner_attention" (see
-  # ``experiments/tpu/remat_regions.py``).
+  # layer: "moe.routing", "attention.inner_attention" and "feed_forward.w2"
+  # (see ``experiments/tpu/remat_regions.py``).
   save_regions: tuple[str, ...] = ()
   # ``tpu_selective`` and ``tpu_selective_and_offload`` only: save regions to
   # save only in their last N transformer layers, which backward reaches

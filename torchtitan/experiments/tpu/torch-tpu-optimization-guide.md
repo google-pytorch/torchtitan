@@ -442,8 +442,10 @@ is set by `compile.memory_policy`:
 - `full`: full recompute; only the layer boundaries are saved.
 - `tpu_selective`: full recompute plus the regions named in `compile.save_regions` (every
   layer) or `compile.save_last_n_layers` (the last N layers, which backward reaches first).
-  Two regions exist: `attention.inner_attention` (the Splash output and LSE, so backward skips
-  re-running the kernel) and `moe.routing` (the top-k ids and the expert-sort permutation). It
+  Three regions exist: `attention.inner_attention` (the Splash output and LSE, so backward skips
+  re-running the kernel), `moe.routing` (the top-k ids and the expert-sort permutation) and
+  `feed_forward.w2` (the FFN down-projection output, so backward skips re-running that matmul;
+  only models with a norm after the FFN, such as Muse Glimmer, read it in backward). The policy
   does not combine with scan. This is the TPU way to say "full recompute but keep X".
 - `tpu_selective_and_offload`: `tpu_selective`, plus offload of everything else that is saved (the
   layer boundaries) to host memory as in `full_and_offload` (§9). The save-region values stay in

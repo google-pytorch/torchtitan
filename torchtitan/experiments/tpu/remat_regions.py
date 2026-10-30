@@ -32,6 +32,9 @@ ATTENTION_INNER_ATTENTION = "attention.inner_attention"
 # expert-sort permutation that ``token_dispatcher.local_reorder`` computes from
 # them.
 MOE_ROUTING = "moe.routing"
+# Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
+# norm backward reads; saving it avoids recomputing that matmul.
+FEED_FORWARD_W2 = "feed_forward.w2"
 
 
 def annotate_region(name: str) -> AbstractContextManager[None]:

@@ -55,6 +55,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     resolve_save_regions,
     ROUTING_REGION,
     SaveRegion,
+    select_ffn_down_projection,
     select_route_permutations,
     select_routing,
     select_routing_decisions,
@@ -62,7 +63,11 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     select_splash_attention,
     SPLASH_ATTENTION_REGION,
 )
-from torchtitan.experiments.tpu.remat_regions import MOE_ROUTING, REMAT_REGION
+from torchtitan.experiments.tpu.remat_regions import (
+    FEED_FORWARD_W2,
+    MOE_ROUTING,
+    REMAT_REGION,
+)
 from torchtitan.experiments.tpu.token_dispatcher import (
     local_reorder,
     stable_grouped_reduce,
@@ -263,6 +268,69 @@ class _MoEToy(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+class _Proj(nn.Module):
+    """A bias-free linear layer in the input's dtype, traced as ``aten.linear``."""
+
+    def __init__(self, dim_in: int, dim_out: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim_out, dim_in) * 0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.linear(x, self.weight.to(x.dtype))
+
+
+class _SwiGLU(nn.Module):
+    def __init__(self, dim: int, hidden: int) -> None:
+        super().__init__()
+        self.w1 = _Proj(dim, hidden)
+        self.w2 = _Proj(hidden, dim)
+        self.w3 = _Proj(dim, hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
+
+
+class _FFNBlock(nn.Module):
+    """A dense block whose FFN output feeds a post-norm, as in Muse Glimmer.
+
+    The norm's backward reads the w2 output, so under full recompute the
+    backward re-runs the w2 matmul; that is the recompute the
+    ``feed_forward.w2`` save removes.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.feed_forward = _SwiGLU(dim, 2 * dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + nn.functional.rms_norm(self.feed_forward(x), (x.shape[-1],))
+
+
+class _FFNToy(nn.Module):
+    def __init__(self, n_layers: int = 3) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(_FFNBlock(_DIM) for _ in range(n_layers))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+# CPU tracing decomposes ``F.linear`` into ``mm``; TPU traces keep ``linear``.
+_MATMULS = (
+    torch.ops.aten.linear.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.addmm.default,
+)
+
+
+def _is_w2_matmul(node: torch.fx.Node) -> bool:
+    return node.target in _MATMULS and node.meta.get("custom", {}).get(
+        "module_fqn", ""
+    ).endswith(".feed_forward.w2")
 
 
 def _trace_toy(model: nn.Module):
@@ -702,6 +770,55 @@ class TestTpuSelectivePolicy(unittest.TestCase):
                     and node.name.endswith("_recomputed")
                 ]
                 self.assertEqual(len(recomputed), recomputed_topks)
+
+    def test_saved_w2_skips_the_down_projection_recompute(self) -> None:
+        # Each layer's post-norm backward reads its w2 output; unless it is
+        # saved, backward re-runs that matmul.
+        for save_regions, last_n_layers, saved_layers in (
+            ((FEED_FORWARD_W2,), {}, [0, 1, 2]),
+            ((), {FEED_FORWARD_W2: 1}, [2]),
+        ):
+            with self.subTest(save_regions=save_regions, last_n_layers=last_n_layers):
+                torch.manual_seed(0)
+                chosen = self._run(_FFNToy(), save_regions, last_n_layers)
+
+                self.assertTrue(all(_is_w2_matmul(node) for node in chosen))
+                self.assertEqual(
+                    sorted(_get_layer_id(node) for node in chosen), saved_layers
+                )
+                graph = next(iter(chosen)).graph
+                recomputed = sorted(
+                    _get_layer_id(node)
+                    for node in graph.nodes
+                    if _is_w2_matmul(node) and node.name.endswith("_recomputed")
+                )
+                self.assertEqual(
+                    recomputed, sorted({0, 1, 2} - set(saved_layers))
+                )
+
+
+class TestFeedForwardW2Region(unittest.TestCase):
+    def test_selects_one_w2_matmul_per_layer(self) -> None:
+        torch.manual_seed(0)
+        traced, _ = _trace_toy(_FFNToy())
+
+        w2 = select_ffn_down_projection(traced.gm)
+
+        self.assertEqual([_get_layer_id(node) for node in w2], [0, 1, 2])
+        self.assertTrue(all(_is_w2_matmul(node) for node in w2))
+
+    def test_w2_without_exactly_one_matmul_raises(self) -> None:
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        w = graph.placeholder("w")
+        for _ in range(2):
+            mm = graph.call_function(torch.ops.aten.linear.default, args=(x, w))
+            mm.meta["custom"] = {"module_fqn": "layers.0.feed_forward.w2"}
+        graph.output(mm)
+        gm = torch.fx.GraphModule(nn.Module(), graph)
+
+        with self.assertRaisesRegex(ValueError, "exactly one forward matmul"):
+            select_ffn_down_projection(gm)
 
 
 def _is_splash_node(node: torch.fx.Node) -> bool:

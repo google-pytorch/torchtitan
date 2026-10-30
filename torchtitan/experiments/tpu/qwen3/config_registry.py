@@ -939,6 +939,17 @@ def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
     config.scale_before_down_proj = True
 
 
+def _use_q235_tokamax_attention(cfg: TPUTrainerConfig) -> None:
+  splash = cfg.splash_attention_kernel
+  splash.use_tokamax_splash_attention_kernel = True
+  # Stacking the 16 query heads of a KV head makes a 256-row Q block a
+  # 4096-row tile.
+  splash.sa_num_stacked_q_heads = 16
+  splash.sa_block_q = 256
+  splash.sa_block_kv = 512
+  splash.sa_block_kv_compute = 512
+
+
 def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
@@ -966,7 +977,7 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   # Replacing model_spec also replaces nested MoE policy inherited from the
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
-  cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
+  _use_q235_tokamax_attention(cfg)
   _scale_routes_before_down_proj(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
@@ -1169,7 +1180,7 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
   _scale_routes_before_down_proj(cfg)
-  cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
+  _use_q235_tokamax_attention(cfg)
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
   # TODO(#22): delete once `MoE.forward` guards that write.

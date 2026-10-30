@@ -13,6 +13,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
+    _get_module_fqn,
     annotate_module_fqns,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
@@ -35,10 +36,20 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
+from torchtitan.experiments.tpu.graph_trainer.passes import (
+    expert_all_gather_deadline as deadline_lib,
+)
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
     split_forward_graph_by_layer,
     split_forward_backward_graph,
+)
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    _optimization_barrier,
+)
+from torchtitan.experiments.tpu.graph_trainer.tests.test_tpu_memory_policy import (
+    _SplashCore,
+    _STOCK_STYLE_SPLASH,
 )
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
     thread_host_offload_donors,
@@ -100,11 +111,33 @@ class _ViewOutputLayer(nn.Module):
     return torch.relu(self.linear(inputs.view(4, -1, 8))).view(-1, 8)
 
 
+class _AttentionMoELayer(nn.Module):
+  """A decoder-like layer: a projection into a Splash-like op, then experts."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.attention = nn.Linear(8, 8, bias=False)
+    self.splash = _SplashCore(_STOCK_STYLE_SPLASH, model_layout=False)
+    self.moe = nn.Linear(8, 8, bias=False)
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    return torch.relu(self.moe(self.splash(self.attention(inputs))))
+
+
+class _AttentionMoEToy(_ToyTransformer):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__(n_layers)
+    self.layers = nn.ModuleList(_AttentionMoELayer() for _ in range(n_layers))
+
+
 class GraphSplitTest(absltest.TestCase):
 
-  def _build_toy_model(self, n_layers: int) -> _ToyTransformer:
+  def _build_toy_model(
+      self, n_layers: int, model_cls: type[nn.Module] = _ToyTransformer
+  ) -> nn.Module:
     """Build the shared prefix-plus-transformer-layer test model."""
-    model = _ToyTransformer(n_layers)
+    model = model_cls(n_layers)
     annotate_module_fqns(model)
     return model
 
@@ -138,6 +171,7 @@ class GraphSplitTest(absltest.TestCase):
       traced,
       *,
       fsdp_reshard_after_forward: str,
+      before_split=None,
   ):
     """Apply full remat, then split the real joint trace at fwd/bwd."""
     _full_memory_policy_pass(
@@ -151,6 +185,8 @@ class GraphSplitTest(absltest.TestCase):
         ),
     )
     selective_activation_remat_pass(traced.gm)
+    if before_split is not None:
+      before_split(traced.gm)
     return split_forward_backward_graph(traced.gm, traced.example_inputs)
 
   def _trace_simple_fsdp(
@@ -159,6 +195,8 @@ class GraphSplitTest(absltest.TestCase):
       n_layers: int,
       reduce_dtype: torch.dtype = torch.float32,
       fsdp_reshard_after_forward: str = "always",
+      model_cls: type[nn.Module] = _ToyTransformer,
+      before_split=None,
   ):
     """Trace the shared model through real SimpleFSDP with fake collectives."""
 
@@ -169,7 +207,7 @@ class GraphSplitTest(absltest.TestCase):
     try:
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
-        model = self._build_toy_model(n_layers)
+        model = self._build_toy_model(n_layers, model_cls)
         model = data_parallel(
             model,
             device_mesh=mesh,
@@ -190,6 +228,7 @@ class GraphSplitTest(absltest.TestCase):
     return self._apply_passes_and_split(
         traced,
         fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+        before_split=before_split,
     )
 
   def _assert_collective_chains_are_atomic(
@@ -623,6 +662,7 @@ class GraphSplitTest(absltest.TestCase):
             backward_layers_per_executable=1,
             cpu_offload_prefetch_executables=0,
             donate_internal_buffers=False,
+            expert_all_gather_deadline=False,
         ),
         n_layers=3,
     )
@@ -655,6 +695,30 @@ class GraphSplitTest(absltest.TestCase):
             for node in module.forward_graph.graph.nodes
         )
     )
+
+  def test_expert_all_gather_deadline_joins_weights_with_splash(self):
+    barriers = []
+
+    def apply_deadline(gm: torch.fx.GraphModule) -> None:
+      deadline_lib.apply_expert_all_gather_deadline(gm)
+      barriers.extend(
+          node for node in gm.graph.nodes if node.target is _optimization_barrier
+      )
+
+    # The forward and the recomputed backward copy of each of the 2 layers.
+    split = self._trace_simple_fsdp(
+        n_layers=2, model_cls=_AttentionMoEToy, before_split=apply_deadline
+    )
+    self.assertLen(barriers, 4)
+    for barrier in barriers:
+      anchor, *weights = barrier.args
+      self.assertTrue(deadline_lib._is_splash_output(anchor))
+      self.assertNotEmpty(weights)
+      for weight in weights:
+        self.assertIn(".moe", _get_module_fqn(weight))
+        # Only the barrier reads the gathered weight in its copy of the layer.
+        self.assertEqual(list(weight.users), [barrier])
+    self.assertIsNotNone(split.backward_graph)
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

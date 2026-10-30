@@ -749,7 +749,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
 
   @pl.kernel(
       out_type=out_type,
-      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
+      mesh=pltpu.TensorCoreMesh(axis_name="core")
       if jax.__version_info__ < (0, 11, 0)
       else pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=(
@@ -1095,7 +1095,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       out_type=[pltpu.HBM(t.shape, t.dtype) for t in out_type]
       if jax.__version_info__ < (0, 11, 0)
       else out_type,
-      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
+      mesh=pltpu.TensorCoreMesh(axis_name="core")
       if jax.__version_info__ < (0, 11, 0)
       else pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=(

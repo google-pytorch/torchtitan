@@ -1028,15 +1028,21 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       self.assertEqual(aux_loss.coeff, 1e-3)
       self.assertEqual(aux_loss.top_k, moe.router.top_k)
 
-  def test_235b_splitter_uses_tokamax_splash_attention(self) -> None:
-    for config in (
-        qwen3_moe_235b_fsdp_activation_offload_4x4x4(),
-        qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(),
+  def test_235b_uses_tuned_tokamax_splash_attention(self) -> None:
+    for name, config in (
+        ("splitter", qwen3_moe_235b_fsdp_activation_offload_4x4x4()),
+        ("splitter_maxtext", qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4()),
+        ("scan", qwen3_moe_235b_scan()),
     ):
-      with self.subTest(reduce_dtype=config.training.mixed_precision_reduce):
+      with self.subTest(name):
         splash = config.splash_attention_kernel
         self.assertTrue(splash.use_tokamax_splash_attention_kernel)
         self.assertFalse(splash.sa_use_document_aware_block_skipping)
+        self.assertEqual(splash.sa_num_stacked_q_heads, 16)
+        self.assertEqual(
+            (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
+            (256, 512, 512),
+        )
 
   def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()

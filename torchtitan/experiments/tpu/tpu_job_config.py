@@ -115,6 +115,9 @@ class SplashAttentionKernelConfig:
   # False remains useful with a scanned backward because forward still benefits;
   # combine False with use_vmap_bwd=True to make backward batch-native too.
   sa_use_document_aware_block_skipping: bool = True
+  # Tokamax only. Query heads sharing a KV head that the forward processes as
+  # one tile.
+  sa_num_stacked_q_heads: int = 1
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

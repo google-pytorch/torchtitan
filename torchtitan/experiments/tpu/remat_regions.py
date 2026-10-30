@@ -8,7 +8,7 @@
 
 The names use upstream ``RegionAC``'s naming (``<block-relative module
 FQN>.<local name>``), so eager and graph AC can later share one vocabulary.
-``graph_trainer_save_regions`` and ``graph_trainer_save_last_n_layers`` take
+``compile.save_regions`` and ``compile.save_last_n_layers`` take
 these names.
 
 Model code marks values that op names alone cannot tell apart by computing

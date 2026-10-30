@@ -6,6 +6,7 @@ import shutil
 import tempfile
 from unittest import mock
 
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
@@ -19,12 +20,12 @@ _MODELS = [
     dict(
         testcase_name="qwen3",
         module="torchtitan.experiments.tpu.qwen3",
-        config="qwen3_debugmodel",
+        config="graph_trainer_qwen3_debugmodel",
     ),
     dict(
         testcase_name="llama3",
         module="torchtitan.experiments.tpu.llama3",
-        config="llama3_debugmodel",
+        config="graph_trainer_llama3_debugmodel",
     ),
 ]
 
@@ -35,11 +36,17 @@ def _train_args(
     optimizer_implementation: str = "foreach",
     dataset_path: str = "tests/assets/c4_test",
     dataset: str = "c4_test",
+    *,
+    use_splash_attention_kernel: bool = True,
 ) -> list[str]:
-  """The flags every case here shares, so the arms differ only in what they test."""
+  """The flags every case here shares, so the arms differ only in what they test.
+
+  ``use_splash_attention_kernel=False`` keeps the model on its plain SDPA
+  inner attention (models whose Splash parity is not yet established).
+  """
   # Upstream replaced seq_len/local_batch_size with a token budget:
   # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
-  return [
+  args = [
       f"--module={module}",
       f"--config={config}",
       f"--optimizer.implementation={optimizer_implementation}",
@@ -51,10 +58,10 @@ def _train_args(
       "--training.mixed_precision_param=float32",
       "--training.mixed_precision_reduce=float32",
       "--training.num_tokens_per_microbatch_per_dp_rank=512",
-      "--splash_attention_kernel.use_splash_attention_kernel",
-      "--tpu_config.use_graph_trainer",
-      "--tpu_config.compile_mode=aot_fx_trace",
   ]
+  if use_splash_attention_kernel:
+    args.append("--splash_attention_kernel.use_splash_attention_kernel")
+  return args
 
 
 class _RecordLosses:
@@ -102,34 +109,34 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="qwen3_simple_fsdp",
           module="torchtitan.experiments.tpu.qwen3",
-          config="qwen3_debugmodel",
+          config="graph_trainer_qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
           ],
       ),
       dict(
           testcase_name="llama3_simple_fsdp",
           module="torchtitan.experiments.tpu.llama3",
-          config="llama3_debugmodel",
+          config="graph_trainer_llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
           ],
       ),
       dict(
           testcase_name="llama3_simple_fsdp_scan_layers_hsdp",
           module="torchtitan.experiments.tpu.llama3",
-          config="llama3_debugmodel",
+          config="graph_trainer_llama3_debugmodel",
           # Unset, so FSDP gets the remaining num_devices / 2.
           data_parallel_shard_degree=None,
           tensor_parallel_degree=1,
           data_parallel_replicate_degree=2,
           args=[
-              "--tpu_config.use_simple_fsdp",
-              "--tpu_config.use_scan_layers",
+              "--parallelism.use_simple_fsdp",
+              "--compile.use_scan_layers",
           ],
           # TODO(b/574966859): Broken by cl/1001117754 `RuntimeError:
           # traverse_and_compile(): expected Pallas kernels and scans in the
@@ -147,11 +154,70 @@ class TpuGraphTrainerDistributedTest(
       dict(
           testcase_name="muse_glimmer_simple_fsdp",
           module="torchtitan.experiments.tpu.muse_glimmer",
-          config="muse_glimmer_debugmodel",
+          config="graph_trainer_muse_glimmer_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--tpu_config.use_simple_fsdp",
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      # Gemma 4 (examples/gemma4). Context 256 exceeds the debugmodel's
+      # 128-token sliding window, so the sliding layers actually mask; the
+      # token budget keeps 4 sequences per rank. Plain SDPA: Splash/tokamax
+      # parity on Gemma 4 is its own PR. No scan case: the sliding (head_dim
+      # 32, QKVLinear) and global (head_dim 64, QKVLinearKeqV) layers cannot
+      # be stacked. No TP case: the wrapper is SimpleFSDP/HSDP only.
+      dict(
+          testcase_name="gemma4_simple_fsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="graph_trainer_gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          use_splash_attention_kernel=False,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.fsdp_reshard_after_forward=always",
+              "--compile.enable_remat_barriers",
+              "--compile.fsdp_barrier_policy=interleave",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
+          testcase_name="gemma4_moe_simple_fsdp",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="graph_trainer_gemma4_moe_debug",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          use_splash_attention_kernel=False,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.fsdp_reshard_after_forward=always",
+              "--compile.enable_remat_barriers",
+              "--compile.fsdp_barrier_policy=interleave",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
+          testcase_name="gemma4_graph_split_offload",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="graph_trainer_gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          use_splash_attention_kernel=False,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.fsdp_reshard_after_forward=always",
+              "--compile.memory_policy=full_and_offload",
+              "--compile.graph_split.enabled",
+              "--compile.graph_split.forward_layers_per_executable=1",
+              "--compile.graph_split.forward_isolate_prefix",
+              "--compile.graph_split.backward_partition_mode=by_layer",
+              "--compile.graph_split.backward_layers_per_executable=1",
+              "--compile.graph_split.cpu_offload_prefetch_executables=1",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -171,12 +237,18 @@ class TpuGraphTrainerDistributedTest(
       dataset="c4_test",
       args: list[str] | None = None,
       skip_reason: str | None = None,
+      use_splash_attention_kernel: bool = True,
   ):
     if skip_reason:
       self.skipTest(skip_reason)
 
     combined_args = _train_args(
-        module, config, optimizer_implementation, dataset_path, dataset
+        module,
+        config,
+        optimizer_implementation,
+        dataset_path,
+        dataset,
+        use_splash_attention_kernel=use_splash_attention_kernel,
     ) + (args or [])
 
     self._test_train_distributed(
@@ -202,11 +274,11 @@ class TpuGraphTrainerDistributedTest(
     """
     tempdir = self.create_tempdir().full_path
     losses = {}
-    for arm, extra in (("loop", []), ("scan", ["--tpu_config.use_scan_layers"])):
+    for arm, extra in (("loop", []), ("scan", ["--compile.use_scan_layers"])):
       path = os.path.join(tempdir, f"{arm}.json")
       self._test_train_distributed(
           config_args=_train_args(module, config)
-          + ["--tpu_config.use_simple_fsdp"]
+          + ["--parallelism.use_simple_fsdp"]
           + extra,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
@@ -222,6 +294,98 @@ class TpuGraphTrainerDistributedTest(
     # severed carry moves the loss by percent, far outside this.
     for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
       self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
+
+  def test_gemma4_graph_trainer_matches_the_layer_compile(self):
+    """The graph trainer must train Gemma 4 to the losses of the eager lane.
+
+    The PR-1 lane is the regular TPU trainer with per-block
+    ``torch.compile(dynamic=False)`` and SimpleFSDP; this PR adds the
+    ``aot_fx_trace`` joint graph on the same recipe. Same model config, data,
+    seed, fp32 params and reductions, so the two arms differ only in how the
+    step is captured. Every step is compared, not just the first: a wrapper
+    that mis-shards an uneven parameter (the vocabulary over 8 ranks, say) or
+    drops a gradient leaves step 1 exact and only diverges once the optimizer
+    has stepped.
+    """
+    module = "torchtitan.experiments.tpu.examples.gemma4"
+    # Context 256 > the 128-token sliding window, 4 sequences per rank.
+    shape = [
+        "--training.max_context_length=256",
+        "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+    ]
+    layer_compile_args = _train_args(
+        module,
+        "gemma4_debugmodel",
+        use_splash_attention_kernel=False,
+    )
+    graph_trainer_args = _train_args(
+        module,
+        "graph_trainer_gemma4_debugmodel",
+        use_splash_attention_kernel=False,
+    )
+    arms = {
+        "layer_compile": [
+            *layer_compile_args,
+            "--parallelism.use_simple_fsdp",
+            *shape,
+        ],
+        "graph_trainer": [
+            *graph_trainer_args,
+            "--parallelism.use_simple_fsdp",
+            *shape,
+        ],
+        "control": [
+            *graph_trainer_args,
+            "--parallelism.use_simple_fsdp",
+            *shape,
+            "--lr_scheduler.warmup_steps=3",
+        ],
+    }
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    for arm, config_args in arms.items():
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=config_args,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        losses[arm] = json.load(f)
+
+    self.assertNotEmpty(losses["layer_compile"])
+    self.assertLen(losses["graph_trainer"], len(losses["layer_compile"]))
+    # Both arms are fp32 end to end; what differs is XLA's fusion and
+    # reduction order between one joint program and per-block programs.
+    # Measured on v5e-8 (tpu_4x2x1) with full AC on both arms: |diff| <= 4.3e-6
+    # absolute, 5.9e-7 relative, over the 3 steps (7.674668 vs 7.674666 at step 1). A dropped
+    # gradient or a mis-sharded parameter moves the loss by percent, far
+    # outside this.
+    for (step, graph), (_, layer) in zip(
+        losses["graph_trainer"], losses["layer_compile"]
+    ):
+      logging.info(
+          "gemma4 step %d: graph_trainer loss %.6f, layer_compile loss %.6f,"
+          " |diff| %.2e (%.2e relative)",
+          step,
+          graph,
+          layer,
+          abs(graph - layer),
+          abs(graph - layer) / abs(layer),
+      )
+      self.assertAlmostEqual(
+          graph, layer, delta=abs(layer) * 1e-5, msg=f"step {step}"
+      )
+    control_losses = dict(losses["control"])
+    layer_losses = dict(losses["layer_compile"])
+    for step in (2, 3):
+      self.assertGreater(
+          abs(control_losses[step] - layer_losses[step]),
+          abs(layer_losses[step]) * 1e-5,
+          msg=f"control, step {step}",
+      )
 
 
 if __name__ == "__main__":

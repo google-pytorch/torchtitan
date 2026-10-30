@@ -128,7 +128,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
                 "per-layer buffers cannot be shared across layers. Stacking "
                 "does not support MoE load balancing yet "
                 "(https://github.com/google-pytorch/torchtitan/issues/22); "
-                "drop --tpu-config.use-scan-layers, or set "
+                "drop --compile.use-scan-layers, or set "
                 "load_balance_coeff to None."
             )
         got = spec(layer)
@@ -608,7 +608,7 @@ class LayerStack:
             )
         if use_scan:
             # Logged because a recipe would otherwise believe its own setting:
-            # `graph_trainer_memory_policy` tags joint-graph nodes, and the
+            # `compile.memory_policy` tags joint-graph nodes, and the
             # body's are not in it. Only `LayerStack.run`'s budget reaches them,
             # and it must be 0.0 or the in-body gather is saved instead of
             # recomputed.
@@ -791,7 +791,7 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
     * The layer must not mutate its inputs. ``scan`` is a higher-order op, and a
       body that writes to what it was handed raises
       ``UncapturedHigherOrderOpError`` at trace time.
-    * The step has to be traced: ``--tpu-config.compile-mode=aot_fx_trace``.
+    * The step has to be traced: ``--compile.mode=aot_fx_trace``.
       Eager ``scan`` doesn't materialize on TPU.
 
     What does and does not change:

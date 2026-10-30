@@ -24,7 +24,7 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
-from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
+from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.protocols.model_spec import ModelSpec
@@ -86,4 +86,28 @@ def model_registry(flavor: str) -> ModelSpec:
     return dataclasses.replace(
         graph_trainer_model_registry(flavor),
         parallelize_fn=parallelize_qwen3,
+    )
+
+
+def to_graph_trainer_model_spec(model_spec: ModelSpec) -> ModelSpec:
+    """Convert an already-specialized Qwen spec to its TPU graph counterpart.
+
+    Recipes use this after applying TPU converters to the regular model config.
+    It mirrors upstream ``to_graph_trainer_config``: preserve that configured
+    model and the recipe-owned hooks, but replace its model type and execution
+    callables with the GraphTrainer versions.
+    """
+    graph_spec = model_registry(model_spec.flavor)
+    graph_model_cls = type(graph_spec.model)
+    graph_model = graph_model_cls(
+        **{
+            field.name: getattr(model_spec.model, field.name)
+            for field in dataclasses.fields(model_spec.model)
+        }
+    )
+    return dataclasses.replace(
+        model_spec,
+        model=graph_model,
+        parallelize_fn=graph_spec.parallelize_fn,
+        pipelining_fn=graph_spec.pipelining_fn,
     )

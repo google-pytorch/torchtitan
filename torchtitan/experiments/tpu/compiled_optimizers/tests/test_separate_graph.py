@@ -1,9 +1,12 @@
 """Unit tests for separate-graph compiled AdamW optimizer on TPU / CPU."""
 
+from unittest import mock
+
 from absl.testing import absltest
 import torch
 from torch import nn
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
+from torchtitan.experiments.tpu.compiled_optimizers import separate_graph
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer
 
 
@@ -21,6 +24,21 @@ class DummyTrainer:
 
   def __init__(self, optimizer: torch.optim.Optimizer):
     self.optimizers = DummyOptimizersContainer(optimizer)
+
+
+class SeparateGraphCompilerConstructionTest(absltest.TestCase):
+
+  def test_static_compiler_is_instantiated_before_graph_arguments(self):
+    graph_module = torch.fx.symbolic_trace(lambda value: (value + 1,))
+    example_inputs = (torch.ones(1),)
+    compiler = mock.Mock()
+    compiler_class = mock.Mock(return_value=compiler)
+
+    with mock.patch.object(separate_graph, "StaticCompiler", compiler_class):
+      separate_graph._tpu_backend_compile_pass(graph_module, example_inputs)
+
+    compiler_class.assert_called_once_with()
+    compiler.assert_called_once_with(graph_module, list(example_inputs))
 
 
 class SeparateGraphOptimizerTest(BaseAcceleratorDeviceTest):

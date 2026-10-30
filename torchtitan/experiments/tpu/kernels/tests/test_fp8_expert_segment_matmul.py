@@ -1,5 +1,7 @@
 """Accelerator tests for the FP8 expert grouped matmuls."""
 
+import contextlib
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -35,6 +37,20 @@ def _grouped_reference(lhs, rhs, group_sizes):
     return torch.cat(out)
 
 
+@contextlib.contextmanager
+def _skip_if_no_fp8_mxu(test: absltest.TestCase):
+    """Skips ``test`` where tokamax GMM v2 cannot quantize lhs to e4m3.
+
+    In-kernel FP8 lhs quantization needs an FP8 x FP8 MXU (v7x).
+    """
+    try:
+        yield
+    except ValueError as e:
+        if "not a supported combination" not in str(e):
+            raise
+        test.skipTest(f"No FP8 x FP8 matmul on this TPU: {e}")
+
+
 def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
     got, want = got.detach().float().cpu(), want.detach().float().cpu()
     return ((got - want).norm() / want.norm()).item()
@@ -68,7 +84,9 @@ class Fp8GmmTest(base_device_test.BaseAcceleratorDeviceTest):
             _GROUP_SIZES,
         )
         self.assertEqual(out.dtype, jnp.bfloat16)
-        self.assertLess(_rel_err(_to_torch(out), want), 5e-3)
+        # As in the torch-op test below: rounding differences, not the FP8
+        # quantization error (about 0.04 against exact FP32).
+        self.assertLess(_rel_err(_to_torch(out), want), 1e-2)
 
     def test_bwd_is_close_to_f32(self):
         lhs, rhs, dout, sizes = self._operands()
@@ -174,8 +192,11 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         )
         self.assertEqual(out.dtype, torch.bfloat16)
         # XLA's FP32 -> FP8 convert may round a few elements one FP8 ulp
-        # differently from torch's, so compare in norm.
-        self.assertLess(_rel_err(out, want), 5e-3)
+        # differently from torch's, and the BF16 output adds about 0.002, so
+        # compare in norm. v7x's native FP8 path differs a bit more than v6e
+        # (0.006 vs 0.004), still far below the FP8 quantization error (about
+        # 0.04 against exact FP32).
+        self.assertLess(_rel_err(out, want), 1e-2)
 
     def test_backward_is_close_to_bf16(self):
         lhs, rhs, dout, sizes = self._operands()
@@ -288,6 +309,40 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             joint.cpu(), torch.cat(split, dim=-1).cpu(), rtol=0, atol=0
         )
 
+
+    def test_fused_lhs_quant_is_close(self):
+        # GMM v2 scales lhs per row and 512-wide K block instead of per row.
+        lhs, rhs, dout, sizes = self._operands(k=1024)
+        dev = self.accelerator_device
+
+        def run(fused):
+            x, a, b = self._to_dev(lhs, rhs, rhs.flip(0), grad=True)
+            out = fp8_esm.fp8_paired_segment_matmul_pallas_2d(
+                x,
+                a,
+                b,
+                sizes.to(dev),
+                split=False,
+                fused_lhs_quant=fused,
+                fwd_tiling=_TILING,
+                dlhs_tiling=_TILING,
+                # tokamax's TGMM gives dY one scale per column over all rows
+                # and supports a dWeight K tile of at most that many rows
+                # (512 here), so do not take the full K = 1024.
+                drhs_tiling=(128, 256, 0),
+            )
+            grads = torch.autograd.grad(
+                out, (x, a, b), torch.cat([dout, dout], -1).to(dev)
+            )
+            return out, grads
+
+        with _skip_if_no_fp8_mxu(self):
+            out, grads = run(fused=True)
+        want, want_grads = run(fused=False)
+        self.assertLess(_rel_err(out, want), 0.02)
+        # The backward is the same op either way.
+        for got, ref in zip(grads, want_grads):
+            torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=0, atol=0)
 
     @parameterized.parameters(True, False)
     def test_swiglu_matches_separate_ops(self, fused_quant):

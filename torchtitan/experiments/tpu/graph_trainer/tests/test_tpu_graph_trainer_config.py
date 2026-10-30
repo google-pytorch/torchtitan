@@ -89,6 +89,7 @@ from torchtitan.experiments.tpu.overrides.real_rope import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
 from torchtitan.experiments.tpu.qwen3.config_registry import (
@@ -108,6 +109,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_235b_fsdp_activation_offload_maxtext,
     qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_fp8,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
     reg_trainer_qwen3_8b,
@@ -1075,6 +1077,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertLen(
         list(graph_config.model_spec.model.traverse(TpuPackedQKVLinear.Config)),
         94,
+    )
+
+  def test_235b_scan_fp8_keeps_route_scores_after_the_experts(self) -> None:
+    # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2,
+    # so the recipe multiplies them after the experts instead.
+    config = qwen3_moe_235b_scan_fp8()
+
+    assert config.model_spec is not None
+    model = config.model_spec.model
+    experts = list(model.traverse(TpuGroupedExperts.Config))
+    self.assertLen(experts, 94)
+    self.assertTrue(all(e.use_fp8_grouped_mm for _, e, _, _ in experts))
+    # The recipe targets v7x, so it turns on in-kernel W1/W3 quantization.
+    self.assertTrue(all(e.fp8_w13_fused_lhs_quant for _, e, _, _ in experts))
+    routed = list(model.traverse(TpuRoutedExperts.Config))
+    self.assertLen(routed, 94)
+    self.assertFalse(any(r.scale_before_down_proj for _, r, _, _ in routed))
+    dispatchers = list(model.traverse(TpuAllToAllTokenDispatcher.Config))
+    self.assertLen(dispatchers, 94)
+    self.assertTrue(
+        all(d.fuse_route_score_backward for _, d, _, _ in dispatchers)
     )
 
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:

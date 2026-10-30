@@ -46,6 +46,7 @@ def _passthrough_jaxtyped(*args, **kwargs):
 
 
 jaxtyping.jaxtyped = _passthrough_jaxtyped
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2 as tokamax_gmm_v2  # noqa: E402  pylint: disable=g-import-not-at-top
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as tokamax_gmm  # noqa: E402  pylint: disable=g-import-not-at-top
 
 jaxtyping.jaxtyped = _real_jaxtyped
@@ -375,6 +376,71 @@ _register_autograd(
 
 
 # ---------------------------------------------------------------------------
+# In-kernel lhs quantization. tokamax's GMM v2 can quantize BF16 lhs tiles to
+# FP8 itself (absmax per row and 512-wide K block, applied to the FP32
+# accumulator), which removes the standalone amax and cast passes over the
+# T*K routed rows that feed the forward GEMM. The backward still needs the
+# row-quantized X for dW, so the op also returns it; in the forward that is
+# not activation-checkpointed nothing consumes it and XLA drops that pass,
+# leaving one quantization of X (in the recompute) instead of two.
+# ---------------------------------------------------------------------------
+
+
+def fp8_gmm_fwd_fused_lhs(
+    lhs: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """``lhs[M, K] @ rhs[G, K, N]`` with lhs quantized inside the GMM v2 kernel."""
+    num_groups, _, n_dim = rhs_q.shape
+    return call_named(
+        tokamax_gmm_v2.gmm_v2,
+        "fp8_moe_gmm_fwd_fused_lhs",
+        lhs,
+        rhs_q,
+        group_sizes,
+        jnp.broadcast_to(
+            rhs_scale.reshape(1, 1, 1, n_dim), (num_groups, 1, 1, n_dim)
+        ),
+        preferred_element_type=jnp.dtype(out_dtype),
+        maybe_quantize_lhs=True,
+        lhs_quant_dtype=jnp.dtype(FWD_DTYPE),
+    )
+
+
+@pallas.jax_op("tt_experts::fp8_paired_grouped_mm_fq")
+def _fp8_paired_grouped_mm_fq_fwd(
+    lhs: jax.Array,
+    rhs_a: jax.Array,
+    rhs_b: jax.Array,
+    group_sizes: jax.Array,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> _Residuals:
+    # GMM v2 picks its own VMEM-aware tiling.
+    del fwd_tm, fwd_tk, fwd_tn, dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk
+    del drhs_tn
+    rhs = jnp.concatenate([rhs_a, rhs_b], axis=2)
+    lhs_q, lhs_scale, rhs_q, rhs_scale = quantize_operands(lhs, rhs)
+    out = fp8_gmm_fwd_fused_lhs(lhs, rhs_q, rhs_scale, group_sizes, lhs.dtype)
+    return out, _to_i8(lhs_q), lhs_scale, _to_i8(rhs_q), rhs_scale
+
+
+_register_autograd(
+    _fp8_paired_grouped_mm_fq_fwd, _fp8_paired_grouped_mm_bwd, num_weights=2
+)
+
+
+# ---------------------------------------------------------------------------
 # SwiGLU into W2: the op takes the paired W1/W3 output ``[gate | up]`` and
 # runs ``silu(gate) * up`` -> per-row e4m3 quantization -> W2 GEMM. With
 # ``fused_quant`` a Pallas kernel produces the FP8 hidden and its scales in one
@@ -638,13 +704,21 @@ def fp8_paired_segment_matmul_pallas_2d(
     dlhs_tiling: Tiling = (512, 0, 0),
     drhs_tiling: Tiling = (512, 0, 0),
     split: bool = True,
+    fused_lhs_quant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     """``(lhs @ rhs_a, lhs @ rhs_b)`` per expert as one FP8 GEMM over ``[a | b]``.
 
     Tilings are as in `fp8_segment_matmul_pallas_2d`, for N = 2 * rhs_a's N.
-    With ``split=False`` returns the ``[M, 2N]`` concatenation instead.
+    With ``split=False`` returns the ``[M, 2N]`` concatenation instead. With
+    ``fused_lhs_quant`` the forward GEMM quantizes lhs in-kernel (GMM v2, which
+    picks its own forward tiling).
     """
-    out, *_ = _fp8_paired_grouped_mm_fwd(
+    op = (
+        _fp8_paired_grouped_mm_fq_fwd
+        if fused_lhs_quant
+        else _fp8_paired_grouped_mm_fwd
+    )
+    out, *_ = op(
         lhs,
         rhs_a,
         rhs_b,

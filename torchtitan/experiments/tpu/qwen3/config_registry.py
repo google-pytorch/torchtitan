@@ -46,6 +46,7 @@ from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
     TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
@@ -1262,6 +1263,37 @@ def qwen3_moe_235b_scan_proxy() -> TpuGraphTrainer.Config:
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 1 * 4096
   cfg.training.num_tokens_per_train_step = 32 * 4096
   return cfg
+
+
+def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_fp8_grouped_mm = True
+    # In-kernel W1/W3 lhs quantization needs v7x, which this recipe targets.
+    experts.fp8_w13_fused_lhs_quant = True
+  # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2, so
+  # keep the score multiply after the experts, with its backward in one FP32
+  # fusion.
+  for _, routed, _, _ in cfg.model_spec.model.traverse(TpuRoutedExperts.Config):
+    routed.scale_before_down_proj = False
+  for _, dispatcher, _, _ in cfg.model_spec.model.traverse(
+      TpuAllToAllTokenDispatcher.Config
+  ):
+    dispatcher.fuse_route_score_backward = True
+  return cfg
+
+
+def qwen3_moe_235b_scan_fp8() -> TpuGraphTrainer.Config:
+  """`qwen3_moe_235b_scan` with FP8 expert GEMMs.
+
+  The expert W1/W3/W2 GEMMs and their backward run on FP8 operands through
+  tokamax's Mosaic GMM/TGMM (e4m3 forward, e5m2 gradients, dynamic row-wise
+  scales; see `kernels/fp8_expert_segment_matmul.py`). Attention, router and
+  lm_head stay BF16.
+  """
+  return _with_fp8_experts(qwen3_moe_235b_scan())
 
 
 def qwen3_moe_235b_scan_maxtext() -> TpuGraphTrainer.Config:

@@ -942,10 +942,11 @@ def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
 def _use_q235_tokamax_attention(cfg: TPUTrainerConfig) -> None:
   splash = cfg.splash_attention_kernel
   splash.use_tokamax_splash_attention_kernel = True
-  # Stacking the 16 query heads of a KV head makes a 256-row Q block a
-  # 4096-row tile.
+  splash.use_batch_loop_fwd = True
+  # Stacking the 16 query heads of a KV head makes a 128-row Q block a
+  # 2048-row tile.
   splash.sa_num_stacked_q_heads = 16
-  splash.sa_block_q = 256
+  splash.sa_block_q = 128
   splash.sa_block_kv = 512
   splash.sa_block_kv_compute = 512
 

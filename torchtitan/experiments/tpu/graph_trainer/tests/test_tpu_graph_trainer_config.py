@@ -1038,10 +1038,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         splash = config.splash_attention_kernel
         self.assertTrue(splash.use_tokamax_splash_attention_kernel)
         self.assertFalse(splash.sa_use_document_aware_block_skipping)
+        self.assertTrue(splash.use_batch_loop_fwd)
         self.assertEqual(splash.sa_num_stacked_q_heads, 16)
         self.assertEqual(
             (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
-            (256, 512, 512),
+            (128, 512, 512),
         )
 
   def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:

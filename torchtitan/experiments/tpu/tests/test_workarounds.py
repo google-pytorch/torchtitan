@@ -353,9 +353,9 @@ class WorkaroundsTest(parameterized.TestCase):
     model, sa = self._tokamax_patch_fixture()
     self.assertEqual(TokamaxConfig.block_q, 512, "precondition: class default")
     sa.sa_num_stacked_q_heads = 16
-    self.addCleanup(
-        setattr, TokamaxConfig, "num_stacked_q_heads", TokamaxConfig.num_stacked_q_heads
-    )
+    sa.use_batch_loop_fwd = True
+    for name in ("num_stacked_q_heads", "use_batch_loop_fwd"):
+      self.addCleanup(setattr, TokamaxConfig, name, getattr(TokamaxConfig, name))
 
     workarounds.use_tokamax_splash_attention_patch(model, sa)
 
@@ -370,6 +370,7 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertEqual(TokamaxConfig.v_layout, "HEAD_DIM_MINOR")
     self.assertTrue(TokamaxConfig.use_vmap_bwd)
     self.assertEqual(TokamaxConfig.num_stacked_q_heads, 16)
+    self.assertTrue(TokamaxConfig.use_batch_loop_fwd)
 
   def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
     """A real splash config whose fields resolve to nothing must fail loudly."""

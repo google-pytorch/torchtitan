@@ -442,6 +442,8 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       ("mqa_scan_bwd", 1, dict(use_vmap_bwd=False)),
       ("mqa_vmap_bwd", 1, dict(use_vmap_bwd=True)),
       ("gqa_vmap_bwd_stacked", 2, dict(use_vmap_bwd=True, num_stacked_q_heads=4)),
+      ("gqa_loop_fwd_stacked", 2, dict(use_vmap_bwd=True, use_batch_loop_fwd=True, num_stacked_q_heads=4)),
+      ("mqa_loop_fwd", 1, dict(use_vmap_bwd=True, use_batch_loop_fwd=True)),
   )
   def test_segment_ids_parity(self, n_kv_heads, config):
     """Packed-document forward and gradients match a block-causal SDPA reference."""
@@ -507,10 +509,11 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
           got.cpu(), want.transpose(1, 2), rtol=5e-2, atol=5e-2, msg=name
       )
 
-    if config.get("num_stacked_q_heads", 1) != 1:
-      # Stacking only regroups query rows of the same matmuls, so the output
-      # must equal the unstacked kernel's bit for bit.
-      self._set_tokamax_config(num_stacked_q_heads=1)
+    if config.get("num_stacked_q_heads", 1) != 1 or config.get("use_batch_loop_fwd"):
+      # Stacking only regroups query rows of the same matmuls, and per-example
+      # calls only drop tiles with no same-document pair, so the output must
+      # equal the unstacked, vmapped kernel's bit for bit.
+      self._set_tokamax_config(num_stacked_q_heads=1, use_batch_loop_fwd=False)
       out_unstacked = tokamax_splash_attention.splash_sdpa(
           q_t.detach(),
           k_t.detach(),

@@ -118,6 +118,10 @@ class SplashAttentionKernelConfig:
   # Tokamax only. Query heads sharing a KV head that the forward processes as
   # one tile.
   sa_num_stacked_q_heads: int = 1
+  # Tokamax only. Run the forward once per example instead of vmapping it.
+  # Tokamax skips tiles with no same-document pair, but a vmapped call must keep
+  # every tile that any example in the batch needs.
+  use_batch_loop_fwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

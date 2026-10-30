@@ -909,6 +909,18 @@ class GraphSplitTest(absltest.TestCase):
                 chunked.partition_map[cast], chunked.partition_map[node]
             )
 
+    # Pipelining only RS keeps each AG with its layer's compute.
+    rs_only = split_backward_graph_by_layer(
+        backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=("rs",)
+    )
+    self.assertEqual(
+        rs_only.collective_layer_to_partition["ag"], rs_only.layer_to_partition
+    )
+    self.assertEqual(
+        rs_only.collective_layer_to_partition["rs"],
+        {layer: part + 1 for layer, part in rs_only.layer_to_partition.items()},
+    )
+
     # A real Zero2-like trace has RS but no backward AG ownership.
     zero2_backward = self._trace_simple_fsdp(
         n_layers=2,

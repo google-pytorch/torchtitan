@@ -12,6 +12,8 @@ axis as one stream. This module provides the TPU replacements:
    ``conv1d`` and the recurrence run on each ``[B, S]`` row independently
    without dynamic-shape ``cu_seqlens`` offsets (upstream ``GatedDeltaNet``
    only passes ``cu_seqlens``, not ``positions`` / ``segment_ids``).
+   ``tokamax_gated_delta.TokamaxGatedDeltaKernel`` swaps the recurrence for
+   Tokamax's Mosaic TPU kernels.
 3. ``TpuGatedDeltaNet``: ``GatedDeltaNet`` that passes ``positions`` down, so
    the causal ``conv1d`` and the recurrence also restart at every document
    packed into a row (``positions == 0``), as upstream's ``cu_seqlens`` kernels
@@ -313,6 +315,26 @@ def chunked_gated_delta(
   return out.transpose(1, 2).contiguous().to(out_dtype)
 
 
+def per_row_segment_ids(
+    segment_ids_BS: torch.Tensor, max_num_segments: int
+) -> torch.Tensor:
+  """Per-row document ids, keeping at most ``max_num_segments`` apart.
+
+  Args:
+    segment_ids_BS: ``[B, S]`` document index of each token, non-decreasing
+      along each row in steps of one (``segment_ids_from_positions``, possibly
+      counting on from earlier rows).
+    max_num_segments: Documents per row kept apart.
+
+  Returns:
+    ``[B, S]`` int32 ids that start at 1 in every row. Documents beyond
+    ``max_num_segments`` share the last id, so they run as one sequence, as
+    without document ids.
+  """
+  ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
+  return ids.clamp(min=1, max=max_num_segments).to(torch.int32)
+
+
 class TpuGatedDeltaKernel(GatedDeltaKernel):
   """``GatedDeltaKernel`` running ``chunked_gated_delta`` on ``[B, S]`` rows."""
 
@@ -323,6 +345,54 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
   def __init__(self, config: Config):
     super().__init__(config)
     self.chunk_size = config.chunk_size
+
+  def document_ids(self, segment_ids_BS: torch.Tensor) -> torch.Tensor:
+    """The document ids that the causal convolution and the recurrence use.
+
+    ``TpuInnerGatedDeltaNet`` passes the same ids to both, so a kernel that
+    keeps only some documents apart (``TokamaxGatedDeltaKernel``) merges the
+    others in the convolution too. This one keeps every document apart.
+
+    Args:
+      segment_ids_BS: ``[B, S]`` document index of each token.
+
+    Returns:
+      ``[B, S]`` document ids.
+    """
+    return segment_ids_BS
+
+  def recurrence(
+      self,
+      q_BSHK: torch.Tensor,
+      k_BSHK: torch.Tensor,
+      v_BSHV: torch.Tensor,
+      g_BSH: torch.Tensor,
+      beta_BSH: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    """The gated delta rule on ``[B, S]`` rows; subclasses swap the kernel.
+
+    Args:
+      q_BSHK: Queries, one key head per value head.
+      k_BSHK: Keys, one key head per value head.
+      v_BSHV: Values.
+      g_BSH: Log-space decay.
+      beta_BSH: Update gate.
+      segment_ids_BS: Optional ``[B, S]`` document index of each token; the
+        recurrence restarts at every document.
+
+    Returns:
+      ``[B, S, H, V]`` output.
+    """
+    return chunked_gated_delta(
+        q_BSHK,
+        k_BSHK,
+        v_BSHV,
+        g_BSH,
+        beta_BSH,
+        chunk_size=self.chunk_size,
+        segment_ids=segment_ids_BS,
+    )
 
   def forward(
       self,
@@ -346,14 +416,13 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
     if repeats > 1:
       xq_BSHK = xq_BSHK.repeat_interleave(repeats, dim=2)
       xk_BSHK = xk_BSHK.repeat_interleave(repeats, dim=2)
-    return chunked_gated_delta(
+    return self.recurrence(
         xq_BSHK,
         xk_BSHK,
         xv_BSHV,
         g_BSH,
         beta_BSH,
-        chunk_size=self.chunk_size,
-        segment_ids=segment_ids_BS,
+        segment_ids_BS=segment_ids_BS,
     )
 
 
@@ -411,9 +480,11 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
             f" {num_tokens} tokens."
         )
       # Document index of each token: documents start at positions == 0.
-      segment_ids_BS = segment_ids_from_positions(
-          positions.reshape(-1)
-      ).reshape(query_BSC.shape[:2])
+      segment_ids_BS = self.kernel.document_ids(
+          segment_ids_from_positions(positions.reshape(-1)).reshape(
+              query_BSC.shape[:2]
+          )
+      )
 
     def causal_conv(
         x_BSC: torch.Tensor,

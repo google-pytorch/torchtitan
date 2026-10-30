@@ -43,6 +43,12 @@ _TPU_MOE_CONVERTERS = [
 FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
 )
+# Applied via override resolution so recipes can pass `min_log_decay` /
+# `max_num_segments` kwargs (`tokamax_gated_delta` imports KDA lazily).
+TOKAMAX_GATED_DELTA_OVERRIDE = (
+    "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta."
+    "tokamax_gated_delta_kernel"
+)
 
 
 def _enable_pallas_cross_entropy(
@@ -91,6 +97,30 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
     experts_config.use_kernel_native_weight_layout = True
   for _, dispatcher, _, _ in dispatchers:
     dispatcher.fuse_route_score_backward = True
+
+
+def _use_tokamax_gated_delta(
+    cfg: TPUTrainerConfig, **override_kwargs: float | int | None
+) -> None:
+  """Runs every GatedDeltaNet with Tokamax's Mosaic TPU KDA kernels."""
+  has_existing = any(
+      (entry if isinstance(entry, str) else entry[0])
+      == TOKAMAX_GATED_DELTA_OVERRIDE
+      for entry in cfg.override.imports
+  )
+  if has_existing and not override_kwargs:
+    return
+  cfg.override.imports = [
+      entry
+      for entry in cfg.override.imports
+      if (entry if isinstance(entry, str) else entry[0])
+      != TOKAMAX_GATED_DELTA_OVERRIDE
+  ]
+  cfg.override.imports.append(
+      (TOKAMAX_GATED_DELTA_OVERRIDE, override_kwargs)
+      if override_kwargs
+      else TOKAMAX_GATED_DELTA_OVERRIDE
+  )
 
 
 def qwen35_debugmodel() -> TPUTrainerConfig:

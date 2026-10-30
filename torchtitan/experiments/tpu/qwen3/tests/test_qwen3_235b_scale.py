@@ -32,7 +32,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import plan_stacked_gathers
 from torchtitan.experiments.tpu.qwen3 import config_registry
-from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
+from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
 

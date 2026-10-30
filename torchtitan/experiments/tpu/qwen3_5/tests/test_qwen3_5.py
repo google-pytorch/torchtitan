@@ -35,7 +35,7 @@ from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
-from torchtitan.experiments.tpu.graph_trainer.config import to_tpu_graph_trainer_config
+from torchtitan.experiments.tpu.graph_trainer.config import apply_tpu_graph_trainer_model_transforms
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.grouped_experts import (
@@ -1405,6 +1405,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(cfg.training.mixed_precision_reduce, "float32")
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
     self.assertEqual(cfg.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertTrue(cfg.compile.compile_grad_norm)
+    self.assertEqual(cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
     self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)
     splash = cfg.splash_attention_kernel
     self.assertTrue(splash.use_splash_attention_kernel)
@@ -1447,16 +1449,15 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_35b_benchmark_graph_trainer_config(self):
     """Tests the benchmark recipe as train.py hands it to TpuGraphTrainer."""
-    cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
-    gt_cfg = to_tpu_graph_trainer_config(
-        cfg, gt_qwen3_5.model_registry, target_cls=TpuGraphTrainer.Config
-    )
+    gt_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    self.assertIsInstance(gt_cfg, TpuGraphTrainer.Config)
+    self.assertIs(type(gt_cfg)._owner, TpuGraphTrainer)
+    apply_tpu_graph_trainer_model_transforms(gt_cfg)
     self.assertIs(
         gt_cfg.model_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5
     )
     self.assertIsNone(gt_cfg.model_spec.pipelining_fn)
     self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
-    self.assertEqual(gt_cfg.override.imports, cfg.override.imports)
     # The conversion re-wraps the model config: the kernels and GDN reset
     # setting must survive it.
     self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
@@ -1470,7 +1471,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         [False] * 30,
     )
     splitter = GraphSplitter.from_trainer_config(
-        gt_cfg, optimizer_in_graph=cfg.tpu_config.optimizer_in_graph
+        gt_cfg,
+        optimizer_in_graph=(gt_cfg.compile.optimizer_compile == "in_graph"),
     )
     self.assertTrue(splitter.enabled)
     self.assertEqual(splitter.n_layers, 40)
@@ -1513,7 +1515,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     # fused AdamW outside the graph, Tokamax GatedDeltaNet, Pallas MoE / CE
     # kernels, and Splash attention.
     bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    self.assertIsInstance(bench_cfg, TpuGraphTrainer.Config)
     self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+
     # Pretraining: no GatedDeltaNet packed-document resets (RL keeps them).
     def resets(cfg):
       return [
@@ -1561,22 +1565,27 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         bench_cfg.libtpu_init_flags["xla_tpu_scoped_vmem_limit_kib"], "65472"
     )
     self.assertEqual(bench_cfg.libtpu_init_flags["xla_tpu_dvfs_p_state"], "7")
-    tpu_config = bench_cfg.tpu_config
-    self.assertTrue(tpu_config.use_graph_trainer)
-    self.assertEqual(tpu_config.graph_trainer_memory_policy, "tpu_selective")
+    compile_cfg = bench_cfg.compile
+    self.assertTrue(compile_cfg.enable)
+    self.assertEqual(compile_cfg.mode, "aot_fx_trace")
+    self.assertEqual(compile_cfg.memory_policy, "tpu_selective")
     self.assertEqual(
-        tpu_config.graph_trainer_save_regions,
+        compile_cfg.save_regions,
         ("moe.routing", "attention.inner_attention"),
     )
-    self.assertTrue(tpu_config.use_graph_split)
-    self.assertTrue(tpu_config.graph_split.forward_isolate_prefix)
-    self.assertEqual(tpu_config.graph_split.forward_layers_per_executable, 2)
-    self.assertEqual(tpu_config.graph_split.backward_layers_per_executable, 2)
+    self.assertFalse(compile_cfg.enable_remat_barriers)
+    self.assertEqual(compile_cfg.fsdp_barrier_policy, "none")
+    self.assertTrue(compile_cfg.graph_split.enabled)
+    self.assertTrue(compile_cfg.graph_split.forward_isolate_prefix)
+    self.assertEqual(compile_cfg.graph_split.forward_layers_per_executable, 2)
+    self.assertEqual(compile_cfg.graph_split.backward_layers_per_executable, 2)
     self.assertEqual(
-        tpu_config.graph_split.backward_partition_mode, "fsdp_pipeline"
+        compile_cfg.graph_split.backward_partition_mode, "fsdp_pipeline"
     )
-    self.assertFalse(tpu_config.optimizer_in_graph)
-    self.assertTrue(tpu_config.compile_grad_norm)
+    self.assertEqual(compile_cfg.optimizer_compile, "eager")
+    self.assertTrue(compile_cfg.compile_grad_norm)
+    self.assertFalse(bench_cfg.tpu_config.enable_amp)
+    self.assertFalse(bench_cfg.tpu_config.enable_mfu_benchmark)
     self.assertEqual(bench_cfg.optimizer.implementation, "fused")
     self.assertTrue(
         bench_cfg.splash_attention_kernel.use_splash_attention_kernel
@@ -1627,6 +1636,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         "--training.max_context_length=8192",
         "--training.num_tokens_per_microbatch_per_dp_rank=65536",
     ])
+    self.assertIsInstance(parsed, TpuGraphTrainer.Config)
     self.assertEqual(parsed.training.steps, 20)
     self.assertEqual(parsed.training.max_context_length, 8192)
     self.assertEqual(
@@ -1640,25 +1650,24 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     parsed_96k = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
         "--config=qwen35_moe_35b_split_tokamax_benchmark",
-        "--tpu_config.graph_split.forward_layers_per_executable=1",
-        "--tpu_config.graph_split.backward_layers_per_executable=1",
-        "--tpu_config.graph_trainer_save_regions",
+        "--compile.graph_split.forward_layers_per_executable=1",
+        "--compile.graph_split.backward_layers_per_executable=1",
+        "--compile.save_regions",
         "moe.routing",
-        "--tpu_config.graph_trainer_save_last_n_layers",
+        "--compile.save_last_n_layers",
         "attention.inner_attention",
         "2",
     ])
+    apply_tpu_graph_trainer_model_transforms(parsed_96k)
     self.assertEqual(
-        parsed_96k.tpu_config.graph_split.forward_layers_per_executable, 1
+        parsed_96k.compile.graph_split.forward_layers_per_executable, 1
     )
     self.assertEqual(
-        parsed_96k.tpu_config.graph_split.backward_layers_per_executable, 1
+        parsed_96k.compile.graph_split.backward_layers_per_executable, 1
     )
+    self.assertEqual(parsed_96k.compile.save_regions, ("moe.routing",))
     self.assertEqual(
-        parsed_96k.tpu_config.graph_trainer_save_regions, ("moe.routing",)
-    )
-    self.assertEqual(
-        parsed_96k.tpu_config.graph_trainer_save_last_n_layers,
+        parsed_96k.compile.save_last_n_layers,
         {"attention.inner_attention": 2},
     )
 

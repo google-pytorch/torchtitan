@@ -137,7 +137,7 @@ class ScanOffloadDistributedTest(
     self._test_train_distributed(
         config_args=[
             "--module=torchtitan.experiments.tpu.llama3",
-            "--config=llama3_debugmodel",
+            "--config=graph_trainer_llama3_debugmodel",
             "--optimizer.implementation=foreach",
             "--dataloader.dataset_path=tests/assets/c4_test",
             "--dataloader.dataset=c4_test",
@@ -148,11 +148,9 @@ class ScanOffloadDistributedTest(
             "--training.mixed_precision_reduce=float32",
             "--training.num_tokens_per_microbatch_per_dp_rank=512",
             "--splash_attention_kernel.use_splash_attention_kernel",
-            "--tpu_config.use_graph_trainer",
-            "--tpu_config.compile_mode=aot_fx_trace",
-            "--tpu_config.use_simple_fsdp",
-            "--tpu_config.use_scan_layers",
-            "--tpu_config.graph_trainer_memory_policy=full_and_scan_offload",
+            "--parallelism.use_simple_fsdp",
+            "--compile.use_scan_layers",
+            "--compile.memory_policy=full_and_scan_offload",
         ],
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,

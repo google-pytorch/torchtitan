@@ -82,14 +82,14 @@ permutation, under 1 MiB per layer). `attention.inner_attention` keeps each
 layer's Splash output and LSE, so backward doesn't rerun the forward Splash
 kernel. Against plain `full`, this was 2.9% faster per step for about
 13.5 GiB more peak HBM per device. To trade that speed back for memory, add
-`--tpu_config.graph_trainer_memory_policy=full --tpu_config.graph_trainer_save_regions`
+`--compile.memory_policy=full --compile.save_regions`
 (the second flag, with no values, clears the save regions, which only apply
 to `tpu_selective`).
 
 Saving the Splash output in only the last N layers trades speed for memory
 in proportion, about 0.28 GiB per layer. For example, the last 24 layers were
 1.6% faster than `full` for 6.8 GiB more peak HBM:
-`--tpu_config.graph_trainer_save_regions moe.routing --tpu_config.graph_trainer_save_last_n_layers attention.inner_attention 24`.
+`--compile.save_regions moe.routing --compile.save_last_n_layers attention.inner_attention 24`.
 
 ## Benchmark Results
 Run Date: 10/13/2026 (mean of steps 10-30)

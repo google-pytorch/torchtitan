@@ -23,12 +23,19 @@ from torchtitan.experiments.tpu import (
   grad_norm,
 )
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
+from torchtitan.experiments.tpu.graph_trainer.config import (
+  apply_tpu_graph_trainer_model_transforms,
+)
 from torchtitan.experiments.tpu.qwen3.config_registry import (
+  qwen3_8b,
   qwen3_moe_30b_fsdp_only_full_ac_benchmark,
   reg_trainer_qwen3_8b,
 )
 from torchtitan.experiments.tpu.train import TPUTrainer
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+  TPUTrainerConfig,
+  TpuTrainerCompileConfig,
+)
 from torchtitan.models.llama3.config_registry import model_registry
 
 
@@ -60,15 +67,14 @@ class CompiledGradNormUnitTest(absltest.TestCase):
         qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     ):
       with self.subTest(recipe=recipe.__name__):
-        self.assertTrue(recipe().tpu_config.compile_grad_norm)
+        self.assertTrue(recipe().compile.compile_grad_norm)
 
   def test_unsupported_training_topologies_are_rejected(self) -> None:
     cases = (
-        ({"expert_parallel_degree": 2}, False, "EP1 and PP1"),
-        ({"pipeline_parallel_degree": 2}, False, "EP1 and PP1"),
-        ({}, True, "optimizer_in_graph"),
+        ({"expert_parallel_degree": 2}, "EP1 and PP1"),
+        ({"pipeline_parallel_degree": 2}, "EP1 and PP1"),
     )
-    for parallelism, optimizer_in_graph, message in cases:
+    for parallelism, message in cases:
       with self.subTest(parallelism=parallelism), self.assertRaisesRegex(
           ValueError, message
       ):
@@ -77,11 +83,14 @@ class CompiledGradNormUnitTest(absltest.TestCase):
         TPUTrainerConfig(
             model_spec=model_registry("debugmodel", attn_backend="sdpa"),
             parallelism=ParallelismConfig(**parallelism),
-            tpu_config=TPUConfig(
-                compile_grad_norm=True,
-                optimizer_in_graph=optimizer_in_graph,
-            ),
+            compile=TpuTrainerCompileConfig(compile_grad_norm=True),
         )
+
+    config = qwen3_8b()
+    config.compile.compile_grad_norm = True
+    config.compile.optimizer_compile = "in_graph"
+    with self.assertRaisesRegex(ValueError, "optimizer_compile='in_graph'"):
+      apply_tpu_graph_trainer_model_transforms(config)
 
 
 def _run_clip_parity(

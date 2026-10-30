@@ -92,8 +92,8 @@ dataset and test tokenizer, averaged over steps 10-30):
 | Splash saved in all 52 layers (default) | ~5.32s (-5.1%) | ~46.3% | 63.77GiB |
 
 Losses match `full`. To opt out, add
-`--tpu_config.graph_trainer_memory_policy=full --tpu_config.graph_trainer_save_regions`
+`--compile.memory_policy=full --compile.save_regions`
 (the second flag, with no values, clears the save regions, which only apply
 to `tpu_selective`). To get about half the speedup with no extra peak HBM,
 save Splash in the last 26 layers only:
-`--tpu_config.graph_trainer_save_regions --tpu_config.graph_trainer_save_last_n_layers attention.inner_attention 26`.
+`--compile.save_regions --compile.save_last_n_layers attention.inner_attention 26`.

@@ -141,7 +141,7 @@ switch a region to dynamic shapes after a recompile, quietly tanking performance
 genuinely are fixed (they should be for training), `dynamic=False` is always correct.
 
 **Don't use `torch.compile` on the whole model.** Wrapping the entire model in one
-`torch.compile(model, fullgraph=True)` (`compile_mode="fullgraph"`) is appealing but has real
+`torch.compile(model, fullgraph=True)` (`compile.mode="fullgraph"`) is appealing but has real
 failure modes on TorchTPU, and no TorchTitan TPU recipe uses it:
 
 - Without activation checkpointing inside the graph, all layers' activations are live at once →
@@ -154,8 +154,8 @@ failure modes on TorchTPU, and no TorchTitan TPU recipe uses it:
   graph's input set shifts and recompilation/errors follow.
 - And critically: even when whole-model compile *works*, it covers only the model's forward and
   backward. The loss and the optimizer step remain separate programs: eager by default, or
-  separately compiled with `compile_optimizer=True` / `compile_grad_norm=True` (and `loss` in
-  `compile.components`). Either way it does **not** remove the whole-step dispatch idle (see §7).
+  separately compiled with `compile.optimizer_compile="separate_graph"` /
+  `compile.compile_grad_norm=True` (and `loss` in `compile.components`). Either way it does **not** remove the whole-step dispatch idle (see §7).
 
 `torch.compile` is a tool for **regions**: per-block compile is the right way to use it. If you
 want the whole step as one program, use **GraphTrainer** (§8). It traces forward, loss, backward
@@ -369,8 +369,9 @@ surface:**
 - Use the fused CE kernel (§4) so the loss is a single `custom_call` instead of a chain of eager
   ops.
 - Prefer a fused kernel over an eager op sequence wherever one exists (attention, etc.).
-- Compile the glue that has its own switch: `compile_optimizer=True` (the AdamW step as one
-  graph), `compile_grad_norm=True` (the global gradient norm; the in-place clip stays eager) and
+- Compile the glue that has its own switch: `compile.optimizer_compile="separate_graph"` (the
+  AdamW step as one graph), `compile.compile_grad_norm=True` (the global gradient norm; the
+  in-place clip stays eager) and
   `loss` in `compile.components` (the loss function, when `compile.enable` is set). Each turns a
   chain of eager ops into one program; the dispatch between programs remains.
 - Keep batch/dim large (§3) so the compiled regions dominate the step and the fixed eager glue is a
@@ -395,36 +396,42 @@ the TPU subclass of TorchTitan's [GraphTrainer](../graph_trainer/README.md), tra
 training step (forward, loss, backward and optionally the optimizer step) with `make_fx` into a
 single FX graph. It then runs graph passes over it and compiles the result for TPU, so the
 forward, loss and backward run as one XLA program (the optimizer step too, with
-`optimizer_in_graph`; otherwise the optimizer step and gradient norm run outside the step graph,
-eagerly or as their own graphs with `compile_optimizer=True` / `compile_grad_norm=True`).
+`compile.optimizer_compile="in_graph"`; otherwise the optimizer step and gradient norm run outside
+the step graph, eagerly or as their own graphs with `compile.optimizer_compile="separate_graph"` /
+`compile.compile_grad_norm=True`).
 
 How it differs from whole-model `torch.compile` (§4):
 
 | | `torch.compile` on the model | GraphTrainer (`aot_fx_trace`) |
 |---|---|---|
 | Tracer | Dynamo: guards, graph breaks | `make_fx`: the whole step is traced ahead of time |
-| Covers | model forward + backward | forward + loss + backward, plus the optimizer with `optimizer_in_graph` |
+| Covers | model forward + backward | forward + loss + backward, plus the optimizer with `optimizer_compile="in_graph"` |
 | Activation memory | `checkpoint()` inside the compiled region, if it traces at all on TorchTPU (§4: `preserve_rng_state` is the known problem; no TPU recipe does it) | a memory-policy pass on the graph decides per tensor: save, recompute or offload to host |
 | FSDP | SimpleFSDP | SimpleFSDP collectives in the same graph, with passes that schedule all-gather prefetch |
 
-**How to enable it:**
+**How to enable it:** a recipe selects GraphTrainer by returning a `TpuGraphTrainer.Config`;
+`train.py` dispatches on the config type. Convert a regular TPU recipe and set its GraphTrainer
+compile policy:
 
 ```python
-tpu_config=TPUConfig(
-    use_graph_trainer=True,
-    compile_mode="aot_fx_trace",            # the joint-graph mode; required
-    graph_trainer_memory_policy="default",  # replaces the eager activation_checkpoint config
-    optimizer_in_graph=True,                # optional: fold AdamW into the step graph
-),
+config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+    base_config, graph_trainer_model_registry  # e.g. graph_trainer.qwen3.model_registry
+)
+config.compile = TpuGraphTrainerCompileConfig(
+    enable=True,
+    components=["model"],
+    memory_policy="default",       # replaces the eager activation_checkpoint config
+    optimizer_compile="in_graph",  # optional: fold AdamW into the step graph
+)
 ```
 
-With `compile_mode="aot_fx_trace"`, per-block `torch.compile` is switched off automatically, so you
-do not compile twice. Reference recipes are `qwen3_8b()` in
+`compile.mode` defaults to `"aot_fx_trace"`, the joint-graph mode. In it GraphTrainer does not wrap
+blocks in `torch.compile`, so you do not compile twice. Reference recipes are `qwen3_8b()` in
 [`qwen3/config_registry.py`](qwen3/config_registry.py), which includes the in-graph optimizer, and
 the `llama3_*_scan()` recipes in [`llama3/config_registry.py`](llama3/config_registry.py).
 
 **Memory policy.** GraphTrainer ignores the eager `activation_checkpoint` config. Activation memory
-is set by `graph_trainer_memory_policy`:
+is set by `compile.memory_policy`:
 
 - `default`: selective recompute. Saves the outputs of the ops on GraphTrainer's save list and
   recomputes the rest. On TPU the list covers `aten.linear` (torch_tpu traces `F.linear` as one
@@ -433,14 +440,15 @@ is set by `graph_trainer_memory_policy`:
   Pallas custom ops: with Splash on, attention is recomputed under `default`, and only
   `tpu_selective` can save it.
 - `full`: full recompute; only the layer boundaries are saved.
-- `tpu_selective`: full recompute plus the regions named in `graph_trainer_save_regions` (every
-  layer) or `graph_trainer_save_last_n_layers` (the last N layers, which backward reaches first).
+- `tpu_selective`: full recompute plus the regions named in `compile.save_regions` (every
+  layer) or `compile.save_last_n_layers` (the last N layers, which backward reaches first).
   Two regions exist: `attention.inner_attention` (the Splash output and LSE, so backward skips
   re-running the kernel) and `moe.routing` (the top-k ids and the expert-sort permutation). It
-  does not combine with scan. This is the TPU way to say "full recompute but keep X": upstream's
-  `compile.full_recompute_save_ops` does not reach the TPU trainer (a TPU recipe's `compile` is the
-  base config, and the GraphTrainer conversion builds a fresh compile config carrying only the
-  policy and the offload budget).
+  does not combine with scan. This is the TPU way to say "full recompute but keep X".
+- `tpu_selective_and_offload`: `tpu_selective`, plus offload of everything else that is saved (the
+  layer boundaries) to host memory as in `full_and_offload` (§9). The save-region values stay in
+  HBM. The Qwen3-235B graph-splitter recipe uses it to keep the Splash output of its last 36
+  layers on device.
 - `eager`: alternates matmuls between save and recompute, matching TorchTitan's eager selective AC.
 - `sac_and_offload`, `full_and_offload`, `full_and_scan_offload`: `default` or `full`, plus offload
   of saved activations to host memory (§9).
@@ -448,7 +456,8 @@ is set by `graph_trainer_memory_policy`:
 Exceptions that matter for the memory budget: under every policy, FSDP all-gather outputs are
 force-saved only under ZeRO-2 (`fsdp_reshard_after_forward="never"`), because that is what "do not
 reshard" means; under ZeRO-3 the policy may recompute them. RNG ops (dropout) are saved by `full`
-and the policies built on it (`full_and_offload`, `full_and_scan_offload`, `tpu_selective`),
+and the policies built on it (`full_and_offload`, `full_and_scan_offload`, `tpu_selective`,
+`tpu_selective_and_offload`),
 because the graph path cannot replay their random state; under `default`, `eager` and
 `sac_and_offload` an RNG op inside a recompute region is a runtime error (no TPU recipe has
 dropout). Under scan, the MoE expert-count all-reduces are saved as well
@@ -459,14 +468,14 @@ collective.
 
 - **The whole step must trace.** There are no graph breaks to fall back on, and data-dependent
   Python control flow is not supported.
-- **Use it only with `compile_mode="aot_fx_trace"`.** GraphTrainer combined with `layer` compile
-  mode causes severe HBM fragmentation and OOMs; `train.py` warns about this.
+- **Keep `compile.mode="aot_fx_trace"`.** The TPU joint-graph options (scan, the graph splitter,
+  remat barriers, the in-graph optimizer) are rejected in the other modes.
 - **One unrolled step graph stops compiling or fitting at large sizes.** Use scan or the graph splitter
   (§9).
-- **`optimizer_in_graph` costs HBM.** Step inputs are not donated today, so the graph holds both
-  the input and the updated copies of parameters and optimizer state. Budget for it, or keep the
-  optimizer as a separate graph (`compile_optimizer=True`). `compile_grad_norm` cannot be combined
-  with `optimizer_in_graph`.
+- **`optimizer_compile="in_graph"` costs HBM.** Step inputs are not donated today, so the graph
+  holds both the input and the updated copies of parameters and optimizer state. Budget for it, or
+  keep the optimizer as a separate graph (`optimizer_compile="separate_graph"`).
+  `compile_grad_norm` cannot be combined with the in-graph optimizer.
 - **libtpu 0.0.48+:** set `xla_enable_hlo_sharding_v3=False`, as the recipes do. Shardy HLO
   sharding v3 is on by default there and segfaults on GraphTrainer.
 
@@ -494,7 +503,7 @@ Scan and the graph splitter are two ways to give the step a structure that fixes
 offload fixes the third and works with either. The large recipes combine ZeRO-3, full recompute,
 offload, and one of scan or the graph splitter.
 
-| | Scan (`use_scan_layers`) | Graph splitter (`use_graph_split`) |
+| | Scan (`compile.use_scan_layers`) | Graph splitter (`compile.graph_split.enabled`) |
 |---|---|---|
 | Step runs as | one program, the layers as one loop | many programs, one per layer group |
 | Compiler sees | one layer body | each child separately |
@@ -507,19 +516,17 @@ offload, and one of scan or the graph splitter.
 No recipe combines the two; pick one.
 
 For mid-size models there is a lighter third option that keeps one unrolled graph:
-`graph_trainer_fsdp_schedule="prefetch"` or `"interleave"` with
-`enable_graph_trainer_remat_schedule=True`, as in `qwen3_8b_zero3()`.
+`compile.fsdp_barrier_policy="prefetch"` or `"interleave"` with
+`compile.enable_remat_barriers=True`, as in `qwen3_8b_zero3()`.
 
 ### Scan over layers
 
-`use_scan_layers=True` runs the decoder layers as a single `scan`
+`compile.use_scan_layers=True` runs the decoder layers as a single `scan`
 ([`graph_trainer/layer_stack.py`](graph_trainer/layer_stack.py)):
 
 ```python
-config.tpu_config.use_graph_trainer = True
-config.tpu_config.compile_mode = "aot_fx_trace"
-config.tpu_config.use_scan_layers = True
-config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+config.compile.use_scan_layers = True
+config.compile.memory_policy = "full_and_scan_offload"
 ```
 
 What it changes:
@@ -535,8 +542,8 @@ What it changes:
 
 Constraints:
 
-- It needs GraphTrainer (the config rejects it otherwise), traced with
-  `compile_mode="aot_fx_trace"`: an eager `scan` does not run on TPU.
+- It is a GraphTrainer compile option, traced with `compile.mode="aot_fx_trace"`: an eager
+  `scan` does not run on TPU.
 - Not every parallelism is supported. Data-parallel meshes work, FSDP and HSDP (the 2-D shard x
   replicate mesh) are tested; tensor, context, pipeline and expert parallelism are rejected.
 - The layer body must not mutate its inputs or module state; `scan` raises at trace time. MoE
@@ -556,21 +563,20 @@ Constraints:
 
 ### Graph splitter
 
-`use_graph_split=True` keeps the layers unrolled but cuts the traced step into separately compiled
-programs ([`graph_trainer/graph_split.py`](graph_trainer/graph_split.py)). It first splits the
-step into a forward and a backward graph, then optionally subdivides each by layer:
+`compile.graph_split.enabled=True` keeps the layers unrolled but cuts the traced step into
+separately compiled programs ([`graph_trainer/graph_split.py`](graph_trainer/graph_split.py)). It
+first splits the step into a forward and a backward graph, then optionally subdivides each by
+layer:
 
 ```python
-config.tpu_config.use_graph_trainer = True
-config.tpu_config.compile_mode = "aot_fx_trace"
-config.tpu_config.use_graph_split = True
-config.tpu_config.graph_split.forward_layers_per_executable = 1
-config.tpu_config.graph_split.forward_isolate_prefix = True
-config.tpu_config.graph_split.backward_partition_mode = "by_layer"
-config.tpu_config.graph_split.backward_layers_per_executable = 1
+config.compile.graph_split.enabled = True
+config.compile.graph_split.forward_layers_per_executable = 1
+config.compile.graph_split.forward_isolate_prefix = True
+config.compile.graph_split.backward_partition_mode = "by_layer"
+config.compile.graph_split.backward_layers_per_executable = 1
 ```
 
-The knobs, in [`GraphSplitterConfig` (`tpu_job_config.py`)](tpu_job_config.py):
+The knobs, in [`GraphSplitterConfig` (`graph_trainer/config.py`)](graph_trainer/config.py):
 
 - `forward_layers_per_executable`: complete layers per forward program. The default `-1` keeps the
   forward as one program.
@@ -595,16 +601,17 @@ widens the scheduling window at the cost of larger programs. Start at 1 and meas
 
 Constraints:
 
-- It requires `graph_trainer_fsdp_schedule="none"`.
-- It does not support `optimizer_in_graph`. Keep the optimizer as a separate program.
+- It requires `compile.fsdp_barrier_policy="none"`. Remat barriers do compose with it.
+- It does not support `optimizer_compile="in_graph"`. Keep the optimizer as a separate program.
 - It does not support serialized precompiled FX artifacts. TorchTPU's normal compilation cache
   still works.
-- `donate_internal_buffers` lets XLA reuse dead buffers at program boundaries. Leave it at its
-  default (`False`) until TorchTPU includes donation in its compilation cache key.
+- `donate_internal_buffers` (default `True`) lets XLA reuse dead buffers at program boundaries.
+  Disable it only for diagnostics.
 
-> **Same flag, different meaning on the regular trainer.** Without GraphTrainer,
-> `use_graph_split=True` only inserts a sync between the eager forward and backward. That splits
-> one large XLA graph into two and cuts first-step compile time. None of the knobs above apply.
+> **Not the regular trainer's forward/backward boundary.** Without GraphTrainer,
+> `compile.materialize_forward_before_backward=True` only inserts a sync between the eager forward
+> and backward. That splits one large XLA graph into two and cuts first-step compile time. None of
+> the knobs above apply.
 
 ### CPU offload
 
@@ -621,9 +628,10 @@ Select it through the memory policy:
 |---|---|---|
 | `sac_and_offload` | unrolled graph or graph splitter | activations that selective recompute still saves |
 | `full_and_offload` | unrolled graph or graph splitter | saved layer boundaries under full recompute |
+| `tpu_selective_and_offload` | unrolled graph or graph splitter | saved layer boundaries; the `tpu_selective` save regions stay in HBM |
 | `full_and_scan_offload` | scan | the one stacked layer-input tensor |
 
-`graph_trainer_cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors
+`compile.cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors
 are picked largest-first until the budget is spent. It does not apply to the scan policy, which
 always offloads its one tensor. Make sure the host has that much free RAM per rank.
 
@@ -638,7 +646,7 @@ The Llama3 scan recipes above 8B need this policy to run at all.
 
 **With the graph splitter, prefetch the reload.** By default each reload sits in the same program as the
 backward that consumes it, so the transfer is exposed.
-`graph_split.cpu_offload_prefetch_executables = 1` issues it one backward program earlier, where
+`compile.graph_split.cpu_offload_prefetch_executables = 1` issues it one backward program earlier, where
 the previous layer's compute hides it. The cost is carrying one completed activation across one
 program boundary. The 235B recipe uses it: the hidden transfer time is worth far more than the HBM
 it costs. It requires a split backward (`backward_partition_mode` other than `none`).

@@ -15,7 +15,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 
 ## Notes as of 5/21/26
 - `--tpu_config.use_simple_fsdp` is enabled.
-- `--compile.enable` is enabled with `--tpu_config.compile_mode=layer`.
+- `--compile.enable` is enabled with `--compile.mode=layer`.
 
 ## DDP with torch.compile
 
@@ -48,7 +48,7 @@ gcluster job submit \
     --training.dtype=float32 \
     --training.mixed_precision_param=bfloat16 \
     --tpu_config.use_simple_fsdp \
-    --tpu_config.compile_mode=layer \
+    --compile.mode=layer \
     --splash_attention_kernel.use_splash_attention_kernel \
     --metrics.log_freq=1 \
     --conformer.use-ctc-loss \

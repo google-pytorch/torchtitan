@@ -5,17 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpointer.dcp import CheckpointManager
-from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import (
-    default_adamw,
-    OptimizersContainer,
-)
+from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -24,6 +20,7 @@ from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
+    TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
 # Imported from the defining submodules rather than the
@@ -36,6 +33,15 @@ from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
+from torchtitan.experiments.graph_trainer.llama3 import (
+    model_registry as graph_trainer_model_registry,
+)
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
+)
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama as tpu_parallelize_llama
 from torchtitan.models.llama3.config_registry import model_registry
 
@@ -76,28 +82,33 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
-def _on_scan_lane(config: TPUTrainerConfig) -> TPUTrainerConfig:
+def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   """Move a recipe onto the graph trainer with scanned layers and host offload.
 
   Offload is not optional above 8B: without it the scan bodies keep every
   layer's input live and 405B does not compile.
   """
-  config.tpu_config.use_graph_trainer = True
-  config.tpu_config.compile_mode = "aot_fx_trace"
-  config.tpu_config.use_scan_layers = True
-  config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      config, graph_trainer_model_registry
+  )
+  graph_config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      memory_policy="full_and_scan_offload",
+      use_scan_layers=True,
+  )
   # bf16 Adam moments halve the optimizer state, which is 12.7 GiB at 405B and
   # the difference between sequence 8192 fitting and not.
-  config.optimizer.implementation = "fused_opt_states_bf16"
+  graph_config.optimizer.implementation = "fused_opt_states_bf16"
   # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
   # libtpu 0.0.48; see cl/979992733), which segfaults in
   # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
-  config.xla_flags["xla_enable_hlo_sharding_v3"] = "false"
-  config.libtpu_init_flags = tpu_flags.merge_flags(
-      config.libtpu_init_flags,
+  graph_config.xla_flags["xla_enable_hlo_sharding_v3"] = "false"
+  graph_config.libtpu_init_flags = tpu_flags.merge_flags(
+      graph_config.libtpu_init_flags,
       _LLAMA3_SCAN_FLAGS,
   )
-  return config
+  return graph_config
 
 
 def llama3_debugmodel() -> TPUTrainerConfig:
@@ -136,6 +147,18 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
+
+
+def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
+  """Llama3 debug model using TPU GraphTrainer."""
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      llama3_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
   return config
 
 
@@ -217,9 +240,8 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -283,9 +305,8 @@ def llama3_70b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -349,9 +370,8 @@ def llama3_405b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -440,9 +460,8 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -467,17 +486,17 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
   return config
 
 
-def llama3_8b_scan() -> TPUTrainerConfig:
+def llama3_8b_scan() -> TpuGraphTrainer.Config:
   """Llama3 8B on the scan lane."""
   return _on_scan_lane(llama3_8b())
 
 
-def llama3_70b_scan() -> TPUTrainerConfig:
+def llama3_70b_scan() -> TpuGraphTrainer.Config:
   """Llama3 70B on the scan lane."""
   return _on_scan_lane(llama3_70b())
 
 
-def llama3_405b_scan() -> TPUTrainerConfig:
+def llama3_405b_scan() -> TpuGraphTrainer.Config:
   """Llama3 405B on the scan lane. Layerwise does not compile at this size."""
   return _on_scan_lane(llama3_405b())
 

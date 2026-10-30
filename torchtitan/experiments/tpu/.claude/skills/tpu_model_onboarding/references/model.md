@@ -106,10 +106,13 @@ How it is checked, in this order:
   (`cfg = <name>_debugmodel(); cfg.x = ...`). `c4_test_dataloader()` for debug
   recipes.
 - `tpu/train.py`: import the package for side effects and add
-  `model_spec.name` to the tuple that pops `tpu_compile_mode` under
-  GraphTrainer; `train_minimal.py` needs the import too.
-- GraphTrainer (rung 2): `train.py` needs a GraphTrainer registry per model
-  (the `elif model_name == "<name>"` route). Reject the parallelisms the model
+  `model_spec.name` to the tuple that passes `compile.mode` to the regular
+  trainer's parallelize as `tpu_compile_mode`; `train_minimal.py` needs the
+  import too.
+- GraphTrainer (rung 2): add a `graph_trainer_<name>_debugmodel` recipe that
+  returns `TpuGraphTrainer.Config.from_tpu_trainer_config(<name>_debugmodel(),
+  <GraphTrainer registry>)` with a `TpuGraphTrainerCompileConfig`;
+  `train.py` dispatches on the config type. Reject the parallelisms the model
   does not support in `Model.Config.update_from_config`, which the trainer
   calls before either parallelize path, not in a parallelize wrapper; then a
   dense `Decoder` reuses the llama3 parallelization on both paths (the TPU

@@ -15,6 +15,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.experiments.tpu import workarounds
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import resolve_save_regions
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
@@ -390,7 +391,9 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
   ):
     """Tests each 30B recipe's trainer, loss and AdamW implementation."""
     config = getattr(config_registry, name)()
-    self.assertEqual(config.tpu_config.use_graph_trainer, graph_trainer)
+    self.assertEqual(
+        isinstance(config, TpuGraphTrainer.Config), graph_trainer
+    )
     self.assertEqual(
         isinstance(config.loss, PallasCrossEntropyLoss.Config), fused
     )
@@ -415,19 +418,17 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     """Tests Zero-3, the remat policy and the FSDP schedule."""
     config = getattr(config_registry, name)()
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(
-        config.tpu_config.graph_trainer_memory_policy, memory_policy
-    )
-    self.assertEqual(config.tpu_config.graph_trainer_save_regions, save_regions)
-    self.assertEqual(config.tpu_config.graph_trainer_save_last_n_layers, {})
-    self.assertNotEqual(config.tpu_config.graph_trainer_fsdp_schedule, "none")
+    self.assertEqual(config.compile.memory_policy, memory_policy)
+    self.assertEqual(config.compile.save_regions, save_regions)
+    self.assertEqual(config.compile.save_last_n_layers, {})
+    self.assertNotEqual(config.compile.fsdp_barrier_policy, "none")
 
   @parameterized.parameters(
       # Opt out to plain full rematerialization.
       (
           (
-              "--tpu_config.graph_trainer_memory_policy=full",
-              "--tpu_config.graph_trainer_save_regions",
+              "--compile.memory_policy=full",
+              "--compile.save_regions",
           ),
           "full",
           {},
@@ -435,8 +436,8 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
       # Splash saved in the last 26 layers only: no extra peak HBM.
       (
           (
-              "--tpu_config.graph_trainer_save_regions",
-              "--tpu_config.graph_trainer_save_last_n_layers",
+              "--compile.save_regions",
+              "--compile.save_last_n_layers",
               "attention.inner_attention",
               "26",
           ),
@@ -453,15 +454,13 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
         "--config=muse_glimmer_30b_full_logits",
         *flags,
     ])
-    tpu_config = config.tpu_config
-    self.assertEqual(tpu_config.graph_trainer_memory_policy, memory_policy)
-    self.assertEqual(tpu_config.graph_trainer_save_regions, ())
-    self.assertEqual(tpu_config.graph_trainer_save_last_n_layers, last_n_layers)
+    compile_config = config.compile
+    self.assertEqual(compile_config.memory_policy, memory_policy)
+    self.assertEqual(compile_config.save_regions, ())
+    self.assertEqual(compile_config.save_last_n_layers, last_n_layers)
     if memory_policy == "tpu_selective":
       # The policy accepts the combination (each region listed once).
-      resolve_save_regions(
-          tpu_config.graph_trainer_save_regions, last_n_layers
-      )
+      resolve_save_regions(compile_config.save_regions, last_n_layers)
 
   def test_30b_fused_ce_recipe_passes_logit_transform_check(self):
     """Tests that the 30B head and loss agree on cap and 0.196 multiplier."""

@@ -86,7 +86,7 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   recipe at 32K tokens per rank on one host), `split=2` had 24% shorter step
   time (+31% throughput) than one layer per executable (`split=1`).
 * **AdamW**: torch_tpu's fused AdamW outside the step graph
-  (`optimizer_in_graph=False`, `compile_grad_norm=True`).
+  (`optimizer_compile="eager"`, `compile_grad_norm=True`).
 * **`GatedDeltaNet`**: Tokamax's Mosaic TPU KDA kernels
   (`TokamaxGatedDeltaKernel`, through the `tokamax_gated_delta_kernel`
   override), with the forward returning the backward kernels' residuals; the

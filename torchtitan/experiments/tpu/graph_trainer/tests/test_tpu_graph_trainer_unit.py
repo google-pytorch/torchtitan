@@ -2,16 +2,13 @@
 
 from types import SimpleNamespace
 import typing
-import unittest
 from unittest import mock
 
 from absl.testing import absltest
 import torch
 from torch import nn
 from torchtitan.config.manager import ConfigManager
-from torchtitan.experiments.graph_trainer import configs as gt_configs
 from torchtitan.experiments.graph_trainer import make_fx_tracer
-from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
 from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,
 )
@@ -19,6 +16,9 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
 from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
+from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    model_registry as tpu_graph_trainer_model_registry,
+)
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
@@ -105,22 +105,20 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
             "--config=qwen3_debugmodel",
             "--training.num_tokens_per_microbatch_per_dp_rank=32",
             "--training.max_context_length=16",
-            "--tpu_config.compile_mode=fullgraph",
+            "--compile.mode=fullgraph",
         ]),
     )
 
-  def test_to_graph_trainer_config_target_cls(self) -> None:
-    """Verifies that to_graph_trainer_config converts TPUTrainerConfig to TpuGraphTrainer.Config."""
-    self.config.tpu_config.compile_mode = "aot_fx_trace"
-    gt_cfg = gt_configs.to_graph_trainer_config(
+  def test_from_tpu_trainer_config_target_cls(self) -> None:
+    """The classmethod binds the final TpuGraphTrainer config type."""
+    gt_cfg = tpu_graph_trainer.TpuGraphTrainer.Config.from_tpu_trainer_config(
         self.config,
-        qwen3_gt.model_registry,
-        target_cls=tpu_graph_trainer.TpuGraphTrainer.Config,
+        tpu_graph_trainer_model_registry,
     )
     self.assertIsInstance(
         gt_cfg,
         tpu_graph_trainer.TpuGraphTrainer.Config,
-        "to_graph_trainer_config must produce a TpuGraphTrainer.Config when target_cls is provided.",
+        "from_tpu_trainer_config must produce TpuGraphTrainer.Config.",
     )
     assert self.config.model_spec is not None
     assert gt_cfg.model_spec is not None
@@ -137,7 +135,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
             "--config=qwen3_debugmodel",
             "--training.num_tokens_per_microbatch_per_dp_rank=32",
             "--training.max_context_length=16",
-            "--tpu_config.compile_mode=fullgraph",
+            "--compile.mode=fullgraph",
             "--loss-kernel.use-loss-kernel",
         ]),
     )

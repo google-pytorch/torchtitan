@@ -7,6 +7,10 @@ on:
         description: 'Branch, tag, or commit SHA of torch_tpu to checkout'
         required: false
         default: 'main'
+      torch_version:
+        description: 'PyTorch nightly version to build against (e.g. 2.16.0.dev20261027). Empty uses the pin in env.TORCH_VERSION.'
+        required: false
+        default: ''
       push_image:
         description: 'Push the image to GAR'
         required: false
@@ -24,6 +28,11 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.14"
+  # Pinned PyTorch nightly. Both the torch_tpu wheel build and the image install
+  # this exact version. Bump it once torch_tpu builds against a newer nightly.
+  # Last known good: 2.16.0.dev20261027 (dev20261028 added Float8_e5m3fnu,
+  # which torch_tpu's csrc/common/to_string.cc does not handle yet).
+  TORCH_VERSION: ${{ github.event.inputs.torch_version || '2.16.0.dev20261027' }}
 
 jobs:
   build-wheel:
@@ -68,7 +77,7 @@ jobs:
         run: |
           mkdir -p torch_tpu/dist
           pip install --upgrade pip
-          pip download --no-deps --pre torch \
+          pip download --no-deps --pre "torch==${TORCH_VERSION}" \
             --index-url https://download.pytorch.org/whl/nightly/cpu \
             --only-binary=:all: \
             --python-version "${PYTHON_VERSION}" \
@@ -204,6 +213,7 @@ jobs:
             echo "org.opencontainers.image.description=Nightly TorchTitan TPU image built from source against PyTorch Nightly"
             echo "torchtitan.branch=${TORCHITAN_REF}"
             echo "torch_tpu.branch=${TORCH_TPU_REF}"
+            echo "torch.version=${TORCH_VERSION}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
         env:
@@ -230,6 +240,7 @@ jobs:
           build-args: |
             CACHE_BUSTER=${{ steps.meta.outputs.NIGHTLY_DATE }}
             PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            TORCH_VERSION=${{ env.TORCH_VERSION }}
 
       # Downstream jobs should reference the image by digest. Candidate tags are
       # mutable if this workflow is used to build two runs on the same day, and

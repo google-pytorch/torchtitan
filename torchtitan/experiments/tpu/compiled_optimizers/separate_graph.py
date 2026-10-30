@@ -5,10 +5,8 @@ executable via `StaticCompiler`, eliminating 300+ host dispatch roundtrips per
 step without merging the optimizer into the forward/backward graph.
 
 Used by:
-1. Regular Trainer (`use_graph_trainer=False`) when `--tpu-config.compile-optimizer`
-   is enabled.
-2. Graph Trainer (`use_graph_trainer=True`) when `optimizer_in_graph=False`
-   and `--tpu-config.compile-optimizer` is enabled.
+1. Regular TPUTrainer when `--compile.optimizer-compile=separate_graph`.
+2. TpuGraphTrainer when `--compile.optimizer-compile=separate_graph`.
 """
 
 from typing import Any, Optional

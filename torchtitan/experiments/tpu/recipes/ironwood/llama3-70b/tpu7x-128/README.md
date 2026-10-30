@@ -23,8 +23,8 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Float8**: `llama3_70b_float8` swaps the model's linears for torchao `Float8Linear`
   layers using the `rowwise` recipe, via `TpuFloat8LinearConverter`
   ([`float8_converter.py`](../../../../float8_converter.py)). The output projection
-  (`output`/`lm_head`) stays in bf16. Unlike the CUDA converter, the TPU converter
-  turns off `use_fast_accum`; TPU matmuls accumulate in float32.
+  (`output`/`lm_head`) stays in bf16. `use_fast_accum` is a no-op on TPU; TPU
+  matmuls accumulate in float32.
 - **torchao**: the float8 config needs torchao in the image. The TPU
   [Dockerfile](../../../../Dockerfile) installs it.
 - Dataset: `c4_test` (synthetic/test dataset).
@@ -36,7 +36,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 Defaults from [`llama3_70b`](../../../../llama3/config_registry.py):
 - **Sequence Length**: 8192
 - **Torch Compile**: Layerwise, with the `tpu` backend. `compile.components=["model"]`
-  together with the default `tpu_config.compile_mode="layer"` compiles each
+  together with the default `compile.mode="layer"` compiles each
   TransformerBlock separately (`fullgraph=True`) rather than the model as one graph.
 - **Simple FSDP**: Enabled.
 - **Splash Attention**: Enabled with block size 2048.

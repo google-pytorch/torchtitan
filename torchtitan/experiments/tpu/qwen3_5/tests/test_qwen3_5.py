@@ -1320,6 +1320,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(cfg.training.mixed_precision_reduce, "float32")
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
     self.assertEqual(cfg.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertTrue(cfg.compile.compile_grad_norm)
+    self.assertEqual(cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
     self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)
     splash = cfg.splash_attention_kernel
     self.assertTrue(splash.use_splash_attention_kernel)

@@ -9,10 +9,12 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
     TpuTokenDispatcherConverter,
     scale_route_weights,
     stable_grouped_reduce,
 )
+from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 
@@ -300,3 +302,66 @@ def test_converter_preserves_fields_and_is_idempotent():
     dispatcher = root.dispatcher
     converter.convert(root)
     assert root.dispatcher is dispatcher
+
+
+class _SwiGLUExperts(torch.nn.Module):
+  """Per-row SwiGLU experts that accept ``row_scale_R`` like TpuGroupedExperts."""
+
+  def __init__(self, w1_EDF, w3_EDF, w2_EFD):
+    super().__init__()
+    self.w1_EDF, self.w3_EDF, self.w2_EFD = w1_EDF, w3_EDF, w2_EFD
+
+  def forward(self, x_RD, num_tokens_per_expert_E, row_scale_R=None):
+    expert_R = torch.repeat_interleave(
+        torch.arange(len(num_tokens_per_expert_E)), num_tokens_per_expert_E
+    )
+    gate_RF = torch.einsum("rd,rdf->rf", x_RD, self.w1_EDF[expert_R])
+    up_RF = torch.einsum("rd,rdf->rf", x_RD, self.w3_EDF[expert_R])
+    hidden_RF = torch.nn.functional.silu(gate_RF) * up_RF
+    if row_scale_R is not None:
+      hidden_RF = hidden_RF * row_scale_R.reshape(-1, 1)
+    return torch.einsum("rf,rfd->rd", hidden_RF, self.w2_EFD[expert_R])
+
+
+def test_scale_before_down_proj_matches_scaling_the_output():
+  generator = torch.Generator().manual_seed(1357)
+  num_experts, top_k, dim, hidden = 3, 2, 4, 6
+  weights = [
+      torch.randn(num_experts, *shape, generator=generator, requires_grad=True)
+      for shape in ((dim, hidden), (dim, hidden), (hidden, dim))
+  ]
+  x = torch.randn(5, dim, generator=generator, requires_grad=True)
+  scores = torch.rand(5, top_k, generator=generator, requires_grad=True)
+  expert_ids = torch.randint(0, num_experts, (5, top_k), generator=generator)
+  counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
+
+  def run(scale_before_down_proj):
+    routed = TpuRoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(
+            dim=dim, hidden_dim=hidden, num_experts=num_experts
+        ),
+        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+            num_experts=num_experts, top_k=top_k
+        ),
+        scale_before_down_proj=scale_before_down_proj,
+    ).build()
+    routed.inner_experts = _SwiGLUExperts(*weights)
+    out = routed(x, scores, expert_ids, counts)
+    return out, torch.autograd.grad(out.square().sum(), (x, scores, *weights))
+
+  actual, actual_grads = run(True)
+  expected, expected_grads = run(False)
+  torch.testing.assert_close(actual, expected)
+  for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+  with pytest.raises(ValueError, match="enable only one"):
+    TpuRoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(
+            dim=dim, hidden_dim=hidden, num_experts=num_experts
+        ),
+        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+            num_experts=num_experts, top_k=top_k, fuse_route_score_backward=True
+        ),
+        scale_before_down_proj=True,
+    ).build()

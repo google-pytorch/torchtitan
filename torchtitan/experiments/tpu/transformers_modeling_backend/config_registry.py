@@ -19,7 +19,6 @@ from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.config.configs import (
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -35,7 +34,7 @@ from torchtitan.experiments.transformers_modeling_backend import (
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
-from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TpuTrainerCompileConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -236,11 +235,6 @@ def _tpu_hf_config(
       # parallelize.py for why it is not FSDP2. The shared backend requires
       # spmd_types, which this fork does not default to.
       parallelism=ParallelismConfig(use_simple_fsdp=True, spmd_backend="spmd_types"),
-      # "layer" compiles each decoder block on its own. Compiling is what makes
-      # the SimpleFSDP choice pay off: its all-gather sits on the .weight
-      # access path, so the graph break lands before the layer body and the
-      # body stays one compile region.
-      tpu_config=TPUConfig(compile_mode="layer"),
       # Kernel tuning for the splash_tpu attention implementation, pushed to
       # the HF adapter by workarounds.apply_patches; CLI overrides via
       # --splash_attention_kernel.sa_*. 1024 forward/dkv blocks are the
@@ -250,10 +244,15 @@ def _tpu_hf_config(
           sa_block_q=1024, sa_block_kv=1024, sa_block_kv_compute=1024,
           sa_block_q_dkv=1024, sa_block_kv_dkv=1024, sa_block_kv_dkv_compute=1024,
       ),
-      compile=CompileConfig(
+      # "layer" compiles each decoder block on its own. Compiling is what makes
+      # the SimpleFSDP choice pay off: its all-gather sits on the .weight
+      # access path, so the graph break lands before the layer body and the
+      # body stays one compile region.
+      compile=TpuTrainerCompileConfig(
           enable=compile,
           backend="tpu",
           components=["model"],
+          mode="layer",
       ),
       dataloader=_c4_test_loader(),
       metrics=MetricsProcessor.Config(log_freq=1),

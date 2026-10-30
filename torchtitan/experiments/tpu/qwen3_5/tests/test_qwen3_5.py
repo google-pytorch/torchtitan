@@ -12,7 +12,7 @@ Covers:
    accuracy of the autograd it replaces.
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
-   (with negative controls).
+   (with negative controls), plus Splash parity on TPU.
 4. Flavor, registry and recipe checks.
 """
 
@@ -27,16 +27,20 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
@@ -179,11 +183,22 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           flavor="debugmodel_moe",
           use_tpu_grouped_experts=True,
       ),
+      dict(
+          testcase_name="_moe_pallas_paired_grouped_mm",
+          flavor="debugmodel_moe",
+          use_tpu_grouped_experts=True,
+          use_pallas_paired_grouped_mm=True,
+      ),
   )
   def test_qwen3_5_hf_reference_parity(
-      self, flavor: str, use_tpu_grouped_experts: bool
+      self,
+      flavor: str,
+      use_tpu_grouped_experts: bool,
+      use_pallas_paired_grouped_mm: bool = False,
   ):
     """Tests forward logits, loss, and all gradients against HF Qwen3.5."""
+    if use_pallas_paired_grouped_mm and not self._is_tpu():
+      self.skipTest("Pallas grouped matmuls are TPU-only.")
     is_moe = flavor == "debugmodel_moe"
     hf_model = self._build_hf_reference(is_moe=is_moe)
     converters = (
@@ -192,6 +207,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     tt_config = qwen3_5_tpu.model_registry(
         flavor, seq_len=128, converters=converters
     ).model
+    if use_pallas_paired_grouped_mm:
+      # The expert kernels of `_use_tpu_moe_kernels`, on canonical weights so
+      # that the gradients compare by name.
+      for _, experts, _, _ in tt_config.traverse(TpuGroupedExperts.Config):
+        experts.use_pallas_grouped_mm = True
+        experts.use_pallas_paired_grouped_mm = True
+        experts.pallas_grouped_mm_tile_m = 256
+        experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     tt_config.vocab_size = 2048
     tt_config.tok_embeddings.num_embeddings = 2048
     tt_config.lm_head.out_features = 2048
@@ -1046,6 +1069,56 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         msg="Negative control failed: unpacked positions did not change Doc B",
     )
 
+  def test_splash_attention_matches_sdpa_on_packed_documents(self):
+    """Tests Splash Attention patch on TpuQwen35Attention vs CPU SDPA."""
+    if not self._is_tpu():
+      self.skipTest("Splash Attention is a TPU-only Pallas kernel.")
+    config = qwen3_5_tpu.model_registry("debugmodel").model
+    batch, seq_len = 2, 256
+    attn_cpu = config.layers[3].attention.build()
+    attn_cpu.init_states(buffer_device=torch.device("cpu"))
+    attn_cpu = attn_cpu.cpu()
+    attn_tpu = copy.deepcopy(attn_cpu).to(self.accelerator_device)
+
+    sa_config = SplashAttentionKernelConfig(
+        use_splash_attention_kernel=True,
+        sa_block_q=128,
+        sa_block_kv=128,
+        sa_block_kv_compute=128,
+        sa_block_q_dkv=128,
+        sa_block_kv_dkv=128,
+        sa_block_kv_dkv_compute=128,
+        sa_block_q_dq=128,
+        sa_block_kv_dq=128,
+    )
+    workarounds.use_splash_attention_patch(attn_tpu, sa_config)
+
+    x_cpu, x_tpu = self._create_input_tensor_cpu_device(
+        (batch * seq_len, config.dim), requires_grad=True
+    )
+    positions_cpu = torch.cat([
+        torch.arange(100),
+        torch.arange(seq_len - 100),
+        torch.arange(seq_len),
+    ])
+    positions_tpu = positions_cpu.to(self.accelerator_device)
+
+    with set_unflatten_seq_len(seq_len):
+      out_cpu = attn_cpu(x_cpu, None, positions_cpu)
+      out_tpu = attn_tpu(x_tpu, None, positions_tpu)
+      with torch.no_grad():
+        out_cpu_unpacked = attn_cpu(
+            x_cpu, None, torch.arange(seq_len).repeat(batch)
+        )
+
+    self.assertGreater(_relative_l2_error(out_cpu_unpacked, out_cpu), 0.1)
+    self.assertLessEqual(_relative_l2_error(out_tpu, out_cpu), 1e-2)
+
+    grad_out = torch.randn_like(out_cpu)
+    out_cpu.backward(grad_out)
+    out_tpu.backward(grad_out.to(self.accelerator_device))
+    self.assertLessEqual(_relative_l2_error(x_tpu.grad, x_cpu.grad), 2.5e-2)
+
   def test_flavors_and_registry(self):
     """Tests the 35B-A3B geometry and the TPU modules of every flavor."""
     moe_35b = qwen3_5_tpu.model_registry("35B-A3B").model
@@ -1100,13 +1173,68 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with self.assertRaisesRegex(ValueError, "exceeds max context length"):
       qwen3_5_tpu.model_registry("debugmodel", seq_len=262145)
 
+  def _assert_uses_tpu_moe_kernels(self, model_config) -> None:
+    """Asserts that `_use_tpu_moe_kernels` reached every MoE layer."""
+    num_moe = sum(layer.moe is not None for layer in model_config.layers)
+    experts = [
+        c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)
+    ]
+    dispatchers = [
+        c
+        for _, c, _, _ in model_config.traverse(
+            TpuAllToAllTokenDispatcher.Config
+        )
+    ]
+    # A traversal that stops matching would silently drop the kernels.
+    self.assertGreater(num_moe, 0)
+    self.assertLen(experts, num_moe)
+    self.assertLen(dispatchers, num_moe)
+    for experts_config in experts:
+      self.assertTrue(experts_config.use_pallas_grouped_mm)
+      self.assertTrue(experts_config.use_pallas_paired_grouped_mm)
+      self.assertTrue(experts_config.use_kernel_native_weight_layout)
+      self.assertEqual(experts_config.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(
+          experts_config.pallas_grouped_mm_tgmm_tiling, (256, 0, 0)
+      )
+    for dispatcher in dispatchers:
+      self.assertTrue(dispatcher.fuse_route_score_backward)
+
+  def test_tpu_moe_kernels_debug_recipe(self):
+    """Tests that the debug recipe selects the 35B recipe's expert kernels."""
+    cfg = config_registry.qwen35_moe_debugmodel_tpu_moe_kernels()
+    self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)
+
   def test_35b_recipe(self):
     """Tests the 35B-A3B recipe, also as parsed from the command line."""
     cfg = config_registry.qwen35_moe_35b()
     self.assertEqual(cfg.model_spec.flavor, "35B-A3B")
-    self.assertEqual(cfg.training.dtype, "bfloat16")
+    self.assertEqual(cfg.training.dtype, "float32")
+    self.assertEqual(cfg.training.mixed_precision_param, "bfloat16")
+    self.assertEqual(cfg.training.mixed_precision_reduce, "float32")
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
     self.assertEqual(cfg.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertTrue(cfg.compile.compile_grad_norm)
+    self.assertEqual(cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    self._assert_uses_tpu_moe_kernels(cfg.model_spec.model)
+    splash = cfg.splash_attention_kernel
+    self.assertTrue(splash.use_splash_attention_kernel)
+    self.assertEqual(
+        (
+            splash.sa_block_q,
+            splash.sa_block_kv,
+            splash.sa_block_q_dkv,
+            splash.sa_block_kv_dkv,
+            splash.sa_block_q_dq,
+            splash.sa_block_kv_dq,
+        ),
+        (1024,) * 6,
+    )
+    self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertIn(config_registry.FUSED_LOSS_OVERRIDE, cfg.override.imports)
+    self.assertEqual(
+        cfg.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
+    )
     with torch.device("meta"):
       model = cfg.model_spec.model.build()
     self.assertLen(model.layers, 40)
@@ -1122,6 +1250,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
     self.assertEqual(
         parsed.training.num_tokens_per_microbatch_per_dp_rank, 8192
+    )
+    self.assertIsInstance(parsed.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        parsed.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
     )
 
 

@@ -5,6 +5,10 @@ Upstream d771abb0 migrated the data stack to Grain and deleted
 `HuggingFaceTextDataLoader.Config(dataset="c4_test")`. `TPUGrainDataLoader`
 keeps that spelling (and the `--dataloader.dataset` /
 `--dataloader.dataset_path` flags) on top of upstream's `GrainDataLoader`.
+
+`--dataloader.dataset` also selects single-turn chat datasets for fine-tuning
+(`CHAT_DATASETS`), with `--dataloader.dataset_split`,
+`--dataloader.prompt_field` and `--dataloader.response_field`.
 """
 
 import dataclasses
@@ -18,9 +22,15 @@ from typing import Any
 from torchtitan.components.data.dataset import SingleDatasetConfig
 from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
+from torchtitan.components.data.packing import FirstFitPackingConfig
+from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.tools.logging import logger
 
 __all__ = [
+    "CHAT_DATASETS",
+    "FieldsToChat",
     "TPUGrainDataLoader",
     "c4_test_dataloader",
 ]
@@ -62,17 +72,145 @@ def _text_dataset(name: str, dataset_path: str | None) -> SingleDatasetConfig:
   )
 
 
+
+@dataclasses.dataclass(frozen=True)
+class FieldsToChat:
+  """Turns a record into a single-turn chat from two of its fields.
+
+  A `ChatProcessor` `messages_fn` that is set from field names, so single-turn
+  datasets need no Python code.
+  """
+
+  prompt_field: str
+  response_field: str
+
+  def __call__(self, sample: dict[str, Any]) -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": sample[self.prompt_field]},
+        {"role": "assistant", "content": sample[self.response_field]},
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChatDataset:
+  """A single-turn chat dataset: a Hugging Face source and its two fields."""
+
+  path: str
+  name: str | None = None
+  prompt_field: str = "prompt"
+  response_field: str = "response"
+
+
+CHAT_DATASETS: dict[str, _ChatDataset] = {
+    # Grade-school math word problems with worked solutions; train/test splits.
+    "gsm8k": _ChatDataset(
+        path="openai/gsm8k",
+        name="main",
+        prompt_field="question",
+        response_field="answer",
+    ),
+    # A local JSON or JSON Lines file, given by `dataset_path`.
+    "chat_json": _ChatDataset(path="json"),
+}
+"""Single-turn chat datasets for fine-tuning, by `--dataloader.dataset` name."""
+
+
+def _is_not_none(sample: Any) -> bool:
+  return sample is not None
+
+
+def _chat_dataset(
+    name: str,
+    *,
+    dataset_path: str | None,
+    split: str | None,
+    prompt_field: str | None,
+    response_field: str | None,
+) -> SingleDatasetConfig:
+  """Resolves a registered chat dataset, applying the loader's overrides.
+
+  Args:
+    name: Key in `CHAT_DATASETS`.
+    dataset_path: For `chat_json`, the JSON/JSON Lines file (required); for
+      other entries, replaces the Hugging Face path (e.g. a local mirror).
+    split: Dataset split; defaults to "train". A local JSON file
+      (`chat_json`) is loaded as this split, so a validator reading "test"
+      takes its own eval file.
+    prompt_field: Overrides the entry's prompt field.
+    response_field: Overrides the entry's response field.
+
+  Returns:
+    The dataset config, tokenized with `ChatProcessor` so that the loss covers
+    the response only.
+  """
+  entry = CHAT_DATASETS[name]
+  split = split or "train"
+  path, load_dataset_kwargs = entry.path, {}
+  if entry.path == "json":
+    if not dataset_path:
+      raise ValueError(
+          f"--dataloader.dataset={name} needs --dataloader.dataset_path"
+      )
+    load_dataset_kwargs = {"data_files": {split: dataset_path}}
+  elif dataset_path:
+    path = dataset_path
+  return SingleDatasetConfig(
+      source=HuggingFaceRandomAccessSource.Config(
+          path=path,
+          name=entry.name,
+          split=split,
+          load_dataset_kwargs=load_dataset_kwargs,
+      ),
+      processor=ChatProcessor.Config(
+          messages_fn=FieldsToChat(
+              prompt_field=prompt_field or entry.prompt_field,
+              response_field=response_field or entry.response_field,
+          )
+      ),
+      post_filters=(_is_not_none,),
+  )
+
 class TPUGrainDataLoader(GrainDataLoader):
-  """GrainDataLoader wrapper preserving TPU CLI flags (`dataset`, `dataset_path`)."""
+  """GrainDataLoader selecting its dataset by name from the CLI.
+
+  `dataset` is a key in `CHAT_DATASETS` (first-fit packed chats, loss on the
+  response only), in upstream `DATASETS` (text), or in the Flux datasets.
+  """
 
   @dataclasses.dataclass(kw_only=True, slots=True)
   class Config(GrainDataLoader.Config):
     dataset: str = "c4_test"  # pytype: disable=signature-mismatch
     dataset_path: str | None = None
+    dataset_split: str | None = None
+    """Chat datasets only: the split to read (default "train")."""
+    prompt_field: str | None = None
+    """Chat datasets only: overrides the field holding the prompt."""
+    response_field: str | None = None
+    """Chat datasets only: overrides the field holding the response."""
 
   def __init__(self, config: Config, **kwargs: Any) -> None:
     if isinstance(config.dataset, str):
-      if config.dataset in DATASETS:
+      chat_options = (
+          config.dataset_split, config.prompt_field, config.response_field
+      )
+      if config.dataset not in CHAT_DATASETS and any(
+          option is not None for option in chat_options
+      ):
+        logger.warning(
+            "dataset_split, prompt_field and response_field only apply to chat"
+            f" datasets {sorted(CHAT_DATASETS)}; ignored for {config.dataset!r}."
+        )
+      if config.dataset in CHAT_DATASETS:
+        ds_cfg = FirstFitPackingConfig(
+            dataset=_chat_dataset(
+                config.dataset,
+                dataset_path=config.dataset_path,
+                split=config.dataset_split,
+                prompt_field=config.prompt_field,
+                response_field=config.response_field,
+            )
+        )
+      elif config.dataset in DATASETS:
         ds_cfg = ConcatThenSplitPackingConfig(
             dataset=_text_dataset(config.dataset, config.dataset_path)
         )

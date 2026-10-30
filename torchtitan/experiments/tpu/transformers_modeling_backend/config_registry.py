@@ -36,6 +36,9 @@ from torchtitan.experiments.transformers_modeling_backend import (
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TpuTrainerCompileConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.components.validate import Validator
+from torchtitan.experiments.tpu.datasets import TPUGrainDataLoader
+from torchtitan.experiments.transformers_modeling_backend.tokenizer import HFBackendTokenizer
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
 from .job_config import TPUTransformersBackendConfig
@@ -316,6 +319,59 @@ def hf_full_max_plain_ce() -> TPUTransformersBackendConfig:
   """``hf_full_max`` with the model's own head and plain cross entropy."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
                         attn="splash_tpu", save_attention=True)
+
+
+def hf_sft_full_max() -> TPUTransformersBackendConfig:
+  """``hf_full_max`` fine-tuning a pretrained checkpoint on chat data.
+
+  Loads the HF weights from ``--hf_assets_path`` (``--hf_model`` the same
+  folder) and trains all parameters on a single-turn chat dataset, with the
+  loss on the response only. The validator reports the loss on a held-out
+  split every ``--validator.freq`` steps.
+
+  The data is chosen on the command line, by name in
+  ``experiments.tpu.datasets.CHAT_DATASETS`` (default ``gsm8k``)::
+
+      --dataloader.dataset=gsm8k
+      --validator.dataloader.dataset=gsm8k
+      --validator.dataloader.dataset_split=test
+
+  or from local JSON/JSON Lines files::
+
+      --dataloader.dataset=chat_json --dataloader.dataset_path=train.jsonl
+      --dataloader.prompt_field=question --dataloader.response_field=answer
+      (and the same for --validator.dataloader.* with the eval file)
+
+  For GSM8K, the default 100 steps of 8 x 4096 tokens are ~2 epochs, and 10
+  validation steps cover the test split about once.
+
+  Chat templates that render an empty think block into the assistant turn
+  (e.g. Qwen3, the default ``--hf_model``) put it in the supervised span, so
+  fine-tuning trains answers without thinking. Keeping thinking needs data
+  with reasoning content, as upstream's Qwen3 SFT recipe does with
+  ``reasoning_content``.
+  """
+  config = hf_full_max()
+  config.tokenizer = HFBackendTokenizer.Config()
+  config.dataloader = TPUGrainDataLoader.Config(dataset="gsm8k")
+  config.validator = Validator.Config(
+      enable=True,
+      freq=25,
+      steps=10,
+      dataloader=TPUGrainDataLoader.Config(dataset="gsm8k", dataset_split="test"),
+  )
+  config.optimizer = default_adamw(lr=1e-5, implementation="foreach")
+  config.lr_scheduler = LRSchedulersContainer.Config(
+      warmup_steps=10, decay_ratio=0.9, decay_type="cosine", min_lr_factor=0.1
+  )
+  config.training.steps = 100
+  config.checkpoint = CheckpointManager.Config(
+      enable=True,
+      initial_load_in_hf=True,
+      interval=1_000_000,
+      last_save_model_only=True,
+  )
+  return config
 
 
 def hf_moe_auto() -> TPUTransformersBackendConfig:

@@ -452,8 +452,13 @@ def _collect_collective_chains(
 
     compute -> RS -> compute
 
-  Keep the post-RS cast with the launch/wait chain to preserve a single
-  forward dependency between the two executables.
+  Keep the post-RS epilogue with the launch/wait chain to preserve a single
+  forward dependency between the two executables: the single-input casts and
+  size-preserving views reachable from the wait through such nodes, such as
+  the ``reshape`` / ``movedim`` with which ``_movedim_reduce_scatter_tensor``
+  restores the gradient's layout before the cast. Views that change the
+  element count (slices, expands) would change the size of what the RS
+  executable outputs, so they stay with their consumers.
   """
   chains = {
       node: {node}
@@ -466,13 +471,20 @@ def _collect_collective_chains(
       if producer is not None:
         chains[producer].add(node)
         if is_reduce_scatter_tensor(producer):
-          chains[producer].update(
-              user
-              for user in node.users
-              if user.op == "call_function"
-              and user.target is torch.ops.aten._to_copy.default
-              and len(user.all_input_nodes) == 1
-          )
+          pending_users = list(node.users)
+          while pending_users:
+            user = pending_users.pop()
+            if (
+                user in chains[producer]
+                or user.op != "call_function"
+                or len(user.all_input_nodes) != 1
+            ):
+              continue
+            if user.target is torch.ops.aten._to_copy.default or (
+                _is_view(user) and _preserves_numel(user)
+            ):
+              chains[producer].add(user)
+              pending_users.extend(user.users)
   for producer, chain in chains.items():
     if not is_all_gather_into_tensor(producer):
       continue

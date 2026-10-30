@@ -18,6 +18,14 @@ from torchtitan.experiments.tpu.datasets import (
     TPUGrainDataLoader,
     c4_test_dataloader,
 )
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    GraphSplitterConfig,
+    TpuGraphTrainerCompileConfig,
+    TpuGraphTrainerMemoryPolicy,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
+)
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -121,6 +129,76 @@ def _use_tokamax_gated_delta(
       if override_kwargs
       else TOKAMAX_GATED_DELTA_OVERRIDE
   )
+
+
+def _use_graph_split(
+    base_cfg: TPUTrainerConfig,
+    *,
+    layers_per_executable: int,
+    memory_policy: TpuGraphTrainerMemoryPolicy = "full",
+    save_regions: tuple[str, ...] = (),
+) -> TpuGraphTrainer.Config:
+  """Converts `base_cfg` to per-layer executables on `TpuGraphTrainer`.
+
+  As one unrolled step graph, the 40-layer model neither compiles within an
+  hour on 8 host CPUs nor fits in HBM on one tpu7x-2x2x1 host: XLA keeps most
+  layers' unsharded expert gradients (3 x 512 MiB bf16 weights, 3 x 1 GiB fp32
+  gradients per layer) alive until late in the step. Per-layer forward and
+  backward executables bound both: each backward child reduce-scatters its own
+  layers' gradients, and repeated layers hit the compilation cache. As in the
+  Qwen3-235B recipes, `fsdp_pipeline` issues each child's all-gather one child
+  early and its reduce-scatter one child late, and AdamW runs outside the step
+  graph as torch_tpu's fused AdamW (graph splitting does not support
+  `optimizer_compile='in_graph'`).
+
+  Args:
+    base_cfg: The base TPU recipe to convert.
+    layers_per_executable: Transformer layers per forward and backward child. On
+      the 40-layer model, 2 layers per executable cut the 84 children to 44; in
+      the A/B that chose it (32K tokens per rank, one tpu7x-2x2x1 host) that had
+      24% shorter step time (+31% throughput) than 1.
+    memory_policy: GraphTrainer activation checkpointing policy (`"full"` or
+      `"tpu_selective"`).
+    save_regions: Region names kept alive across forward/backward executables
+      when `memory_policy == "tpu_selective"`.
+
+  Returns:
+    A `TpuGraphTrainer.Config` configured for ZeRO-3 graph splitting.
+  """
+  # Imported lazily because `qwen3_5.__init__` re-exports `config_registry`
+  # while `graph_trainer.qwen3_5` imports `qwen3_5`.
+  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.graph_trainer.qwen3_5 import (
+      model_registry as graph_trainer_model_registry,
+  )
+  # pylint: enable=g-import-not-at-top
+
+  cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      base_cfg, graph_trainer_model_registry
+  )
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+      mode="aot_fx_trace",
+      memory_policy=memory_policy,
+      save_regions=save_regions,
+      optimizer_compile="eager",
+      compile_grad_norm=True,
+      enable_remat_barriers=False,
+      fsdp_barrier_policy="none",
+      graph_split=GraphSplitterConfig(
+          enabled=True,
+          forward_layers_per_executable=layers_per_executable,
+          forward_isolate_prefix=True,
+          backward_partition_mode="fsdp_pipeline",
+          backward_layers_per_executable=layers_per_executable,
+      ),
+  )
+  # torch_tpu's fused AdamW updates every parameter in one program, computing
+  # in FP32 and storing in each parameter buffer's dtype.
+  cfg.optimizer.implementation = "fused"
+  return cfg
 
 
 def qwen35_debugmodel() -> TPUTrainerConfig:
@@ -266,4 +344,65 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
   )
   _use_tpu_moe_kernels(cfg)
   _enable_pallas_cross_entropy(cfg)
+  return cfg
+
+
+def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
+  """Qwen3.5-35B-A3B benchmark: ZeRO-3, graph split, Tokamax GatedDeltaNet.
+
+  Runs on any TPU7x slice from one tpu7x-2x2x1 host (4 chips, 8 ranks) up to
+  256 FSDP ranks (256 routed experts sharded on dim 0): bf16 parameters and
+  AdamW state, ZeRO-3 with selective rematerialization, GraphTrainer with 2
+  layers per forward and backward executable, Tokamax's Mosaic KDA kernels for
+  the 30 GatedDeltaNet layers, Pallas paired grouped matmuls for the experts,
+  Splash attention, and the Pallas fused linear cross-entropy. 32K tokens per
+  rank (16 sequences of 2048).
+  """
+  base_cfg = qwen35_moe_35b()
+  # bf16 parameters and AdamW state (8 bytes per parameter) instead of
+  # qwen35_moe_35b's FP32 master weights, so that the benchmark fits one
+  # tpu7x-2x2x1 host: with FP32 master weights its second step runs out of
+  # HBM there (0.6 GiB short at 32K tokens per rank, 13 GiB at 64K).
+  base_cfg.training.dtype = "bfloat16"
+  base_cfg.dataloader = c4_test_dataloader()
+  base_cfg.hf_assets_path = "./tests/assets/tokenizer"
+  base_cfg.parallelism = ParallelismConfig(
+      data_parallel_replicate_degree=1,
+      data_parallel_shard_degree=-1,
+      tensor_parallel_degree=1,
+      pipeline_parallel_degree=1,
+      context_parallel_degree=1,
+      expert_parallel_degree=1,
+      use_simple_fsdp=True,
+      enable_tpu_topo_mesh=True,
+  )
+  # Match the Qwen3 GraphTrainer recipes: disable HLO sharding v3 (Shardy) on
+  # partitioned child executables.
+  base_cfg.xla_flags = tpu_flags.merge_flags(
+      xla_enable_hlo_sharding_v3=False,
+  )
+  base_cfg.tpu_config = TPUConfig(
+      enable_amp=False,
+      enable_mfu_benchmark=False,
+  )
+  # Save each layer's MoE router top-k / sort permutation and the 10 full
+  # attention layers' Splash output + LSE (~5.98 GiB logical at 64K tokens/rank)
+  # so backward skips re-running router top-k/argsort and Splash forward.
+  cfg = _use_graph_split(
+      base_cfg,
+      layers_per_executable=2,
+      memory_policy="tpu_selective",
+      save_regions=("moe.routing", "attention.inner_attention"),
+  )
+  _use_tokamax_gated_delta(cfg)
+  # Throughput DVFS operating point (p_state=7) and SparseCore collective
+  # offload (async AG, dual-SC RS, latency-hiding scheduler), merged onto
+  # qwen35_moe_35b's 65472 KiB scoped VMEM limit.
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+      tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
+      tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+  )
   return cfg

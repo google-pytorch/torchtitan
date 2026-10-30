@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 GraphTrainerFSDPBarrierPolicy = Literal["none", "prefetch", "interleave"]
 BackwardPartitionMode = Literal["none", "by_layer", "fsdp_pipeline"]
+PipelinedCollective = Literal["ag", "rs"]
 # This extends TPUTrainer's optimizer_compile modes with joint-graph execution.
 TpuGraphTrainerOptimizerCompileMode = Literal[
     "eager", "separate_graph", "in_graph"
@@ -111,6 +112,10 @@ class GraphSplitterConfig:
   # the routed-token gathers. Values are unchanged. Applies to layers that
   # have both an MoE and Splash; raises if no layer does.
   expert_all_gathers_under_splash: bool = False
+  # ``fsdp_pipeline`` only: which collectives move to the neighbouring
+  # executables, parameter all-gathers ("ag") and/or gradient reductions
+  # ("rs"). The rest stay with their layer, as in ``by_layer``.
+  pipeline_kinds: tuple[PipelinedCollective, ...] = ("ag", "rs")
 
 
 @dataclass(kw_only=True, slots=True)

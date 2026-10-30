@@ -1052,8 +1052,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             (128, 512, 512),
         )
 
-  def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:
+  def test_235b_4x4x4_reduce_scatter_policy(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+
+    graph_split = config.compile.graph_split
+    self.assertEqual(graph_split.backward_partition_mode, "fsdp_pipeline")
+    self.assertEqual(graph_split.pipeline_kinds, ("rs",))
 
     self.assertEqual(
         {

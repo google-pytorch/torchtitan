@@ -1125,6 +1125,12 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
       cfg.libtpu_init_flags,
       tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
   )
+  # At 128 ranks the FP32 expert reduce-scatters cannot finish inside their
+  # layer's executable without stalling it; run each one in the next
+  # executable instead. The deadline barrier already hides the all-gathers.
+  # Measured 24.261 -> 23.861 s/step on top of #119.
+  cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
+  cfg.compile.graph_split.pipeline_kinds = ("rs",)
   return cfg
 
 

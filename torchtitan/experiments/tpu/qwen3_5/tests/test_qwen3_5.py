@@ -1422,6 +1422,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         (1024,) * 6,
     )
     self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        (cfg.loss.b_block_size, cfg.loss.h_block_size, cfg.loss.v_block_size),
+        (1024, 512, 2048),
+    )
     self.assertIn(config_registry.FUSED_LOSS_OVERRIDE, cfg.override.imports)
     self.assertEqual(
         cfg.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
@@ -1458,6 +1462,15 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertIsNone(gt_cfg.model_spec.pipelining_fn)
     self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
+    self.assertIsInstance(gt_cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        (
+            gt_cfg.loss.b_block_size,
+            gt_cfg.loss.h_block_size,
+            gt_cfg.loss.v_block_size,
+        ),
+        (1024, 2048, 640),
+    )
     # The conversion re-wraps the model config: the kernels and GDN reset
     # setting must survive it.
     self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
@@ -1591,6 +1604,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         bench_cfg.splash_attention_kernel.use_splash_attention_kernel
     )
     self.assertIsInstance(bench_cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        (
+            bench_cfg.loss.b_block_size,
+            bench_cfg.loss.h_block_size,
+            bench_cfg.loss.v_block_size,
+        ),
+        (1024, 2048, 640),
+    )
 
     # Apply both recipe overrides (`tokamax_gated_delta` imports KDA lazily).
     apply_overrides(bench_cfg.override, bench_cfg)
@@ -1645,6 +1666,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
     self.assertEqual(parsed.model_spec.max_context_length, 262144)
     self.assertEqual(resets(parsed), [False] * 30)
+    self.assertEqual(
+        (
+            parsed.loss.b_block_size,
+            parsed.loss.h_block_size,
+            parsed.loss.v_block_size,
+        ),
+        (1024, 2048, 640),
+    )
 
     # The README's 96K split=1 + selective save_last_n_layers flags also parse.
     parsed_96k = ConfigManager().parse_args([

@@ -112,7 +112,7 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
 * **Attention**: Splash attention with segment ids from `positions`; 1024
   blocks keep `head_dim=256` within the scoped VMEM limit.
 * **Loss**: Pallas fused linear cross-entropy (no `[tokens, 248320]` logits in
-  HBM).
+  HBM) with one hidden block (`(b, h, v) = (1024, 2048, 640)`).
 * **Logging** every 5 steps: a per-step `loss.item()` keeps the host from
   dispatching the next step while the current one runs.
 * **XLA and libtpu flags**: `xla_enable_hlo_sharding_v3=False` (avoids Shardy
@@ -134,7 +134,7 @@ packed-document resets, `mixed_precision_reduce="float32"`,
 
 | Slice (chips, ranks) | Step time | Tokens/s/rank | TFLOPS/rank | MFU | Trainer memory |
 | --- | --- | --- | --- | --- | --- |
-| `2x2x1` (4, 8) | 6.46 s | 10,153 | 223.24 | 19.35% | 37.84 GiB |
+| `2x2x1` (4, 8) | 6.36 s | 10,307 | 226.63 | 19.65% | 37.84 GiB |
 
 `Trainer memory` is the trainer's `reserved_bytes.all.peak` metric (peak XLA
 program reservation), excluding persistent ZeRO-3 sharded bf16 parameters,

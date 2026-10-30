@@ -46,8 +46,9 @@ from torchtitan.experiments.tpu.transformers_modeling_backend.tests.lane_args im
 )
 
 
-def _document_mask(positions: torch.Tensor, causal: bool) -> torch.Tensor:
-  """Dense ``[1, 1, T, T]`` additive mask: same document, causal if asked.
+def _document_mask(positions: torch.Tensor, causal: bool, window: int | None = None) -> torch.Tensor:
+  """Dense ``[1, 1, T, T]`` additive mask: same document, causal if asked,
+  and within ``window`` keys of the query (HF's causal convention, q - k < W).
 
   ``positions`` restart at 0 at every packed-sample boundary; this is the
   mask the lane hands splash as segment ids (plus its causal flag), written
@@ -55,9 +56,11 @@ def _document_mask(positions: torch.Tensor, causal: bool) -> torch.Tensor:
   """
   doc = torch.cumsum((positions == 0).int(), dim=0)
   allowed = doc[:, None] == doc[None, :]
+  idx = torch.arange(positions.shape[0])
   if causal:
-    idx = torch.arange(positions.shape[0])
     allowed &= idx[:, None] >= idx[None, :]
+  if window is not None:
+    allowed &= (idx[:, None] - idx[None, :]) < window
   mask = torch.zeros(allowed.shape, dtype=torch.float32)
   mask.masked_fill_(~allowed, float("-inf"))
   return mask[None, None]
@@ -111,7 +114,11 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   # (Gemma-2), so a model with one is referenced against HF's eager attention,
   # which applies it.
   text_ref = ref_config.get_text_config() if hasattr(ref_config, "get_text_config") else ref_config
-  reference_attn = "eager" if getattr(text_ref, "attn_logit_softcapping", None) else "sdpa"
+  # Attention sinks (gpt-oss, Flint) likewise exist only in HF's eager path.
+  has_sinks = any(n.endswith(".sinks") for n, _ in hf.named_parameters())
+  reference_attn = (
+      "eager" if getattr(text_ref, "attn_logit_softcapping", None) or has_sinks else "sdpa"
+  )
   TPUHFTransformerModel._set_attn_everywhere(ref_config, reference_attn)
   reference = type(hf)(config=ref_config)
   missing, unexpected = reference.load_state_dict(
@@ -125,7 +132,15 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   positions = extra.get("positions")
   positions = positions.cpu() if positions is not None else torch.arange(tokens.shape[0])
   causal = any(getattr(m, "is_causal", False) for m in hf.modules())
-  ref_kwargs = {"position_ids": positions[None], "attention_mask": _document_mask(positions, causal)}
+  ref_mask = _document_mask(positions, causal)
+  # HF uses an explicit 4D mask as-is in every layer, so a model with
+  # sliding-window layers (Flint, ...) gets HF's per-layer-type mapping instead:
+  # without it the reference silently drops the window the device applies.
+  window = getattr(text_ref, "sliding_window", None)
+  if isinstance(window, int) and "sliding_attention" in (getattr(text_ref, "layer_types", None) or ()):
+    ref_mask = {"full_attention": ref_mask,
+                "sliding_attention": _document_mask(positions, causal, window)}
+  ref_kwargs = {"position_ids": positions[None], "attention_mask": ref_mask}
   if wrapper._forward_kwargs is not None:
     ref_kwargs = {k: v for k, v in ref_kwargs.items() if k in wrapper._forward_kwargs}
   logits = _reference_logits(reference, wrapper, tokens.cpu()[None], ref_kwargs)
@@ -197,6 +212,21 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
            # the arithmetic itself in fp32). Detection does not rest on grads:
            # with the cap dropped the LOSS is off by 6.2e-2 (tolerance 1e-2).
            grad_atol=2e-2, grad_rtol=5e-2),
+      # Flint: attention sinks (s_aux) go into the kernel; the shrunk
+      # config keeps one dense and one MoE layer (sigmoid router + shared
+      # expert, HF's own MoE block under this dense config), a sliding window,
+      # and one RoPE / one no-RoPE layer.
+      dict(testcase_name="flint_attention_sinks", config="hf_debugmodel_max",
+           hf_model="RecursiveSI/flint",
+           args=["--loss.b_block_size=256",
+                 '--hf_config_overrides={"num_experts": 8, "num_experts_per_tok": 2, '
+                 '"moe_intermediate_size": 64, "shared_expert_intermediate_size": 128, '
+                 '"mlp_only_layers": [0], "no_rope_layer_indices": [0], "sliding_window": 33, '
+                 '"layer_types": ["sliding_attention", "full_attention"]}'],
+           # At init the sinks are small (std 0.02): dropping them moves the
+           # worst gradient by ~1.4e-3, inside the default 5e-3. The correct
+           # path differs by ~1.5e-4, so a tighter bound catches a wrong sink term.
+           grad_atol=5e-4, min_transformers="5.21"),
       dict(testcase_name="gemma3_softcap_fused", config="hf_debugmodel_max",
            hf_model="google/gemma-3-1b-it",
            args=["--loss.b_block_size=256",
@@ -231,8 +261,14 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
   ])
   def test_one_step_matches_hf(
       self, config, hf_model, args=None, loss_atol=1e-2, loss_rtol=1e-3,
-      grad_atol=5e-3, grad_rtol=5e-3, check_grads=True,
+      grad_atol=5e-3, grad_rtol=5e-3, check_grads=True, expected_fallbacks=(),
+      min_transformers=None,
   ):
+    if min_transformers is not None:
+      import transformers
+      from packaging import version
+      if version.parse(transformers.__version__) < version.parse(min_transformers):
+        self.skipTest(f"{hf_model} needs transformers>={min_transformers}")
     # Eager: the adapter's fallback report fires outside Dynamo tracing, so a
     # kernel that did not run is visible rather than silently measured as sdpa.
     result = one_step_vs_reference(
@@ -241,8 +277,12 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
     self.assertEqual(result["attn_impl"], "splash_tpu", "the device run did not select splash")
-    self.assertEqual(result["fallbacks"], [], "the splash adapter fell back to sdpa")
-    self.assertTrue(result["splash_fired"], "the splash kernel never ran")
+    # A case the kernel cannot express must take the adapter's fallback and say
+    # so (expected_fallbacks); every other case must fire the kernel.
+    self.assertEqual(result["fallbacks"], sorted(expected_fallbacks),
+                     "unexpected splash adapter fallbacks")
+    if not expected_fallbacks:
+      self.assertTrue(result["splash_fired"], "the splash kernel never ran")
     self.assertEqual(result["fused_operands"], result["fused_loss"],
                      "fused-loss config and the model's output disagree")
     logging.info(

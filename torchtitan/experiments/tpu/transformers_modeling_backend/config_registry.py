@@ -23,7 +23,10 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.experiments.tpu.activation_checkpoint import AttentionSavingSelectiveAC
+from torchtitan.experiments.tpu.activation_checkpoint import (
+    AttentionOnlyAC,
+    AttentionSavingSelectiveAC,
+)
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
@@ -334,6 +337,22 @@ def hf_moe_auto() -> TPUTransformersBackendConfig:
   """
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
                         compile=True, use_pallas_grouped_mm=True)
+
+
+def hf_moe_auto_max() -> TPUTransformersBackendConfig:
+  """``hf_moe_auto`` plus what ``hf_full_max`` adds: the fused CE (no full fp32
+  logits -- 18 GiB at 32k tokens for a 150k vocabulary) and selective AC that
+  keeps the attention output."""
+  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
+                        compile=True, use_pallas_grouped_mm=True, fused_loss=True,
+                        save_attention=True)
+
+
+def hf_moe_auto_max_attnac() -> TPUTransformersBackendConfig:
+  """TUNING: ``hf_moe_auto_max`` with full AC that keeps the attention output."""
+  config = hf_moe_auto_max()
+  config.activation_checkpoint = AttentionOnlyAC.Config()
+  return config
 
 
 def hf_moe_auto_eager() -> TPUTransformersBackendConfig:

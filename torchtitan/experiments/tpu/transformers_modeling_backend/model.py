@@ -32,6 +32,7 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 import contextlib
 import copy
 import json
+import os
 from dataclasses import dataclass
 
 import torch
@@ -796,11 +797,13 @@ class TPUHFTransformerModel(HFTransformerModel):
     # (TorchTitan's init). This lane keeps the checkpoint's value instead
     # (update_from_config) so HF's *stock* init -- what runs when the patch
     # does not match: GPT-2, BERT, XLM-R -- uses 0.02 rather than 1.0. When
-    # the patch is what runs, restore TorchTitan's 1.0 for its duration.
+    # the patch is what runs, give it TorchTitan's 1.0 for the embedding only:
+    # overriding initializer_range itself would also reach model-specific
+    # _init_weights overrides (Flint's experts, router and attention sinks),
+    # which then start at std 1.0 -- a router saturated from step 0.
     patched = getattr(PreTrainedModel._init_weights, "__name__", "") == "_init_weights_patched"
-    saved = self.model.config.initializer_range
     if patched:
-      self.model.config.initializer_range = 1.0
+      self.model.config.embedding_init_std = 1.0
     # Sentinel: every parameter starts as NaN, so one the initializer never
     # wrote is detectable afterwards instead of training on to_empty garbage.
     # The base's Llama-like patch is installed on PreTrainedModel itself and
@@ -813,7 +816,7 @@ class TPUHFTransformerModel(HFTransformerModel):
     try:
       super().init_states(buffer_device=buffer_device)
     finally:
-      self.model.config.initializer_range = saved
+      self.model.config.__dict__.pop("embedding_init_std", None)
     self._init_untouched_parameters()
 
     # Titan MoE modules swapped in by moe_replacement stay on meta until the
@@ -1020,3 +1023,22 @@ def _use_pallas_grouped_mm(moe_config) -> None:
     experts.pallas_grouped_mm_tile_n = tile
     experts.pallas_grouped_mm_tgmm_tiling = (256, tile, tile)
     experts.use_kernel_native_weight_layout = True
+    # TUNING ONLY (not for merge): TT_HF_GMM="key=value,..." overrides
+    # TpuGroupedExperts.Config fields; "a:b:c" is a tuple of ints, "none" None,
+    # "true"/"false" booleans (no quotes, so it survives a shell-in-YAML launch).
+    override = os.environ.get("TT_HF_GMM")
+    if override:
+      for item in override.split(","):
+        key, raw = item.split("=", 1)
+        if not hasattr(experts, key):
+          raise ValueError(f"TT_HF_GMM: TpuGroupedExperts.Config has no field {key!r}")
+        if raw.lower() in ("true", "false"):
+          value = raw.lower() == "true"
+        elif raw.lower() == "none":
+          value = None
+        elif ":" in raw:
+          value = tuple(int(x) for x in raw.split(":"))
+        else:
+          value = int(raw)
+        setattr(experts, key, value)
+      logger.info("TT_HF_GMM override applied: %s", override)

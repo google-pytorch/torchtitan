@@ -323,7 +323,7 @@ def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
             f"{len(scans)} scan nodes, "
             f"{sum(1 for n in scans if _is_backward_node(n))} in the backward. "
             "With no scan layers this policy has no stacked activation to move; "
-            "run with --tpu-config.use-scan-layers or pick another policy."
+            "run with --compile.use-scan-layers or pick another policy."
         )
 
     fwd_scan, out_index = _find_stack_producer(node)

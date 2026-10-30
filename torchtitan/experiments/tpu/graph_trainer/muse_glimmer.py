@@ -5,7 +5,8 @@ TPU Muse Glimmer model registry and FSDP policy:
 
 * The model config comes from ``experiments.tpu.muse_glimmer.model_registry``,
   so every layer keeps the window-aware SDPA inner attention that the Splash
-  patch (``workarounds.apply_patches``, run by ``TpuGraphTrainer`` after init)
+  patch (``workarounds.apply_patches``, run by ``TpuGraphTrainer`` before
+  ``parallelize_fn``)
   turns into causal / sliding-window ``LocalMask`` kernels. This also makes the
   TPU-only ``testmodel`` flavor available.
 * Before upstream's SimpleFSDP setup, vocab-sized weights whose dim 0 does not

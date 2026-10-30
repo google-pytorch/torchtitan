@@ -1,12 +1,9 @@
 """Tests for `TpuFloat8LinearConverter`."""
 
-import dataclasses
-
 from absl.testing import absltest
 import torch
 from torch.nn import functional as F
 from torchao.float8.config import Float8LinearConfig
-from torchao.float8.config import Float8GemmConfig
 from torchao.float8.config import ScalingGranularity
 from torchtitan.components.quantization.float8 import Float8Linear
 from torchtitan.components.quantization.float8 import Float8LinearConverter
@@ -29,17 +26,13 @@ def _converted(model_config) -> tuple[list[str], list[str]]:
 
 class TpuFloat8LinearConverterTest(absltest.TestCase):
 
-  def test_rowwise_recipe_without_fast_accum(self):
+  def test_rowwise_recipe(self):
+    """Verifies that the rowwise recipe builds the upstream torchao config."""
     converter = TpuFloat8LinearConverter.Config(recipe_name="rowwise").build()
 
     self.assertIsInstance(converter, TpuFloat8LinearConverter)
     expected = Float8LinearConfig.from_recipe_name("rowwise")
-    self.assertEqual(
-        converter.torchao_config,
-        dataclasses.replace(
-            expected, gemm_config_output=Float8GemmConfig(use_fast_accum=False)
-        ),
-    )
+    self.assertEqual(converter.torchao_config, expected)
     config = converter.torchao_config
     for cast_config in (
         config.cast_config_input,
@@ -50,6 +43,7 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
           cast_config.scaling_granularity, ScalingGranularity.AXISWISE
       )
     self.assertTrue(config.round_scales_to_power_of_2)
+    self.assertTrue(config.gemm_config_output.use_fast_accum)
     self.assertFalse(config.gemm_config_grad_input.use_fast_accum)
     self.assertFalse(config.gemm_config_grad_weight.use_fast_accum)
 
@@ -81,7 +75,7 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
     for fqn in fp8:
       module = model.get_submodule(fqn)
       self.assertIsInstance(module, Float8Linear)
-      self.assertFalse(module.config.gemm_config_output.use_fast_accum)
+      self.assertTrue(module.config.gemm_config_output.use_fast_accum)
 
   def test_emulated_layer_matches_linear(self):
     torch.manual_seed(0)

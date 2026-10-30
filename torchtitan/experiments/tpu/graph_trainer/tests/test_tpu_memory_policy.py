@@ -9,6 +9,7 @@
 import operator
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -18,6 +19,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import CheckpointPolicy
 
+from torchtitan.experiments.graph_trainer import cpu_offload
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
     _is_backward_node,
@@ -450,9 +452,9 @@ def _selective_config(
     save_regions: tuple[str, ...], last_n_layers: dict[str, int] | None = None
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        tpu_config=SimpleNamespace(
-            graph_trainer_save_regions=save_regions,
-            graph_trainer_save_last_n_layers=last_n_layers or {},
+        compile=SimpleNamespace(
+            save_regions=save_regions,
+            save_last_n_layers=last_n_layers or {},
         ),
         parallelism=_parallelism("always"),
     )
@@ -638,6 +640,40 @@ class TestTpuSelectivePolicy(unittest.TestCase):
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual([_get_layer_id(node) for node in splash], [2])
+
+    def test_selective_and_offload_keeps_saves_in_hbm(self) -> None:
+        def tag(policy: str, last_n_layers: dict[str, int] | None = None):
+            torch.manual_seed(0)
+            traced, _ = _trace_toy(_MoEToy(_splash_cores()))
+            remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
+            config = _selective_config((), last_n_layers)
+            config.compile.cpu_offload_budget_gb = 100.0
+            config.compile.full_recompute_save_ops = ""
+            # The toy's tensors are below the offload size floor.
+            with mock.patch.object(cpu_offload, "_MIN_OFFLOAD_BYTES", 0):
+                MEMORY_POLICY_REGISTRY[policy](traced.gm, config=config)
+            return traced.gm
+
+        def offloaded(gm: torch.fx.GraphModule) -> set[str]:
+            return {
+                node.name
+                for node in gm.graph.nodes
+                if node.meta.get("recompute") is CheckpointPolicy.MUST_CPU_OFFLOAD
+            }
+
+        # Splash is saved in layers 1 and 2 of 3. The offload tagger never
+        # offloads the last layer, so layer 1 is the one that would catch the
+        # save tags being overwritten.
+        gm = tag("tpu_selective_and_offload", {"attention.inner_attention": 2})
+        policies = {
+            _get_layer_id(node): {user.meta.get("recompute") for user in node.users}
+            for node in gm.graph.nodes
+            if _is_splash_node(node)
+        }
+        self.assertEqual(policies[1], {CheckpointPolicy.MUST_SAVE})
+        self.assertEqual(policies[2], {CheckpointPolicy.MUST_SAVE})
+        # Everything else is offloaded exactly as full_and_offload does it.
+        self.assertEqual(offloaded(gm), offloaded(tag("full_and_offload")))
 
     def test_saved_routing_skips_the_router_topk_recompute(self) -> None:
         # Backward needs each router's expert ids to scatter the gate-score

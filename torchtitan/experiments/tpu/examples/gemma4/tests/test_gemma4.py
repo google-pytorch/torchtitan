@@ -13,6 +13,7 @@ from torchtitan.components.loss import (
     CrossEntropyLoss,
     cross_entropy_loss,
 )
+from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
@@ -41,6 +42,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import (
     QKVLinear,
@@ -564,14 +566,97 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
       model = config.build()
     for layer in model.layers.values():
       inner = layer.attention.inner_attention
+      self.assertIsInstance(inner, SlidingWindowScaledDotProductAttention)
       if layer.attention.is_sliding:
-        self.assertIsInstance(inner, SlidingWindowScaledDotProductAttention)
         self.assertEqual(
             inner.sliding_window_size,
             layer.attention.sliding_window_size - 1,
         )
       else:
-        self.assertIs(type(inner), ScaledDotProductInnerAttention)
+        self.assertIsNone(inner.sliding_window_size)
+
+  def test_packed_document_masking_on_sliding_and_global_layers(self):
+    """Packed positions (resetting to 0 at doc boundaries) mask cross-doc keys."""
+    head_dim = 8
+    for is_sliding, window in ((True, self._WINDOW), (False, None)):
+      cfg = Gemma4Attention.Config(
+          dim=self._DIM,
+          n_heads=4,
+          n_kv_heads=2,
+          head_dim=head_dim,
+          is_sliding=is_sliding,
+          sliding_window_size=window,
+          qk_norm=RMSNorm.Config(
+              normalized_shape=head_dim, eps=1e-6, param_init=_NORM_INIT
+          ),
+          v_norm=RMSNorm.Config(
+              normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
+          ),
+          qkv_linear=QKVLinear.Config(
+              head_dim=head_dim,
+              wq=Linear.Config(
+                  in_features=self._DIM,
+                  out_features=32,
+                  param_init=_LINEAR_INIT,
+              ),
+              wkv=Linear.Config(
+                  in_features=self._DIM,
+                  out_features=16,
+                  param_init=_LINEAR_INIT,
+              ),
+          ),
+          wo=Linear.Config(
+              in_features=32, out_features=self._DIM, param_init=_LINEAR_INIT
+          ),
+          inner_attention=ScaledDotProductInnerAttention.Config(),
+          rope=Gemma4RoPE.Config(
+              dim=head_dim, max_context_length=self._SEQ_LEN, theta=10000.0
+          ),
+      )
+      torch.manual_seed(0)
+      attn = cfg.build()
+      attn.init_states()
+
+      # Two packed documents of length 6 in a 12-token sequence (doc boundary
+      # at index 6 is inside the 4-token sliding window for tokens 6..8).
+      doc_split = 6
+      positions_1d = torch.cat(
+          [torch.arange(doc_split), torch.arange(self._SEQ_LEN - doc_split)]
+      )
+      positions = positions_1d.repeat(2)
+      seg_1d = torch.tensor(
+          [1] * doc_split + [2] * (self._SEQ_LEN - doc_split)
+      )
+      same_doc = seg_1d[:, None] == seg_1d[None, :]
+      dist = (
+          torch.arange(self._SEQ_LEN)[:, None]
+          - torch.arange(self._SEQ_LEN)[None, :]
+      )
+      unpacked_mask = dist >= 0
+      if is_sliding and window is not None:
+        unpacked_mask = unpacked_mask & (dist < window)
+      packed_mask = unpacked_mask & same_doc
+
+      x = torch.randn(2 * self._SEQ_LEN, self._DIM)
+      with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
+        actual = attn(x, attention_masks=None, positions=positions).view(
+            2, self._SEQ_LEN, self._DIM
+        )
+        expected = self._attention_with_mask(attn, packed_mask)(
+            x, attention_masks=None, positions=positions
+        ).view(2, self._SEQ_LEN, self._DIM)
+        unpacked = self._attention_with_mask(attn, unpacked_mask)(
+            x, attention_masks=None, positions=positions
+        ).view(2, self._SEQ_LEN, self._DIM)
+
+      torch.testing.assert_close(actual, expected)
+      # Document 1 (rows :doc_split) is identical; document 2 must differ when
+      # cross-document keys are masked out.
+      torch.testing.assert_close(
+          actual[:, :doc_split], unpacked[:, :doc_split]
+      )
+      doc2_diff = (actual[:, doc_split:] - unpacked[:, doc_split:]).abs().amax()
+      self.assertGreater(doc2_diff.item(), 1e-4)
 
 
 class TestGemma4HFReferenceParity(BaseDeviceTest):
@@ -845,6 +930,208 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
       )
       hf_logits = hf_model(input_ids=tokens).logits
     torch.testing.assert_close(tt_logits, hf_logits, atol=5e-2, rtol=1e-2)
+
+
+# Splash / tokamax attention patches vs. SDPA on debugmodel's attention layers:
+# layer 0 is sliding-window (window 128, head_dim 64, full RoPE, Splash
+# LocalMask), and layer 5 is global (head_dim 128, K=V, partial RoPE 0.25,
+# Splash CausalMask).
+_SPLASH_TEST_CONFIGS = [
+    dict(
+        testcase_name=f"_{kernel}_{layer_name}",
+        kernel=kernel,
+        layer_id=layer_id,
+    )
+    for kernel in ("splash", "splash_batch_native", "tokamax")
+    for layer_name, layer_id in (("SWA_ROPE", 0), ("GLOBAL_KEQV", 5))
+]
+
+
+class TestGemma4SplashAttentionParity(BaseDeviceTest):
+  """TPU-only checks that Splash and Tokamax patches match Gemma 4 SDPA on packed docs."""
+
+  def setUp(self):
+    super().setUp()
+    # torch_tpu defaults fp32 matmuls to a single bf16 pass ("medium"); run
+    # the non-attention matmuls (wq/wk/wv/wo) at full fp32 so the comparison
+    # isolates the attention kernel numerics.
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous_precision)
+
+  def _check_relative_l2(
+      self,
+      test: torch.Tensor,
+      reference: torch.Tensor,
+      max_rel_error: float,
+      check_name: str,
+  ) -> None:
+    """Checks ``||test - reference|| / ||reference|| <= max_rel_error``."""
+    test_f = test.detach().float().cpu()
+    ref_f = reference.detach().float().cpu()
+    rel_error = (
+        torch.linalg.vector_norm(test_f - ref_f)
+        / torch.linalg.vector_norm(ref_f).clamp_min(1e-12)
+    ).item()
+    self.assertLessEqual(
+        rel_error,
+        max_rel_error,
+        f"{check_name}: relative L2 error {rel_error:.3e} >"
+        f" {max_rel_error:.1e}",
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="splash", kernel="splash"),
+      dict(testcase_name="tokamax", kernel="tokamax"),
+  )
+  def test_patch_replaces_every_layer(self, kernel: str):
+    """Both Splash and Tokamax patches replace/rebind every Gemma 4 layer.
+
+    Verifies that on a meta-device ``debugmodel`` (5 sliding-window layers +
+    1 global K=V layer), the patch takes effect on all 6 layers and preserves
+    per-layer ``sliding_window_size`` (127 on sliding layers, None on global).
+    """
+    with torch.device("meta"):
+      model = gemma4_configs["debugmodel"].build()
+    if kernel == "tokamax":
+      workarounds.use_tokamax_splash_attention_patch(
+          model, SplashAttentionKernelConfig()
+      )
+    else:
+      workarounds.use_splash_attention_patch(
+          model, SplashAttentionKernelConfig()
+      )
+    layers = list(model.layers.values())
+    self.assertLen(layers, 6)
+    for idx, layer in enumerate(layers):
+      inner = layer.attention.inner_attention
+      expected_window = 127 if idx < 5 else None
+      if kernel == "tokamax":
+        self.assertIn("forward", vars(inner))
+        self.assertEqual(inner.sliding_window_size, expected_window)
+      else:
+        self.assertNotIn("ScaledDotProduct", type(inner).__name__)
+        self.assertEqual(inner.inner.local_window_size, expected_window)
+
+  @parameterized.named_parameters(*_SPLASH_TEST_CONFIGS)
+  def test_gemma4_splash_attention_matches_sdpa(
+      self, kernel: str, layer_id: int
+  ):
+    """Tests Splash and tokamax attention patches against SDPA on packed docs.
+
+    Exercises ``use_splash_attention_patch`` (both document-aware block
+    skipping and batch-native masking) and
+    ``use_tokamax_splash_attention_patch`` on a ``Gemma4Attention`` layer from
+    ``debugmodel``: layer 0 has ``sliding_window_size = 128`` (patched to
+    ``127`` on ``inner_attention``, exercising Splash ``LocalMask``), and
+    layer 5 is global ``K=V`` with ``head_dim = 128`` and partial RoPE
+    (exercising ``CausalMask``). The input has packed documents with resets inside
+    the 128-token window so both windowing and ``segment_ids`` masking are
+    active.
+    """
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("Splash and tokamax attention kernels only run on TPU.")
+
+    model_config = copy.deepcopy(gemma4_configs["debugmodel"])
+    batch, seq_len, dim = 2, 512, model_config.dim
+    attention_config = model_config.layers[layer_id].attention
+
+    torch.manual_seed(0)
+    attention_cpu = attention_config.build()
+    attention_cpu.init_states(buffer_device=torch.device("cpu"))
+    attention_cpu = attention_cpu.cpu()
+    # Move Q/K norm weights slightly off all-ones so per-channel scaling is
+    # non-trivial in both forward and backward.
+    gen = torch.Generator().manual_seed(1234)
+    with torch.no_grad():
+      for name, param in attention_cpu.named_parameters():
+        if "norm" in name:
+          param.copy_(
+              1.0 + 0.1 * torch.randn(param.shape, generator=gen).to(param)
+          )
+    attention_device = copy.deepcopy(attention_cpu).to(self.accelerator_device)
+
+    sa_config = SplashAttentionKernelConfig(
+        sa_use_document_aware_block_skipping=(kernel == "splash")
+    )
+    if kernel == "tokamax":
+      workarounds.use_tokamax_splash_attention_patch(
+          attention_device, sa_config
+      )
+    elif kernel in ("splash", "splash_batch_native"):
+      workarounds.use_splash_attention_patch(attention_device, sa_config)
+    else:
+      self.fail(f"Unknown kernel: {kernel}")
+
+    # Row 0 packs 3 documents (boundaries at 150 and 350, both inside the
+    # 128-token window of subsequent queries); row 1 is a single document.
+    doc_lengths_row0 = (150, 200, seq_len - 350)
+    positions_row0 = torch.cat([torch.arange(n) for n in doc_lengths_row0])
+    positions_row1 = torch.arange(seq_len)
+    positions_cpu = torch.cat([positions_row0, positions_row1]).to(torch.long)
+    positions_device = positions_cpu.to(self.accelerator_device)
+
+    x_cpu, x_device = self._create_input_tensor_cpu_device(
+        size=(batch * seq_len, dim), requires_grad=True
+    )
+
+    with set_unflatten_seq_len(seq_len):
+      y_cpu = attention_cpu(x_cpu, attention_masks=None, positions=positions_cpu)
+      y_device = attention_device(
+          x_device, attention_masks=None, positions=positions_device
+      )
+
+    # Splash/tokamax run QK^T and PV in bf16 on the TPU MXU, vs. fp32 SDPA on
+    # CPU.
+    self._check_relative_l2(
+        y_device,
+        y_cpu,
+        max_rel_error=1e-2,
+        check_name=f"Gemma4Attention ({kernel}) forward",
+    )
+
+    grad_out_cpu, grad_out_device = self._create_input_tensor_cpu_device(
+        size=y_cpu.shape
+    )
+    y_cpu.backward(grad_out_cpu)
+    y_device.backward(grad_out_device)
+
+    self._check_relative_l2(
+        x_device.grad,
+        x_cpu.grad,
+        max_rel_error=2.5e-2,
+        check_name=f"Gemma4Attention ({kernel}) input grad",
+    )
+    for (name, p_cpu), (_, p_device) in zip(
+        attention_cpu.named_parameters(), attention_device.named_parameters()
+    ):
+      self._check_relative_l2(
+          p_device.grad,
+          p_cpu.grad,
+          max_rel_error=2.5e-2,
+          check_name=f"Gemma4Attention ({kernel}) param grad ({name})",
+      )
+
+    # Failure control: if the kernel ignored the sliding window or the
+    # packed-document boundaries (plain full-sequence causal SDPA with the same
+    # RoPE positions), the output would shift by >10% relative L2, well above
+    # the 1e-2 tolerance checked above.
+    unmasked_cpu = copy.deepcopy(attention_cpu)
+    unmasked_cpu.inner_attention = ScaledDotProductInnerAttention.Config().build()
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      y_unmasked = unmasked_cpu(
+          x_cpu, attention_masks=None, positions=positions_cpu
+      )
+    unmasked_diff = (
+        torch.linalg.vector_norm(y_device.detach().float().cpu() - y_unmasked)
+        / torch.linalg.vector_norm(y_unmasked)
+    ).item()
+    self.assertGreater(
+        unmasked_diff,
+        0.1,
+        "Unmasked causal attention is too close to the windowed/packed output;"
+        " the 1e-2 check above would not catch a broken mask.",
+    )
 
 
 if __name__ == "__main__":

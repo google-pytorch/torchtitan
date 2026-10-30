@@ -10,8 +10,7 @@ experts on dim 0).
 
 ## Launch
 
-One `tpu7x-2x2x1` host, at the recipe's context 2048 and 32K tokens per rank
-(the first row of the measured results below):
+One `tpu7x-2x2x1` host, at the recipe's context 2048 and 32K tokens per rank:
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
@@ -26,7 +25,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
 
 Add `--training.max_context_length=8192
 --training.num_tokens_per_microbatch_per_dp_rank=65536` for context 8192 and
-64K tokens per rank (the second row).
+64K tokens per rank, as in the results below.
 
 Multi-host launch on `tpu7x-4x4x4` (16 hosts, 128 ranks; see the TPU
 [README](../../../../README.md) for cluster setup), at context 8192 and 64K
@@ -75,6 +74,15 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   permutation) and `attention.inner_attention` (the Splash Attention output
   and its log-sum-exp) across forward and backward executables, so backward
   does not re-run the MoE top-k and sort or the Splash Attention forward.
+  Without document resets (at context 8192), this cut step-1 compile time by
+  35–36% (`303 s -> 198 s` at 64K tokens per rank, `355 s -> 228 s` at 96K) and
+  step time from 6.94 to 6.86 s (`18.21% MFU`) at 64K; at 96K with one layer per
+  executable it took 10.50 to 10.01 s (`18.73% MFU`) with Splash saved in the
+  last two full-attention layers only
+  (`--compile.graph_split.forward_layers_per_executable=1
+  --compile.graph_split.backward_layers_per_executable=1
+  --compile.save_regions moe.routing
+  --compile.save_last_n_layers attention.inner_attention 2`).
 * **GraphTrainer with graph split**: as one step graph, the 40-layer model
   neither compiles within an hour on 8 host CPUs nor fits in HBM on one host
   (XLA keeps most layers' unsharded `3 x 1 GiB` fp32 expert gradients alive
@@ -84,13 +92,21 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   With `backward_partition_mode=fsdp_pipeline`, `split=2` cuts the step from 84
   to 44 child executables; in the A/B that chose it (an earlier build of this
   recipe at 32K tokens per rank on one host), `split=2` had 24% shorter step
-  time (+31% throughput) than one layer per executable (`split=1`).
+  time (+31% throughput) than one layer per executable (`split=1`). `split=1`
+  halves the peak per-executable unsharded parameter and gradient buffers for
+  96K–128K tokens per rank (without document resets, at context 8192:
+  `10.01 s/step`, `18.73% MFU` at 96K on `2x2x1`; `13.56 s/step`, `18.43% MFU`
+  at 128K on `4x4x4`).
 * **AdamW**: torch_tpu's fused AdamW outside the step graph
   (`optimizer_compile="eager"`, `compile_grad_norm=True`).
 * **`GatedDeltaNet`**: Tokamax's Mosaic TPU KDA kernels
   (`TokamaxGatedDeltaKernel`, through the `tokamax_gated_delta_kernel`
-  override), with the forward returning the backward kernels' residuals; the
-  causal convolution and its input gradient are computed from shifted slices.
+  override), with the forward returning the backward kernels' residuals.
+  Pretraining runs it over whole `[B, S]` rows (`reset_at_documents=False`):
+  restarting at packed documents makes the kernels lay every document out
+  from a 64-token chunk boundary (6.74 vs 9.78 s/step at 64K tokens per rank
+  on `2x2x1`). The causal convolution and its input gradient are
+  computed from shifted slices.
 * **MoE**: Pallas paired grouped matmuls with kernel-native expert weights
   and the fused route-score backward.
 * **Attention**: Splash attention with segment ids from `positions`; 1024
@@ -110,33 +126,29 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
 
 ## Benchmark Results
 
-Measured on one `tpu7x-2x2x1` host (4 chips, 8 ranks) on Cloud GKE with the
-full 40-layer model (`qwen35_moe_35b_split_tokamax_benchmark`,
-`mixed_precision_reduce="float32"`, `enable_tpu_topo_mesh=True`), step 20 of 20:
+Full 40-layer model (`qwen35_moe_35b_split_tokamax_benchmark`: no GatedDeltaNet
+packed-document resets, `mixed_precision_reduce="float32"`,
+`enable_tpu_topo_mesh=True`), context length 8192
+(`--training.max_context_length=8192`), 65,536 tokens per rank (`8 × 8192`),
+2 layers per executable, Cloud GKE (224-vCPU hosts), step 20 of 20:
 
-| Context | Tokens/rank | Step time | Tokens/s/rank | TFLOPS/rank | MFU | Trainer memory |
-| --- | --- | --- | --- | --- | --- | --- |
-| 2048 | 32,768 (`16 × 2048`) | 4.78 s | 6,849 | 129.91 | 11.26% | 23.96 GiB |
-| 8192 | 65,536 (`8 × 8192`) | 9.78 s | 6,703 | 147.38 | 12.78% | 45.11 GiB |
+| Slice (chips, ranks) | Step time | Tokens/s/rank | TFLOPS/rank | MFU | Trainer memory |
+| --- | --- | --- | --- | --- | --- |
+| `2x2x1` (4, 8) | 6.74 s | 9,727 | 213.89 | 18.54% | 40.12 GiB |
 
 `Trainer memory` is the trainer's `reserved_bytes.all.peak` metric (peak XLA
 program reservation), excluding persistent ZeRO-3 sharded bf16 parameters,
-gradients, and AdamW moments (~32.3 GiB per rank across 8 ranks).
-
-The GatedDeltaNet restarts at every packed document here, and Tokamax lays
-every document out from a 64-token chunk boundary for that (see Notes).
+gradients, and AdamW moments (`258 GiB / ranks`, or ~32.3 GiB per rank across
+8 ranks).
 
 ## Notes
 
-* Packed documents: the attention masks documents via `positions`, and the
-  `GatedDeltaNet` restarts its causal convolution and delta-rule state at every
-  document (`positions == 0`), through static-shape `[B, S]` segment ids
-  instead of upstream's varlen `cu_seqlens`. The XLA kernel masks within
-  chunks; Tokamax's kernels take `segment_ids` and lay every document out from
-  a 64-token chunk boundary, keeping up to `max_num_segments` documents per row
-  apart (default: one per 512 tokens and at least 4, so 12% more kernel tokens
-  from a 2048-token context up). A row's documents beyond that run as one
-  sequence, in the causal convolution too.
+* With `reset_at_documents=False` (this recipe), `GatedDeltaNet` runs one
+  recurrence per `[B, S]` row: documents packed into a row share the causal
+  convolution and the delta-rule state. The default (`True`, for RL; or via
+  `torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets`
+  in `--override.imports`) restarts both at every document (`positions == 0`).
+  Attention always masks documents via `positions`.
 * The Tokamax kernels clamp the per-token log decay at -5
   (`TokamaxGatedDeltaKernel.Config.min_log_decay`): the backward kernel's
   16-token sub-block re-centering grows like `exp(-15 * g)` and overflows fp32

@@ -261,6 +261,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       use_vmap_bwd=_sa("use_vmap_bwd"),
       num_stacked_q_heads=_sa("num_stacked_q_heads"),
       use_batch_loop_fwd=_sa("use_batch_loop_fwd"),
+      use_batch_loop_bwd=_sa("use_batch_loop_bwd"),
       q_layout=_sa("q_layout"),
       k_layout=_sa("k_layout"),
       v_layout=_sa("v_layout"),

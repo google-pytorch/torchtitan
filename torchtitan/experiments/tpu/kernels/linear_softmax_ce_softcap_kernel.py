@@ -16,9 +16,11 @@
 """Linear Cross-Entropy kernel with an optional soft-capped logit transform.
 
 Vendored from ``tokamax._src.ops.linear_softmax_cross_entropy_loss.
-pallas_mosaic_tpu_kernel`` (the revision installed in the TPU image; the
-original DeepMind license header above is retained). The only delta from the
-upstream kernel is the optional elementwise logit transform needed by Muse
+pallas_mosaic_tpu_kernel`` in Tokamax 0.0.14 (the original DeepMind license
+header above is retained), and used for every Mosaic fused-CE call. Tokamax
+0.0.16 rebuilt the backward around input/output-buffered pipelining that needs
+separate in/out buffer counts (JAX 0.12); on older JAX it single-buffers and
+the backward is ~1.7x slower. The only delta from the upstream kernel is the optional elementwise logit transform needed by Muse
 Glimmer's ``SoftCappedLinear`` LM head::
 
     logits = soft_cap * tanh(z * output_multiplier / soft_cap)      (cap set)

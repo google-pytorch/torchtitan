@@ -1,6 +1,5 @@
 """Tests for linear_softmax_cross_entropy_loss."""
 
-import importlib
 from unittest import mock
 
 from absl import logging
@@ -21,13 +20,8 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
     x = jnp.zeros((2, 4), dtype=jnp.bfloat16)
     labels = jnp.zeros((2,), dtype=jnp.int32)
     weights = jnp.zeros((4, 8), dtype=jnp.bfloat16)
-    kernel = importlib.import_module(
-        "tokamax._src.ops.linear_softmax_cross_entropy_loss."
-        "pallas_mosaic_tpu_kernel"
-    )
-
     with mock.patch.object(
-        kernel,
+        linear_softmax_cross_entropy_loss.pallas_kernel,
         "linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu",
         return_value=(jnp.zeros_like(x), jnp.zeros_like(weights)),
     ) as backward:

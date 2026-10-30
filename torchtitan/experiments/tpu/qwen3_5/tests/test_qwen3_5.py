@@ -611,6 +611,70 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
       torch.testing.assert_close(out_fallback, out_slice)
 
+  def test_tpu_rms_norm_gated_dispatches_to_pallas_when_supported(self):
+    """Tests TpuRMSNormGated Pallas dispatch at >=2048 rows and fallbacks."""
+    dev = self.accelerator_device
+    torch.manual_seed(17)
+    x_cpu = torch.randn(512, 4, 128, dtype=torch.bfloat16)
+    gate_cpu = torch.randn(512, 4, 128, dtype=torch.bfloat16)
+    w_cpu = (1.0 + 0.1 * torch.randn(128)).to(torch.bfloat16)
+    dy_cpu = torch.randn(512, 4, 128, dtype=torch.bfloat16)
+
+    ref_norm = gated_delta.RMSNormGated(
+        gated_delta.RMSNormGated.Config(dim=128)
+    )
+    with torch.no_grad():
+      ref_norm.weight.copy_(w_cpu)
+    ref_norm = ref_norm.to(dev)
+    x_ref = x_cpu.to(dev).requires_grad_(True)
+    gate_ref = gate_cpu.to(dev).requires_grad_(True)
+    out_ref = ref_norm(x_ref, gate_ref)
+    grads_ref = torch.autograd.grad(
+        out_ref, (x_ref, gate_ref, ref_norm.weight), dy_cpu.to(dev)
+    )
+
+    tpu_norm = gated_delta.TpuRMSNormGated(
+        gated_delta.TpuRMSNormGated.Config(dim=128)
+    )
+    with torch.no_grad():
+      tpu_norm.weight.copy_(w_cpu)
+    tpu_norm = tpu_norm.to(dev)
+    x_dev = x_cpu.to(dev).requires_grad_(True)
+    gate_dev = gate_cpu.to(dev).requires_grad_(True)
+
+    # Verify nn.Module forward hooks run (not bypassed by free helper).
+    hook_calls = 0
+
+    def _post_hook(_mod, _inp, _out):
+      nonlocal hook_calls
+      hook_calls += 1
+
+    handle = tpu_norm.register_forward_hook(_post_hook)
+    self.addCleanup(handle.remove)
+
+    if self._is_tpu() and gated_delta.rms_norm_gated is not None:
+      with mock.patch.object(
+          gated_delta.rms_norm_gated,
+          "rms_norm_gated",
+          wraps=gated_delta.rms_norm_gated.rms_norm_gated,
+      ) as pallas_spy:
+        out_dev = tpu_norm(x_dev, gate_dev)
+        self.assertEqual(pallas_spy.call_count, 1)
+        # Rows = 256 * 4 = 1024 (< 2048 block size) falls back cleanly.
+        _ = tpu_norm(x_dev[:256], gate_dev[:256])
+        self.assertEqual(pallas_spy.call_count, 1)
+    else:
+      out_dev = tpu_norm(x_dev, gate_dev)
+      _ = tpu_norm(x_dev[:256], gate_dev[:256])
+    self.assertEqual(hook_calls, 2)
+
+    grads_dev = torch.autograd.grad(
+        out_dev, (x_dev, gate_dev, tpu_norm.weight), dy_cpu.to(dev)
+    )
+    self.assertLess(_relative_l2_error(out_dev, out_ref), 1e-2)
+    for g_actual, g_expected in zip(grads_dev, grads_ref, strict=True):
+      self.assertLess(_relative_l2_error(g_actual, g_expected), 1e-2)
+
   def test_causal_conv_silu_backward_avoids_scatter_adds(self):
     """Tests that the conv backward does not add slices into zero buffers.
 
@@ -1351,6 +1415,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             self.assertIsInstance(
                 layer.delta_net.inner_gated_delta_net,
                 gated_delta.TpuInnerGatedDeltaNet.Config,
+            )
+            self.assertIsInstance(
+                layer.delta_net.norm, gated_delta.TpuRMSNormGated.Config
             )
             for conv in (
                 layer.delta_net.conv_q,

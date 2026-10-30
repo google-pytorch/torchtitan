@@ -105,8 +105,8 @@ GatedDeltaNet then runs the XLA `chunked_gated_delta`.
   Pretraining runs it over whole `[B, S]` rows (`reset_at_documents=False`):
   restarting at packed documents makes the kernels lay every document out
   from a 64-token chunk boundary (6.74 vs 9.78 s/step at 64K tokens per rank
-  on `2x2x1`). The causal convolution + SiLU runs as a Pallas kernel
-  (`kernels/causal_conv1d.py`).
+  on `2x2x1`). The causal convolution + SiLU and the gated RMSNorm run as
+  Pallas kernels (`kernels/causal_conv1d.py`, `kernels/rms_norm_gated.py`).
 * **MoE**: Pallas paired grouped matmuls with kernel-native expert weights
   and the fused route-score backward.
 * **Attention**: Splash attention with segment ids from `positions`; 1024
@@ -136,7 +136,15 @@ packed-document resets, `mixed_precision_reduce="float32"`,
 
 | Slice (chips, ranks) | Step time | Tokens/s/rank | TFLOPS/rank | MFU | Trainer memory |
 | --- | --- | --- | --- | --- | --- |
-| `2x2x1` (4, 8) | 6.20 s | 10,562 | 232.24 | 20.13% | 37.84 GiB |
+| `2x2x1` (4, 8) | 6.12 s | 10,708 | 235.44 | 20.41% | 36.58 GiB |
+| `2x2x2` (8, 16) | 6.07 s | 10,797 | 237.40 | 20.58% | 36.58 GiB |
+| `2x2x4` (16, 32) | 6.14 s | 10,681 | 234.86 | 20.36% | 36.58 GiB |
+| `2x4x4` (32, 64) | 6.31 s | 10,389 | 228.44 | 19.80% | 36.58 GiB |
+
+The recipe is tuned on `2x2x1` and run unchanged on the larger slices. Above
+64K tokens per rank, `2x2x1` runs out of HBM with 2 layers per executable;
+with 1 layer per executable, 96K tokens per rank reaches 20.10% MFU (comparable
+to 20.41% at 64K).
 
 `Trainer memory` is the trainer's `reserved_bytes.all.peak` metric (peak XLA
 program reservation), excluding persistent ZeRO-3 sharded bf16 parameters,

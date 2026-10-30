@@ -468,6 +468,7 @@ def sbd_attention_fwd(
     bias: jax.Array | None,
     dropout_seed: jax.Array | None,
     segment_ids: jax.Array | None,
+    sinks: jax.Array | None,
     causal: bool,
     scale: float,
     local_window_size: int,
@@ -497,7 +498,9 @@ def sbd_attention_fwd(
   `(H, PER_KEY_ROWS, S)` per-key, shared across batch, or None;
   `dropout_seed` is `(B, 2)` int32 seed words, or None when dropout is off;
   `segment_ids` is `(B, S)` int32 packed-document ids (a token attends only
-  within its own id, on top of the causal / window mask), or None. The
+  within its own id, on top of the causal / window mask), or None; `sinks` is
+  `(H,)` fp32 attention-sink logits (one extra softmax column per head that
+  takes probability but contributes no value, gpt-oss style), or None. The
   remaining args are trace-time statics; the dkv-only ones ride along for
   `setup_context` to hand to the backward op."""
   seq_len = q.shape[2 if heads_first else 1]
@@ -565,7 +568,7 @@ def sbd_attention_fwd(
         None,  # dropout_mask (explicit-mask path unused here)
         seed_b,
         _segment_ids(seg_b),
-        None,  # sinks
+        sinks,  # shared across batch, like bias
         mask_value,
         is_mqa,
         cfg,
@@ -599,6 +602,7 @@ def sbd_attention_bwd(
     bias: jax.Array | None,
     dropout_seed: jax.Array | None,
     segment_ids: jax.Array | None,
+    sinks: jax.Array | None,
     out: jax.Array,
     logsumexp: jax.Array,
     grad_out: jax.Array,
@@ -624,10 +628,10 @@ def sbd_attention_bwd(
     bias_per_key_dbias_mxu_reduce: bool,
     document_aware_skipping: bool,
     dq_reduction_steps: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Backward from saved residuals -- no forward re-run. Returns
-  `(dq, dk, dv, dbias)`; `dbias` is a `(0,)` placeholder when bias is None
-  (the op's output arity is fixed)."""
+  `(dq, dk, dv, dbias, dsinks)`; `dbias` / `dsinks` are `(0,)` placeholders
+  when bias / sinks are None (the op's output arity is fixed)."""
   seq_len = q.shape[2 if heads_first else 1]
   use_bias = bias is not None
   use_dropout = dropout_seed is not None
@@ -744,7 +748,22 @@ def sbd_attention_bwd(
     dbias = jnp.sum(dbias_b, axis=0).astype(bias.dtype)
   else:
     dbias = jnp.zeros((0,), dtype=q.dtype)
-  return dq, dk, dv, dbias
+  # The saved logsumexp already counts the sink, so dq/dk/dv above are exact
+  # without it; only the sink's own cotangent is left. With w = exp(sink - lse)
+  # the sink's probability, d out / d sink = -w * out, so
+  # dsink = -sum over batch and queries of w * rowsum(out * grad_out). Done
+  # here in fp32 rather than by the kernel's bwd, which sums in out's dtype.
+  if sinks is not None:
+    lse = logsumexp.astype(jnp.float32)
+    if use_base2_exp:
+      lse = lse / sbd_kernel.LOG2E
+    di = jnp.einsum("bhsd,bhsd->bhs", out_tr.astype(jnp.float32),
+                    g_tr.astype(jnp.float32))
+    w = jnp.exp(sinks.astype(jnp.float32)[None, :, None] - lse)
+    dsinks = -jnp.sum(w * di, axis=(0, 2)).astype(sinks.dtype)
+  else:
+    dsinks = jnp.zeros((0,), dtype=q.dtype)
+  return dq, dk, dv, dbias, dsinks
 
 
 def _per_example(mask_info, segment_ids, document_aware_skipping):
@@ -779,20 +798,22 @@ _NUM_STATIC_ARGS = 4 + len(SbdConfig.static_args())  # causal, scale, window, la
 
 
 def _setup_context(ctx, inputs, output):
-  q, k, v, bias, dropout_seed, segment_ids = inputs[: len(inputs) - _NUM_STATIC_ARGS]
+  q, k, v, bias, dropout_seed, segment_ids, sinks = inputs[: len(inputs) - _NUM_STATIC_ARGS]
   out, logsumexp = output
-  ctx.save_for_backward(q, k, v, bias, dropout_seed, segment_ids, out, logsumexp)
+  ctx.save_for_backward(q, k, v, bias, dropout_seed, segment_ids, sinks, out, logsumexp)
   ctx.static_args = tuple(inputs[len(inputs) - _NUM_STATIC_ARGS :])
 
 
 def _backward(ctx, grad_out, grad_lse):
   del grad_lse
-  q, k, v, bias, dropout_seed, segment_ids, out, logsumexp = ctx.saved_tensors
-  dq, dk, dv, dbias = _sbd_bwd(
-      q, k, v, bias, dropout_seed, segment_ids, out, logsumexp, grad_out, *ctx.static_args
+  q, k, v, bias, dropout_seed, segment_ids, sinks, out, logsumexp = ctx.saved_tensors
+  dq, dk, dv, dbias, dsinks = _sbd_bwd(
+      q, k, v, bias, dropout_seed, segment_ids, sinks, out, logsumexp, grad_out,
+      *ctx.static_args
   )
   dbias_ret = dbias if bias is not None else None
-  return (dq, dk, dv, dbias_ret, None, None) + (None,) * _NUM_STATIC_ARGS
+  dsinks_ret = dsinks if sinks is not None else None
+  return (dq, dk, dv, dbias_ret, None, None, dsinks_ret) + (None,) * _NUM_STATIC_ARGS
 
 
 _sbd_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -829,6 +850,7 @@ def sbd_splash_attention(
     scale: Optional[float] = None,
     local_window_size: Optional[int] = None,
     heads_first: bool = False,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
   """Splash attention with optional additive bias and PRNG dropout.
 
@@ -866,6 +888,10 @@ def sbd_splash_attention(
       is the cheaper call: the wrapper's transpose pair disappears, and with
       it three saved full-size copies per call. Prefer it from callers that
       already hold heads-first tensors (HF attention does).
+    sinks: optional `(H,)` attention-sink logits, one per query head (gpt-oss
+      style): an extra softmax column that takes probability mass but adds
+      no value, compared against the scaled logits. Trainable -- the
+      backward returns its gradient, summed over batch and queries.
 
   Returns:
     `(B, S, H, D)` attention output. Dropout follows the family convention:
@@ -907,6 +933,12 @@ def sbd_splash_attention(
     segment_ids = segment_ids.to(device=q.device, dtype=torch.int32).contiguous()
   scale_val = 1.0 / math.sqrt(q.shape[-1]) if scale is None else float(scale)
   window_val = -1 if local_window_size is None else int(local_window_size)
+  if sinks is not None:
+    if sinks.shape != (q.shape[h_axis],):
+      raise ValueError(
+          f"sinks must be (H,) = ({q.shape[h_axis]},), got {tuple(sinks.shape)}"
+      )
+    sinks = sinks.to(device=q.device).contiguous()
   out, _ = _sbd_fwd(
       q,
       k,
@@ -914,6 +946,7 @@ def sbd_splash_attention(
       bias,
       seed_t,
       segment_ids,
+      sinks,
       is_causal,
       scale_val,
       window_val,

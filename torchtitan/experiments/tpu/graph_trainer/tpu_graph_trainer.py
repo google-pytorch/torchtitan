@@ -669,37 +669,44 @@ def _make_fwd_bwd_adamw_fn(
 
 
 def _split_optimizers_by_mesh(optimizers_container) -> bool:
-    try:
-        from torch.distributed.tensor import DTensor
-    except Exception:
-        DTensor = None
-
     def _mesh_key(p):
-        if DTensor is None or not isinstance(p, DTensor):
-            return None
-        try:
-            return id(p._spec.mesh)
-        except Exception:
-            return None
+        spec = getattr(p, "_spec", None)
+        return None if spec is None else id(spec.mesh)
 
     did_split = False
     for opt in optimizers_container.optimizers:
         new_groups: list[dict] = []
         for grp in opt.param_groups:
             params = list(grp["params"])
-            base_kwargs = {k: v for k, v in grp.items() if k != "params"}
+            names = grp.get("param_names")
+            if names is not None and len(names) != len(params):
+                raise ValueError(
+                    f"param_names length ({len(names)}) != "
+                    f"params length ({len(params)})"
+                )
+            base_kwargs = {
+                k: v
+                for k, v in grp.items()
+                if k not in ("params", "param_names")
+            }
             buckets: dict = {}
-            for p in params:
+            for i, p in enumerate(params):
                 key = _mesh_key(p)
-                buckets.setdefault(key, []).append(p)
+                bucket = buckets.setdefault(
+                    key, {"params": [], "param_names": []}
+                )
+                bucket["params"].append(p)
+                if names is not None:
+                    bucket["param_names"].append(names[i])
             if len(buckets) > 1:
                 did_split = True
-            for bucket_params in buckets.values():
-                new_groups.append({"params": bucket_params, **base_kwargs})
+            for bucket in buckets.values():
+                if names is None:
+                    del bucket["param_names"]
+                new_groups.append({**bucket, **base_kwargs})
         if len(new_groups) == len(opt.param_groups):
             continue
         opt.param_groups = []
-        opt.state.clear()
         for grp in new_groups:
             opt.add_param_group(grp)
     return did_split

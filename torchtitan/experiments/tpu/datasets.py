@@ -133,9 +133,9 @@ def _chat_dataset(
     name: Key in `CHAT_DATASETS`.
     dataset_path: For `chat_json`, the JSON/JSON Lines file (required); for
       other entries, replaces the Hugging Face path (e.g. a local mirror).
-    split: Dataset split; defaults to "train". Ignored for local JSON files
-      (`chat_json`): the file is the split, so point `dataset_path` at a
-      separate file for evaluation.
+    split: Dataset split; defaults to "train". A local JSON file
+      (`chat_json`) is loaded as this split, so a validator reading "test"
+      takes its own eval file.
     prompt_field: Overrides the entry's prompt field.
     response_field: Overrides the entry's response field.
 
@@ -144,21 +144,21 @@ def _chat_dataset(
     the response only.
   """
   entry = CHAT_DATASETS[name]
+  split = split or "train"
   path, load_dataset_kwargs = entry.path, {}
   if entry.path == "json":
     if not dataset_path:
       raise ValueError(
           f"--dataloader.dataset={name} needs --dataloader.dataset_path"
       )
-    load_dataset_kwargs = {"data_files": dataset_path}
+    load_dataset_kwargs = {"data_files": {split: dataset_path}}
   elif dataset_path:
     path = dataset_path
   return SingleDatasetConfig(
       source=HuggingFaceRandomAccessSource.Config(
           path=path,
           name=entry.name,
-          # Hugging Face's json loader names a single file's rows "train".
-          split="train" if entry.path == "json" else (split or "train"),
+          split=split,
           load_dataset_kwargs=load_dataset_kwargs,
       ),
       processor=ChatProcessor.Config(
@@ -182,8 +182,7 @@ class TPUGrainDataLoader(GrainDataLoader):
     dataset: str = "c4_test"  # pytype: disable=signature-mismatch
     dataset_path: str | None = None
     dataset_split: str | None = None
-    """Chat datasets only: the split to read (default "train"); local JSON
-    files (`chat_json`) are a single split, so it is ignored for them."""
+    """Chat datasets only: the split to read (default "train")."""
     prompt_field: str | None = None
     """Chat datasets only: overrides the field holding the prompt."""
     response_field: str | None = None
@@ -200,15 +199,6 @@ class TPUGrainDataLoader(GrainDataLoader):
         logger.warning(
             "dataset_split, prompt_field and response_field only apply to chat"
             f" datasets {sorted(CHAT_DATASETS)}; ignored for {config.dataset!r}."
-        )
-      if (
-          config.dataset in CHAT_DATASETS
-          and CHAT_DATASETS[config.dataset].path == "json"
-          and config.dataset_split not in (None, "train")
-      ):
-        logger.warning(
-            f"dataset_split={config.dataset_split!r} is ignored for"
-            f" {config.dataset!r}: the whole file {config.dataset_path} is read."
         )
       if config.dataset in CHAT_DATASETS:
         ds_cfg = FirstFitPackingConfig(

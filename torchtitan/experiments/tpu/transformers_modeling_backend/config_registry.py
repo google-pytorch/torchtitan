@@ -344,6 +344,12 @@ def hf_sft_full_max() -> TPUTransformersBackendConfig:
 
   For GSM8K, the default 100 steps of 8 x 4096 tokens are ~2 epochs, and 10
   validation steps cover the test split about once.
+
+  Chat templates that render an empty think block into the assistant turn
+  (e.g. Qwen3, the default ``--hf_model``) put it in the supervised span, so
+  fine-tuning trains answers without thinking. Keeping thinking needs data
+  with reasoning content, as upstream's Qwen3 SFT recipe does with
+  ``reasoning_content``.
   """
   config = hf_full_max()
   config.tokenizer = HFBackendTokenizer.Config()

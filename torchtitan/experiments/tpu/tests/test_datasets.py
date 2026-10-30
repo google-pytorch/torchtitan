@@ -112,18 +112,21 @@ class ChatDatasetTest(absltest.TestCase):
     )
     self.assertEqual(ds.source.path, "json")
     self.assertEqual(
-        ds.source.load_dataset_kwargs, {"data_files": "/data/train.jsonl"}
+        ds.source.load_dataset_kwargs,
+        {"data_files": {"train": "/data/train.jsonl"}},
     )
     self.assertEqual(ds.source.split, "train")
 
-  def test_chat_json_reads_the_whole_file_whatever_the_split(self) -> None:
+  def test_chat_json_file_gets_the_requested_split(self) -> None:
     ds = self._resolve("chat_json", dataset_path="/data/eval.jsonl", split="test")
-    self.assertEqual(ds.source.split, "train")
+    self.assertEqual(
+        ds.source.load_dataset_kwargs, {"data_files": {"test": "/data/eval.jsonl"}}
+    )
+    self.assertEqual(ds.source.split, "test")
 
   def test_chat_json_requires_a_path(self) -> None:
     with self.assertRaisesRegex(ValueError, "dataset_path"):
       self._resolve("chat_json")
-
 
 
 class TPUGrainDataLoaderChatTest(absltest.TestCase):
@@ -141,40 +144,34 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
     )
 
   def test_chat_json_trains_on_the_response_only(self) -> None:
-    loader = self._build(
-        dataset="chat_json",
-        dataset_path=self._SFT_DATA_PATH,
-        prompt_field="question",
-        response_field="answer",
-        shuffle=False,
-    )
-    labels = next(iter(loader))["labels"].flatten().tolist()
     with open(self._SFT_DATA_PATH) as f:
       first_answer = json.load(f)[0]["answer"]
     tokenizer = HuggingFaceTokenizer(tokenizer_path=self._TOKENIZER_PATH)
     answer = tokenizer.encode(first_answer, add_bos=False, add_eos=False)
-    # The first document's prompt is masked, so its answer is the first
-    # supervised span.
-    self.assertEqual(labels[0], IGNORE_INDEX)
-    trained = [t for t in labels if t != IGNORE_INDEX]
-    self.assertEqual(trained[: len(answer)], answer)
-
-  def test_split_warns_and_is_ignored_for_chat_json(self) -> None:
-    with self.assertLogs(logger, level="WARNING") as logs:
-      loader = self._build(
-          dataset="chat_json",
-          dataset_path=self._SFT_DATA_PATH,
-          dataset_split="test",
-          prompt_field="question",
-          response_field="answer",
-      )
-    self.assertIn("is ignored", "\n".join(logs.output))
-    self.assertIn("labels", next(iter(loader)))
+    # A local file is read the same way whichever split it is loaded as,
+    # e.g. "test" for a validator, without warnings.
+    for split in (None, "test"):
+      with self.subTest(split=split), self.assertNoLogs(logger, "WARNING"):
+        loader = self._build(
+            dataset="chat_json",
+            dataset_path=self._SFT_DATA_PATH,
+            dataset_split=split,
+            prompt_field="question",
+            response_field="answer",
+            shuffle=False,
+        )
+        labels = next(iter(loader))["labels"].flatten().tolist()
+        # The first document's prompt is masked, so its answer is the first
+        # supervised span.
+        self.assertEqual(labels[0], IGNORE_INDEX)
+        trained = [t for t in labels if t != IGNORE_INDEX]
+        self.assertEqual(trained[: len(answer)], answer)
 
   def test_chat_options_warn_for_text_datasets(self) -> None:
     with self.assertLogs(logger, level="WARNING") as logs:
       self._build(dataset="c4_test", prompt_field="question")
     self.assertIn("only apply to chat datasets", "\n".join(logs.output))
+
 
 if __name__ == "__main__":
   absltest.main()

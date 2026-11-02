@@ -1,9 +1,14 @@
-import os
+from dataclasses import dataclass
 import glob
-import torch
-from typing import Iterator
+import os
+from typing import Any, Iterator
 
-class PrecomputedDataloader:
+import torch
+
+from torchtitan.components.data.loader import BaseDataLoader
+
+
+class PrecomputedDataloader(BaseDataLoader):
     """
     A dataloader that loads precomputed batches from a directory.
 
@@ -11,7 +16,30 @@ class PrecomputedDataloader:
     in the given data directory. It loads them in numerical order of batch index
     and yields each batch and its image encodings up to `max_steps`.
     """
-    def __init__(self, data_dir: str, max_steps: int, rank: int = 0):
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseDataLoader.Config):
+        data_dir: str = ""
+        max_steps: int = 1
+        rank: int = 0
+
+    def __init__(
+        self,
+        data_dir: str | Config = "",
+        max_steps: int = 1,
+        rank: int = 0,
+        *,
+        config: Config | None = None,
+        **kwargs: Any,
+    ):
+        del kwargs
+        if isinstance(data_dir, PrecomputedDataloader.Config):
+            config = data_dir
+        if config is not None:
+            data_dir = config.data_dir
+            max_steps = config.max_steps
+            rank = config.rank
+
         self.data_dir = data_dir
         self.max_steps = max_steps
         self.rank = rank
@@ -42,5 +70,12 @@ class PrecomputedDataloader:
             if step >= self.max_steps:
                 raise RuntimeError(f"Reached max_steps={self.max_steps} while iterating through precomputed batches. Please ensure that the number of precomputed batches is at least max_steps.")
 
+    def state_dict(self) -> dict[str, Any]:
+        return {}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        del state_dict
+
     def close(self) -> None:
         """No-op; called by Trainer.close()."""
+

@@ -47,6 +47,79 @@ class FluxTrainer(Trainer):
         inference: Inference = field(default_factory=Inference)
 
     def __init__(self, config: Config):
+        assert config.model_spec is not None
+        model_args = config.model_spec.model
+        assert isinstance(model_args, FluxModel.Config)
+
+        # If precomputed_dataset_path or random_dataset is provided in
+        # experiment configs, we load precomputed/random embeddings directly
+        # and skip running the autoencoder, text encoders (T5, CLIP), and the
+        # Hugging Face dataset/tokenizer in Trainer.__init__.
+        precompute_path = config.flux.precomputed_dataset_path
+        random_dataset = getattr(config.flux, "random_dataset", False)
+
+        if precompute_path is not None or random_dataset:
+            rank = int(os.environ.get("RANK", 0))
+            if not config.validator.enable and not config.tokenizer.test_mode:
+                # Trainer.__init__ always builds config.tokenizer even though
+                # precomputed/random embeddings bypass text tokenization. Use
+                # the local test tokenizer asset so distributed jobs do not hit
+                # Hugging Face Hub rate limits across all ranks at startup.
+                config.tokenizer = replace(
+                    config.tokenizer,
+                    test_mode=True,
+                    t5_tokenizer_path="tests/assets/tokenizer",
+                    clip_tokenizer_path="tests/assets/tokenizer",
+                )
+            if random_dataset:
+                logger.info("Using RandomDataloader for embeddings")
+
+                # Upstream d771abb0 deleted training.local_batch_size in
+                # favour of a token budget; flux batches images, so recover
+                # the sample count.
+                #
+                # The same release deleted training.seq_len, which used to be
+                # computed here from `config.dataloader.img_size`. The recipe
+                # now owns that arithmetic (`_flux_seq_len` sets
+                # `max_context_length`), so read `img_size` straight back off
+                # `config.flux.img_size` or the processor that `_flux_dataset`
+                # configured.
+                img_size = getattr(config.flux, "img_size", None)
+                if img_size is None:
+                    processor = getattr(
+                        getattr(config.dataloader, "dataset", None),
+                        "processor",
+                        None,
+                    )
+                    img_size = getattr(processor, "img_size", None)
+                if img_size is None:
+                    raise ValueError(
+                        "flux.random_dataset needs an image size, but "
+                        f"{type(getattr(config.dataloader, 'dataset', None)).__name__} "
+                        "exposes no processor.img_size. Configure the dataloader "
+                        "with _flux_dataset(...) or set --flux.img_size."
+                    )
+                config.dataloader = RandomDataloader.Config(
+                    bsz=(
+                        config.training.num_tokens_per_microbatch_per_dp_rank
+                        // config.training.max_context_length
+                    ),
+                    max_steps=config.training.steps,
+                    img_size=img_size,
+                    max_t5_len=config.tokenizer.max_t5_encoding_len,
+                    t5_dim=model_args.context_in_dim,
+                    clip_dim=model_args.vec_in_dim,
+                )
+            elif precompute_path is not None:
+                logger.info(
+                    f"Loading precomputed embeddings from {precompute_path}"
+                )
+                config.dataloader = PrecomputedDataloader.Config(
+                    data_dir=precompute_path,
+                    max_steps=config.training.steps,
+                    rank=rank,
+                )
+
         super().__init__(config)
 
         # Flux samples diffusion noise and timesteps during each model step, so
@@ -74,62 +147,10 @@ class FluxTrainer(Trainer):
             else torch.float32
         )
 
-        # load components
-        assert config.model_spec is not None
-        model_args = config.model_spec.model
-        assert isinstance(model_args, FluxModel.Config)
-
-        # If precomputed_dataset_path is provided in experiment configs,
-        # we load precomputed embeddings directly from disk and skip
-        # computing them as part of the training loop (i.e., skip running the
-        # autoencoder and text encoders (T5, CLIP).
-        precompute_path = config.flux.precomputed_dataset_path
-        random_dataset = getattr(config.flux, "random_dataset", False)
-
         if precompute_path is not None or random_dataset:
             self.autoencoder = None
             self.clip_encoder = None
             self.t5_encoder = None
-
-            rank = int(os.environ.get("RANK", 0))
-            if random_dataset:
-                logger.info("Using RandomDataloader for embeddings")
-
-                # Upstream d771abb0 deleted training.local_batch_size in
-                # favour of a token budget; flux batches images, so recover
-                # the sample count.
-                #
-                # The same release deleted training.seq_len, which used to be
-                # computed here from `config.dataloader.img_size`. The recipe
-                # now owns that arithmetic (`_flux_seq_len` sets
-                # `max_context_length`), so read `img_size` straight back off
-                # the processor that `_flux_dataset` configured.
-                processor = getattr(config.dataloader.dataset, "processor", None)
-                img_size = getattr(processor, "img_size", None)
-                if img_size is None:
-                    raise ValueError(
-                        "flux.random_dataset needs an image size, but "
-                        f"{type(config.dataloader.dataset).__name__} exposes no "
-                        "processor.img_size. Configure the dataloader with "
-                        "_flux_dataset(...)."
-                    )
-                self.dataloader = RandomDataloader(
-                    bsz=(
-                        config.training.num_tokens_per_microbatch_per_dp_rank
-                        // config.training.max_context_length
-                    ),
-                    max_steps=config.training.steps,
-                    img_size=img_size,
-                    max_t5_len=config.tokenizer.max_t5_encoding_len,
-                    t5_dim=model_args.context_in_dim,
-                    clip_dim=model_args.vec_in_dim,
-                )
-            elif precompute_path is not None:
-                logger.info(f"Loading precomputed embeddings from {precompute_path}")
-
-                self.dataloader = PrecomputedDataloader(precompute_path, config.training.steps, rank=rank)
-            else:
-                raise ValueError("Either precomputed_dataset_path or random_dataset must be provided in config.flux.")
         else:
             # To support FSDP, we follow a four-step initialization pattern.
             # 1. Initialize on the 'meta' device to define the model.

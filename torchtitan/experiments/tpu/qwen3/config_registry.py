@@ -198,7 +198,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -283,7 +283,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -355,6 +355,8 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
+      # Keep the established dense optimizer path until native fused AdamW has
+      # a dedicated long-convergence validation for this recipe.
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
@@ -735,7 +737,6 @@ def qwen3_32b_maxtext_parity() -> TpuGraphTrainer.Config:
 def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   """TPU specialization of the global-aux Qwen3 30B recipe."""
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
-  cfg.optimizer.implementation = "foreach"
   cfg.loss = CrossEntropyLoss.Config()
   cfg.model_spec = model_registry(
       "30B-A3B-global-aux",

@@ -384,7 +384,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
   @parameterized.parameters(
       ("muse_glimmer_30b_full_logits", True, False, "fused"),
       ("muse_glimmer_30b_fused_ce", True, True, "fused"),
-      ("reg_trainer_muse_glimmer_30b_fused_ce", False, True, "foreach"),
+      ("reg_trainer_muse_glimmer_30b_fused_ce", False, True, "fused"),
   )
   def test_30b_recipe_trainer_loss_and_optimizer_selection(
       self, name, graph_trainer, fused, optimizer_implementation

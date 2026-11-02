@@ -93,7 +93,7 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -158,8 +158,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
       # tokenizer via --hf_assets_path for meaningful loss values.
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      # foreach for the regular trainer; the GraphTrainer recipes use fused.
-      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
       training=TrainingConfig(
           max_norm=1.0,
@@ -264,9 +263,6 @@ def muse_glimmer_30b_full_logits() -> TpuGraphTrainer.Config:
       enable_remat_barriers=True,
       fsdp_barrier_policy="prefetch",
   )
-  # Fused AdamW traces into the optimizer-in-graph step and matches foreach
-  # (2,924 vs 2,913 TPS, same HBM and loss).
-  config.optimizer.implementation = "fused"
   return config
 
 

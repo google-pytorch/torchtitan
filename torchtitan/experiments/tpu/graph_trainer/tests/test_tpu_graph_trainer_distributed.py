@@ -138,13 +138,6 @@ class TpuGraphTrainerDistributedTest(
               "--parallelism.use_simple_fsdp",
               "--compile.use_scan_layers",
           ],
-          # TODO(b/574966859): Broken by cl/1001117754 `RuntimeError:
-          # traverse_and_compile(): expected Pallas kernels and scans in the
-          # same program to have the same device assignment`
-          skip_reason=(
-              "b/574966859: broken by cl/1001117754 (scan + Pallas device"
-              " assignment mismatch under HSDP)"
-          ),
       ),
       # Muse Glimmer (text-only). Context 256 exceeds the debugmodel's
       # 128-token sliding window, so the SWA layers actually mask; the token

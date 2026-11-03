@@ -47,10 +47,6 @@ jaxtyping.jaxtyped = _real_jaxtyped
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
 import torch
 from torch_tpu._internal.pallas import pallas
-# TODO: call Tokamax's kernel for the non-soft-capped case once we are on JAX
-# 0.12. Its 0.0.16+ backward needs separate in/out pipeline buffering
-# (jax-ml/jax@c7dadc8) and is ~1.7x slower on older JAX.
-from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as pallas_kernel
 
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:
@@ -69,6 +65,24 @@ def _my_fwd(
     soft_cap=None,
     output_multiplier=1.0,
 ):
+  if _has_logit_transform(soft_cap, output_multiplier):
+    from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel  # pylint: disable=g-import-not-at-top
+
+    fwd_fn = (
+        softcap_kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu
+    )
+    return fwd_fn(
+        x,
+        labels,
+        weights,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        reduction=reduction,
+        soft_cap=soft_cap,
+        output_multiplier=output_multiplier,
+    )
+
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
@@ -77,7 +91,9 @@ def _my_fwd(
     )
     return loss, lse
 
-  return pallas_kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel
+
+  loss, lse = kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
       x,
       labels,
       weights,
@@ -85,9 +101,8 @@ def _my_fwd(
       h_block_size=h_block_size,
       v_block_size=v_block_size,
       reduction=reduction,
-      soft_cap=soft_cap,
-      output_multiplier=output_multiplier,
   )
+  return loss, lse
 
 
 def _my_bwd(
@@ -109,6 +124,28 @@ def _my_bwd(
   # can fold that distinction away; an executable boundary preserves the
   # one-element shape, so normalize it explicitly before entering Tokamax.
   dout = jax.numpy.reshape(dout, ())
+  if _has_logit_transform(soft_cap, output_multiplier):
+    from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel  # pylint: disable=g-import-not-at-top
+
+    grad_fn = (
+        softcap_kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
+    )
+    grad_x, grad_w = grad_fn(
+        dout,
+        lse,
+        x,
+        labels,
+        weights,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        reduction=reduction,
+        soft_cap=soft_cap,
+        output_multiplier=output_multiplier,
+    )
+    # Same autograd dtype contract as the identity paths below.
+    return grad_x.astype(x.dtype), grad_w.astype(weights.dtype)
+
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
@@ -119,8 +156,10 @@ def _my_bwd(
     # accumulate in FP32, but gradients cross this boundary in the input dtype.
     return grad_x.astype(x.dtype), grad_w.astype(weights.dtype)
 
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel  # pylint: disable=g-import-not-at-top
+
   grad_x, grad_w = (
-      pallas_kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+      kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
           dout,
           lse,
           x,
@@ -130,8 +169,6 @@ def _my_bwd(
           h_block_size=h_block_size,
           v_block_size=v_block_size,
           reduction=reduction,
-          soft_cap=soft_cap,
-          output_multiplier=output_multiplier,
       )
   )
   # Keep the Pallas and reference implementations on the same autograd dtype

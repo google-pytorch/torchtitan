@@ -599,6 +599,14 @@ def construct_tpu_transform_passes(
     )
     passes.append(apply_combine_barrier_pass)
 
+    if config.compile.use_scan_layers and not config.compile.graph_split.enabled:
+        # Only checked on the unsplit program.
+        from torchtitan.experiments.tpu.graph_trainer.passes.fence_scan_segments import (
+            fence_scan_segments,
+        )
+
+        passes.append(fence_scan_segments)
+
     if fsdp_barrier_policy != "none":
         model_config = config.model_spec.model
         n_layers = len(model_config.layers)

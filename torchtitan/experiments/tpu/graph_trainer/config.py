@@ -240,14 +240,14 @@ def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
       )
     return
   if compile_config.use_scan_layers:
-    # One scan body runs every layer, so a region is saved in all or none.
-    unsupported = set(save_regions) - SCAN_SAVE_REGIONS
-    if last_n_layers or unsupported:
+    unsupported = {*save_regions, *last_n_layers} - SCAN_SAVE_REGIONS
+    if unsupported:
       raise ValueError(
           "--compile.use-scan-layers supports only "
           "compile.memory_policy='tpu_selective' or "
           "'tpu_selective_and_offload' with "
-          f"compile.save_regions from {sorted(SCAN_SAVE_REGIONS)}"
+          "compile.save_regions or compile.save_last_n_layers from "
+          f"{sorted(SCAN_SAVE_REGIONS)}"
       )
   resolve_save_regions(save_regions, last_n_layers, policy)
 
@@ -398,6 +398,9 @@ def apply_tpu_graph_trainer_model_transforms(
           save_regions=tuple(compile_config.save_regions)
           if memory_policy in ("tpu_selective", "tpu_selective_and_offload")
           else (),
+          save_last_n_layers=tuple(
+              sorted(compile_config.save_last_n_layers.items())
+          ),
       ),
       parallelize_fn=parallelize_fn_with_shard_dims,
   )

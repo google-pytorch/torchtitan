@@ -388,15 +388,21 @@ class StackedLayers(TpuLayerLoop):
         *,
         use_scan: bool,
         save_regions: tuple[str, ...] = (),
+        save_last_n_layers: tuple[tuple[str, int], ...] = (),
     ):
         super().__init__(layers)
         self.stack = stack
         self.use_scan = use_scan
         self.save_regions = save_regions
+        self.save_last_n_layers = save_last_n_layers
 
     def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
         return self.stack.run(
-            h, *args, use_scan=self.use_scan, save_regions=self.save_regions
+            h,
+            *args,
+            use_scan=self.use_scan,
+            save_regions=self.save_regions,
+            save_last_n_layers=self.save_last_n_layers,
         )
 
 
@@ -565,6 +571,7 @@ class LayerStack:
         *,
         use_scan: bool,
         save_regions: tuple[str, ...] = (),
+        save_last_n_layers: tuple[tuple[str, int], ...] = (),
     ) -> None:
         """Attach the stack to the model, at the end of its ``__init__``.
 
@@ -630,13 +637,19 @@ class LayerStack:
             # body's nodes; only `save_regions` does. See `scan_remat_policy`.
             logger.info(
                 "Decoder layers run as a scan: the body recomputes everything "
-                "but its MoE expert counts and save regions %s",
+                "but its MoE expert counts and save regions %s (in the last N "
+                "layers: %s)",
                 list(save_regions),
+                dict(save_last_n_layers),
             )
         # The container holds the same layer modules, so `self.layers` keeps
         # working and is deliberately not repointed at it.
         model.layers = StackedLayers(
-            model.layers, self, use_scan=use_scan, save_regions=save_regions
+            model.layers,
+            self,
+            use_scan=use_scan,
+            save_regions=save_regions,
+            save_last_n_layers=save_last_n_layers,
         )
 
     # -- running the layers ------------------------------------------------
@@ -647,6 +660,7 @@ class LayerStack:
         *args,
         use_scan: bool,
         save_regions: tuple[str, ...] = (),
+        save_last_n_layers: tuple[tuple[str, int], ...] = (),
     ):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
@@ -762,11 +776,16 @@ class LayerStack:
             # The policy picks what the body saves for backward, by region.
             # Left alone, the partitioner would save the gathered weight, and
             # the saved copy is carried out of the loop: the whole memory win
-            # gone. See `scan_remat_policy`.
-            carry, _ = scan_with_remat_policy(
-                scan_body, h, xs, frozenset(save_regions)
-            )
-            return carry
+            # gone. See `scan_remat_policy`. Layers that save different
+            # regions run as consecutive scans over slices of the same stacks.
+            for start, stop, regions in _segments(
+                self.n_layers, save_regions, save_last_n_layers
+            ):
+                segment = xs
+                if (start, stop) != (0, self.n_layers):
+                    segment = {k: v[start:stop] for k, v in xs.items()}
+                h, _ = scan_with_remat_policy(scan_body, h, segment, regions)
+            return h
 
         stacks = {_mangle(n): getattr(self.holder, _mangle(n)) for n in self.names}
         for i in range(self.n_layers):
@@ -774,8 +793,36 @@ class LayerStack:
         return h
 
 
+def _segments(
+    n_layers: int,
+    save_regions: tuple[str, ...],
+    save_last_n_layers: tuple[tuple[str, int], ...],
+) -> list[tuple[int, int, frozenset[str]]]:
+    """Split the layers into runs that save the same regions, one scan each.
+
+    One scan body has one partition, so a region saved in only some layers
+    needs its own scan. 94 layers, attention saved in the last 36:
+    ``[(0, 58, {}), (58, 94, {"attention.inner_attention"})]``.
+    """
+    cuts = {max(n_layers - n, 0) for _, n in save_last_n_layers}
+    starts = sorted(({0} | cuts) - {n_layers})
+    return [
+        (
+            start,
+            stop,
+            frozenset(save_regions)
+            | {r for r, n in save_last_n_layers if start >= n_layers - n},
+        )
+        for start, stop in zip(starts, [*starts[1:], n_layers])
+    ]
+
+
 def _apply_stacked_layers(
-    model: nn.Module, *, use_scan: bool, save_regions: tuple[str, ...] = ()
+    model: nn.Module,
+    *,
+    use_scan: bool,
+    save_regions: tuple[str, ...] = (),
+    save_last_n_layers: tuple[tuple[str, int], ...] = (),
 ) -> None:
     """Stack the decoder layers' weights, and with ``use_scan`` run them as one.
 
@@ -841,7 +888,12 @@ def _apply_stacked_layers(
     setattr(model, STACK_ATTR, holder)
     stack = LayerStack(model.layers, holder)
     stack.unregister_and_allocate()
-    stack.install(model, use_scan=use_scan, save_regions=save_regions)
+    stack.install(
+        model,
+        use_scan=use_scan,
+        save_regions=save_regions,
+        save_last_n_layers=save_last_n_layers,
+    )
     logger.info(
         "Stacked %d weights across %d layers, run as a %s",
         len(stack.names),
@@ -852,7 +904,10 @@ def _apply_stacked_layers(
 
 @functools.cache
 def _stacked_model_class(
-    config_cls: type, use_scan: bool, save_regions: tuple[str, ...] = ()
+    config_cls: type,
+    use_scan: bool,
+    save_regions: tuple[str, ...] = (),
+    save_last_n_layers: tuple[tuple[str, int], ...] = (),
 ) -> type:
     """Build the ``Stacked<Model>`` subclass that stacks itself on construction.
 
@@ -866,7 +921,12 @@ def _stacked_model_class(
 
     def __init__(self, *args, **kwargs):
         base.__init__(self, *args, **kwargs)
-        _apply_stacked_layers(self, use_scan=use_scan, save_regions=save_regions)
+        _apply_stacked_layers(
+            self,
+            use_scan=use_scan,
+            save_regions=save_regions,
+            save_last_n_layers=save_last_n_layers,
+        )
 
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
@@ -902,6 +962,7 @@ def with_tpu_stacked_layers(
     *,
     use_scan: bool,
     save_regions: tuple[str, ...] = (),
+    save_last_n_layers: tuple[tuple[str, int], ...] = (),
 ) -> Decoder.Config:
     """Put ``model_config`` on a model that arrives already stacked.
 
@@ -913,12 +974,15 @@ def with_tpu_stacked_layers(
     ``use_scan`` additionally runs the layers as one ``scan`` rather than one
     at a time; it is fixed at construction because it decides which container
     ``model.layers`` becomes. ``save_regions`` names the regions the scan body
-    keeps for backward; see ``scan_remat_policy``.
+    keeps for backward, and ``save_last_n_layers`` the (region, N) it keeps in
+    its last N layers only; see ``scan_remat_policy``.
 
     Builds on :func:`tpu_model_class`, and has to be applied in the same place
     and for the same reasons; see its docstring.
     """
     return derive(
         model_config,
-        _stacked_model_class(type(model_config), use_scan, save_regions).Config,
+        _stacked_model_class(
+            type(model_config), use_scan, save_regions, save_last_n_layers
+        ).Config,
     )

@@ -30,7 +30,9 @@ from torchtitan.config import apply_overrides, derive, OverrideConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.tpu.graph_trainer import layer_stack
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
+    _segments,
     check_layers_are_stackable,
     LayerStackHolder,
     STACK_ATTR,
@@ -130,6 +132,7 @@ def _build(
     device: str | torch.device = "cpu",
     world_size: int = 1,
     flatten: bool = False,
+    stack_kwargs: dict | None = None,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
@@ -158,7 +161,9 @@ def _build(
         mixed_precision_param=param_dtype, mixed_precision_reduce="float32"
     )
     if stacked or scan:
-        convert = functools.partial(with_tpu_stacked_layers, use_scan=scan)
+        convert = functools.partial(
+            with_tpu_stacked_layers, use_scan=scan, **(stack_kwargs or {})
+        )
     else:
         convert = _layer_loop
     with torch.device("meta"):
@@ -383,6 +388,48 @@ class TestLayerStack(unittest.TestCase):
                     msg=f"layers.{i}.{name}",
                 )
 
+    def test_last_n_layers_run_as_a_second_scan(self):
+        """The last N layers get their own scan and policy, over a slice of the
+        same stacks, and the gradients still match the loop.
+
+        CPU has no Splash, so the scan is asked to save no regions; the test
+        records what it was asked for.
+        """
+        plain = _build(stacked=False)
+        n_layers = len(plain.layers)
+        scanned = _build(
+            stacked=True,
+            scan=True,
+            stack_kwargs={
+                "save_last_n_layers": (("attention.inner_attention", 1),)
+            },
+        )
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
+        calls = []
+        scan = layer_stack.scan_with_remat_policy
+
+        def spy_scan(body, init, xs, regions):
+            calls.append((next(iter(xs.values())).shape[0], sorted(regions)))
+            return scan(body, init, xs, frozenset())
+
+        with patch.object(layer_stack, "scan_with_remat_policy", spy_scan):
+            scanned(tokens).sum().backward()
+        plain(tokens).sum().backward()
+
+        self.assertEqual(
+            calls, [(n_layers - 1, []), (1, ["attention.inner_attention"])]
+        )
+        stacks = getattr(scanned, STACK_ATTR)._parameters
+        for i, layer in enumerate(plain.layers.values()):
+            for name, param in layer.named_parameters():
+                torch.testing.assert_close(
+                    stacks[name.replace(".", "__")].grad[i].to_local(),
+                    param.grad.to_local(),
+                    rtol=1e-5,
+                    atol=5e-5,
+                    msg=f"layers.{i}.{name}",
+                )
+
     def test_the_body_gathers_in_the_compute_dtype(self):
         """The gather is also the cast, exactly as SimpleFSDP's is.
 
@@ -515,6 +562,26 @@ def _toy_layer(dim=4, extra=None, out=None, cache=None, frozen=False):
 
 def _toy_layers(*mods):
     return nn.ModuleDict({str(i): m for i, m in enumerate(mods)})
+
+
+class TestSegments(unittest.TestCase):
+    def test_no_last_n_is_one_segment(self):
+        self.assertEqual(
+            _segments(94, ("a",), ()), [(0, 94, frozenset({"a"}))]
+        )
+
+    def test_last_36_of_94(self):
+        self.assertEqual(
+            _segments(94, (), (("a", 36),)),
+            [(0, 58, frozenset()), (58, 94, frozenset({"a"}))],
+        )
+
+    def test_n_of_0_or_at_least_all_layers_is_one_segment(self):
+        self.assertEqual(_segments(4, (), (("a", 0),)), [(0, 4, frozenset())])
+        for n in (4, 9):
+            self.assertEqual(
+                _segments(4, (), (("a", n),)), [(0, 4, frozenset({"a"}))]
+            )
 
 
 class TestStackable(unittest.TestCase):

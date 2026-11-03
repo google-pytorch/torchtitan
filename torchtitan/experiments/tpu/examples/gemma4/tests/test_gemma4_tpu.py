@@ -24,6 +24,7 @@ from torchtitan.experiments.tpu.examples.gemma4 import (
     gemma4_configs,
 )
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
+from torchtitan.experiments.tpu.examples.gemma4 import config_registry
 from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     gemma4_26b_a4b,
     gemma4_31b,
@@ -130,15 +131,27 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
   def test_config_registry_valid(self):
     for fn in (
         gemma4_debugmodel,
+        gemma4_debugmodel_fused_ce,
         gemma4_moe_testmodel,
         gemma4_moe_debug,
+        gemma4_moe_debug_fused_ce,
+        gemma4_moe_debug_pallas,
+        config_registry.graph_trainer_gemma4_debugmodel,
+        config_registry.graph_trainer_gemma4_moe_debug,
         gemma4_31b,
         gemma4_26b_a4b,
+        config_registry.gemma4_31b_graph_trainer,
+        config_registry.gemma4_31b_graph_split,
+        config_registry.gemma4_31b_graph_split_offload,
+        config_registry.gemma4_26b_a4b_graph_trainer,
+        config_registry.gemma4_26b_a4b_graph_split,
+        config_registry.gemma4_26b_a4b_graph_split_offload,
     ):
       cfg = fn()
       self.assertEqual(cfg.model_spec.name, "gemma4")
       self.assertIn(cfg.model_spec.flavor, gemma4_configs)
       self.assertFalse(cfg.model_spec.model.enable_weight_tying)
+      self.assertEqual(cfg.optimizer.implementation, "fused")
 
   def test_build_flavor_config_weight_tying(self):
     tied = _build_flavor_config("testmodel")

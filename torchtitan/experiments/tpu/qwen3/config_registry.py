@@ -846,17 +846,20 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
       use_tokamax_splash_attention_kernel=True,
-      # Batch-native masking lets the always-vmapped forward avoid a serial
-      # batch loop; use_vmap_bwd applies the same optimization to backward.
-      # Runtime segment IDs still preserve exact packed-document boundaries.
-      # At local batch 6, the combined change reduced XProf peak HBM from
-      # 14.924 to 14.575 GiB (-0.349 GiB); no vmap memory penalty was observed.
+      # Batch-native masking lets use_vmap_bwd vectorize the backward over the
+      # batch; runtime segment IDs still preserve exact packed-document
+      # boundaries. At local batch 6, vmapping forward and backward this way
+      # reduced XProf peak HBM from 14.924 to 14.575 GiB (-0.349 GiB).
       use_vmap_bwd=True,
       sa_use_document_aware_block_skipping=False,
+      use_batch_loop_fwd=True,
+      # Stacking the 8 query heads of a KV head makes a 256-row Q block a
+      # 2048-row tile.
+      sa_num_stacked_q_heads=8,
       sa_q_layout="SEQ_MINOR",
       sa_k_layout="SEQ_MINOR",
-      sa_block_q=1024,
-      sa_block_kv=1024,
+      sa_block_q=256,
+      sa_block_kv=512,
       sa_block_dkv=1024,
       # Matched Qwen3-30B/TPU7x profiling showed a 26.3-ms (1.60%) step win and
       # 0.199-GiB lower peak HBM. The attention calls themselves took 2.5 ms

@@ -47,6 +47,9 @@ jaxtyping.jaxtyped = _real_jaxtyped
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
 import torch
 from torch_tpu._internal.pallas import pallas
+# TODO: call Tokamax's kernel for the non-soft-capped case once we are on JAX
+# 0.12. Its 0.0.16+ backward needs separate in/out pipeline buffering
+# (jax-ml/jax@c7dadc8) and is ~1.7x slower on older JAX.
 from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as pallas_kernel
 
 

@@ -842,6 +842,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.splash_attention_kernel.sa_v_layout,
         "HEAD_DIM_MINOR",
     )
+    splash = config.splash_attention_kernel
+    self.assertTrue(splash.use_batch_loop_fwd)
+    self.assertEqual(splash.sa_num_stacked_q_heads, 8)
+    self.assertEqual(
+        (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
+        (256, 512, 512),
+    )
 
     self.assertEqual(config.splash_attention_kernel.sa_block_kv_compute, 512)
     self.assertEqual(config.splash_attention_kernel.sa_block_q_dkv, 2048)

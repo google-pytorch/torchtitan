@@ -1075,7 +1075,10 @@ class HFTransformerModel(BaseModel):
                         b=cutoff_factor * final_out_std,
                     )
                 else:
-                    std = config.initializer_range
+                    # A caller may state the embedding std on its own so that
+                    # initializer_range keeps the checkpoint's value for every
+                    # other init (model-specific _init_weights overrides read it).
+                    std = getattr(config, "embedding_init_std", None) or config.initializer_range
                     module.weight.data.normal_(mean=0.0, std=std)
 
                 if module.padding_idx is not None:

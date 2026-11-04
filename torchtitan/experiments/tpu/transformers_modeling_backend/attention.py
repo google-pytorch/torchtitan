@@ -280,12 +280,16 @@ def _segment_ids(module, attention_mask, kwargs) -> torch.Tensor | None:
     return seg
 
 
-def _softcapped_attention(module, query, key, value, mask, is_causal, scaling, softcap, dropout):
-    """Plain attention with HF's soft-cap, for the fallback (SDPA has no cap).
+def _eager_attention(module, query, key, value, mask, is_causal, scaling, dropout,
+                     softcap=None, sinks=None):
+    """Plain attention with HF's soft-cap and/or attention sinks, for the
+    fallback (SDPA has neither).
 
-    Same arithmetic as HF's eager path: scale, ``softcap * tanh(x / softcap)``,
-    mask, softmax in fp32, dropout, @ v. ``mask`` is what ``_fallback_mask``
-    built (boolean or additive, broadcast over heads) or None.
+    Same arithmetic as HF's eager paths: scale, ``softcap * tanh(x / softcap)``,
+    mask, softmax in fp32 -- over the scores plus one per-head sink logit
+    column when ``sinks`` is given (gpt-oss, Flint), whose probability is then
+    dropped -- dropout, @ v. ``mask`` is what ``_fallback_mask`` built
+    (boolean or additive, broadcast over heads) or None.
     """
     heads, kv_heads = query.shape[1], key.shape[1]
     if kv_heads != heads:
@@ -293,7 +297,8 @@ def _softcapped_attention(module, query, key, value, mask, is_causal, scaling, s
         value = value.repeat_interleave(heads // kv_heads, dim=1)
     scale = scaling if scaling is not None else query.shape[-1] ** -0.5
     scores = torch.matmul(query, key.transpose(-1, -2)) * scale
-    scores = softcap * torch.tanh(scores / softcap)
+    if softcap is not None:
+        scores = softcap * torch.tanh(scores / softcap)
     if mask is None and is_causal:
         q_len, kv_len = query.shape[-2], key.shape[-2]
         mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(kv_len - q_len)
@@ -302,7 +307,13 @@ def _softcapped_attention(module, query, key, value, mask, is_causal, scaling, s
             scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
         else:
             scores = scores + mask
-    probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+    scores = scores.float()
+    if sinks is not None:
+        sink = sinks.float().reshape(1, -1, 1, 1).expand(*scores.shape[:-1], 1)
+        probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
+    else:
+        probs = torch.softmax(scores, dim=-1)
+    probs = probs.to(query.dtype)
     if dropout and module.training:
         probs = torch.nn.functional.dropout(probs, p=dropout)
     return torch.matmul(probs, value).transpose(1, 2).contiguous()
@@ -385,6 +396,11 @@ def splash_attention_forward(
     softcap = kwargs.pop("softcap", None)
     if softcap is not None and softcap <= 0:
         softcap = None
+    # Attention sinks (gpt-oss, Flint): one learned logit per head in the
+    # softmax denominator, handed over as ``s_aux``. The kernel adds it as an
+    # extra column (and returns its gradient); the eager fallback below keeps
+    # it too, so no path trains without the sinks.
+    sinks = kwargs.pop("s_aux", None)
     window = _window(module, kwargs)
     reason = _unsupported(module, query, key, attention_mask, dropout, is_causal, window)
     if reason is not None:
@@ -398,9 +414,10 @@ def splash_attention_forward(
             module, query, key, attention_mask, kwargs, is_causal, window
         )
         kwargs.pop("tpu_segment_ids", None)
-        if softcap is not None:
-            return _softcapped_attention(
-                module, query, key, value, fb_mask, fb_causal, scaling, softcap, dropout
+        if softcap is not None or sinks is not None:
+            return _eager_attention(
+                module, query, key, value, fb_mask, fb_causal, scaling, dropout,
+                softcap=softcap, sinks=sinks,
             ), None
         return sdpa_attention_forward(
             module, query, key, value, fb_mask,
@@ -436,12 +453,12 @@ def splash_attention_forward(
     )
 
     out = _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                       dropout, kernel_kwargs, seg_desc, softcap=softcap)
+                       dropout, kernel_kwargs, seg_desc, softcap=softcap, sinks=sinks)
     return out, None
 
 
 def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                 dropout, kernel_kwargs, seg_desc, softcap=None):
+                 dropout, kernel_kwargs, seg_desc, softcap=None, sinks=None):
     """The kernel call: document-aware skipping, exact segment masking at
     token granularity, in-kernel PRNG dropout."""
     from torchtitan.experiments.tpu.kernels.splash_bias_dropout import (
@@ -498,14 +515,15 @@ def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
         # window of W keeps W (its FA2 path passes W - 1 the same way).
         local_window_size=None if window is None else window - 1,
         heads_first=True,
+        sinks=sinks,
     )
     if not _tracing():
         _log_once(
             "splash_tpu fired",
             "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d "
-            "causal=%s dropout=%s segment_ids=%s)",
+            "causal=%s dropout=%s segment_ids=%s sinks=%s)",
             query.shape[1], key.shape[1], query.shape[-2], query.shape[-1], is_causal,
-            dropout, seg_desc,
+            dropout, seg_desc, sinks is not None,
         )
     # HF's contract is (B, S, H, D) out (its own sdpa path transposes too),
     # while heads-first hands back (B, H, S, D) -- the same single transpose

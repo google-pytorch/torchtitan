@@ -112,3 +112,22 @@ class AttentionSavingSelectiveAC(SelectiveAC):
 
   def get_save_ops(self) -> set:
     return _SaveOpsIncludingPallasAttention(super().get_save_ops())
+
+
+class AttentionOnlyAC(SelectiveAC):
+  """Full AC, except the Pallas attention output is kept.
+
+  ``FullAC`` recomputes the whole block in backward, splash forward included.
+  This policy saves only the splash forward's outputs (attention output plus
+  its logsumexp) and recomputes everything else, matmuls included, so its
+  memory is ``FullAC``'s plus one attention output per layer, and backward
+  skips the attention forward. On Flint at 65536 tokens per TensorCore
+  (v7x) that recompute is ~0.45 s of a 7.1 s step.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(SelectiveAC.Config):
+    pass
+
+  def get_save_ops(self) -> set:
+    return _SaveOpsIncludingPallasAttention()

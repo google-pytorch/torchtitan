@@ -23,17 +23,33 @@ def _relative_l2_error(test: torch.Tensor, reference: torch.Tensor) -> float:
   return float((test - reference).norm() / reference.norm().clamp_min(1e-12))
 
 
-def _clamp_decays(
+def _clamp_decays_ctx(
     kernel: gated_delta.TpuGatedDeltaKernel, min_log_decay: float
-) -> None:
-  """Makes an XLA kernel clamp its decays as the Tokamax kernels do."""
+):
+  """Patches an XLA kernel to clamp its decays as the Tokamax kernels do."""
   parent_recurrence = gated_delta.TpuGatedDeltaKernel.recurrence
 
-  def recurrence(q, k, v, g, beta, segment_ids_BS=None):
-    g = g.clamp_min(min_log_decay)
-    return parent_recurrence(kernel, q, k, v, g, beta, segment_ids_BS)
+  def recurrence(
+      q_BSHK,
+      k_BSHK,
+      v_BSHV,
+      g_BSH,
+      beta_BSH,
+      segment_ids_BS=None,
+  ):
+    return parent_recurrence(
+        kernel,
+        q_BSHK,
+        k_BSHK,
+        v_BSHV,
+        g_BSH.clamp_min(min_log_decay),
+        beta_BSH,
+        segment_ids_BS,
+    )
 
-  kernel.recurrence = recurrence
+  return mock.patch.object(
+      kernel, "recurrence", autospec=True, side_effect=recurrence
+  )
 
 
 class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
@@ -176,50 +192,190 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     for bad in (dict(min_log_decay=-6.0), dict(min_log_decay=0.0)):
       with self.assertRaisesRegex(ValueError, "min_log_decay"):
         tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(**bad).build()
+      with mock.patch.object(
+          tokamax_gated_delta, "_require_tokamax_kda", return_value=mock.Mock()
+      ):
+        dummy = torch.zeros(1, 64, 1, 128)
+        dummy_g = torch.zeros(1, 64, 1)
+        with self.assertRaisesRegex(ValueError, "min_log_decay"):
+          tokamax_gated_delta.tokamax_gated_delta(
+              dummy, dummy, dummy, dummy_g, dummy_g, **bad
+          )
     with self.assertRaisesRegex(ValueError, "max_num_segments"):
       tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
           max_num_segments=0
       ).build()
 
+    # `_tpu_generation` parses `"tpu7x"`, `"TPU v6e"`, `"TPU v5 lite"`, `"tpu-4"`.
+    try:
+      for dev_name, expected_gen in (
+          ("TPU7x", 7),
+          ("TPU v6e", 6),
+          ("TPU v5 lite", 5),
+          ("tpu-4", 4),
+          ("unknown", None),
+      ):
+        tokamax_gated_delta._tpu_generation.cache_clear()  # pylint: disable=protected-access
+        fake_tpu = mock.Mock()
+        fake_tpu.get_device_properties.return_value = mock.Mock(name=dev_name)
+        fake_tpu.get_device_properties.return_value.name = dev_name
+        with mock.patch.object(torch, "tpu", fake_tpu, create=True):
+          self.assertEqual(
+              tokamax_gated_delta._tpu_generation(),  # pylint: disable=protected-access
+              expected_gen,
+              msg=dev_name,
+          )
+    finally:
+      tokamax_gated_delta._tpu_generation.cache_clear()  # pylint: disable=protected-access
+
   def test_unsupported_inputs_fall_back_to_xla(self):
-    """Tests that inputs the Mosaic kernels do not take run the XLA path."""
+    """Tests that unsupported inputs run XLA with the same min_log_decay clamp."""
     kernel = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config().build()
-    cases = [("cpu", torch.device("cpu"), 100, None)]
+    cases = [
+        (
+            "cpu",
+            torch.device("cpu"),
+            100,
+            128,
+            128,
+            torch.float32,
+            torch.float32,
+            None,
+        ),
+        (
+            "empty_seq",
+            torch.device("cpu"),
+            0,
+            128,
+            128,
+            torch.float32,
+            torch.float32,
+            None,
+        ),
+    ]
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+      dev_tpu = self.accelerator_device
       # 100-token rows without document ids: not a multiple of 64.
-      cases.append(("non_chunk_multiple", self.accelerator_device, 100, None))
+      cases.append((
+          "non_chunk_multiple",
+          dev_tpu,
+          100,
+          128,
+          128,
+          torch.float32,
+          torch.float32,
+          None,
+      ))
       # TPU v5 generation (< v6 Mosaic requirement) on a 128-token row.
-      cases.append(("tpu_v5_gen", self.accelerator_device, 128, 5))
+      cases.append((
+          "tpu_v5_gen",
+          dev_tpu,
+          128,
+          128,
+          128,
+          torch.float32,
+          torch.float32,
+          5,
+      ))
+      # Head dims not divisible by 128 (`d_k=64` or `d_v=64`) and mixed dtypes.
+      cases.append((
+          "unaligned_dk",
+          dev_tpu,
+          128,
+          64,
+          128,
+          torch.bfloat16,
+          torch.bfloat16,
+          None,
+      ))
+      cases.append((
+          "unaligned_dv",
+          dev_tpu,
+          128,
+          128,
+          64,
+          torch.bfloat16,
+          torch.bfloat16,
+          None,
+      ))
+      cases.append((
+          "mixed_dtypes",
+          dev_tpu,
+          128,
+          128,
+          128,
+          torch.bfloat16,
+          torch.float32,
+          None,
+      ))
+      cases.append((
+          "empty_seq_tpu",
+          dev_tpu,
+          0,
+          128,
+          128,
+          torch.bfloat16,
+          torch.bfloat16,
+          None,
+      ))
     torch.manual_seed(0)
-    for case_name, dev, seq_len, mock_gen in cases:
+    for case_name, dev, seq_len, d_k, d_v, q_dtype, v_dtype, mock_gen in cases:
       with self.subTest(case=case_name):
         shape = (2, seq_len, 4)
-        q, k = (torch.randn(*shape, 128, device=dev) for _ in range(2))
-        v = torch.randn(*shape, 128, device=dev)
-        g = -F.softplus(torch.randn(*shape, device=dev))
-        beta = torch.sigmoid(torch.randn(*shape, device=dev))
+        q = torch.randn(*shape, d_k, dtype=q_dtype, device=dev)
+        k = torch.randn(*shape, d_k, dtype=q_dtype, device=dev)
+        v = torch.randn(*shape, d_v, dtype=v_dtype, device=dev)
+        # Include decays below `min_log_decay` (-5.0) to verify fallback clamping.
+        g = -10.0 * torch.rand(*shape, device=dev)
+        beta = torch.sigmoid(torch.randn(*shape, device=dev)).to(q_dtype)
         gen_ctx = (
             mock.patch.object(
-                tokamax_gated_delta, "_tpu_generation", return_value=mock_gen
+                tokamax_gated_delta,
+                "_tpu_generation",
+                autospec=True,
+                return_value=mock_gen,
             )
             if mock_gen is not None
             else contextlib.nullcontext()
         )
+        q_in = q.detach().clone().requires_grad_()
+        k_in = k.detach().clone().requires_grad_()
+        v_in = v.detach().clone().requires_grad_()
+        g_in = g.detach().clone().requires_grad_()
+        beta_in = beta.detach().clone().requires_grad_()
         with (
             gen_ctx,
             mock.patch.object(
                 tokamax_gated_delta,
                 "tokamax_gated_delta",
+                autospec=True,
                 side_effect=AssertionError("ran the Mosaic kernels"),
             ),
         ):
-          out = kernel.recurrence(q, k, v, g, beta)
+          out = kernel.recurrence(q_in, k_in, v_in, g_in, beta_in)
+        self.assertEqual(out.shape, (2, seq_len, 4, d_v))
+        self.assertEqual(out.dtype, q_dtype)
+        if seq_len == 0:
+          out.float().sum().backward()
+          self.assertIsNotNone(g_in.grad)
+          continue
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+        clamped = g < kernel.min_log_decay
+        self.assertTrue(bool((g_in.grad[clamped] == 0).all().item()))
         # On TPU two evaluations of the same fp32 XLA computation differ
-        # slightly (up to 6.7e-5 here).
-        tolerances = dict(atol=2e-4, rtol=2e-3) if dev.type == "tpu" else {}
-        torch.testing.assert_close(
-            out, gated_delta.chunked_gated_delta(q, k, v, g, beta), **tolerances
+        # slightly (up to 6.7e-5 here); bf16 uses looser tolerances.
+        tolerances = (
+            dict(atol=1e-2, rtol=1e-2)
+            if q_dtype == torch.bfloat16
+            else (dict(atol=2e-4, rtol=2e-3) if dev.type == "tpu" else {})
         )
+        expected = gated_delta.chunked_gated_delta(
+            q, k, v, g.clamp_min(kernel.min_log_decay), beta
+        )
+        torch.testing.assert_close(out.detach(), expected, **tolerances)
+        unclamped = gated_delta.chunked_gated_delta(q, k, v, g, beta)
+        self.assertGreater(_relative_l2_error(out.detach(), unclamped), 1e-4)
 
   @parameterized.named_parameters(
       dict(testcase_name="_all_documents", max_num_segments=8),
@@ -567,12 +723,18 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     clamped_kernel = modules["xla_clamped"].inner_gated_delta_net.kernel
     parent_recurrence = gated_delta.TpuGatedDeltaKernel.recurrence
 
-    def record(q, k, v, g, beta, segment_ids_BS=None):
-      decays.append(g.detach().float().cpu())
-      return parent_recurrence(xla_kernel, q, k, v, g, beta, segment_ids_BS)
-
-    xla_kernel.recurrence = record
-    _clamp_decays(clamped_kernel, min_log_decay)
+    def record(
+        q_BSHK,
+        k_BSHK,
+        v_BSHV,
+        g_BSH,
+        beta_BSH,
+        segment_ids_BS=None,
+    ):
+      decays.append(g_BSH.detach().float().cpu())
+      return parent_recurrence(
+          xla_kernel, q_BSHK, k_BSHK, v_BSHV, g_BSH, beta_BSH, segment_ids_BS
+      )
 
     positions = torch.arange(seq_len).repeat(batch).to(dev)
     x_base = torch.randn(
@@ -591,7 +753,13 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
       grads = {n: p.grad for n, p in mod.named_parameters()}
       return {"out": out, "dx": x_in.grad, **grads}
 
-    results = {name: run_module(mod) for name, mod in modules.items()}
+    with (
+        mock.patch.object(
+            xla_kernel, "recurrence", autospec=True, side_effect=record
+        ),
+        _clamp_decays_ctx(clamped_kernel, min_log_decay),
+    ):
+      results = {name: run_module(mod) for name, mod in modules.items()}
     g = decays[0]
     clamped_fraction = float((g < min_log_decay).float().mean())
     logging.info(
@@ -696,21 +864,22 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
           param.data = param.data.float()
       if cfg.enable_weight_tying:
         model.tok_embeddings.weight = model.lm_head.weight
-      if clamp_xla:
-        for module in model.modules():
-          if isinstance(module, gated_delta.TpuGatedDeltaKernel):
-            _clamp_decays(module, min_log_decay)
-      optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-      losses = []
-      for _ in range(steps):
-        optimizer.zero_grad()
-        with set_unflatten_seq_len(seq_len):
-          logits = model(inputs, positions=positions)
-        loss = F.cross_entropy(logits.float().reshape(-1, vocab_size), labels)
-        loss.backward()
-        optimizer.step()
-        losses.append(float(loss.detach().cpu()))
-      return losses
+      with contextlib.ExitStack() as stack:
+        if clamp_xla:
+          for module in model.modules():
+            if isinstance(module, gated_delta.TpuGatedDeltaKernel):
+              stack.enter_context(_clamp_decays_ctx(module, min_log_decay))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        losses = []
+        for _ in range(steps):
+          optimizer.zero_grad()
+          with set_unflatten_seq_len(seq_len):
+            logits = model(inputs, positions=positions)
+          loss = F.cross_entropy(logits.float().reshape(-1, vocab_size), labels)
+          loss.backward()
+          optimizer.step()
+          losses.append(float(loss.detach().cpu()))
+        return losses
 
     losses = {
         "xla": train(config),

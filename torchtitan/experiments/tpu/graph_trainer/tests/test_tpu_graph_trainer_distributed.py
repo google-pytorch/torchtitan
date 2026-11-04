@@ -380,6 +380,86 @@ class TpuGraphTrainerDistributedTest(
           msg=f"control, step {step}",
       )
 
+  def test_qwen3_5_graph_trainer_matches_eager(self):
+    """The graph-split GraphTrainer must train Qwen3.5 MoE to eager's losses.
+
+    The eager lane is the regular TPU trainer on `qwen35_moe_debugmodel`
+    (SimpleFSDP, selective AC, no compile); the GraphTrainer lane is
+    `graph_trainer_qwen35_moe_debugmodel`: the same model through
+    `_use_graph_split`, as the 35B recipes use it (one layer per forward and
+    backward executable, `tpu_selective` saving only `moe.routing`). Same model
+    config, data, seed, fp32 params and reductions, and foreach AdamW, so the
+    arms differ only in how the step is captured and executed. Every step is
+    compared, not just the first (see the Gemma 4 test).
+    """
+    module = "torchtitan.experiments.tpu.qwen3_5"
+    arms = {
+        "eager": (
+            _train_args(
+                module,
+                "qwen35_moe_debugmodel",
+                use_splash_attention_kernel=False,
+            ),
+            False,
+        ),
+        "graph_trainer": (
+            _train_args(
+                module,
+                "graph_trainer_qwen35_moe_debugmodel",
+                use_splash_attention_kernel=False,
+            ),
+            True,
+        ),
+        "control": (
+            _train_args(
+                module,
+                "graph_trainer_qwen35_moe_debugmodel",
+                use_splash_attention_kernel=False,
+            )
+            + ["--lr_scheduler.warmup_steps=3"],
+            True,
+        ),
+    }
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    for arm, (config_args, enable_compile) in arms.items():
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=config_args + ["--parallelism.use_simple_fsdp"],
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=enable_compile,
+      )
+      with open(path) as f:
+        losses[arm] = json.load(f)
+
+    self.assertNotEmpty(losses["eager"])
+    self.assertLen(losses["graph_trainer"], len(losses["eager"]))
+    for (step, graph), (_, eager) in zip(
+        losses["graph_trainer"], losses["eager"]
+    ):
+      logging.info(
+          "qwen3_5 step %d: graph_trainer loss %.6f, eager loss %.6f,"
+          " |diff| %.2e (%.2e relative)",
+          step,
+          graph,
+          eager,
+          abs(graph - eager),
+          abs(graph - eager) / abs(eager),
+      )
+      self.assertAlmostEqual(
+          graph, eager, delta=abs(eager) * 1e-4, msg=f"step {step}"
+      )
+    control_losses = dict(losses["control"])
+    eager_losses = dict(losses["eager"])
+    for step in (2, 3):
+      self.assertGreater(
+          abs(control_losses[step] - eager_losses[step]),
+          abs(eager_losses[step]) * 1e-4,
+          msg=f"control, step {step}",
+      )
+
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]

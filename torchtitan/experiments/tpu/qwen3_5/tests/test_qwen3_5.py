@@ -651,6 +651,54 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         # Negative control: autograd of the forward does use them.
         self.assertNotEmpty(backward_ops(autograd_conv_silu, seg) & scatter_ops)
 
+  @parameterized.named_parameters(
+      # Slow decays: every token's gradient matters.
+      dict(testcase_name="_slow_decays", max_decay_rate=0.2),
+      # Qwen3.5's initialization: A_log = log(U(0.01, 16)).
+      dict(testcase_name="_init_decays", max_decay_rate=16.0),
+  )
+  def test_chunked_gated_delta_compiled_grads_match_eager(
+      self, max_decay_rate: float
+  ):
+    """Tests chunked_gated_delta's gradients under torch.compile vs eager.
+
+    TpuGraphTrainer compiles the joint graph. On TPU, the gradient through a
+    slice of the decays' cumsum (`cumsum(-1)[..., -1:]`, the chunk totals)
+    that is also used elementwise came out wrong when compiled (dg relative
+    error 3.8, and NaN losses at step 1 on the debug model), while eager was
+    right.
+    """
+    torch.manual_seed(0)
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    dev = self.accelerator_device
+    shape = (2, 128, 4)
+    q, k, v = (torch.randn(*shape, 128, device=dev) for _ in range(3))
+    rate = torch.empty(shape[-1], device=dev).uniform_(0.01, max_decay_rate)
+    g = -rate * F.softplus(torch.randn(*shape, device=dev) + 1.0)
+    beta = torch.sigmoid(torch.randn(*shape, device=dev))
+    grad_out = torch.randn(*shape, 128, device=dev)
+
+    def run(fn):
+      inputs = [x.detach().clone().requires_grad_() for x in (q, k, v, g, beta)]
+      out = fn(*inputs)
+      return [out, *torch.autograd.grad(out, inputs, grad_out)]
+
+    backend = "tpu" if self._is_tpu() else "aot_eager"
+    expected = run(gated_delta.chunked_gated_delta)
+    actual = run(
+        torch.compile(
+            gated_delta.chunked_gated_delta, backend=backend, fullgraph=True
+        )
+    )
+    for name, a_t, e_t in zip(
+        ("out", "dq", "dk", "dv", "dg", "dbeta"), actual, expected, strict=True
+    ):
+      self.assertTrue(torch.isfinite(a_t).all().item(), msg=name)
+      # TPU7x / v5e: <= 5e-7 with the fix.
+      self.assertLessEqual(
+          _relative_l2_error(a_t, e_t), 1e-4, msg=f"compiled {name}"
+      )
+
   def test_causal_conv_silu_compiles_fullgraph(self):
     """Tests causal_conv_silu under torch.compile(fullgraph=True).
 
@@ -1513,6 +1561,36 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertTrue(splitter.enabled)
     self.assertEqual(splitter.n_layers, 40)
+
+  def test_graph_trainer_debug_recipe(self):
+    """Tests the GraphTrainer debug recipe's split and selective remat."""
+    gt_cfg = config_registry.graph_trainer_qwen35_moe_debugmodel()
+    self.assertIsInstance(gt_cfg, TpuGraphTrainer.Config)
+    apply_tpu_graph_trainer_model_transforms(gt_cfg)
+    self.assertIs(
+        gt_cfg.model_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5
+    )
+    self.assertEqual(gt_cfg.model_spec.flavor, "debugmodel_moe")
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, gt_cfg.override.imports
+    )
+    compile_cfg = gt_cfg.compile
+    self.assertEqual(compile_cfg.mode, "aot_fx_trace")
+    self.assertEqual(compile_cfg.memory_policy, "tpu_selective")
+    self.assertEqual(compile_cfg.save_regions, ("moe.routing",))
+    self.assertEqual(compile_cfg.graph_split.forward_layers_per_executable, 1)
+    self.assertEqual(compile_cfg.graph_split.backward_layers_per_executable, 1)
+    splitter = GraphSplitter.from_trainer_config(
+        gt_cfg,
+        optimizer_in_graph=(compile_cfg.optimizer_compile == "in_graph"),
+    )
+    self.assertTrue(splitter.enabled)
+    self.assertEqual(splitter.n_layers, 4)
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+    ])
+    self.assertIsInstance(parsed, TpuGraphTrainer.Config)
 
   def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
     """Tests that TP, CP, PP and EP fail before the model is touched."""

@@ -46,9 +46,6 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
     _is_backward_node,
 )
-from torchtitan.experiments.graph_trainer.fsdp_passes import (
-    _collect_bucketed_fsdp_comms,
-)
 from torchtitan.experiments.graph_trainer.graph_pp.partition import (
     _forward_mutations_to_materialize,
 )
@@ -417,12 +414,44 @@ def _collective_producer(node: torch.fx.Node) -> torch.fx.Node | None:
   return None
 
 
+def _op_name(node: torch.fx.Node) -> str | None:
+  if node.op != "call_function" or not isinstance(
+      node.target, torch._ops.OpOverload
+  ):
+    return None
+  return node.target.name()
+
+
 def _is_collective(node: torch.fx.Node) -> bool:
   return (
-      is_all_gather_into_tensor(node)
-      or is_reduce_scatter_tensor(node)
+      _is_gather(node)
+      or _is_reduce_scatter(node)
       or is_all_reduce_tensor(node)
       or is_all_to_all_tensor(node)
+  )
+
+
+def _is_gather(node: torch.fx.Node) -> bool:
+  return is_all_gather_into_tensor(node) or _op_name(node) == "tpu::_all_gather_dim"
+
+
+def _is_reduce_scatter(node: torch.fx.Node) -> bool:
+  return (
+      is_reduce_scatter_tensor(node)
+      or _op_name(node) == "tpu::_reduce_scatter_dim"
+  )
+
+
+def _is_movement(node: torch.fx.Node) -> bool:
+  """A one-input view or copy (incl. dtype casts): no compute to schedule."""
+  return (
+      node.op == "call_function"
+      and len(node.all_input_nodes) == 1
+      and (
+          _is_view(node)
+          or node.target
+          in (torch.ops.aten._to_copy.default, torch.ops.aten.clone.default)
+      )
   )
 
 
@@ -439,8 +468,9 @@ def _collect_collective_chains(
 ) -> dict[torch.fx.Node, set[torch.fx.Node]]:
   """Collect indivisible collective and FSDP dtype-conversion chains.
 
-  Collective classification comes from TorchInductor's bucketing helpers. For
-  each all-gather launch, repeatedly follow tensor inputs through upstream
+  Collective classification comes from TorchInductor's bucketing helpers, plus
+  TorchTPU's dim-d all-gather and reduce-scatter, single ops with no wait node. For each
+  all-gather launch, repeatedly follow tensor inputs through upstream
   ``call_function`` nodes toward its parameter placeholder. Retain only nodes
   used exclusively by that launch chain. This keeps layout preparation with its
   all-gather without maintaining an op allowlist or absorbing shared compute.
@@ -457,8 +487,13 @@ def _collect_collective_chains(
 
     compute -> RS -> compute
 
-  Keep the post-RS cast with the launch/wait chain to preserve a single
-  forward dependency between the two executables.
+  Keep the casts and views after a reduction with the launch/wait chain to
+  preserve a single forward dependency between the two executables. Before a
+  reduction, the chain also takes the views and widening casts of the computed
+  gradient: a view must not cross an executable boundary (TorchTPU
+  materializes a strided input with an eager copy), and the narrower tensor is
+  cheaper to carry. A narrowing cast, like ``to(BF16)`` above, stays with the
+  compute.
   """
   chains = {
       node: {node}
@@ -470,16 +505,26 @@ def _collect_collective_chains(
       producer = _collective_producer(node)
       if producer is not None:
         chains[producer].add(node)
-        if is_reduce_scatter_tensor(producer):
-          chains[producer].update(
-              user
-              for user in node.users
-              if user.op == "call_function"
-              and user.target is torch.ops.aten._to_copy.default
-              and len(user.all_input_nodes) == 1
-          )
   for producer, chain in chains.items():
-    if not is_all_gather_into_tensor(producer):
+    if not (_is_reduce_scatter(producer) or is_all_reduce_tensor(producer)):
+      continue
+    pending = list(chain)
+    while pending:
+      for user in pending.pop().users:
+        if user not in chain and _is_movement(user):
+          chain.add(user)
+          pending.append(user)
+    node = producer.args[0]
+    while (
+        _is_movement(node)
+        and set(node.users) <= chain
+        and node.meta["val"].element_size()
+        >= node.all_input_nodes[0].meta["val"].element_size()
+    ):
+      chain.add(node)
+      node = node.all_input_nodes[0]
+  for producer, chain in chains.items():
+    if not _is_gather(producer):
       continue
     candidates: set[torch.fx.Node] = set()
     pending = list(producer.all_input_nodes)
@@ -743,7 +788,7 @@ def split_forward_graph_by_layer(
       partition_map[node] = partition_map[collective_producer]
     else:
       partition_map[node] = current_partition
-      if _is_collective(node):
+      if _is_collective(node) and not str(_op_name(node)).startswith("tpu::"):
         pending_collectives[node] = max(1, collective_wait_counts[node])
 
     if _is_spmd_region_marker(node, "enter_spmd_safe_region"):
@@ -806,29 +851,48 @@ def split_forward_graph_by_layer(
   return chunked
 
 
-def _collect_backward_fsdp_owners(
-    gm: torch.fx.GraphModule,
-    *,
-    n_layers: int,
+def _collect_backward_collective_owners(
     collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
+    n_layers: int,
 ) -> dict[torch.fx.Node, tuple[str, int]]:
-  _, comms = _collect_bucketed_fsdp_comms(gm, n_layers=n_layers)
-  owners = {
-      comm.launch: (comm.kind, comm.logical_index)
-      for comm in comms
-      if comm.direction == "bwd"
-      and comm.kind in ("ag", "rs")
-      and comm.logical_index is not None
-      and comm.logical_index < n_layers
+  """Assign each backward FSDP collective chain to the layer it serves.
+
+  Chains are classified by their role in the graph, whatever op implements
+  them: one fed only by graph inputs is a parameter gather (``"ag"``), owned by
+  the layer of its first consumer; one read only by gradient outputs, directly
+  or through another such chain, is a gradient reduction (``"rs"``), owned by
+  the layer that produced its input. Other collectives, such as MoE token
+  exchange, depend on compute on both sides and stay with their inputs. Raises
+  on an all-gather or reduce-scatter that fits neither role.
+  """
+  member = {
+      node: launch
+      for launch, chain in collective_chains.items()
+      for node in chain
   }
-  missing_chains = [
-      launch.name for launch in owners if launch not in collective_chains
-  ]
-  if missing_chains:
-    raise ValueError(
-        "FSDP backward collectives have incomplete chains: "
-        f"{sorted(missing_chains)}"
-    )
+  kinds: dict[torch.fx.Node, str] = {}
+  owners: dict[torch.fx.Node, tuple[str, int]] = {}
+  for launch in reversed(list(collective_chains)):
+    chain = collective_chains[launch]
+    inputs = {n for c in chain for n in c.all_input_nodes if n not in chain}
+    users = {n for c in chain for n in c.users if n not in chain}
+    if all(n.op in ("placeholder", "get_attr") for n in inputs):
+      kinds[launch], layer_ids = "ag", {_get_layer_id(n) for n in users}
+    elif users and all(
+        n.op == "output" or kinds.get(member.get(n)) == "rs" for n in users
+    ):
+      kinds[launch] = "rs"
+      layer_ids = {_get_layer_id(n) for n in inputs | {launch}}
+    elif _is_gather(launch) or _is_reduce_scatter(launch):
+      raise ValueError(
+          f"Backward FSDP collective {launch.name!r} is neither a parameter "
+          "gather nor a gradient reduction"
+      )
+    else:
+      continue
+    layer_ids = {i for i in layer_ids if 0 <= i < n_layers}
+    if layer_ids:
+      owners[launch] = (kinds[launch], max(layer_ids))
   return owners
 
 
@@ -909,11 +973,7 @@ def split_backward_graph_by_layer(
       layer_id: compute_offset + index // layers_per_executable
       for layer_id, index in layer_indices.items()
   }
-  owners = _collect_backward_fsdp_owners(
-      gm,
-      n_layers=n_layers,
-      collective_chains=collective_chains,
-  )
+  owners = _collect_backward_collective_owners(collective_chains, n_layers)
 
   if pipeline_collectives:
     owned_collectives = set(owners.values())

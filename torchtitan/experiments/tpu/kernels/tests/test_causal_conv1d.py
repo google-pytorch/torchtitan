@@ -69,6 +69,14 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
           dtype=torch.bfloat16,
       ),
       dict(
+          testcase_name="_bf16_max_width8",
+          batch=2,
+          seq_len=64,
+          channels=128,
+          width=8,
+          dtype=torch.bfloat16,
+      ),
+      dict(
           testcase_name="_fp32_exact",
           batch=2,
           seq_len=64,
@@ -244,6 +252,10 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
       )
       self.assertEqual(
           causal_conv1d._max_supported_seq_len(torch.float32),  # pylint: disable=protected-access
+          4096,
+      )
+      self.assertEqual(
+          causal_conv1d._max_supported_seq_len(torch.bfloat16, width=8),  # pylint: disable=protected-access
           4096,
       )
 

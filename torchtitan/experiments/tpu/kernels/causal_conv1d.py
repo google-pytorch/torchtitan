@@ -54,14 +54,17 @@ def _tpu_generation() -> int | None:
   return gen
 
 
-def _max_supported_seq_len(dtype: torch.dtype) -> int:
+def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:
   """Maximum whole-strip ``seq_len`` that fits default scoped VMEM."""
   gen = _tpu_generation()
   if gen is not None and gen >= 7:
-    # TPU7x has >= 32 MiB default scoped VMEM (63.94 MiB in 35B recipes).
-    return 8192 if dtype == torch.bfloat16 else 4096
-  # TPU v5/v6 default to 16 MiB scoped VMEM.
-  return 2048 if dtype == torch.bfloat16 else 1024
+    # TPU7x has >= 32 MiB default scoped VMEM (63.94 MiB in 35B recipes);
+    # wider kernels (> 4 taps) keep more rolled strips live in backward.
+    base = 8192 if dtype == torch.bfloat16 else 4096
+  else:
+    # TPU v5/v6 default to 16 MiB scoped VMEM.
+    base = 2048 if dtype == torch.bfloat16 else 1024
+  return base // 2 if width > 4 else base
 
 
 def _shift_down(x: jax.Array, shift: int, rows: jax.Array) -> jax.Array:
@@ -229,7 +232,7 @@ def supports(x_BSC: torch.Tensor, weight_C1W: torch.Tensor) -> bool:
     return False
   batch, seq_len, channels = x_BSC.shape
   width = weight_C1W.shape[2]
-  max_s = _max_supported_seq_len(x_BSC.dtype)
+  max_s = _max_supported_seq_len(x_BSC.dtype, width)
   return (
       batch > 0
       and 0 < seq_len <= max_s

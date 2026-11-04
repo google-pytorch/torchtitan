@@ -668,48 +668,10 @@ def _make_fwd_bwd_adamw_fn(
     return fwd_bwd_adamw
 
 
-def _split_optimizers_by_mesh(optimizers_container) -> bool:
-    def _mesh_key(p):
-        spec = getattr(p, "_spec", None)
-        return None if spec is None else id(spec.mesh)
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 
-    did_split = False
-    for opt in optimizers_container.optimizers:
-        new_groups: list[dict] = []
-        for grp in opt.param_groups:
-            params = list(grp["params"])
-            names = grp.get("param_names")
-            if names is not None and len(names) != len(params):
-                raise ValueError(
-                    f"param_names length ({len(names)}) != "
-                    f"params length ({len(params)})"
-                )
-            base_kwargs = {
-                k: v
-                for k, v in grp.items()
-                if k not in ("params", "param_names")
-            }
-            buckets: dict = {}
-            for i, p in enumerate(params):
-                key = _mesh_key(p)
-                bucket = buckets.setdefault(
-                    key, {"params": [], "param_names": []}
-                )
-                bucket["params"].append(p)
-                if names is not None:
-                    bucket["param_names"].append(names[i])
-            if len(buckets) > 1:
-                did_split = True
-            for bucket in buckets.values():
-                if names is None:
-                    del bucket["param_names"]
-                new_groups.append({**bucket, **base_kwargs})
-        if len(new_groups) == len(opt.param_groups):
-            continue
-        opt.param_groups = []
-        for grp in new_groups:
-            opt.add_param_group(grp)
-    return did_split
+
+_split_optimizers_by_mesh = split_optimizers_by_mesh
 
 
 def _dump_weight_stats(model_parts) -> None:

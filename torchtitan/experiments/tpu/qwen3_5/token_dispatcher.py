@@ -12,16 +12,21 @@ transport modes:
    (``roe_sort_gather``), fuses route-weight scaling + FP32 token reduction in
    VMEM (``roe_unsort_combine``), and sums partial outputs across ``ep_mesh``
    via SparseCore ``torch.tpu.ops.reduce_scatter_dim``. When ``ep_size <= K``,
-   this cuts activation ICI traffic by up to ``2 * K / (ep_size - 1)`` (``2.67x``
-   at ``EP=4, K=8``, ``1.14x`` at ``EP=8, K=8``) and eliminates ``ragged_all_to_all``
+   this cuts activation ICI traffic by up to ``2 * K / (ep_size - 1)``
+   (``2.67x``
+   at ``EP=4, K=8``, ``1.14x`` at ``EP=8, K=8``) and eliminates
+   ``ragged_all_to_all``
    gather/scatter stalls.
 2. ``"ragged_all_to_all"`` (default via ``"auto"`` when ``ep_size > top_k``):
    gathers ``int32[E]`` per-expert token counts via ``all_gather_dim`` and
-   exchanges only the routed token slices via ``torch.tpu.ops.ragged_all_to_all``.
+   exchanges only the routed token slices via
+   ``torch.tpu.ops.ragged_all_to_all``.
 
-``TpuQwen35RoutedExperts`` optionally pipelines ``dispatch -> experts -> combine``
+``TpuQwen35RoutedExperts`` optionally pipelines ``dispatch -> experts ->
+combine``
 across ``num_token_chunks`` sequence chunks while unsharding FSDP expert weights
-once per layer, cutting peak static ``(cap, D)`` HBM buffers by ``num_token_chunks``
+once per layer, cutting peak static ``(cap, D)`` HBM buffers by
+``num_token_chunks``
 and overlapping chunk ``c`` MXU expert GEMMs with chunk ``c + 1`` SparseCore
 collectives.
 """
@@ -58,7 +63,6 @@ from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     LocalDispatchMetadata,
 )
-
 
 CommMode = Literal["auto", "ring_of_experts", "ragged_all_to_all"]
 
@@ -110,9 +114,7 @@ def _ep_reduce_scatter_sum_impl(
     return torch.tpu.ops.reduce_scatter_dim(src, 0, group=pg, reduce_op="sum")
   if pg is not None:
     return _wait(
-        reduce_scatter_single(
-            src, reduceOp="sum", scatter_dim=0, group=ep_mesh
-        )
+        reduce_scatter_single(src, reduceOp="sum", scatter_dim=0, group=ep_mesh)
     )
   chunk = src.shape[0] // ep_size
   return src.view(ep_size, chunk, *src.shape[1:]).sum(dim=0)
@@ -319,7 +321,15 @@ class _RaggedAllToAll(torch.autograd.Function):
 
 
 @dataclass(frozen=True, kw_only=True)
-class TpuQwen35DispatchMetadata(LocalDispatchMetadata):
+class _EpDispatchMetadata:
+  """Base class for EP > 1 dispatch metadata (distinct from ``LocalDispatchMetadata``)."""
+
+  token_indices_experts_sorted_N: torch.Tensor
+  topk_scores_experts_sorted_N: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True)
+class TpuQwen35DispatchMetadata(_EpDispatchMetadata):
   """Dropless ``ragged_all_to_all`` EP dispatch metadata."""
 
   routed_rows: int
@@ -755,7 +765,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
   ) -> tuple[
       torch.Tensor,
       torch.Tensor,
-      AllToAllDispatchMetadata | LocalDispatchMetadata,
+      AllToAllDispatchMetadata | LocalDispatchMetadata | _EpDispatchMetadata,
   ]:
     if self.ep_mesh is None:
       return super().dispatch(
@@ -784,14 +794,15 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     with maybe_set_sparse_mesh():
       pg = self.ep_mesh.get_group()
       with torch.no_grad():
-        local_counts_E = num_local_tokens_per_expert_E.to(torch.int32).reshape(
-            -1
-        )
-        all_sizes_SE = (
-            self._gather_expert_counts(local_counts_E, pg, ep_size)
-            .to(torch.int32)
-            .reshape(ep_size, self.num_experts)
-        )
+        with annotate_region(MOE_ROUTING):
+          local_counts_E = num_local_tokens_per_expert_E.to(
+              torch.int32
+          ).reshape(-1)
+          all_sizes_SE = (
+              self._gather_expert_counts(local_counts_E, pg, ep_size)
+              .to(torch.int32)
+              .reshape(ep_size, self.num_experts)
+          )
         counts_SDE = all_sizes_SE.view(ep_size, ep_size, e)
         all_send_offsets_SE = (
             all_sizes_SE.cumsum(dim=-1, dtype=torch.int32) - all_sizes_SE
@@ -880,7 +891,9 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
   def combine(
       self,
       routed_output_RD: torch.Tensor,
-      metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+      metadata: (
+          AllToAllDispatchMetadata | LocalDispatchMetadata | _EpDispatchMetadata
+      ),
       x_TD: torch.Tensor,
   ) -> torch.Tensor:
     if self.ep_mesh is None:
@@ -998,12 +1011,10 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
     for chunk_idx, (x_c, scores_c, ids_c) in enumerate(
         zip(x_chunks, score_chunks, id_chunks)
     ):
-      with annotate(
-          {
-              "ep_chunk_idx": chunk_idx,
-              "ep_max_inflight_chunks": self.max_inflight_chunks,
-          }
-      ):
+      with annotate({
+          "ep_chunk_idx": chunk_idx,
+          "ep_max_inflight_chunks": self.max_inflight_chunks,
+      }):
         counts_c = (
             _tokens_per_expert(ids_c, num_experts)
             if needs_chunk_counts

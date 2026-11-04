@@ -26,11 +26,9 @@ only make sense together are the named bundles below, composed with
 import os
 from typing import Iterable, Mapping, MutableMapping
 
-import tyro
-
 from torchtitan.config.manager import custom_registry
 from torchtitan.tools.logging import logger
-
+import tyro
 
 FlagValue = bool | int | float | str
 
@@ -75,7 +73,9 @@ def merge_flags(
   """Merges bundles then keyword overrides, later arguments winning."""
   merged = FlagMap()
   for layer in (*bundles, overrides):
-    merged.update({name: _flag_value_str(value) for name, value in layer.items()})
+    merged.update(
+        {name: _flag_value_str(value) for name, value in layer.items()}
+    )
   return merged
 
 
@@ -215,11 +215,15 @@ SPARSECORE_COLLECTIVE_OFFLOAD: FlagMap = {
 
 # Additional SparseCore / scheduler flags from MaxText MLPerf v6.1 MoE recipes
 # on TPU7x for overlapping dependent EP + FSDP all-gather / reduce-scatter
-# collectives (do not set xla_tpu_enable_async_all_to_all, which halts
+# collectives while keeping small routing-weight gathers and ragged-buffer
+# layout copies on the TensorCore (+3.6% on Qwen3.5-397B EP=8; do not set
+# xla_tpu_enable_async_all_to_all, which halts
 # SparseCoreTileExecuteCoreSequencer on small ragged_all_to_all tensors).
 MAXTEXT_MOE_SPARSECORE_OFFLOAD: FlagMap = {
     "xla_tpu_enable_sparse_core_reduce_scatter_v2": "true",
     "xla_tpu_enable_layer_scheduler_for_dependent_collectives": "true",
+    "xla_tpu_enable_offloading_gather_to_sparsecore": "false",
+    "xla_tpu_enable_offloading_copy_to_sparsecore": "false",
 }
 
 # Request TPU7x performance state 7, the throughput-oriented operating point.

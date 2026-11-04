@@ -1947,6 +1947,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           ),
           "true",
       )
+      self.assertEqual(
+          ep_cfg.libtpu_init_flags.get(
+              "xla_tpu_enable_offloading_gather_to_sparsecore"
+          ),
+          "false",
+      )
+      self.assertEqual(
+          ep_cfg.libtpu_init_flags.get(
+              "xla_tpu_enable_offloading_copy_to_sparsecore"
+          ),
+          "false",
+      )
       self.assertNotIn(
           "xla_tpu_enable_async_all_to_all", ep_cfg.libtpu_init_flags
       )
@@ -2021,6 +2033,60 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         all(
             r.num_token_chunks == 8 and r.max_inflight_chunks == 2
             for _, r, _, _ in parsed_ep_routed
+        )
+    )
+
+    ep_397b = config_registry.qwen35_moe_397b_split_tokamax_ep_benchmark()
+    self.assertIsInstance(ep_397b, TpuGraphTrainer.Config)
+    self.assertEqual(ep_397b.model_spec.flavor, "397B-A17B")
+    self.assertEqual(ep_397b.training.dtype, "bfloat16")
+    self.assertEqual(ep_397b.training.mixed_precision_param, "bfloat16")
+    self.assertEqual(ep_397b.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(ep_397b.training.max_context_length, 8192)
+    self.assertEqual(
+        ep_397b.training.num_tokens_per_microbatch_per_dp_rank, 24576
+    )
+    self.assertEqual(ep_397b.parallelism.expert_parallel_degree, 8)
+    self.assertEqual(
+        ep_397b.libtpu_init_flags.get(
+            "xla_tpu_enable_offloading_gather_to_sparsecore"
+        ),
+        "false",
+    )
+    self.assertEqual(
+        ep_397b.libtpu_init_flags.get(
+            "xla_tpu_enable_offloading_copy_to_sparsecore"
+        ),
+        "false",
+    )
+    apply_tpu_graph_trainer_model_transforms(ep_397b)
+    ep_397b.model_spec.model.update_from_config(
+        config=ep_397b, global_batch_size=8, local_global_batch_size=8
+    )
+    self.assertLen(ep_397b.model_spec.model.layers, 60)
+    self.assertTrue(
+        all(
+            r.num_token_chunks == 12 and r.max_inflight_chunks == 2
+            for _, r, _, _ in ep_397b.model_spec.model.traverse(
+                qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
+            )
+        )
+    )
+    self.assertTrue(
+        all(
+            d.roe_weights_on_activation and d.roe_use_pallas_tc
+            for _, d, _, _ in ep_397b.model_spec.model.traverse(
+                qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
+            )
+        )
+    )
+    self.assertTrue(
+        all(
+            e.pallas_grouped_mm_tgmm_tiling == (512, 1024, 0)
+            and e.pallas_grouped_mm_w2_transposed_tgmm_tiling == (512, 0, 2048)
+            for _, e, _, _ in ep_397b.model_spec.model.traverse(
+                TpuGroupedExperts.Config
+            )
         )
     )
 
@@ -3316,7 +3382,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertFalse(any("c10d_functional" in name for name in op_names))
       self.assertFalse(
           any("roe_routing_metadata" in str(n.target) for n in route_saved),
-          msg=f"roe_compute_routing must not be saved by moe.routing: {route_saved}",
+          msg=(
+              "roe_compute_routing must not be saved by moe.routing:"
+              f" {route_saved}"
+          ),
       )
 
   def test_ep_chunked_routed_experts_and_chunk_barriers(self):
@@ -3394,12 +3463,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     orig_fwd = routed_c4.inner_experts.forward
 
     def _spy_inner(*args, **kwargs):
-      unshard_calls.append(
-          (
-              bool(kwargs.get("unshard_only", False)),
-              kwargs.get("pre_unsharded_weights") is not None,
-          )
-      )
+      unshard_calls.append((
+          bool(kwargs.get("unshard_only", False)),
+          kwargs.get("pre_unsharded_weights") is not None,
+      ))
       return orig_fwd(*args, **kwargs)
 
     with mock.patch.object(

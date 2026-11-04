@@ -336,6 +336,7 @@ class TpuGraphTrainer(GraphTrainer):
     ) -> torch.Tensor:
         """Override of GraphTrainer._make_fx_forward_backward_step applying TPU pipeline graph passes."""
         from torchtitan.experiments.graph_trainer.common_utils import (
+            accumulate_param_grads_,
             maybe_register_blockmask_pytree_node,
         )
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -410,9 +411,10 @@ class TpuGraphTrainer(GraphTrainer):
                 [model], list(outputs[1 + len(params) :])
             )
 
-        for param, grad in zip(params, grads, strict=True):
-            if param.requires_grad and grad is not None:
-                param.grad = grad
+        # Sum gradients into `param.grad` (rather than overwriting) so
+        # multi-microbatch gradient accumulation and tied parameters preserve
+        # earlier microbatches' contributions before `optimizers.zero_grad()`.
+        accumulate_param_grads_(params, grads)
 
         return loss
 

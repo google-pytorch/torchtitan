@@ -95,15 +95,30 @@ def _find_local_grad_before_reduce_dtype_cast(
     return source
 
 
-def _parameter_layer_id(parameter_fqns: tuple[str, ...]) -> int:
-    layer_ids = set()
-    for fqn in parameter_fqns:
-        parts = fqn.split(".")
-        if len(parts) >= 2 and parts[0] == "layers":
+def _extract_layer_index_from_fqn(fqn: str) -> int | None:
+    """Extracts the transformer block index from a parameter FQN, or None.
+
+    Native TorchTitan models name parameters `layers.<N>.*`, whereas wrapped
+    HuggingFace models keep their adapter prefix on `named_parameters()` (e.g.
+    `model.esmc.layers.<N>.*` or `model.encoder.layer.<N>.*`) even after forward
+    node `module_fqn` metadata is canonicalized to `layers.<N>.*`.
+    """
+    parts = fqn.split(".")
+    for idx, part in enumerate(parts[:-1]):
+        if part in ("layers", "layer"):
             try:
-                layer_ids.add(int(parts[1]))
+                return int(parts[idx + 1])
             except ValueError:
-                pass
+                continue
+    return None
+
+
+def _parameter_layer_id(parameter_fqns: tuple[str, ...]) -> int:
+    layer_ids = {
+        layer_id
+        for fqn in parameter_fqns
+        if (layer_id := _extract_layer_index_from_fqn(fqn)) is not None
+    }
     if len(layer_ids) > 1:
         raise RuntimeError(
             "TPU remat scheduling does not support parameters shared across "

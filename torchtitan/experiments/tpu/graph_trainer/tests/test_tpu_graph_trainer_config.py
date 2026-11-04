@@ -31,6 +31,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
+from torchtitan.experiments.tpu.graph_trainer import hf_transformers as hf_gt
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     MaxTextTpuGraphTrainerQwen3Model,
     model_registry as tpu_qwen3_graph_registry,
@@ -1495,6 +1496,375 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(m.layer_stacks.flattened_for, 512)
     self.assertEqual(getattr(m.layer_stacks, "_fsdp_shard_dim", None), {"w": 1})
     self.assertTrue(m.layer_stacks.split_meshes_built)
+
+  def test_annotate_hf_module_fqns_canonicalizes_layers_and_lm_head(self) -> None:
+    from torchtitan.experiments.graph_trainer.common_utils import _get_layer_id
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+
+    class InnerBlock(nn.Module):
+      def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+      def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+    class WrappedHFModel(nn.Module):
+      def __init__(self, use_module_dict: bool) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(8, 4)
+        self.esmc = nn.Module()
+        if use_module_dict:
+          self.esmc.layers = nn.ModuleDict(
+              {"0": InnerBlock(), "1": InnerBlock()}
+          )
+        else:
+          self.esmc.layers = nn.ModuleList([InnerBlock(), InnerBlock()])
+        self.final_norm = nn.LayerNorm(4)
+        self.sequence_head = nn.Linear(4, 8, bias=False)
+
+    class Adapter(nn.Module):
+      def __init__(self, use_module_dict: bool) -> None:
+        super().__init__()
+        self.model = WrappedHFModel(use_module_dict=use_module_dict)
+
+      @property
+      def tok_embeddings(self) -> nn.Module:
+        return self.model.embed
+
+      @property
+      def layers(self) -> nn.Module:
+        return self.model.esmc.layers
+
+      @property
+      def norm(self) -> nn.Module:
+        return self.model.final_norm
+
+      @property
+      def lm_head(self) -> nn.Module:
+        return self.model.sequence_head
+
+      def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.model.embed(tokens)
+        blocks = (
+            self.model.esmc.layers.values()
+            if isinstance(self.model.esmc.layers, nn.ModuleDict)
+            else self.model.esmc.layers
+        )
+        for block in blocks:
+          x = block(x)
+        x = self.model.final_norm(x)
+        return self.model.sequence_head(x)
+
+    for use_module_dict in (False, True):
+      adapter = Adapter(use_module_dict=use_module_dict)
+      # Calling annotate_hf_module_fqns twice must be idempotent rather than
+      # stacking nested wrappers.
+      hf_gt.annotate_hf_module_fqns(adapter)
+      first_orig = getattr(
+          adapter.model.sequence_head, "_graph_trainer_orig_forward"
+      )
+      hf_gt.annotate_hf_module_fqns(adapter)
+      self.assertIs(
+          getattr(adapter.model.sequence_head, "_graph_trainer_orig_forward"),
+          first_orig,
+      )
+      tokens = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+      traced = minimal_fx_tracer(
+          lambda t: adapter(t).sum(), module=adapter
+      )(tokens)
+      fqns = [
+          node.meta.get("custom", {}).get("module_fqn")
+          for node in traced.gm.graph.nodes
+          if node.op == "call_function"
+          and node.meta.get("custom", {}).get("module_fqn")
+      ]
+      self.assertIn("tok_embeddings", fqns)
+      self.assertIn("layers.0.proj", fqns)
+      self.assertIn("layers.1.proj", fqns)
+      self.assertIn("norm", fqns)
+      self.assertIn("lm_head", fqns)
+      mm_nodes = [
+          node
+          for node in traced.gm.graph.nodes
+          if node.op == "call_function"
+          and node.target is torch.ops.aten.mm.default
+      ]
+      self.assertEqual([_get_layer_id(node) for node in mm_nodes[:2]], [0, 1])
+
+  def test_parallelize_hf_transformers_graph_guards_and_class_swap_order(
+      self,
+  ) -> None:
+    from unittest import mock
+    from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+    from torchtitan.experiments.transformers_modeling_backend.module_conversion import (
+        convert_hf_to_module,
+    )
+    from torchtitan.models.common.embedding import Embedding
+
+    base_pdims = SimpleNamespace(
+        tp_enabled=False,
+        pp_enabled=False,
+        cp_enabled=False,
+        ep_enabled=False,
+    )
+    training = TrainingConfig()
+    compile_cfg = CompileConfig(enable=True)
+
+    for flag in ("tp_enabled", "pp_enabled", "cp_enabled", "ep_enabled"):
+      bad_pdims = SimpleNamespace(**{**base_pdims.__dict__, flag: True})
+      with self.assertRaisesRegex(NotImplementedError, "SimpleFSDP/HSDP only"):
+        hf_gt.parallelize_hf_transformers_graph(
+            nn.Linear(4, 4),
+            parallel_dims=typing.cast(typing.Any, bad_pdims),
+            training=training,
+            parallelism=ParallelismConfig(use_simple_fsdp=True),
+            compile_config=compile_cfg,
+            dump_folder="/tmp",
+        )
+
+    with self.assertRaisesRegex(ValueError, "use_simple_fsdp"):
+      hf_gt.parallelize_hf_transformers_graph(
+          nn.Linear(4, 4),
+          parallel_dims=typing.cast(typing.Any, base_pdims),
+          training=training,
+          parallelism=ParallelismConfig(use_simple_fsdp=False),
+          compile_config=compile_cfg,
+          dump_folder="/tmp",
+      )
+
+    moe_layer = nn.Linear(4, 4)
+    moe_layer.moe_enabled = True  # type: ignore[attr-defined]
+    moe_model = nn.Module()
+    moe_model.layers = nn.ModuleDict({"0": moe_layer})
+    with self.assertRaisesRegex(NotImplementedError, "dense models only"):
+      hf_gt.parallelize_hf_transformers_graph(
+          moe_model,
+          parallel_dims=typing.cast(typing.Any, base_pdims),
+          training=training,
+          parallelism=ParallelismConfig(use_simple_fsdp=True),
+          compile_config=compile_cfg,
+          dump_folder="/tmp",
+      )
+
+    # Verify `convert_hf_to_module` (`nn.Embedding.__class__ = Embedding`) runs
+    # BEFORE `annotate_hf_module_fqns`, so `Embedding.forward` is not shadowed.
+    class ToyAdapter(nn.Module):
+      def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed = nn.Embedding(8, 4)
+        self.model.layers = nn.ModuleDict({"0": nn.Linear(4, 4, bias=False)})
+        self.model.head = nn.Linear(4, 8, bias=False)
+
+      @property
+      def tok_embeddings(self) -> nn.Module:
+        return self.model.embed
+
+      @property
+      def layers(self) -> nn.Module:
+        return self.model.layers
+
+      @property
+      def lm_head(self) -> nn.Module:
+        return self.model.head
+
+      def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.model.embed(tokens)
+        x = self.model.layers["0"](x)
+        return self.model.head(x)
+
+    embedding_forward_calls: list[bool] = []
+    orig_embedding_forward = Embedding.forward
+
+    def tracked_embedding_forward(emb_self, x):
+      embedding_forward_calls.append(True)
+      return orig_embedding_forward(emb_self, x)
+
+    def fake_parallelize_tpu(m, **kwargs):
+      self.assertFalse(kwargs["compile_config"].enable)
+      self.assertIsNone(kwargs["ac_config"])
+      self.assertEqual(kwargs["tpu_compile_mode"], "aot_fx_trace")
+      convert_hf_to_module(m)
+      return m
+
+    toy = ToyAdapter()
+    with (
+        mock.patch.object(
+            hf_gt, "parallelize_hf_transformers_tpu", side_effect=fake_parallelize_tpu
+        ),
+        mock.patch.object(Embedding, "forward", tracked_embedding_forward),
+    ):
+      out_model = hf_gt.parallelize_hf_transformers_graph(
+          toy,
+          parallel_dims=typing.cast(typing.Any, base_pdims),
+          training=training,
+          parallelism=ParallelismConfig(use_simple_fsdp=True),
+          compile_config=compile_cfg,
+          dump_folder="/tmp",
+      )
+      self.assertIsInstance(out_model.tok_embeddings, Embedding)
+      traced = minimal_fx_tracer(
+          lambda t: out_model(t).sum(), module=out_model
+      )(torch.tensor([[1, 2]], dtype=torch.long))
+
+    self.assertGreaterEqual(len(embedding_forward_calls), 1)
+    emb_nodes = [
+        n
+        for n in traced.gm.graph.nodes
+        if n.op == "call_function"
+        and n.meta.get("custom", {}).get("module_fqn") == "tok_embeddings"
+    ]
+    self.assertNotEmpty(emb_nodes)
+
+  def test_tpu_graph_trainer_accumulates_grads_across_microbatches(self) -> None:
+    class TinyModel(nn.Module):
+      def __init__(self) -> None:
+        super().__init__()
+        self.w = nn.Parameter(torch.tensor([[2.0, -1.0], [0.5, 3.0]]))
+
+      def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return inputs @ self.w
+
+    model = TinyModel()
+    fake_trainer = SimpleNamespace(
+        config=SimpleNamespace(
+            compile=SimpleNamespace(
+                precompile_artifact_dir="",
+                enable_passes=False,
+            )
+        ),
+        loss_fn=lambda pred, labels, global_valid_tokens=None: (
+            (pred - labels) ** 2
+        ).sum(),
+        _collect_moe_routing_metrics=False,
+        _traced_step=None,
+        _graph_splitter=SimpleNamespace(enabled=False),
+        _prepare_trace_inputs=None,
+        _prepare_trace_call_inputs=None,
+        train_context=torch.enable_grad,
+    )
+    params = list(model.parameters())
+    x1 = torch.tensor([[1.0, 2.0]])
+    y1 = torch.tensor([[0.0, 1.0]])
+    x2 = torch.tensor([[-1.0, 0.5]])
+    y2 = torch.tensor([[2.0, -0.5]])
+    valid = torch.tensor(2)
+
+    TpuGraphTrainer._make_fx_forward_backward_step(
+        typing.cast(typing.Any, fake_trainer),
+        model,
+        x1,
+        y1,
+        valid,
+        params,
+        {},
+    )
+    first_grad = model.w.grad.detach().clone()  # type: ignore[union-attr]
+    TpuGraphTrainer._make_fx_forward_backward_step(
+        typing.cast(typing.Any, fake_trainer),
+        model,
+        x2,
+        y2,
+        valid,
+        params,
+        {},
+    )
+    accum_grad = model.w.grad.detach().clone()  # type: ignore[union-attr]
+
+    ref_model = TinyModel()
+    loss_total = ((x1 @ ref_model.w - y1) ** 2).sum() + (
+        (x2 @ ref_model.w - y2) ** 2
+    ).sum()
+    loss_total.backward()
+    self.assertFalse(torch.allclose(accum_grad, first_grad))
+    torch.testing.assert_close(accum_grad, ref_model.w.grad)
+
+  def test_hf_esmc_graph_recipe_converts_to_graph_trainer_config(self) -> None:
+    from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
+        _infer_layer_topology,
+    )
+    from torchtitan.experiments.tpu.transformers_modeling_backend.config_registry import (
+        as_cpu_reference,
+        hf_esmc600m_mlm_uniref50_tpu7x16,
+        hf_esmc_mlm_uniref50_graph,
+    )
+
+    tpu7x16 = hf_esmc600m_mlm_uniref50_tpu7x16()
+    self.assertEqual(tpu7x16.hf_model, "biohub/ESMC-600M")
+    self.assertTrue(tpu7x16.tpu_config.use_graph_trainer)
+    self.assertEqual(tpu7x16.tpu_config.graph_trainer_memory_policy, "default")
+    self.assertEqual(
+        tpu7x16.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
+    )
+    self.assertEqual(tpu7x16.training.num_tokens_per_train_step, 32 * 64 * 2048)
+    self.assertEqual(tpu7x16.metrics.log_freq, 10)
+
+    cpu_ref = as_cpu_reference(hf_esmc600m_mlm_uniref50_tpu7x16())
+    self.assertFalse(cpu_ref.compile.enable)
+    self.assertFalse(cpu_ref.tpu_config.use_graph_trainer)
+    self.assertEqual(cpu_ref.tpu_config.compile_mode, "none")
+    self.assertFalse(cpu_ref.tpu_config.compile_grad_norm)
+    self.assertFalse(cpu_ref.tpu_config.compile_optimizer)
+    self.assertFalse(cpu_ref.esmc_fused_qk_norm_rope)
+
+    config = hf_esmc_mlm_uniref50_graph()
+    self.assertTrue(config.tpu_config.use_graph_trainer)
+    self.assertEqual(config.tpu_config.compile_mode, "aot_fx_trace")
+    self.assertTrue(config.tpu_config.compile_grad_norm)
+    self.assertTrue(config.tpu_config.compile_optimizer)
+    self.assertTrue(config.esmc_fused_qk_norm_rope)
+    self.assertEqual(config.metrics.log_freq, 25)
+
+    assert config.model_spec is not None
+    orig_n_layers = config.model_spec.model.n_layers
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        hf_gt.make_model_registry(config.model_spec),
+        target_cls=hf_gt.TpuGraphTrainerHFConfig,
+    )
+    # Shallow-copy isolation: mutating graph_config.model_spec.model must not
+    # alias back onto the caller's `config.model_spec.model`.
+    self.assertIsNot(graph_config.model_spec.model, config.model_spec.model)
+    graph_config.model_spec.model.n_layers = 99
+    self.assertEqual(config.model_spec.model.n_layers, orig_n_layers)
+
+    self.assertTrue(graph_config.esmc_fused_qk_norm_rope)
+    self.assertEqual(graph_config.metrics.log_freq, 25)
+    self.assertIs(
+        graph_config.model_spec.parallelize_fn,
+        hf_gt.parallelize_hf_transformers_graph,
+    )
+
+    self.assertEqual(
+        _infer_layer_topology(
+            SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=36))
+        ),
+        (36, frozenset()),
+    )
+    with self.assertRaisesRegex(ValueError, "Cannot infer layer count"):
+      _infer_layer_topology(SimpleNamespace(n_layers=0))
+
+    config.tpu_config.graph_trainer_memory_policy = "tpu_selective"
+    config.tpu_config.graph_trainer_save_regions = ("attention.inner_attention",)
+    config.tpu_config.enable_graph_trainer_remat_schedule = True
+    config.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+    config.model_spec.model.n_layers = 36
+    sel_graph_config = to_tpu_graph_trainer_config(
+        config,
+        hf_gt.make_model_registry(config.model_spec),
+        target_cls=hf_gt.TpuGraphTrainerHFConfig,
+    )
+    passes = construct_tpu_pass_pipeline(
+        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+        sel_graph_config,
+    )
+    pass_names = {
+        getattr(graph_pass, "func", graph_pass).__name__ for graph_pass in passes
+    }
+    self.assertIn("apply_tpu_remat_schedule", pass_names)
+    self.assertIn("apply_tpu_fsdp_rs_deadline_schedule", pass_names)
 
 
 if __name__ == "__main__":

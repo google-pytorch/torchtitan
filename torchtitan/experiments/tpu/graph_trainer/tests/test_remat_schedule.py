@@ -560,6 +560,23 @@ class TestScanRecomputePolicy(unittest.TestCase):
 
         self.assertEqual(node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
+    def test_parameter_layer_id_accepts_hf_wrapped_fqns(self) -> None:
+        from torchtitan.experiments.graph_trainer.common_utils import _NOT_IN_LAYERS
+        from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+            _parameter_layer_id,
+        )
+
+        self.assertEqual(_parameter_layer_id(("layers.5.wq.weight",)), 5)
+        self.assertEqual(
+            _parameter_layer_id(("model.esmc.layers.3.attn.weight",)), 3
+        )
+        self.assertEqual(
+            _parameter_layer_id(("model.encoder.layer.7.query.weight",)), 7
+        )
+        self.assertEqual(
+            _parameter_layer_id(("model.sequence_head.weight",)), _NOT_IN_LAYERS
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

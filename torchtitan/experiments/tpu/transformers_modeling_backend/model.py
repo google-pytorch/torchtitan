@@ -33,6 +33,7 @@ import contextlib
 import copy
 import functools
 import json
+import math
 from dataclasses import dataclass
 
 import torch
@@ -141,6 +142,10 @@ class TPUHFTransformerModel(HFTransformerModel):
 
       self._titan_injected_model_args["splash_kernel_kwargs"] = extract_splash_kwargs(
           getattr(config, "splash_attention_kernel", None)
+      )
+      # Opt-in fused ESM-C attention prologue (_EsmcTPUAttention reads it).
+      self._titan_injected_model_args["tpu_fused_qk_norm_rope"] = bool(
+          getattr(config, "esmc_fused_qk_norm_rope", False)
       )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
@@ -998,6 +1003,132 @@ class _EsmcTPUAttention(nn.Module):
   def _derive(cls, hf_cls: type) -> type:
     return type(f"TPU{hf_cls.__name__}", (cls, hf_cls), {})
 
+  def _fused_prologue_unsupported_reason(
+      self,
+      xq: torch.Tensor,
+      xk: torch.Tensor,
+      xv: torch.Tensor,
+      position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+  ) -> str | None:
+    """Returns why the fused Pallas prologue cannot handle this call, or None."""
+    from torchtitan.experiments.tpu.kernels import qk_norm_rope  # pylint: disable=g-import-not-at-top
+
+    heads = self.config.num_attention_heads
+    expected_width = heads * self.head_dim
+    if self.config.num_key_value_heads != heads:
+      return (
+          f"num_key_value_heads={self.config.num_key_value_heads} !="
+          f" heads={heads}"
+      )
+    for name, norm in (("q_norm", self.q_norm), ("k_norm", self.k_norm)):
+      if not isinstance(norm, nn.LayerNorm):
+        return f"{name} is {type(norm).__name__}, expected nn.LayerNorm"
+      if tuple(norm.normalized_shape) != (expected_width,):
+        return (
+            f"{name}.normalized_shape={tuple(norm.normalized_shape)} !="
+            f" ({expected_width},)"
+        )
+      if norm.bias is not None or norm.weight is None:
+        return f"{name} must have weight and no bias"
+    if self.q_norm.eps != self.k_norm.eps:
+      return f"q_norm.eps ({self.q_norm.eps}) != k_norm.eps ({self.k_norm.eps})"
+    if tuple(xk.shape) != tuple(xq.shape) or tuple(xv.shape) != tuple(xq.shape):
+      return "q/k/v projections do not have matching shapes"
+    if not (xq.dtype == xk.dtype == xv.dtype):
+      return f"q/k/v projection dtypes differ: {xq.dtype}, {xk.dtype}, {xv.dtype}"
+    if position_embeddings is None:
+      return "position_embeddings is None"
+    cos, sin = position_embeddings
+    return qk_norm_rope.supported(
+        xq, heads, self.head_dim, cos=cos, sin=sin
+    )
+
+  def _fused_prologue(
+      self,
+      xq: torch.Tensor,
+      xk: torch.Tensor,
+      xv: torch.Tensor,
+      position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float | None] | None:
+    """`(q, k, v, scaling)` heads-first from the fused Pallas prologue, or None.
+
+    Opt-in (`--esmc_fused_qk_norm_rope`, carried on the model config as
+    `tpu_fused_qk_norm_rope`): QK-LayerNorm + split into heads + RoPE +
+    heads-first in one kernel each way (`kernels/qk_norm_rope.py`), eliminating
+    separate norm/RoPE passes and `[B, S, H*D] <-> [B, H, S, D]` relayout copies.
+    Falls back (and reports once outside tracing) for unsupported geometries.
+
+    A power-of-two softmax scale (`64 ** -0.5 = 0.125`) is folded into `q`
+    (exact in bf16) and the returned `scaling` is `1.0`, eliminating the
+    attention kernel's separate `q * scale` and `dq * scale` passes.
+    """
+    if (
+        not getattr(self.config, "tpu_fused_qk_norm_rope", False)
+        or xq.device.type != "tpu"
+    ):
+      return None
+    reason = self._fused_prologue_unsupported_reason(
+        xq, xk, xv, position_embeddings
+    )
+    if reason is not None:
+      if not _attention._tracing():  # pylint: disable=protected-access
+        key = f"esmc_fused_qk_norm_rope fallback: {reason}"
+        if key not in _attention._reported:  # pylint: disable=protected-access
+          _attention._reported.add(key)  # pylint: disable=protected-access
+          logger.warning(
+              "esmc_fused_qk_norm_rope: falling back to XLA prologue (%s)",
+              reason,
+          )
+      return None
+
+    from torchtitan.experiments.tpu.kernels import qk_norm_rope  # pylint: disable=g-import-not-at-top
+
+    assert position_embeddings is not None
+    cos, sin = position_embeddings
+    scaling = self.scaling
+    q_scale = 1.0
+    if scaling is not None and math.frexp(scaling)[0] == 0.5:
+      q_scale, scaling = scaling, 1.0
+    query, key, value = qk_norm_rope.fused_qk_norm_rope(
+        xq,
+        xk,
+        xv,
+        self.q_norm.weight,
+        self.k_norm.weight,
+        cos.to(xq.dtype),
+        sin.to(xq.dtype),
+        heads=self.config.num_attention_heads,
+        eps=self.q_norm.eps,
+        q_scale=q_scale,
+    )
+    return query, key, value, scaling
+
+  def _xla_prologue(
+      self,
+      xq: torch.Tensor,
+      xk: torch.Tensor,
+      xv: torch.Tensor,
+      position_embeddings: tuple[torch.Tensor, torch.Tensor],
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Portable contiguous-transpose + MXU `rotate_half` prologue."""
+    hidden_shape = (*xq.shape[:-1], -1, self.head_dim)
+
+    def heads_first(x: torch.Tensor) -> torch.Tensor:
+      return _attention.ContiguousTranspose12.apply(x.view(hidden_shape))
+
+    target_dtype = xv.dtype
+    query = heads_first(self.q_norm(xq).to(target_dtype))
+    key = heads_first(self.k_norm(xk).to(target_dtype))
+    value = heads_first(xv)
+
+    cos, sin = position_embeddings
+    cos = cos.unsqueeze(1).to(target_dtype)
+    sin = sin.unsqueeze(1).to(target_dtype)
+    rotation = self.rotate_half.to(target_dtype)
+    query = query * cos + (query @ rotation) * sin
+    key = key * cos + (key @ rotation) * sin
+    return query, key, value
+
   def forward(
       self,
       hidden_states: torch.Tensor,
@@ -1005,22 +1136,6 @@ class _EsmcTPUAttention(nn.Module):
       position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
       **kwargs,
   ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    input_shape = hidden_states.shape[:-1]
-    hidden_shape = (*input_shape, -1, self.head_dim)
-
-    def heads_first(x: torch.Tensor) -> torch.Tensor:
-      return _attention.ContiguousTranspose12.apply(x.view(hidden_shape))
-
-    query = heads_first(self.q_norm(self.q_proj(hidden_states)).to(hidden_states.dtype))
-    key = heads_first(self.k_norm(self.k_proj(hidden_states)).to(hidden_states.dtype))
-    value = heads_first(self.v_proj(hidden_states))
-
-    cos, sin = position_embeddings
-    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
-    rotation = self.rotate_half.to(query.dtype)
-    query = query * cos + (query @ rotation) * sin
-    key = key * cos + (key @ rotation) * sin
-
     attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, None  # pylint: disable=protected-access
     )
@@ -1028,6 +1143,20 @@ class _EsmcTPUAttention(nn.Module):
       return super().forward(
           hidden_states, attention_mask, position_embeddings, **kwargs
       )
+
+    input_shape = hidden_states.shape[:-1]
+    xq = self.q_proj(hidden_states)
+    xk = self.k_proj(hidden_states)
+    xv = self.v_proj(hidden_states)
+
+    scaling = self.scaling
+    fused = self._fused_prologue(xq, xk, xv, position_embeddings)
+    if fused is not None:
+      query, key, value, scaling = fused
+    else:
+      assert position_embeddings is not None
+      query, key, value = self._xla_prologue(xq, xk, xv, position_embeddings)
+
     attn_output, attn_weights = attention_interface(
         self,
         query,
@@ -1035,7 +1164,7 @@ class _EsmcTPUAttention(nn.Module):
         value,
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
+        scaling=scaling,
         **kwargs,
     )
     return self.o_proj(attn_output.reshape(*input_shape, -1)), attn_weights

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Callable
+import copy
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal
 
@@ -284,12 +285,22 @@ def to_graph_trainer_config(
     # (e.g. GraphTrainerQwen3Model.Config) while preserving all field values
     # (including moe_comm_backend etc.).
     graph_model_cls = type(graph_spec.model)
-    graph_model = graph_model_cls(
-        **{
-            f.name: getattr(base_config.model_spec.model, f.name)
-            for f in fields(base_config.model_spec.model)
-        }
-    )
+    if graph_model_cls is type(base_config.model_spec.model):
+        # Nothing to re-wrap. Configs with a custom __init__ (e.g. the HF
+        # transformers backend's PretrainedConfig-based Config) cannot be
+        # rebuilt field by field; shallow-copy so mutations to the GraphTrainer
+        # config never alias back onto the caller's base_config.
+        graph_model = copy.copy(base_config.model_spec.model)
+        injected = getattr(graph_model, "_titan_injected_model_args", None)
+        if injected is not None:
+            graph_model._titan_injected_model_args = dict(injected)
+    else:
+        graph_model = graph_model_cls(
+            **{
+                f.name: getattr(base_config.model_spec.model, f.name)
+                for f in fields(base_config.model_spec.model)
+            }
+        )
     d["model_spec"] = replace(
         base_config.model_spec,
         parallelize_fn=graph_spec.parallelize_fn,

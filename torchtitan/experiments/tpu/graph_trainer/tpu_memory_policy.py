@@ -156,13 +156,14 @@ def select_routing(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 # save them in every layer.
 ROUTING_REGION = SaveRegion(name=MOE_ROUTING, select=select_routing)
 
-# The forward ops of both TPU Splash kernels. Stock Splash
+# The forward ops of the TPU Splash kernels. Stock Splash
 # (``kernels/splash_attention.py``) registers one op per kernel configuration,
 # ``pallas::splash_attn_fwd_<16 hex digits>``; Tokamax Splash
 # (``kernels/tokamax_splash_attention.py``) registers
-# ``pallas::tokamax_splash_attn_fwd``.
+# ``pallas::tokamax_splash_attn_fwd``; sbd Splash
+# (``kernels/splash_bias_dropout.py``) registers ``pallas::sbd_splash_attn_fwd``.
 _SPLASH_FORWARD_OP_NAME = re.compile(
-    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd)"
+    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd|sbd_splash_attn_fwd)"
 )
 
 
@@ -180,9 +181,9 @@ def _is_splash_forward_op(target: object) -> bool:
 def _is_splash_output(value: object) -> bool:
     """Whether ``value`` is a (4-D BF16 output, 3-D FP32 LSE) pair.
 
-    The LSE is (batch, heads, seq) for both kernels. Stock Splash returns the
-    output in kernel layout (batch, heads, seq, head_dim); Tokamax returns it
-    in model layout (batch, seq, heads, head_dim).
+    The LSE is (batch, heads, seq) for all kernels. Stock/sbd Splash returns
+    the output in kernel layout (batch, heads, seq, head_dim) when heads_first;
+    Tokamax returns it in model layout (batch, seq, heads, head_dim).
     """
     if not (isinstance(value, (tuple, list)) and len(value) == 2):
         return False

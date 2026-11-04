@@ -516,6 +516,39 @@ def tpu_backend_compile_partitioned_pass(
     return gm
 
 
+def _infer_layer_topology(
+    model_config: Any,
+) -> tuple[int, frozenset[int]]:
+    """Infers `(n_layers, moe_layer_ids)` from either a native or HF model config."""
+    if hasattr(model_config, "layers") and model_config.layers is not None:
+        n_layers = len(model_config.layers)
+        # TransformerBlock.Config exposes ``moe`` independently of the concrete
+        # expert implementation, including TPU-converted GroupedExperts.
+        moe_layer_ids = frozenset(
+            index
+            for index, layer in enumerate(model_config.layers)
+            if getattr(layer, "moe", None) is not None
+        )
+        return n_layers, moe_layer_ids
+
+    hf_cfg = getattr(model_config, "hf_config", None)
+    for candidate in (
+        getattr(model_config, "n_layers", None),
+        getattr(hf_cfg, "num_hidden_layers", None),
+        getattr(hf_cfg, "n_layers", None),
+    ):
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and candidate > 0
+        ):
+            return candidate, frozenset()
+
+    raise ValueError(
+        f"Cannot infer layer count from {type(model_config).__name__}"
+    )
+
+
 def construct_tpu_transform_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
@@ -598,15 +631,7 @@ def construct_tpu_transform_passes(
     passes.append(apply_combine_barrier_pass)
 
     if fsdp_schedule != "none":
-        model_config = config.model_spec.model
-        n_layers = len(model_config.layers)
-        # TransformerBlock.Config exposes ``moe`` independently of the concrete
-        # expert implementation, including TPU-converted GroupedExperts.
-        moe_layer_ids = frozenset(
-            index
-            for index, layer in enumerate(model_config.layers)
-            if layer.moe is not None
-        )
+        n_layers, moe_layer_ids = _infer_layer_topology(config.model_spec.model)
         passes.append(
             functools.partial(
                 schedule_fsdp_comms_to_dense_regions_pass,

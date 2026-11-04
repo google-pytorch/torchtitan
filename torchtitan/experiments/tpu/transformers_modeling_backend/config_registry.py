@@ -348,11 +348,15 @@ def hf_esmc_mlm_uniref50() -> TPUTransformersBackendConfig:
       decay_type="cosine",
       min_lr_factor=0.1,
   )
-  # One 2048 kv block per 2048 q block (head_dim 64): no online-softmax rescale
-  # in the forward and no unreduced dq partial in the backward (+3.1% over 1024
-  # blocks on 6B). ``kv_dkv_compute=2048`` runs out of VMEM.
+  # One 2048 kv block per 2048 q block (head_dim 64): each q row sees every key
+  # in one grid step, so the online-softmax running max/sum/output stay in VMEM
+  # instead of being carried across kv grid steps, and the backward writes no
+  # partial dq per kv block (+3.1% over 1024 blocks on 6B). The softmax is still
+  # exact; compute sub-blocks only change the fp32 accumulation order. A 512-wide
+  # forward kv compute sub-block adds +2% on 600M (tpu7x, 16 x 2048
+  # tokens/rank); ``kv_dkv_compute=2048`` runs out of VMEM.
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
-      sa_block_q=2048, sa_block_kv=2048, sa_block_kv_compute=1024,
+      sa_block_q=2048, sa_block_kv=2048, sa_block_kv_compute=512,
       sa_block_q_dkv=2048, sa_block_kv_dkv=2048, sa_block_kv_dkv_compute=1024,
       sa_use_base2_exp=True, sa_use_experimental_scheduler=True,
   )
@@ -360,6 +364,57 @@ def hf_esmc_mlm_uniref50() -> TPUTransformersBackendConfig:
   # reduce-scatter (20% -> 2% of the step on 6B).
   cfg.training.max_context_length = 2048
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 8 * 2048
+  # Amortize host scalar readbacks across 10 steps instead of _tpu_hf_config's
+  # CI default of 1.
+  cfg.metrics.log_freq = 10
+  return cfg
+
+
+def hf_esmc_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
+  """``hf_esmc_mlm_uniref50`` on the TPU GraphTrainer + fused Pallas QK-LN/RoPE.
+
+  Same model, data, loss, optimizer and SimpleFSDP as ``hf_esmc_mlm_uniref50``,
+  with two TPU step optimizations enabled:
+  1. Joint forward + loss + backward compilation (``TpuGraphTrainer`` with
+     ``aot_fx_trace``) so saved activations stay inside one XLA program and are
+     not relaid out at per-layer forward/backward boundaries, plus standalone
+     compiled grad-norm and AdamW programs.
+  2. Fused Pallas QK-LayerNorm + RoPE + heads-first prologue/epilogue
+     (``esmc_fused_qk_norm_rope``, folding ``1/sqrt(64)`` into ``q``).
+
+  Measured on ``tpu7x-16`` (ESMC-600M, per TensorCore, no remat): 16 x 2048
+  tokens/rank reaches ~72.4k tok/s (28.0% MFU, 65.4 GiB HBM). When
+  rematerialization is needed (e.g. 64 x 2048 in one microbatch or ESMC-6B),
+  pass ``--tpu_config.graph_trainer_memory_policy=tpu_selective``,
+  ``--tpu_config.graph_trainer_save_regions attention.inner_attention``,
+  ``--tpu_config.enable_graph_trainer_remat_schedule`` and
+  ``--tpu_config.graph_trainer_fsdp_schedule=interleave``.
+  """
+  cfg = hf_esmc_mlm_uniref50()
+  cfg.tpu_config.use_graph_trainer = True
+  cfg.tpu_config.compile_mode = "aot_fx_trace"
+  cfg.tpu_config.compile_grad_norm = True
+  cfg.tpu_config.compile_optimizer = True
+  cfg.esmc_fused_qk_norm_rope = True
+  cfg.metrics.log_freq = 25
+  return cfg
+
+
+def hf_esmc600m_mlm_uniref50_tpu7x16() -> TPUTransformersBackendConfig:
+  """ESMC-600M at the paper's 4.19M-token step on an 8-chip ``tpu7x-16`` slice.
+
+  ``hf_esmc_mlm_uniref50_graph`` (no rematerialization) with the microbatch set
+  to 16 x 2048 tokens per rank (65.4 GiB HBM; the largest power-of-two divisor
+  of 64 x 2048 that fits 96 GiB without remat): 16 ranks x 8 microbatches x
+  32,768 tokens = 4,194,304 tokens per optimizer step (69,500 tok/s/TC, 27.0%
+  MFU, 3.77s/step, vs 53,318 tok/s/TC / 20.7% MFU on per-layer compile with AC).
+  See recipes/ironwood/esmc/tpu7x-2x2x2/.
+  """
+  cfg = hf_esmc_mlm_uniref50_graph()
+  cfg.hf_model = "biohub/ESMC-600M"
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 2048
+  cfg.training.num_tokens_per_train_step = 32 * 64 * 2048
+  cfg.metrics.log_freq = 10
   return cfg
 
 
@@ -416,4 +471,10 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
     model_config.fused_loss = False
     config.loss = CrossEntropyLoss.Config()
   config.compile.enable = False
+  config.tpu_config.use_graph_trainer = False
+  config.tpu_config.compile_mode = "none"
+  config.tpu_config.compile_grad_norm = False
+  config.tpu_config.compile_optimizer = False
+  config.tpu_config.optimizer_in_graph = False
+  config.esmc_fused_qk_norm_rope = False
   return config

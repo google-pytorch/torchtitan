@@ -28,3 +28,8 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   # backend's ``update_from_config`` through the same ``getattr(config, ...)``
   # path as ``hf_model``.
   hf_config_overrides: str = ""
+  # ESM-C only: run QK-LayerNorm + head split + RoPE + heads-first as one
+  # fused Pallas kernel each way (kernels/qk_norm_rope.py) instead of XLA's
+  # norm / relayout-copy / RoPE passes. Read by the model config's
+  # ``update_from_config`` and carried as ``tpu_fused_qk_norm_rope``.
+  esmc_fused_qk_norm_rope: bool = False

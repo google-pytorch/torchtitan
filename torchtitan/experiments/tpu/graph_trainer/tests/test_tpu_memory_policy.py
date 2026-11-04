@@ -86,14 +86,16 @@ def _register_splash_like_op(name: str, model_layout: bool):
     """Register ``pallas::<name>``: (q, k, v) -> (output, LSE), like Splash.
 
     Like the real kernels, backward is a separate op that reads the saved
-    output and LSE. The LSE is (batch, heads, seq); the output keeps the
-    input layout, which is (batch, heads, seq, dim) for stock Splash and
+    output and LSE. The LSE is always (batch, heads, seq); the output keeps the
+    input layout, which is (batch, heads, seq, dim) for stock/sbd Splash and
     (batch, seq, heads, dim) for Tokamax.
     """
 
     def lse_of(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         lse = (q.float() * k.float()).sum(-1)
-        return lse.transpose(1, 2).contiguous() if model_layout else lse
+        if model_layout:
+            lse = lse.transpose(1, 2).contiguous()
+        return lse
 
     @torch.library.custom_op(f"pallas::{name}", mutates_args=())
     def forward(
@@ -140,6 +142,9 @@ _STOCK_STYLE_SPLASH = _register_splash_like_op(
 # Same stock-style name pattern; returns Tokamax's model layout.
 _MODEL_LAYOUT_SPLASH = _register_splash_like_op(
     "splash_attn_fwd_fedcba9876543210", model_layout=True
+)
+_SBD_SPLASH = _register_splash_like_op(
+    "sbd_splash_attn_fwd", model_layout=False
 )
 
 
@@ -675,7 +680,7 @@ def _is_splash_node(node: torch.fx.Node) -> bool:
 
 
 class TestSplashAttentionRegion(unittest.TestCase):
-    def test_matches_stock_and_tokamax_forward_ops_only(self) -> None:
+    def test_matches_stock_tokamax_and_sbd_forward_ops_only(self) -> None:
         self.assertEqual(
             torch.ops.pallas.splash_attn_fwd_0123456789abcdef.default.name(),
             "pallas::splash_attn_fwd_0123456789abcdef",
@@ -683,13 +688,27 @@ class TestSplashAttentionRegion(unittest.TestCase):
         for name, expected in (
             ("pallas::splash_attn_fwd_0123456789abcdef", True),
             ("pallas::tokamax_splash_attn_fwd", True),
+            ("pallas::sbd_splash_attn_fwd", True),
             ("pallas::splash_attn_bwd_0123456789abcdef", False),
             ("pallas::tokamax_splash_attn_bwd", False),
+            ("pallas::sbd_splash_attn_bwd", False),
             ("pallas::splash_attn_fwd_0123", False),
             ("other::tokamax_splash_attn_fwd", False),
         ):
             with self.subTest(name=name):
                 self.assertEqual(is_splash_forward_op_name(name), expected)
+
+    def test_selects_sbd_splash(self) -> None:
+        torch.manual_seed(0)
+        cores = (_SplashCore(_SBD_SPLASH, model_layout=False),)
+        traced, _ = _trace_toy(_MoEToy(cores))
+
+        splash = select_splash_attention(traced.gm)
+
+        self.assertEqual([_get_layer_id(node) for node in splash], [0])
+        self.assertEqual(splash[0].target.name(), "pallas::sbd_splash_attn_fwd")
+        _, lse = splash[0].meta["val"]
+        self.assertEqual(tuple(lse.shape), (1, _HEADS, _TOKENS))
 
     def test_selects_both_layouts_once_per_layer(self) -> None:
         torch.manual_seed(0)

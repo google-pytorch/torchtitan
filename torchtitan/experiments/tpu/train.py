@@ -212,6 +212,130 @@ def _fit_rope_to_context(model_config: Any, max_context_length: int) -> None:
       setattr(parent, attr, new_rope)
 
 
+def _resolve_graph_trainer_target(model_spec: Any) -> tuple[Any, type]:
+  """Returns `(model_registry, target_config_cls)` for `TpuGraphTrainer`."""
+  from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
+
+  model_name = model_spec.name
+  if model_name == "qwen3":
+    from torchtitan.experiments.tpu.graph_trainer.qwen3 import model_registry as gt_registry
+
+    return gt_registry, TpuGraphTrainer.Config
+  if model_name == "llama3":
+    from torchtitan.experiments.graph_trainer.llama3 import model_registry as gt_registry
+
+    return gt_registry, TpuGraphTrainer.Config
+  if model_name == "deepseek_v3":
+    from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry as gt_registry
+
+    return gt_registry, TpuGraphTrainer.Config
+  if model_name == "muse_glimmer":
+    from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import model_registry as gt_registry
+
+    return gt_registry, TpuGraphTrainer.Config
+  if model_name == "transformers_modeling_backend":
+    from torchtitan.experiments.tpu.graph_trainer.hf_transformers import (
+        TpuGraphTrainerHFConfig,
+        make_model_registry,
+    )
+
+    return make_model_registry(model_spec), TpuGraphTrainerHFConfig
+  raise ValueError(
+      f"Model {model_name} is not currently supported with GraphTrainer."
+  )
+
+
+def _build_tpu_graph_trainer_factory(
+    train_config: tpu_job_config_module.TPUTrainerConfig,
+):
+  """Builds the `trainer_cls(cfg) -> TpuGraphTrainer` factory for `start_trainer`."""
+  if (
+      train_config.tpu_config.use_graph_trainer
+      and train_config.tpu_config.compile_mode
+      not in ("aot_fx_trace", "fullgraph")
+  ):
+    logger.warning(
+        "TpuGraphTrainer enabled without fullgraph compile mode"
+        f" (current mode: {train_config.tpu_config.compile_mode}). This may"
+        " lead to severe HBM fragmentation and stack reservation OOMs."
+    )
+  from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+      TpuGraphTrainer,
+      TpuGraphTrainerConfig,
+  )
+
+  assert train_config.model_spec is not None
+  gt_registry, gt_target_cls = _resolve_graph_trainer_target(
+      train_config.model_spec
+  )
+  gt_cfg = to_tpu_graph_trainer_config(
+      train_config, gt_registry, target_cls=gt_target_cls
+  )
+  if gt_cfg.model_spec is not None:
+    _fit_rope_to_context(
+        gt_cfg.model_spec.model, gt_cfg.training.max_context_length
+    )
+    if train_config.tpu_config.bld_block_layout:
+      # The graph trainer's parallelize_fn binds instance-level forward
+      # wrappers (`annotate_module_fqns`, `apply_spmd_safe`), after which a
+      # class swap no longer takes effect; the post-init
+      # `workarounds.apply_patches` call is too late. See bld_layout.py.
+      gt_parallelize = gt_cfg.model_spec.parallelize_fn
+
+      def _bld_then_parallelize(model, *args, **kwargs):
+        from torchtitan.experiments.tpu.bld_layout import apply_bld_layout, bld_skip_reason
+
+        apply_bld_layout(
+            model,
+            skip_reason=bld_skip_reason(train_config.parallelism),
+        )
+        return gt_parallelize(model, *args, **kwargs)
+
+      gt_cfg.model_spec.parallelize_fn = _bld_then_parallelize
+
+  splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
+  moe_obj = cast(Any, getattr(train_config, "moe", None))
+  tpu_extra = TpuGraphTrainerConfig(
+      device="tpu",
+      attention_backend=getattr(
+          splash_obj,
+          "sa_attention_backend",
+          "splash"
+          if getattr(splash_obj, "use_splash_attention_kernel", False)
+          else "sdpa-no-scale",
+      )
+      if splash_obj is not None
+      else "sdpa-no-scale",
+      moe_enabled=getattr(moe_obj, "enabled", False)
+      if moe_obj is not None
+      else False,
+      moe_padded_dispatcher=getattr(moe_obj, "padded_dispatcher", False)
+      if moe_obj is not None
+      else False,
+      moe_capacity_factor=getattr(moe_obj, "capacity_factor", 1.25)
+      if moe_obj is not None
+      else 1.25,
+      ep_degree=getattr(
+          train_config.parallelism,
+          "expert_parallel_degree",
+          getattr(train_config.parallelism, "ep", 1),
+      ),
+      optimizer_in_graph=train_config.tpu_config.optimizer_in_graph,
+      optimizer_compile=train_config.tpu_config.compile_optimizer,
+      compile_mode=train_config.tpu_config.compile_mode,
+      enable_mfu_benchmark=train_config.tpu_config.enable_mfu_benchmark,
+      mfu_benchmark_start_step=train_config.tpu_config.mfu_benchmark_start_step,
+      mfu_benchmark_final_step=train_config.training.steps,
+      job_config=train_config,
+  )
+
+  def _trainer_factory(cfg):
+    del cfg
+    return TpuGraphTrainer(gt_cfg, tpu_extra=tpu_extra)
+
+  return _trainer_factory
+
+
 def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the training process."""
   rank = int(os.getenv("RANK", "0"))
@@ -259,101 +383,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   # severe HBM fragmentation and stack reservation collisions (e.g. 78.46G memory
   # reservation bottlenecks across multiple disjoint overlay modules).
   elif use_graph_trainer:
-    if (
-        train_config.tpu_config.use_graph_trainer
-        and train_config.tpu_config.compile_mode
-        not in ("aot_fx_trace", "fullgraph")
-    ):
-      logger.warning(
-          "TpuGraphTrainer enabled without fullgraph compile mode"
-          f" (current mode: {train_config.tpu_config.compile_mode}). This may"
-          " lead to severe HBM fragmentation and stack reservation OOMs."
-      )
-    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
-      TpuGraphTrainer,
-      TpuGraphTrainerConfig,
-    )
-
-    if model_name == "qwen3":
-      from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
-          model_registry as gt_registry,
-      )
-    elif model_name == "llama3":
-      from torchtitan.experiments.graph_trainer.llama3 import model_registry as gt_registry
-    elif model_name == "deepseek_v3":
-      from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry as gt_registry
-    elif model_name == "muse_glimmer":
-      from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import (
-          model_registry as gt_registry,
-      )
-    else:
-      raise ValueError(
-          f"Model {model_name} is not currently supported with GraphTrainer."
-      )
-
-    gt_cfg = to_tpu_graph_trainer_config(
-        train_config, gt_registry, target_cls=TpuGraphTrainer.Config
-    )
-    if gt_cfg.model_spec is not None:
-      _fit_rope_to_context(
-          gt_cfg.model_spec.model, gt_cfg.training.max_context_length
-      )
-      if train_config.tpu_config.bld_block_layout:
-        # The graph trainer's parallelize_fn binds instance-level forward
-        # wrappers (`annotate_module_fqns`, `apply_spmd_safe`), after which a
-        # class swap no longer takes effect; the post-init
-        # `workarounds.apply_patches` call is too late. See bld_layout.py.
-        gt_parallelize = gt_cfg.model_spec.parallelize_fn
-
-        def _bld_then_parallelize(model, *args, **kwargs):
-          from torchtitan.experiments.tpu.bld_layout import apply_bld_layout, bld_skip_reason
-
-          apply_bld_layout(
-              model,
-              skip_reason=bld_skip_reason(train_config.parallelism),
-          )
-          return gt_parallelize(model, *args, **kwargs)
-
-        gt_cfg.model_spec.parallelize_fn = _bld_then_parallelize
-
-    splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
-    moe_obj = cast(Any, getattr(train_config, "moe", None))
-    tpu_extra = TpuGraphTrainerConfig(
-        device="tpu",
-        attention_backend=getattr(
-            splash_obj,
-            "sa_attention_backend",
-            "splash"
-            if getattr(splash_obj, "use_splash_attention_kernel", False)
-            else "sdpa-no-scale",
-        )
-        if splash_obj is not None
-        else "sdpa-no-scale",
-        moe_enabled=getattr(moe_obj, "enabled", False)
-        if moe_obj is not None
-        else False,
-        moe_padded_dispatcher=getattr(moe_obj, "padded_dispatcher", False)
-        if moe_obj is not None
-        else False,
-        moe_capacity_factor=getattr(moe_obj, "capacity_factor", 1.25)
-        if moe_obj is not None
-        else 1.25,
-        ep_degree=getattr(
-            train_config.parallelism,
-            "expert_parallel_degree",
-            getattr(train_config.parallelism, "ep", 1),
-        ),
-        optimizer_in_graph=train_config.tpu_config.optimizer_in_graph,
-        optimizer_compile=train_config.tpu_config.compile_optimizer,
-        compile_mode=train_config.tpu_config.compile_mode,
-        enable_mfu_benchmark=train_config.tpu_config.enable_mfu_benchmark,
-        mfu_benchmark_start_step=train_config.tpu_config.mfu_benchmark_start_step,
-        mfu_benchmark_final_step=train_config.training.steps,
-        job_config=train_config,
-    )
-
-    def trainer_cls(cfg):
-      return TpuGraphTrainer(gt_cfg, tpu_extra=tpu_extra)
+    trainer_cls = _build_tpu_graph_trainer_factory(train_config)
   else:
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
       if train_config.tpu_config.compile_mode == "fullgraph":

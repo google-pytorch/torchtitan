@@ -20,11 +20,12 @@ axis as one stream. This module provides the TPU replacements:
    do. The document boundaries are static-shape ``[B, S]`` segment-id masks.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
 
+from torchtitan.config.override import override
 from torchtitan.experiments.tpu import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
@@ -520,11 +521,24 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   recurrence at every packed document. Upstream instead passes ``cu_seqlens``
   document offsets, which ``Qwen35Model`` only builds for the flex and varlen
   attention backends and whose shape changes with the number of documents.
+
+  ``Config.reset_at_documents=False`` drops ``positions`` instead, so the
+  convolution and the recurrence run over each ``[B, S]`` row as one stream,
+  as upstream does without ``cu_seqlens`` (e.g. with SDPA). Pretraining
+  recipes use it: the Tokamax kernels lay every document out from a 64-token
+  chunk boundary to restart at it, which costs time and memory.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(GatedDeltaNet.Config):
-    pass
+    # Restart the causal convolution and the recurrence at every packed
+    # document (`positions == 0`). RL needs this when packing multiple rollouts
+    # into one `[B, S]` row; pretraining on packed text may turn it off.
+    reset_at_documents: bool = True
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+    self.reset_at_documents = config.reset_at_documents
 
   def forward(
       self,
@@ -566,9 +580,20 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         key_head_dim=self.key_head_dim,
         value_head_dim=self.value_head_dim,
         # TPU: pass `positions`; packed documents restart conv + recurrence.
-        positions=positions,
+        positions=positions if self.reset_at_documents else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)
+
+
+@override(
+    target=TpuGatedDeltaNet.Config,
+    description="Set whether GatedDeltaNet resets at packed documents.",
+)
+def gated_delta_document_resets(
+    cfg: TpuGatedDeltaNet.Config, *, enabled: bool = True
+) -> TpuGatedDeltaNet.Config:
+  """Sets ``reset_at_documents`` on ``TpuGatedDeltaNet.Config``."""
+  return replace(cfg, reset_at_documents=enabled)

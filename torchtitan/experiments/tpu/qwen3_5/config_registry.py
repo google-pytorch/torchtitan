@@ -594,12 +594,13 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
 
   `qwen35_moe_35b_split_tokamax_benchmark` configured for the 60-layer,
   512-expert, top-10 397B-A17B model on `tpu7x-2x4x4` (32 chips, 64 ranks) and
-  larger slices with the highest-throughput settings enabled by default:
+  larger slices with the highest-throughput settings enabled by default
+  (`1,013 tok/s/rank`, `112.31 TFLOPS/rank`, `9.74% MFU`, `33.77 GiB` HBM):
   - BF16 parameters, optimizer state (8 bytes per parameter, ~46 GiB per rank
     vs ~92.5 GiB in FP32 on 64 ranks), and BF16 gradient reduce-scatter
     (`+8.8%` step time on 397B, matching MLPerf v6.1 397B GRPO).
   - 24,576 tokens per rank (3 sequences of 8192) across 12 sequence chunks
-    (`W=2` barriers bound live dropless chunk buffers to ~33 GiB trainer HBM).
+    (`W=2` barriers bound live dropless chunk buffers to ~33.8 GiB trainer HBM).
   - Ring-of-Experts with weights-on-activation (`roe_weights_on_activation`),
     paired W1+W3 grouped matmuls with K=1024 dWeight tiling (fitting 64 MiB
     VMEM at D=4096, F=1024), and SparseCore collective offload with gather/copy
@@ -616,12 +617,15 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   _enable_pallas_cross_entropy(cfg)
   # At D=4096, F=1024, untiled paired W1+W3 dWeight needs 86 MiB of VMEM for
   # two FP32 (K, N) accumulators plus double-buffered BF16 slabs; tile K at
-  # 1024 (~20 MiB), and tile D at 2048 when W2 is transposed under wide FSDP.
+  # 1024 (~20 MiB), keep W2's shorter K=1024 untiled, and tile D at 2048 when
+  # W2 is transposed. Inherited tile_m=512 matched tile_m=256 within 0.3% on
+  # 397B TPU7x (while tile_m=128 regressed -3%), so keep tile_m=512.
   for _, experts, _, _ in cfg.model_spec.model.traverse(
       TpuGroupedExperts.Config
   ):
     tm = experts.pallas_grouped_mm_tile_m
     experts.pallas_grouped_mm_tgmm_tiling = (tm, 1024, 0)
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (tm, 0, 0)
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (tm, 0, 2048)
   _use_expert_parallel(cfg, ep_degree=8, num_token_chunks=12)
   return cfg

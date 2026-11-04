@@ -1,3 +1,21 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Modifications: Bridged to PyTorch/TorchTPU via @pallas.jax_op and added
+# weighted gather-reduce, collision-free row-scale gather/scatter, and
+# _ragged_scale_and_dscore_tc backward kernels.
+
 """TensorCore DMA-driven ragged gather / gather-reduce kernels for MoE Ring-of-Experts.
 
 Adapted from MaxText's ``kernels/ragged/ragged_gather_tc.py`` and
@@ -15,13 +33,15 @@ submissions) and bridged to PyTorch/TorchTPU via ``@pallas.jax_op``:
 - ``ragged_gather_reduce_tc`` compacts valid slots per output token, optionally
   multiplies each gathered row in VMEM by its FP32 routing weight, and sums in
   FP32 in deterministic buffer order without touching rows ``>= count``.
-- ``_ragged_scale_and_dscore_tc`` runs a dynamic-grid ``(cdiv(count, 1024), d_chunks)``
+- ``_ragged_scale_and_dscore_tc`` runs a dynamic-grid ``(cdiv(count, 1024),
+d_chunks)``
   backward pass that simultaneously scales ``grad_routed_output`` by routing
   weights and computes the FP32 ``dScore`` dot product while bitwise-masking
   any uninitialized tail rows ``>= count``.
 """
 
 import dataclasses
+import functools
 import math
 import re
 
@@ -31,7 +51,6 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
-
 
 _RAGGED_GATHER_TC_NUM_BUFFERS = 2
 
@@ -43,26 +62,22 @@ _RAGGED_GATHER_REDUCE_TC_ALIGN = 128
 _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
 
-_tpu_gen_cache: list[int | None] = []
 
-
+@torch._dynamo.assume_constant_result
+@functools.lru_cache(maxsize=1)
 def _tpu_generation() -> int | None:
   """Returns the TPU generation (e.g., 5, 6, 7), or ``None`` if unavailable."""
-  if _tpu_gen_cache:
-    return _tpu_gen_cache[0]
-  gen: int | None = None
   get_props = getattr(
       getattr(torch, "tpu", None), "get_device_properties", None
   )
-  if get_props is not None:
-    try:
-      name = get_props().name.lower()
-      match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
-      gen = int(match.group(1)) if match else None
-    except RuntimeError:
-      gen = None
-  _tpu_gen_cache.append(gen)
-  return gen
+  if get_props is None:
+    return None
+  try:
+    name = get_props().name.lower()
+  except RuntimeError:
+    return None
+  match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
+  return int(match.group(1)) if match else None
 
 
 def _tpu_vmem_limit_bytes() -> int:
@@ -157,9 +172,9 @@ def packed_stable_sort(
   shift = jnp.uint32(pos_bits)
   packed_key = (key.astype(jnp.uint32) << shift) | positions.astype(jnp.uint32)
   sorted_packed = jax.lax.sort(packed_key, is_stable=False)
-  sorted_positions = (
-      sorted_packed & jnp.uint32((1 << pos_bits) - 1)
-  ).astype(jnp.int32)
+  sorted_positions = (sorted_packed & jnp.uint32((1 << pos_bits) - 1)).astype(
+      jnp.int32
+  )
   return (sorted_packed >> shift).astype(jnp.int32), sorted_positions
 
 
@@ -353,12 +368,10 @@ def ragged_gather_tc(
       _run_step(block_idx, buf_idx, "copy_out_wait")
 
   out_shape = jax.ShapeDtypeStruct((max_out_tokens, dim0, dim1), x.dtype)
-  scalars = jnp.stack(
-      [
-          jnp.asarray(start, dtype=jnp.int32),
-          jnp.asarray(num_tokens, dtype=jnp.int32),
-      ]
-  )
+  scalars = jnp.stack([
+      jnp.asarray(start, dtype=jnp.int32),
+      jnp.asarray(num_tokens, dtype=jnp.int32),
+  ])
   num_steps = pl.cdiv(
       num_tokens if isinstance(num_tokens, int) else scalars[1], block_size
   )
@@ -446,9 +459,7 @@ def ragged_gather_reduce_tc_metadata(
       (0, num_chunks * chunk - num_indices),
       constant_values=int_max,
   ).reshape(num_chunks, chunk)
-  threshold = jnp.arange(max_blocks + 1, dtype=jnp.int32) * (
-      block_size - top_k
-  )
+  threshold = jnp.arange(max_blocks + 1, dtype=jnp.int32) * (block_size - top_k)
   full_chunks = jnp.sum(
       cost_chunks[:, -1] < threshold[:, None], axis=1, dtype=jnp.int32
   )
@@ -852,12 +863,8 @@ def _ragged_scale_and_dscore_tc(
   if not can_use_pallas:
     iota = jnp.arange(cap, dtype=jnp.int32)
     valid = iota < count
-    g_f32 = jnp.where(
-        valid[:, None], g_gathered_RD.astype(jnp.float32), 0.0
-    )
-    y_f32 = jnp.where(
-        valid[:, None], routed_output_RD.astype(jnp.float32), 0.0
-    )
+    g_f32 = jnp.where(valid[:, None], g_gathered_RD.astype(jnp.float32), 0.0)
+    y_f32 = jnp.where(valid[:, None], routed_output_RD.astype(jnp.float32), 0.0)
     w_f32 = jnp.where(valid, w_rows_cap.astype(jnp.float32), 0.0)
     grad_routed = (g_f32 * w_f32[:, None]).astype(routed_output_RD.dtype)
     dw_rows = jnp.sum(g_f32 * y_f32, axis=1)
@@ -1259,6 +1266,73 @@ _roe_unsort_fwd.register_autograd(
 )
 
 
+@pallas.jax_op("tt_moe::roe_row_scale_fwd")
+def _roe_row_scale_fwd(
+    scores_flat_M: jax.Array,
+    window_slot_order_cap: jax.Array,
+    start_count_2: jax.Array,
+) -> jax.Array:
+  cap = window_slot_order_cap.shape[0]
+  m = scores_flat_M.shape[0]
+  if cap == 0 or m == 0:
+    return jnp.zeros((cap,), dtype=jnp.float32)
+  count = start_count_2[1]
+  iota_cap = jnp.arange(cap, dtype=jnp.int32)
+  valid_cap = iota_cap < count
+  slot_R = jnp.clip(window_slot_order_cap, 0, m - 1)
+  return jnp.where(valid_cap, scores_flat_M.astype(jnp.float32)[slot_R], 0.0)
+
+
+@pallas.jax_op("tt_moe::roe_row_scale_bwd")
+def _roe_row_scale_bwd(
+    grad_row_scale_R: jax.Array,
+    window_slot_order_cap: jax.Array,
+    start_count_2: jax.Array,
+    num_slots: int,
+) -> jax.Array:
+  cap = window_slot_order_cap.shape[0]
+  if cap == 0 or num_slots == 0:
+    return jnp.zeros((num_slots,), dtype=jnp.float32)
+  count = start_count_2[1]
+  iota_cap = jnp.arange(cap, dtype=jnp.int32)
+  valid_cap = iota_cap < count
+  dw_valid = jnp.where(valid_cap, grad_row_scale_R.astype(jnp.float32), 0.0)
+  slot_R = jnp.clip(window_slot_order_cap, 0, num_slots - 1)
+  scatter_idx = jnp.where(valid_cap, slot_R, num_slots + iota_cap)
+  grad_padded = (
+      jnp.zeros((num_slots + cap,), dtype=jnp.float32)
+      .at[scatter_idx]
+      .set(dw_valid, unique_indices=True)
+  )
+  return grad_padded[:num_slots]
+
+
+def _roe_row_scale_setup_context(ctx, inputs, output):
+  del output
+  scores_flat_M, window_slot_order_cap, start_count_2 = inputs
+  ctx.save_for_backward(window_slot_order_cap, start_count_2)
+  ctx.num_slots = scores_flat_M.shape[0]
+  ctx.scores_dtype = scores_flat_M.dtype
+
+
+def _roe_row_scale_backward(ctx, grad_row_scale_R):
+  window_slot_order_cap, start_count_2 = ctx.saved_tensors
+  grad_scores = _roe_row_scale_bwd(
+      grad_row_scale_R.contiguous(),
+      window_slot_order_cap,
+      start_count_2,
+      ctx.num_slots,
+  )
+  if grad_scores.dtype != ctx.scores_dtype:
+    grad_scores = grad_scores.to(ctx.scores_dtype)
+  return grad_scores, None, None
+
+
+_roe_row_scale_fwd.register_autograd(
+    _roe_row_scale_backward, setup_context=_roe_row_scale_setup_context
+)
+
+
 # --- Public PyTorch Entrypoints ---
 
 
@@ -1384,7 +1458,9 @@ class _RoEUnsortReduce(torch.autograd.Function):
       gather_block_size: int,
       reduce_block_size: int,
   ) -> torch.Tensor:
-    ctx.save_for_backward(token_ids_sorted_M, start_count_2, src_rows, tokens, blocks)
+    ctx.save_for_backward(
+        token_ids_sorted_M, start_count_2, src_rows, tokens, blocks
+    )
     ctx.cap = routed_output_RD.shape[0]
     ctx.top_k = top_k
     ctx.gather_block_size = gather_block_size
@@ -1402,7 +1478,9 @@ class _RoEUnsortReduce(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_partial_GD: torch.Tensor):
-    token_ids_sorted_M, start_count_2, src_rows, tokens, blocks = ctx.saved_tensors
+    token_ids_sorted_M, start_count_2, src_rows, tokens, blocks = (
+        ctx.saved_tensors
+    )
     grad_routed_RD = _roe_gather_fwd(
         grad_partial_GD.contiguous(),
         token_ids_sorted_M,
@@ -1447,8 +1525,22 @@ def roe_unsort_reduce(
   )
 
 
+def roe_gather_row_scales(
+    scores_flat_M: torch.Tensor,
+    window_slot_order_cap: torch.Tensor,
+    start_count_2: torch.Tensor,
+) -> torch.Tensor:
+  """Gathers ``[cap]`` FP32 routing weights with collision-free backward scatter."""
+  return _roe_row_scale_fwd(
+      scores_flat_M.contiguous(),
+      window_slot_order_cap.contiguous(),
+      start_count_2.contiguous(),
+  )
+
+
 __all__ = [
     "roe_compute_routing",
+    "roe_gather_row_scales",
     "roe_sort_gather",
     "roe_unsort_combine",
     "roe_unsort_reduce",

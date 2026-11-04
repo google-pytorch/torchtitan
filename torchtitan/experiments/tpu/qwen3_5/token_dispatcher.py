@@ -344,7 +344,7 @@ class TpuQwen35DispatchMetadata(_EpDispatchMetadata):
 
 
 @dataclass(frozen=True, kw_only=True)
-class TpuQwen35RoEDispatchMetadata(LocalDispatchMetadata):
+class TpuQwen35RoEDispatchMetadata(_EpDispatchMetadata):
   """Dropless Ring-of-Experts (``all_gather`` + ``reduce_scatter``) metadata."""
 
   use_pallas_tc: bool
@@ -517,6 +517,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
         # pylint: disable=g-import-not-at-top
         from torchtitan.experiments.tpu.kernels.ragged_gather_tc import (
             roe_compute_routing,
+            roe_gather_row_scales,
             roe_sort_gather,
             safe_gather_block_size,
             safe_reduce_block_size,
@@ -583,16 +584,10 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
         empty_f32 = topk_scores_TK.new_empty((0,))
         expert_row_scale_R = None
         if self.roe_weights_on_activation:
-          scores_flat_M = scores_all_GK.reshape(-1).float()
-          valid_R = (
-              torch.arange(cap, device=x_TD.device, dtype=torch.int32)
-              < start_count_2[1]
-          )
-          slot_R = window_slot_order_cap.clamp(0, scores_flat_M.shape[0] - 1)
-          expert_row_scale_R = torch.where(
-              valid_R,
-              torch.index_select(scores_flat_M, 0, slot_R),
-              torch.zeros((), dtype=torch.float32, device=x_TD.device),
+          expert_row_scale_R = roe_gather_row_scales(
+              scores_all_GK.reshape(-1),
+              window_slot_order_cap,
+              start_count_2,
           )
         metadata = TpuQwen35RoEDispatchMetadata(
             token_indices_experts_sorted_N=token_ids_sorted_M,
@@ -965,6 +960,13 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
     num_chunks = self.num_token_chunks
+    num_tokens = x_TD.shape[0]
+    if num_tokens > 0 and num_tokens % num_chunks != 0:
+      num_chunks = next(
+          d
+          for d in range(min(num_chunks, num_tokens), 0, -1)
+          if num_tokens % d == 0
+      )
     ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
     weights_on_activation = (
         ep_mesh is not None
@@ -975,8 +977,7 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
     if (
         (num_chunks <= 1 and not weights_on_activation)
         or ep_mesh is None
-        or x_TD.shape[0] == 0
-        or x_TD.shape[0] % num_chunks != 0
+        or num_tokens == 0
     ):
       return super().forward(
           x_TD,

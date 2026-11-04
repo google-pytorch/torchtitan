@@ -299,6 +299,132 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
                 tgmm_tile_m=128,
             )
 
+    def test_padded_tail_rows_with_nans_are_ignored(self):
+        """Rows past sum(group_sizes) (partial boundary tile + tail tiles) are ignored."""
+        device = self.accelerator_device
+        group_sizes = torch.tensor([0, 91, 45, 0], dtype=torch.int32)
+        valid_m = int(group_sizes.sum().item())  # 136: 1 full tile + 8 rows of tile 1
+        padded_m = 384  # 3 tiles of 128: partial tile 1 + completely inactive tile 2
+        groups, k, n, tile_m = group_sizes.shape[0], 128, 256, 128
+
+        lhs_valid = self._bounded_values((valid_m, k), 17, 0.003, device)
+        rhs1_ref = self._bounded_values(
+            (groups, k, n), 19, 0.002, device
+        ).requires_grad_()
+        rhs3_ref = self._bounded_values(
+            (groups, k, n), 23, 0.0015, device
+        ).requires_grad_()
+        grad1_valid = self._bounded_values((valid_m, n), 29, 0.002, device)
+        grad3_valid = self._bounded_values((valid_m, n), 31, 0.001, device)
+        group_sizes_dev = group_sizes.to(device)
+
+        # Reference on padded buffer using unpaired segment_matmul_pallas_2d.
+        lhs_ref = torch.cat(
+            [
+                lhs_valid,
+                torch.zeros(
+                    (padded_m - valid_m, k), device=device, dtype=torch.bfloat16
+                ),
+            ],
+            dim=0,
+        ).requires_grad_()
+        grad1_ref = torch.cat(
+            [
+                grad1_valid,
+                torch.zeros(
+                    (padded_m - valid_m, n), device=device, dtype=torch.bfloat16
+                ),
+            ],
+            dim=0,
+        )
+        grad3_ref = torch.cat(
+            [
+                grad3_valid,
+                torch.zeros(
+                    (padded_m - valid_m, n), device=device, dtype=torch.bfloat16
+                ),
+            ],
+            dim=0,
+        )
+        out1_ref = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs_ref,
+            rhs1_ref,
+            group_sizes_dev,
+            tile_m=tile_m,
+            tgmm_tiling=(tile_m, 0, 0),
+        )
+        out3_ref = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs_ref,
+            rhs3_ref,
+            group_sizes_dev,
+            tile_m=tile_m,
+            tgmm_tiling=(tile_m, 0, 0),
+        )
+        dlhs_ref, drhs1_ref, drhs3_ref = torch.autograd.grad(
+            (out1_ref, out3_ref),
+            (lhs_ref, rhs1_ref, rhs3_ref),
+            (grad1_ref, grad3_ref),
+        )
+
+        # Paired kernel with NaN values injected into all unrouted tail rows.
+        nan_lhs = torch.full(
+            (padded_m - valid_m, k),
+            float("nan"),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        nan_grad = torch.full(
+            (padded_m - valid_m, n),
+            float("nan"),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        lhs = torch.cat([lhs_valid, nan_lhs], dim=0).requires_grad_()
+        rhs1 = rhs1_ref.detach().clone().requires_grad_(True)
+        rhs3 = rhs3_ref.detach().clone().requires_grad_(True)
+        grad1 = torch.cat([grad1_valid, nan_grad], dim=0)
+        grad3 = torch.cat([grad3_valid, nan_grad], dim=0)
+
+        out1, out3 = paired_segment_matmul.paired_segment_matmul_pallas_2d(
+            lhs,
+            rhs1,
+            rhs3,
+            group_sizes_dev,
+            tile_m=tile_m,
+            tgmm_tile_m=tile_m,
+        )
+        dlhs, drhs1, drhs3 = torch.autograd.grad(
+            (out1, out3), (lhs, rhs1, rhs3), (grad1, grad3)
+        )
+
+        active_m = ((valid_m + tile_m - 1) // tile_m) * tile_m
+        torch.testing.assert_close(
+            out1[:valid_m], out1_ref[:valid_m], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out3[:valid_m], out3_ref[:valid_m], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out1[valid_m:active_m],
+            torch.zeros_like(out1[valid_m:active_m]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            out3[valid_m:active_m],
+            torch.zeros_like(out3[valid_m:active_m]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            dlhs[:valid_m], dlhs_ref[:valid_m], rtol=0, atol=0
+        )
+        self.assertFalse(torch.isnan(dlhs[:valid_m]).any())
+        self.assertFalse(torch.isnan(drhs1).any())
+        self.assertFalse(torch.isnan(drhs3).any())
+        torch.testing.assert_close(drhs1, drhs1_ref, rtol=0, atol=0)
+        torch.testing.assert_close(drhs3, drhs3_ref, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     absltest.main()

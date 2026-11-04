@@ -1749,8 +1749,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             dump_folder="",
         )
 
-  def test_35b_recipes(self):
-    """Tests the 35B-A3B recipes, their TPU kernels and MFU accounting."""
+  def test_35b_benchmark_recipe_and_mfu(self):
+    """Tests the 35B-A3B EP=1 benchmark recipe, CLI overrides, and MFU accounting."""
     gt_spec = gt_qwen3_5.model_registry("35B-A3B")
     self.assertEqual(gt_spec.name, "qwen3_5")
     self.assertIs(gt_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5)
@@ -1975,107 +1975,99 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         {"attention.inner_attention": 2},
     )
 
-    # Expert Parallelism (EP > 1) recipes and model config updates.
-    for ep_recipe in (
-        config_registry.qwen35_moe_35b_split_tokamax_ep_benchmark,
-    ):
-      ep_cfg = ep_recipe()
-      self.assertIsInstance(ep_cfg, TpuGraphTrainer.Config)
-      self.assertEqual(ep_cfg.training.dtype, "float32")
-      self.assertEqual(ep_cfg.parallelism.expert_parallel_degree, 4)
-      self.assertFalse(ep_cfg.compile.compile_grad_norm)
-      self.assertEqual(ep_cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
-      self.assertEqual(ep_cfg.compile.memory_policy, "tpu_selective")
-      self.assertEqual(
-          ep_cfg.compile.save_regions,
-          ("moe.routing", "attention.inner_attention"),
-      )
-      self.assertEqual(ep_cfg.compile.save_last_n_layers, {})
-      self.assertEqual(
-          ep_cfg.compile.graph_split.backward_partition_mode, "by_layer"
-      )
-      self.assertEqual(
-          ep_cfg.compile.graph_split.forward_layers_per_executable, 1
-      )
-      self.assertEqual(
-          ep_cfg.compile.graph_split.backward_layers_per_executable, 1
-      )
-      self.assertEqual(
-          ep_cfg.libtpu_init_flags.get(
-              "xla_tpu_enable_sparse_core_reduce_scatter_v2"
-          ),
-          "true",
-      )
-      self.assertEqual(
-          ep_cfg.libtpu_init_flags.get(
-              "xla_tpu_enable_layer_scheduler_for_dependent_collectives"
-          ),
-          "true",
-      )
-      self.assertEqual(
-          ep_cfg.libtpu_init_flags.get(
-              "xla_tpu_enable_offloading_gather_to_sparsecore"
-          ),
-          "false",
-      )
-      self.assertEqual(
-          ep_cfg.libtpu_init_flags.get(
-              "xla_tpu_enable_offloading_copy_to_sparsecore"
-          ),
-          "false",
-      )
-      self.assertNotIn(
-          "xla_tpu_enable_async_all_to_all", ep_cfg.libtpu_init_flags
-      )
-      self.assertIs(
-          ep_cfg.model_spec.post_optimizer_build_fn,
-          qwen3_5_tpu.post_optimizer_build_qwen3_5,
-      )
-      apply_tpu_graph_trainer_model_transforms(ep_cfg)
-      ep_cfg.model_spec.model.update_from_config(
-          config=ep_cfg, global_batch_size=8, local_global_batch_size=8
-      )
-      ep_dispatchers = list(
-          ep_cfg.model_spec.model.traverse(
-              qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
-          )
-      )
-      self.assertLen(ep_dispatchers, len(ep_cfg.model_spec.model.layers))
-      self.assertTrue(
-          all(
-              d.fuse_route_score_backward
-              and d.comm_mode == "auto"
-              and d.roe_use_pallas_tc
-              for _, d, _, _ in ep_dispatchers
-          )
-      )
-      self.assertFalse(hasattr(qwen35_token_dispatcher, "EP_CAPACITY_FACTOR"))
-      self.assertTrue(
-          all(
-              not hasattr(d, "capacity_factor") for _, d, _, _ in ep_dispatchers
-          )
-      )
-      ep_routed = list(
-          ep_cfg.model_spec.model.traverse(
-              qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
-          )
-      )
-      self.assertLen(ep_routed, len(ep_cfg.model_spec.model.layers))
-      self.assertTrue(
-          all(
-              r.num_token_chunks == 4 and r.max_inflight_chunks == 2
-              for _, r, _, _ in ep_routed
-          )
-      )
-      ep_experts = list(
-          ep_cfg.model_spec.model.traverse(TpuGroupedExperts.Config)
-      )
-      self.assertTrue(
-          all(
-              e.allow_ep_paired_grouped_mm and e.use_pallas_paired_grouped_mm
-              for _, e, _, _ in ep_experts
-          )
-      )
+  def test_ep_benchmark_recipes_35b_and_397b(self):
+    """Tests 35B-A3B EP=4 and 397B-A17B EP=8 recipes and CLI EP config updates."""
+    ep_cfg = config_registry.qwen35_moe_35b_split_tokamax_ep_benchmark()
+    self.assertIsInstance(ep_cfg, TpuGraphTrainer.Config)
+    self.assertEqual(ep_cfg.training.dtype, "float32")
+    self.assertEqual(ep_cfg.parallelism.expert_parallel_degree, 4)
+    self.assertFalse(ep_cfg.compile.compile_grad_norm)
+    self.assertEqual(ep_cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    self.assertEqual(ep_cfg.compile.memory_policy, "tpu_selective")
+    self.assertEqual(
+        ep_cfg.compile.save_regions,
+        ("moe.routing", "attention.inner_attention"),
+    )
+    self.assertEqual(ep_cfg.compile.save_last_n_layers, {})
+    self.assertEqual(
+        ep_cfg.compile.graph_split.backward_partition_mode, "by_layer"
+    )
+    self.assertEqual(
+        ep_cfg.compile.graph_split.forward_layers_per_executable, 1
+    )
+    self.assertEqual(
+        ep_cfg.compile.graph_split.backward_layers_per_executable, 1
+    )
+    self.assertEqual(
+        ep_cfg.libtpu_init_flags.get(
+            "xla_tpu_enable_sparse_core_reduce_scatter_v2"
+        ),
+        "true",
+    )
+    self.assertEqual(
+        ep_cfg.libtpu_init_flags.get(
+            "xla_tpu_enable_layer_scheduler_for_dependent_collectives"
+        ),
+        "true",
+    )
+    self.assertEqual(
+        ep_cfg.libtpu_init_flags.get(
+            "xla_tpu_enable_offloading_gather_to_sparsecore"
+        ),
+        "false",
+    )
+    self.assertEqual(
+        ep_cfg.libtpu_init_flags.get(
+            "xla_tpu_enable_offloading_copy_to_sparsecore"
+        ),
+        "false",
+    )
+    self.assertNotIn(
+        "xla_tpu_enable_async_all_to_all", ep_cfg.libtpu_init_flags
+    )
+    self.assertIs(
+        ep_cfg.model_spec.post_optimizer_build_fn,
+        qwen3_5_tpu.post_optimizer_build_qwen3_5,
+    )
+    apply_tpu_graph_trainer_model_transforms(ep_cfg)
+    ep_cfg.model_spec.model.update_from_config(
+        config=ep_cfg, global_batch_size=8, local_global_batch_size=8
+    )
+    ep_dispatchers = list(
+        ep_cfg.model_spec.model.traverse(
+            qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
+        )
+    )
+    self.assertLen(ep_dispatchers, len(ep_cfg.model_spec.model.layers))
+    self.assertTrue(
+        all(
+            d.fuse_route_score_backward
+            and d.comm_mode == "auto"
+            and d.roe_use_pallas_tc
+            for _, d, _, _ in ep_dispatchers
+        )
+    )
+    ep_routed = list(
+        ep_cfg.model_spec.model.traverse(
+            qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
+        )
+    )
+    self.assertLen(ep_routed, len(ep_cfg.model_spec.model.layers))
+    self.assertTrue(
+        all(
+            r.num_token_chunks == 4 and r.max_inflight_chunks == 2
+            for _, r, _, _ in ep_routed
+        )
+    )
+    ep_experts = list(
+        ep_cfg.model_spec.model.traverse(TpuGroupedExperts.Config)
+    )
+    self.assertTrue(
+        all(
+            e.allow_ep_paired_grouped_mm and e.use_pallas_paired_grouped_mm
+            for _, e, _, _ in ep_experts
+        )
+    )
 
     parsed_ep = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
@@ -2148,6 +2140,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertTrue(
         all(
             e.pallas_grouped_mm_tgmm_tiling == (512, 1024, 0)
+            and e.pallas_grouped_mm_w2_tgmm_tiling == (512, 0, 0)
             and e.pallas_grouped_mm_w2_transposed_tgmm_tiling == (512, 0, 2048)
             for _, e, _, _ in ep_397b.model_spec.model.traverse(
                 TpuGroupedExperts.Config
@@ -2177,11 +2170,16 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             qwen35_token_dispatcher.LocalDispatchMetadata,
         )
     )
+    self.assertFalse(
+        issubclass(
+            qwen35_token_dispatcher.TpuQwen35RoEDispatchMetadata,
+            qwen35_token_dispatcher.LocalDispatchMetadata,
+        )
+    )
 
-    # Under EP > 1 on TPU, TpuQwen35Model.parallelize upgrades unconfigured
-    # TpuGroupedExperts (use_pallas_grouped_mm=False) to unpaired Pallas
-    # (tile_m=256), leaves CPU EP meshes on GroupedExperts.forward, and
-    # preserves explicit tiling when use_pallas_grouped_mm is already True.
+  def test_parallelize_ep_upgrades_grouped_experts_and_rank_buffer(self):
+    """Tests TpuQwen35Model.parallelize EP grouped-expert defaults and rank buffer."""
+
     def _build_debug_ep_model(tile_m: int | None = None):
       dbg_cfg = config_registry.qwen35_moe_debugmodel()
       if tile_m is not None:
@@ -3484,6 +3482,30 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           ),
       )
 
+      def trace_roe_woa_step(x_in, idx_in, scores_in, counts_in):
+        h_disp, _gs_disp, meta = trace_disp.dispatch(
+            x_in, scores_in, idx_in, counts_in
+        )
+        scaled = (h_disp.float() * meta.expert_row_scale_R.unsqueeze(-1)).to(
+            h_disp.dtype
+        )
+        out_disp = trace_disp.combine(
+            scaled, dataclasses.replace(meta, row_scale_applied=True), x_in
+        )
+        dx, dscores = torch.autograd.grad(out_disp.sum(), (x_in, scores_in))
+        return out_disp, dx, dscores
+
+      gm_woa = make_fx(trace_roe_woa_step, tracing_mode="fake")(
+          xs[0].detach().requires_grad_(True),
+          idxs[0],
+          scores[0].detach().requires_grad_(True),
+          counts[0],
+      )
+      woa_op_names = [
+          str(n.target) for n in gm_woa.graph.nodes if n.op == "call_function"
+      ]
+      self.assertFalse(any("index_add" in name for name in woa_op_names))
+
   def test_ep_chunked_routed_experts_and_chunk_barriers(self):
     """Tests sequence-chunked TpuQwen35RoutedExperts parity and FX chunk barriers."""
     torch.manual_seed(999)
@@ -3589,6 +3611,43 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         strict=True,
     ):
       self.assertLessEqual(_relative_l2_error(p4.grad, p1.grad), tol)
+
+    # Non-divisible `num_token_chunks=12` on `tokens=16` snaps to the largest
+    # divisor `8 <= 12` instead of falling back to unchunked `super().forward`.
+    routed_c12 = _build_routed(12)
+    with torch.no_grad():
+      routed_c12.inner_experts.w1_EFD.copy_(routed_c1.inner_experts.w1_EFD)
+      routed_c12.inner_experts.w2_EDF.copy_(routed_c1.inner_experts.w2_EDF)
+      routed_c12.inner_experts.w3_EFD.copy_(routed_c1.inner_experts.w3_EFD)
+    x12 = x1.detach().clone().requires_grad_(True)
+    s12 = s1.detach().clone().requires_grad_(True)
+    unshard_calls_c12 = []
+    orig_fwd_c12 = routed_c12.inner_experts.forward
+
+    def _spy_inner_c12(*args, **kwargs):
+      unshard_calls_c12.append((
+          bool(kwargs.get("unshard_only", False)),
+          kwargs.get("pre_unsharded_weights") is not None,
+      ))
+      return orig_fwd_c12(*args, **kwargs)
+
+    with mock.patch.object(
+        routed_c12.inner_experts,
+        "forward",
+        autospec=True,
+        side_effect=_spy_inner_c12,
+    ):
+      out12 = routed_c12(x12, s12, ids, counts)
+    (out12 * go).sum().backward()
+    self.assertEqual(
+        unshard_calls_c12,
+        [(True, False)] + [(False, True)] * 8,
+    )
+    test_utils.check_equivalence(
+        out12.cpu(), out1.cpu(), atol=tol, rtol=tol, check_name="snapped c12"
+    )
+    self.assertLessEqual(_relative_l2_error(x12.grad, x1.grad), tol)
+    self.assertLessEqual(_relative_l2_error(s12.grad, s1.grad), tol)
 
     # Trace a 1-layer wrapper on CPU and verify apply_ep_chunk_barrier_pass
     # inserts (4 - 2) = 2 forward + 2 backward barriers inside layer 0 after
@@ -3800,6 +3859,45 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       torch.testing.assert_close(
           g_comp.cpu(), g_eager.cpu(), rtol=3e-2, atol=3e-2
       )
+
+  def test_grouped_experts_pads_rows_to_tgmm_tiling_lcm(self):
+    """Tests TpuGroupedExperts row padding when tgmm_tiling[0] > tile_m."""
+    if not self._is_tpu():
+      self.skipTest("Pallas grouped experts require TPU.")
+    dev = self.accelerator_device
+    torch.manual_seed(23)
+    experts = TpuGroupedExperts.Config(
+        dim=128,
+        hidden_dim=128,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=True,
+        allow_ep_paired_grouped_mm=True,
+        pallas_grouped_mm_tile_m=128,
+        pallas_grouped_mm_tgmm_tiling=(256, 0, 0),
+        pallas_grouped_mm_w2_tgmm_tiling=(256, 0, 0),
+    ).build()
+    experts.to(dev)
+    with torch.no_grad():
+      for p in experts.parameters():
+        p.normal_(0.0, 0.05)
+
+    # num_rows=128 is divisible by tile_m=128, NOT by tgmm_tiling[0]=256.
+    x = torch.randn(
+        128, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    row_scale = torch.rand(
+        128, device=dev, dtype=torch.float32, requires_grad=True
+    )
+    counts = torch.tensor([50, 30], device=dev, dtype=torch.int32)
+    out = experts(x, counts, row_scale_R=row_scale)
+    self.assertEqual(out.shape, (128, 128))
+    loss = out[:80].float().square().sum()
+    loss.backward()
+    self.assertTrue(bool(torch.isfinite(x.grad).all()))
+    self.assertTrue(bool(torch.isfinite(row_scale.grad).all()))
+    for p in experts.parameters():
+      self.assertTrue(bool(torch.isfinite(p.grad).all()))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,9 @@ FSDP_GATHER = "fsdp.gather"
 # The MoE aux loss's all-reduced expert counts. The scan body always saves
 # them: redoing the all-reduce in backward is an exposed round trip per layer.
 MOE_EXPERT_COUNTS = "moe.expert_counts"
+# A scan body's carry, i.e. the layer input. The scan offload keeps the saved
+# copy of it on host; other saved values stay in HBM.
+LAYER_INPUT = "layer_input"
 
 
 def annotate_region(name: str) -> AbstractContextManager[None]:

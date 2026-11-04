@@ -31,6 +31,9 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
+from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import (
+    offload_scan_activations,
+)
 from torchtitan.experiments.tpu.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
@@ -478,6 +481,11 @@ def _tpu_selective_and_offload_memory_policy_pass(
     save-region values stay on device: backward reads them first, and
     offloading them too would add their bytes to the host link every layer.
     """
+    if config.compile.use_scan_layers:
+        # The saves live in the scan body, which `LayerStack.run` tags; the
+        # layer input goes to host from inside the loops.
+        _full_memory_policy_pass(gm, config=config)
+        return offload_scan_activations(gm)
     last_n_layers = config.compile.save_last_n_layers
     regions = resolve_save_regions(
         config.compile.save_regions,

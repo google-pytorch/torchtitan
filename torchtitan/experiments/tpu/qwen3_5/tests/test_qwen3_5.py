@@ -970,9 +970,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     # Config.reset_at_documents=False (pretraining) ignores positions in both
     # forward and backward: whole rows match gdn(x, positions=None).
-    gdn_no_reset = dataclasses.replace(
-        config.layers[0].delta_net, reset_at_documents=False
-    ).build()
+    gdn_no_reset_cfg = dataclasses.replace(
+        config.layers[0].delta_net,
+        document_resets=gated_delta.GatedDeltaDocumentResets.Config(
+            enabled=False
+        ),
+    )
+    self.assertFalse(gdn_no_reset_cfg.reset_at_documents)
+    gdn_no_reset = gdn_no_reset_cfg.build()
     gdn_no_reset.init_states(buffer_device=torch.device("cpu"))
     gdn_no_reset.load_state_dict(gdn.state_dict())
     gdn_no_reset = gdn_no_reset.to(self.accelerator_device)
@@ -1614,16 +1619,30 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(resets(bench_cfg), [False] * 30)
     self.assertEqual(resets(config_registry.qwen35_moe_35b()), [True] * 30)
     re_enabled_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    doc_resets_override = (
+        "torchtitan.experiments.tpu.qwen3_5.gated_delta."
+        "gated_delta_document_resets"
+    )
+    # Combining with the recipe's own overrides (including Tokamax KDA) keeps
+    # both FusedLossLinearWrapper and TokamaxGatedDeltaKernel active without
+    # nested-override conflicts.
     apply_overrides(
         OverrideConfig(
-            imports=[
-                "torchtitan.experiments.tpu.qwen3_5.gated_delta."
-                "gated_delta_document_resets"
-            ]
+            imports=[*re_enabled_cfg.override.imports, doc_resets_override]
         ),
         re_enabled_cfg,
     )
     self.assertEqual(resets(re_enabled_cfg), [True] * 30)
+    for layer in re_enabled_cfg.model_spec.model.layers:
+      if layer.delta_net is not None:
+        self.assertEqual(
+            type(layer.delta_net.inner_gated_delta_net.kernel).__qualname__,
+            "TokamaxGatedDeltaKernel.Config",
+        )
+    self.assertEqual(
+        type(re_enabled_cfg.model_spec.model.lm_head).__qualname__,
+        "FusedLossLinearWrapper.Config",
+    )
     self.assertEqual(
         bench_cfg.override.imports,
         [
@@ -1730,7 +1749,31 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(parsed.model_spec.max_context_length, 262144)
     self.assertEqual(resets(parsed), [False] * 30)
 
-    # The README's 96K split=1 + selective save_last_n_layers flags also parse.
+    # CLI `--override.imports` can re-enable document resets alongside the
+    # recipe's fused-loss and Tokamax KDA overrides (with custom segments).
+    parsed_rl = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--override.imports",
+        config_registry.FUSED_LOSS_OVERRIDE,
+        (
+            f'{config_registry.TOKAMAX_GATED_DELTA_OVERRIDE}={{"max_num_segments":'
+            " 32}"
+        ),
+        doc_resets_override,
+    ])
+    apply_overrides(parsed_rl.override, parsed_rl)
+    self.assertEqual(resets(parsed_rl), [True] * 30)
+    first_gdn_kernel = parsed_rl.model_spec.model.layers[
+        0
+    ].delta_net.inner_gated_delta_net.kernel
+    self.assertEqual(
+        type(first_gdn_kernel).__qualname__, "TokamaxGatedDeltaKernel.Config"
+    )
+    self.assertEqual(first_gdn_kernel.max_num_segments, 32)
+
+    # 1-layer split + selective save_last_n_layers CLI flags (used at 96K
+    # tokens/rank) also parse.
     parsed_96k = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
         "--config=qwen35_moe_35b_split_tokamax_benchmark",

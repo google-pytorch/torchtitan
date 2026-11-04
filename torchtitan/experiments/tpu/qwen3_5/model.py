@@ -9,8 +9,12 @@ from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
-from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
+)
 from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.moe import MoE, RoutedExperts
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
@@ -117,10 +121,12 @@ class TpuQwen35Model(Qwen35Model):
   """``Qwen35Model`` whose config and parallelization wire TPU EP execution.
 
   Under expert parallelism, ``Config.update_from_config`` switches the MoE
-  layers to ``TpuQwen35TokenDispatcher`` and disables the ``EP == 1`` paired
-  Pallas kernel, and ``parallelize`` enables the unpaired Pallas grouped
-  matmuls on TPU so dynamic or empty expert segments under EP never hit
-  ``torch._grouped_mm``.
+  layers to ``TpuQwen35RoutedExperts`` and ``TpuQwen35TokenDispatcher``, keeps
+  paired Pallas grouped matmuls enabled only when ``allow_ep_paired_grouped_mm``
+  is set, and scales ``num_token_chunks`` with ``expert_parallel_degree`` when
+  ``auto_scale_token_chunks`` is enabled. ``parallelize`` upgrades unconfigured
+  TPU expert layers to unpaired Pallas grouped matmuls so dynamic or empty
+  expert segments under EP never hit ``torch._grouped_mm``.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -130,12 +136,31 @@ class TpuQwen35Model(Qwen35Model):
       # Zero-argument super() does not work in slots dataclasses on Python
       # 3.12 (the class is re-created); call the parent explicitly.
       Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
-      if config.parallelism.expert_parallel_degree > 1:
-        # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
-        # for the paired (w1 + w3) Pallas kernel; fall back to unpaired Pallas
-        # grouped matmuls under EP > 1.
+      ep_deg = config.parallelism.expert_parallel_degree
+      if ep_deg > 1:
         for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
-          experts.use_pallas_paired_grouped_mm = False
+          if not experts.allow_ep_paired_grouped_mm:
+            experts.use_pallas_paired_grouped_mm = False
+        for _, routed, parent, field_name in list(
+            self.traverse(RoutedExperts.Config)
+        ):
+          if type(routed) in (  # pylint: disable=unidiomatic-typecheck
+              RoutedExperts.Config,
+              TpuRoutedExperts.Config,
+          ):
+            routed = torchtitan.config.derive(
+                routed,
+                token_dispatcher.TpuQwen35RoutedExperts.Config,
+            )
+            if isinstance(parent, list):
+              parent[field_name] = routed
+            else:
+              setattr(parent, field_name, routed)
+          if (
+              isinstance(routed, token_dispatcher.TpuQwen35RoutedExperts.Config)
+              and routed.auto_scale_token_chunks
+          ):
+            routed.num_token_chunks = max(4, min(ep_deg, 16))
         for _, dispatcher, parent, field_name in list(
             self.traverse(AllToAllTokenDispatcher.Config)
         ):
@@ -203,6 +228,14 @@ class TpuQwen35Model(Qwen35Model):
       )
       self.register_buffer("_ep_local_rank", rank_buf, persistent=False)
       for module in self.modules():
-        dispatcher = getattr(module, "token_dispatcher", None)
-        if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
-          dispatcher.bind_ep_rank_holder(self)
+        if isinstance(module, MoE):
+          inner_experts = module.routed_experts.inner_experts
+          dispatcher = module.routed_experts.token_dispatcher
+          if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
+            dispatcher.bind_ep_rank_holder(self)
+            if not getattr(inner_experts, "use_pallas_grouped_mm", False):
+              dispatcher.roe_zero_pad_tail = True
+        else:
+          dispatcher = getattr(module, "token_dispatcher", None)
+          if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
+            dispatcher.bind_ep_rank_holder(self)

@@ -6,6 +6,7 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
+from torchtitan.config import derive
 from torchtitan.config.configs import (
     CommConfig,
     CompileConfig,
@@ -32,11 +33,15 @@ from torchtitan.experiments.tpu.grouped_experts import (
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
+from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher as qwen35_token_dispatcher
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
     TpuTokenDispatcherConverter,
 )
+from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
@@ -222,36 +227,114 @@ def _use_graph_split(
   return cfg
 
 
-def _use_expert_parallel(cfg: TPUTrainerConfig, *, ep_degree: int) -> None:
+def _use_expert_parallel(
+    cfg: TPUTrainerConfig,
+    *,
+    ep_degree: int,
+    comm_mode: qwen35_token_dispatcher.CommMode = "auto",
+    num_token_chunks: int | None = None,
+    roe_use_pallas_tc: bool = True,
+    allow_ep_paired_grouped_mm: bool = True,
+    enable_sparsecore_offload: bool = True,
+) -> None:
   """Shards the routed experts over `ep_degree` ranks (Expert Parallelism).
 
-  `TpuQwen35Model.Config.update_from_config` switches the token dispatcher to
-  `TpuQwen35TokenDispatcher` (dropless static-shape `ragged_all_to_all`
-  dispatch and combine) and the expert matmuls to the unpaired Pallas kernels.
+  Configures Ring-of-Experts (`comm_mode="auto"`, resolving to
+  `"ring_of_experts"` when `ep_degree <= top_k` and `"ragged_all_to_all"`
+  otherwise), sequence-chunked pipelining (`num_token_chunks`), paired W1+W3
+  Pallas grouped matmuls, and SparseCore collective offload flags adapted from
+  MaxText's MLPerf v6.1 TPU7x recipes.
 
   Args:
     cfg: The recipe to update in place.
     ep_degree: Expert-parallel degree; it must divide the number of experts.
+    comm_mode: EP transport (`"auto"`, `"ring_of_experts"`, or
+      `"ragged_all_to_all"`).
+    num_token_chunks: Number of token sequence chunks per MoE layer (`>= 1`),
+      or `None` to scale automatically as `max(4, min(ep_degree, 16))`
+      (re-evaluated in `TpuQwen35Model.Config.update_from_config` if
+      `--parallelism.expert_parallel_degree` is overridden on the CLI).
+    roe_use_pallas_tc: Use Pallas TensorCore async-DMA gather / weighted
+      gather-reduce kernels for Ring-of-Experts.
+    allow_ep_paired_grouped_mm: Keep the paired W1+W3 Pallas grouped matmul
+      enabled under EP > 1.
+    enable_sparsecore_offload: Add `SPARSECORE_COLLECTIVE_OFFLOAD` and
+      `MAXTEXT_MOE_SPARSECORE_OFFLOAD` to `cfg.libtpu_init_flags`.
   """
   cfg.parallelism.expert_parallel_degree = ep_degree
   # `CompiledGradNorm` needs a single mesh; the eager norm reduces over the
-  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes.
+  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes. Enable `DEFER_AND_FUSE`
+  # so eager `clip_grad_norm_` fuses across the parameter list.
   cfg.compile.compile_grad_norm = False
+  if not cfg.tpu_config.eager_mode:
+    cfg.tpu_config.eager_mode = "DEFER_AND_FUSE"
+
+  resolved_chunks = (
+      max(4, min(ep_degree, 16))
+      if num_token_chunks is None
+      else num_token_chunks
+  )
+  auto_scale_chunks = num_token_chunks is None
+
+  if cfg.model_spec is not None:
+    model_cfg = cfg.model_spec.model
+    for _, experts, _, _ in model_cfg.traverse(TpuGroupedExperts.Config):
+      experts.allow_ep_paired_grouped_mm = allow_ep_paired_grouped_mm
+      if not allow_ep_paired_grouped_mm:
+        experts.use_pallas_paired_grouped_mm = False
+    for _, routed, parent, field_name in list(
+        model_cfg.traverse(RoutedExperts.Config)
+    ):
+      if type(routed) in (  # pylint: disable=unidiomatic-typecheck
+          RoutedExperts.Config,
+          TpuRoutedExperts.Config,
+      ):
+        routed = derive(
+            routed, qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
+        )
+        if isinstance(parent, list):
+          parent[field_name] = routed
+        else:
+          setattr(parent, field_name, routed)
+      if isinstance(
+          routed, qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
+      ):
+        routed.num_token_chunks = resolved_chunks
+        routed.auto_scale_token_chunks = auto_scale_chunks
+    for _, dispatcher, parent, field_name in list(
+        model_cfg.traverse(AllToAllTokenDispatcher.Config)
+    ):
+      if type(dispatcher) in (  # pylint: disable=unidiomatic-typecheck
+          AllToAllTokenDispatcher.Config,
+          TpuAllToAllTokenDispatcher.Config,
+      ):
+        dispatcher = derive(
+            dispatcher, qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
+        )
+        if isinstance(parent, list):
+          parent[field_name] = dispatcher
+        else:
+          setattr(parent, field_name, dispatcher)
+      if isinstance(
+          dispatcher, qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
+      ):
+        dispatcher.comm_mode = comm_mode
+        dispatcher.roe_use_pallas_tc = roe_use_pallas_tc
+
+  if enable_sparsecore_offload:
+    cfg.libtpu_init_flags = tpu_flags.merge_flags(
+        cfg.libtpu_init_flags,
+        tpu_flags.SPARSECORE_COLLECTIVE_OFFLOAD,
+        tpu_flags.MAXTEXT_MOE_SPARSECORE_OFFLOAD,
+    )
+
   if (
       isinstance(cfg.compile, TpuGraphTrainerCompileConfig)
       and cfg.compile.graph_split.enabled
   ):
-    # Full rematerialization avoids keeping `ep_size * N` static EP receive
-    # buffers or `moe.routing` metadata live across child executables.
-    cfg.compile.memory_policy = "full"
-    cfg.compile.save_regions = ()
+    cfg.compile.memory_policy = "tpu_selective"
+    cfg.compile.save_regions = ("moe.routing", "attention.inner_attention")
     cfg.compile.save_last_n_layers = {}
-    # Under `fsdp_pipeline`, backward child `L` holds the all-gather of layer
-    # `L - 1` and the reduce-scatter of layer `L + 1`, so the 3:1
-    # GatedDeltaNet:Attention cycle yields 6 distinct backward children, each
-    # with the EP all-to-alls (~9 min to compile each on 8 CPUs). `by_layer`
-    # children with one layer each are self-contained: 3 distinct backward
-    # children.
     graph_split = cfg.compile.graph_split
     graph_split.forward_layers_per_executable = 1
     graph_split.backward_layers_per_executable = 1

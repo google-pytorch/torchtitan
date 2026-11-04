@@ -32,6 +32,8 @@ ATTENTION_INNER_ATTENTION = "attention.inner_attention"
 # expert-sort permutation that ``token_dispatcher.local_reorder`` computes from
 # them.
 MOE_ROUTING = "moe.routing"
+# Expert-parallel activation all-gather inputs in Ring-of-Experts dispatch.
+MOE_EP_DISPATCH = "moe.ep_dispatch"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"

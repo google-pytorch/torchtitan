@@ -34,6 +34,7 @@ from torchtitan.experiments.graph_trainer.registry import register_memory_policy
 from torchtitan.experiments.tpu.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
+    MOE_EP_DISPATCH,
     MOE_ROUTING,
     REMAT_REGION,
 )
@@ -283,12 +284,25 @@ def select_ffn_down_projection(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 # would still redo the reduction that follows it.
 FFN_W2_REGION = SaveRegion(name=FEED_FORWARD_W2, select=select_ffn_down_projection)
 
+
+def select_ep_dispatch(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return Ring-of-Experts activation all-gather outputs marked in dispatch."""
+    return [
+        node
+        for node in _forward_call_nodes(gm)
+        if _in_remat_region(node, MOE_EP_DISPATCH)
+    ]
+
+
+EP_DISPATCH_REGION = SaveRegion(name=MOE_EP_DISPATCH, select=select_ep_dispatch)
+
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
         ROUTING_REGION,
         SPLASH_ATTENTION_REGION,
         FFN_W2_REGION,
+        EP_DISPATCH_REGION,
     )
 }
 

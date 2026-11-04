@@ -325,21 +325,25 @@ def chunked_gated_delta(
 def per_row_segment_ids(
     segment_ids_BS: torch.Tensor, max_num_segments: int
 ) -> torch.Tensor:
-  """Per-row document ids, keeping at most ``max_num_segments`` apart.
+  """Per-row 1-based document ids, keeping at most ``max_num_segments`` apart.
 
   Args:
     segment_ids_BS: ``[B, S]`` document index of each token, non-decreasing
-      along each row in steps of one (``segment_ids_from_positions``, possibly
-      counting on from earlier rows).
+      along each row (e.g. ``segment_ids_from_positions`` or arbitrary sorted
+      document ids).
     max_num_segments: Documents per row kept apart.
 
   Returns:
-    ``[B, S]`` int32 ids that start at 1 in every row. Documents beyond
+    ``[B, S]`` int32 ids that start at 1 in every row and increment by 1 at
+    each document boundary up to ``max_num_segments``. Documents beyond
     ``max_num_segments`` share the last id, so they run as one sequence, as
     without document ids.
   """
-  ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
-  return ids.clamp(min=1, max=max_num_segments).to(torch.int32)
+  if segment_ids_BS.shape[1] <= 1:
+    return torch.ones_like(segment_ids_BS, dtype=torch.int32)
+  changes = (segment_ids_BS[:, 1:] != segment_ids_BS[:, :-1]).to(torch.int32)
+  ids = F.pad(changes.cumsum(dim=1, dtype=torch.int32), (1, 0)) + 1
+  return ids.clamp(max=max_num_segments).to(torch.int32)
 
 
 class TpuGatedDeltaKernel(GatedDeltaKernel):

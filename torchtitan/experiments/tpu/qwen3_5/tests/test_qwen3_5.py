@@ -986,6 +986,22 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         gated_delta.per_row_segment_ids(stream_ids, 8)[0],
         torch.tensor([1, 1, 2, 3, 3, 3, 4, 4], dtype=torch.int32),
     )
+    # Non-unit document-id steps (e.g. caller-supplied sorted ids with gaps)
+    # still assign 1-based contiguous segment indices instead of collapsing into
+    # max_num_segments prematurely.
+    gapped_ids = torch.tensor(
+        [[0, 0, 5, 5, 10, 10], [7, 7, 7, 20, 20, 20]], dtype=torch.int64
+    )
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(gapped_ids, 4),
+        torch.tensor(
+            [[1, 1, 2, 2, 3, 3], [1, 1, 1, 2, 2, 2]], dtype=torch.int32
+        ),
+    )
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(torch.tensor([[5], [9]]), 4),
+        torch.tensor([[1], [1]], dtype=torch.int32),
+    )
 
   def test_gated_delta_net_document_ids_reach_conv_and_recurrence(self):
     """Tests that the kernel's document ids drive the conv and recurrence."""
@@ -1004,10 +1020,15 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with torch.no_grad(), set_unflatten_seq_len(seq_len):
       expected = gdn(x, positions=merged)
       uncapped = gdn(x, positions=positions)
-      gdn.inner_gated_delta_net.kernel.document_ids = functools.partial(
-          gated_delta.per_row_segment_ids, max_num_segments=cap
-      )
-      capped = gdn(x, positions=positions)
+      with mock.patch.object(
+          gdn.inner_gated_delta_net.kernel,
+          "document_ids",
+          autospec=True,
+          side_effect=functools.partial(
+              gated_delta.per_row_segment_ids, max_num_segments=cap
+          ),
+      ):
+        capped = gdn(x, positions=positions)
 
     tol = 5e-3 if self._is_tpu() else 1e-5
     test_utils.check_equivalence(

@@ -35,6 +35,10 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
+
+# Importing `scan_fsdp` installs `_movedim_reduce_scatter_tensor` on `funcol`,
+# matching real `TpuGraphTrainer` runs.
+import torchtitan.experiments.tpu.graph_trainer.scan_fsdp  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
     split_forward_graph_by_layer,
@@ -100,6 +104,32 @@ class _ViewOutputLayer(nn.Module):
     return torch.relu(self.linear(inputs.view(4, -1, 8))).view(-1, 8)
 
 
+class _RowFoldedToyTransformer(nn.Module):
+  """2D weights (`[8, 256]`) that trigger `_movedim_reduce_scatter_tensor` fold.
+
+  On 2 FSDP ranks, `shard_rows = 4` (`4 % 8 != 0`, `k = 2`, `256 % 256 == 0`),
+  as Qwen3.5 35B `in_proj_a`/`in_proj_b` (`[32, 2048]` across 8 ranks) do.
+  """
+
+  def __init__(
+      self, n_layers: int, dtype: torch.dtype = torch.bfloat16
+  ) -> None:
+    super().__init__()
+    self.layers = nn.ModuleList(
+        nn.Sequential(
+            nn.Linear(256, 8, bias=False, dtype=dtype),
+            nn.ReLU(),
+            nn.Linear(8, 256, bias=False, dtype=dtype),
+        )
+        for _ in range(n_layers)
+    )
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    for layer in self.layers:
+      inputs = layer(inputs)
+    return inputs
+
+
 class GraphSplitTest(absltest.TestCase):
 
   def _build_toy_model(self, n_layers: int) -> _ToyTransformer:
@@ -163,9 +193,7 @@ class GraphSplitTest(absltest.TestCase):
     """Trace the shared model through real SimpleFSDP with fake collectives."""
 
     self.assertFalse(dist.is_initialized())
-    dist.init_process_group(
-        "fake", store=FakeStore(), rank=0, world_size=2
-    )
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
     try:
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
@@ -179,9 +207,7 @@ class GraphSplitTest(absltest.TestCase):
                 reduce_dtype=reduce_dtype,
             ),
         )
-        inputs = torch.randn(
-            2, 8, dtype=torch.bfloat16, requires_grad=True
-        )
+        inputs = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=True)
 
         traced = self._trace_toy_model(model=model, inputs=inputs)
     finally:
@@ -228,13 +254,11 @@ class GraphSplitTest(absltest.TestCase):
             for node in split.forward_graph.graph.nodes
         )
     )
-    self.assertNotEmpty(
-        [
-            node
-            for node in split.backward_graph.graph.nodes
-            if node.meta.get("autograd_backward", False)
-        ]
-    )
+    self.assertNotEmpty([
+        node
+        for node in split.backward_graph.graph.nodes
+        if node.meta.get("autograd_backward", False)
+    ])
     backward = split_backward_graph_by_layer(
         split.backward_graph,
         n_layers=2,
@@ -336,9 +360,7 @@ class GraphSplitTest(absltest.TestCase):
           if node.op == "call_function"
           and node.target is torch.ops.aten.alias.default
       ]
-      backward_names = {
-          node.name for node in split.backward_graph.graph.nodes
-      }
+      backward_names = {node.name for node in split.backward_graph.graph.nodes}
       self.assertNotEmpty(aliases)
       self.assertTrue(
           all(alias.name in backward_names for alias in aliases),
@@ -407,9 +429,7 @@ class GraphSplitTest(absltest.TestCase):
   def test_cpu_offload_ops_are_compiled_inside_layer_children(self):
     """Keep each AO copy and wait together instead of in the eager parent."""
     traced = self._trace_cpu_offload_graph()
-    split = split_forward_backward_graph(
-        traced.gm, traced.example_inputs
-    )
+    split = split_forward_backward_graph(traced.gm, traced.example_inputs)
     donor_specs, donor_output_positions, donor_examples = (
         thread_host_offload_donors(split.forward_graph)
     )
@@ -485,16 +505,14 @@ class GraphSplitTest(absltest.TestCase):
     parent_donors = [
         node
         for node in forward.module.graph.nodes
-        if node.op == "placeholder"
-        and node.meta.get("tpu_force_donate", False)
+        if node.op == "placeholder" and node.meta.get("tpu_force_donate", False)
     ]
     self.assertLen(parent_donors, 1)
     child_donors = [
         node
         for child in forward.module.children()
         for node in child.graph.nodes
-        if node.op == "placeholder"
-        and node.meta.get("tpu_force_donate", False)
+        if node.op == "placeholder" and node.meta.get("tpu_force_donate", False)
     ]
     self.assertLen(child_donors, 1)
     donor_waits = [
@@ -585,9 +603,7 @@ class GraphSplitTest(absltest.TestCase):
     for distance in (0, 1):
       with self.subTest(distance=distance):
         traced = self._trace_cpu_offload_graph()
-        split = split_forward_backward_graph(
-            traced.gm, traced.example_inputs
-        )
+        split = split_forward_backward_graph(traced.gm, traced.example_inputs)
         backward = split_backward_graph_by_layer(
             split.backward_graph,
             n_layers=3,
@@ -814,9 +830,171 @@ class GraphSplitTest(absltest.TestCase):
     self.assertLen(reduce_casts, 2)
     for cast in reduce_casts:
       wait = cast.all_input_nodes[0]
+      self.assertEqual(chunked.partition_map[cast], chunked.partition_map[wait])
+
+    # Also verify that when `_movedim_reduce_scatter_tensor` inserts a post-RS
+    # view (`reshape` / `movedim`) between `wait_tensor` and the post-RS
+    # `_to_copy` cast, both the view and the cast stay with `wait_tensor`.
+    gm_with_post_rs_view = self._trace_simple_fsdp(
+        n_layers=2,
+        reduce_dtype=torch.bfloat16,
+    ).backward_graph
+    inserted_views = []
+    for node in list(gm_with_post_rs_view.graph.nodes):
+      if (
+          node.op == "call_function"
+          and node.target is torch.ops.aten._to_copy.default
+          and len(node.all_input_nodes) == 1
+          and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+      ):
+        wait = node.all_input_nodes[0]
+        with gm_with_post_rs_view.graph.inserting_before(node):
+          view = gm_with_post_rs_view.graph.call_function(
+              torch.ops.aten.view.default, (wait, list(wait.meta["val"].shape))
+          )
+          view.meta["val"] = wait.meta["val"]
+        node.replace_input_with(wait, view)
+        inserted_views.append((wait, view, node))
+    gm_with_post_rs_view.recompile()
+
+    chunked_view = split_backward_graph_by_layer(
+        gm_with_post_rs_view,
+        n_layers=2,
+        pipeline_collectives=True,
+    )
+    self.assertLen(inserted_views, 2)
+    for wait, view, cast in inserted_views:
       self.assertEqual(
-          chunked.partition_map[cast], chunked.partition_map[wait]
+          chunked_view.partition_map[view], chunked_view.partition_map[wait]
       )
+      self.assertEqual(
+          chunked_view.partition_map[cast], chunked_view.partition_map[wait]
+      )
+
+  def test_backward_fsdp_pipeline_keeps_row_folded_rs_view_and_cast_with_wait(
+      self,
+  ):
+    """Real `_movedim_reduce_scatter_tensor` fold + bf16 cast stays atomic."""
+    self.assertFalse(dist.is_initialized())
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+    try:
+      mesh = DeviceMesh("cpu", [0, 1])
+      with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
+        model = _RowFoldedToyTransformer(n_layers=2, dtype=torch.bfloat16)
+        annotate_module_fqns(model)
+        model = data_parallel(
+            model,
+            device_mesh=mesh,
+            mode="fully_shard",
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            ),
+        )
+        inputs = torch.randn(2, 256, dtype=torch.bfloat16, requires_grad=True)
+        traced = self._trace_toy_model(model=model, inputs=inputs)
+    finally:
+      dist.destroy_process_group()
+
+    gm = self._apply_passes_and_split(
+        traced, fsdp_reshard_after_forward="always"
+    ).backward_graph
+    folded_epilogues = []
+    for node in gm.graph.nodes:
+      if (
+          node.op == "call_function"
+          and node.target is torch.ops.aten._to_copy.default
+          and len(node.all_input_nodes) == 1
+          and _is_view(node.all_input_nodes[0])
+      ):
+        view = node.all_input_nodes[0]
+        if len(view.all_input_nodes) == 1 and graph_split_lib.is_wait_tensor(
+            view.all_input_nodes[0]
+        ):
+          folded_epilogues.append((view.all_input_nodes[0], view, node))
+    self.assertLen(folded_epilogues, 2)
+
+    chunked = split_backward_graph_by_layer(
+        gm, n_layers=2, pipeline_collectives=True
+    )
+    for wait, view, cast in folded_epilogues:
+      self.assertEqual(chunked.partition_map[view], chunked.partition_map[wait])
+      self.assertEqual(chunked.partition_map[cast], chunked.partition_map[wait])
+
+  def test_reduce_scatter_chain_stops_at_resizing_views_and_compute(self):
+    """Only casts and size-preserving views after an RS wait join its chain."""
+    for resize_kind in ("expand", "slice"):
+      with self.subTest(resize_kind=resize_kind):
+        gm = self._trace_simple_fsdp(
+            n_layers=2,
+            reduce_dtype=torch.bfloat16,
+        ).backward_graph
+        graph = gm.graph
+        reduce_casts = [
+            node
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target is torch.ops.aten._to_copy.default
+            and len(node.all_input_nodes) == 1
+            and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+        ]
+        self.assertLen(reduce_casts, 2)
+        waits = [cast.all_input_nodes[0] for cast in reduce_casts]
+
+        def insert_before(cast, target, args, shape, *, g=graph):
+          """Makes ``target(<cast's input>, *args)`` the cast's input."""
+          source = cast.all_input_nodes[0]
+          with g.inserting_before(cast):
+            node = g.call_function(target, (source, *args))
+          node.meta["val"] = torch.empty(
+              shape, dtype=source.meta["val"].dtype, device="meta"
+          )
+          cast.replace_input_with(source, node)
+          return node
+
+        # Layer 1 (pipelined RS): wait -> view -> resizing view -> cast.
+        shape = list(waits[1].meta["val"].shape)
+        view = insert_before(
+            reduce_casts[1], torch.ops.aten.view.default, (shape,), shape
+        )
+        if resize_kind == "expand":
+          resized = insert_before(
+              reduce_casts[1],
+              torch.ops.aten.expand.default,
+              ([2, *shape],),
+              [2, *shape],
+          )
+        else:
+          half = max(1, shape[0] // 2)
+          resized = insert_before(
+              reduce_casts[1],
+              torch.ops.aten.slice.Tensor,
+              (0, 0, half),
+              [half, *shape[1:]],
+          )
+        # Layer 0: wait -> mul (compute) -> cast.
+        mul = insert_before(
+            reduce_casts[0],
+            torch.ops.aten.mul.Tensor,
+            (2.0,),
+            list(waits[0].meta["val"].shape),
+        )
+        gm.recompile()
+
+        chains = graph_split_lib._collect_collective_chains(gm)
+        chain0, chain1 = (
+            next(chain for chain in chains.values() if wait in chain)
+            for wait in waits
+        )
+        self.assertIn(view, chain1)
+        self.assertNotIn(resized, chain1)
+        self.assertNotIn(reduce_casts[1], chain1)
+        self.assertNotIn(mul, chain0)
+        self.assertNotIn(reduce_casts[0], chain0)
+        with self.assertRaisesRegex(ValueError, "reverse dependency"):
+          split_backward_graph_by_layer(
+              gm, n_layers=2, pipeline_collectives=True
+          )
 
 
 if __name__ == "__main__":

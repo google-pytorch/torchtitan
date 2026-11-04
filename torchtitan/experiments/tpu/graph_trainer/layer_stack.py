@@ -51,7 +51,7 @@ import torch
 from torch import nn
 from torch._higher_order_ops.scan import scan
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
 from torch.func import functional_call
 
 from torchtitan.config import derive
@@ -208,6 +208,29 @@ class LayerStackHolder(Module):
         # Meshes used to view one layer of a flattened stack in its original
         # shape, keyed by (FSDP mesh, size of the first per-layer axis).
         self.split_meshes: dict[tuple[DeviceMesh, int], DeviceMesh] = {}
+        self._ep_pending_stacks: dict[str, nn.Parameter] = {}
+        self._ep_parallel_dims: object | None = None
+
+    def stash_expert_stacks_for_ep(self, parallel_dims: object) -> None:
+        """Temporarily set aside routed-expert stacks before dense SimpleFSDP.
+
+        When expert parallelism is enabled, routed-expert stacks belong on the
+        sparse ``([dp_replicate,] efsdp, ep)`` mesh rather than the dense
+        ``([dp_replicate,] fsdp)`` mesh. Removing them before ``flatten_for``,
+        ``plan_shard_dims`` and ``apply_simple_fsdp`` keeps dense FSDP on the
+        non-expert stacks; ``build_split_meshes`` then distributes the stashed
+        expert stacks across ``(efsdp, ep)``.
+        """
+        if not getattr(parallel_dims, "ep_enabled", False):
+            return
+        self._ep_parallel_dims = parallel_dims
+        for name in list(self._parameters):
+            if name.startswith(
+                ("moe__routed_experts__inner_experts__", "moe__experts__")
+            ):
+                param = self._parameters.pop(name)
+                if param is not None:
+                    self._ep_pending_stacks[name] = param
 
     def flatten_for(self, degree: int) -> dict[str, torch.Size]:
         """Flattens axes 1 and 2 of stacks that can't be sharded evenly on axis 1.
@@ -297,12 +320,60 @@ class LayerStackHolder(Module):
         }
 
     def build_split_meshes(self) -> None:
-        """Creates the meshes ``as_layer_shape`` uses.
+        """Creates split meshes and distributes any stashed EP expert stacks.
 
         For each flattened stack, splits the shard axis of its FSDP mesh into
-        ``(A, ranks // A)``. This creates process groups, so all ranks must call
-        it at the same point; call it right after ``apply_simple_fsdp``.
+        ``(A, ranks // A)``. When expert stacks were stashed by
+        ``stash_expert_stacks_for_ep``, distributes them across the sparse
+        ``([dp_replicate,] efsdp, ep)`` mesh with ``Shard(1)`` on ``ep`` and an
+        orthogonal inner shard axis on ``efsdp``. This creates process groups,
+        so all ranks must call it at the same point; call it right after
+        ``apply_simple_fsdp``.
         """
+        if self._ep_pending_stacks and self._ep_parallel_dims is not None:
+            pdims = self._ep_parallel_dims
+            mesh_names = (
+                ["dp_replicate", "efsdp", "ep"]
+                if getattr(pdims, "dp_replicate_enabled", False)
+                else ["efsdp", "ep"]
+            )
+            sparse_mesh = pdims.get_mesh(mesh_names)
+            efsdp_degree = sparse_mesh["efsdp"].size()
+            ep_degree = sparse_mesh["ep"].size()
+            for name, param in list(self._ep_pending_stacks.items()):
+                if param.shape[1] % ep_degree != 0:
+                    raise ValueError(
+                        f"{name} has {param.shape[1]} experts on dim 1, which "
+                        f"ep={ep_degree} cannot shard evenly"
+                    )
+                if efsdp_degree == 1:
+                    efsdp_placement = Replicate()
+                else:
+                    efsdp_dim = next(
+                        (
+                            d
+                            for d in range(2, param.ndim)
+                            if param.shape[d] % efsdp_degree == 0
+                        ),
+                        None,
+                    )
+                    if efsdp_dim is None:
+                        raise ValueError(
+                            f"Cannot shard {name} of shape {tuple(param.shape)} "
+                            f"across efsdp={efsdp_degree} and ep={ep_degree}"
+                        )
+                    efsdp_placement = Shard(efsdp_dim)
+                placements = (
+                    [Replicate(), efsdp_placement, Shard(1)]
+                    if getattr(pdims, "dp_replicate_enabled", False)
+                    else [efsdp_placement, Shard(1)]
+                )
+                self._parameters[name] = nn.Parameter(
+                    distribute_tensor(param, sparse_mesh, placements),
+                    requires_grad=param.requires_grad,
+                )
+            self._ep_pending_stacks.clear()
+
         for name, shape in self.layer_shapes.items():
             param = self._parameters.get(name)
             if not isinstance(param, DTensor):

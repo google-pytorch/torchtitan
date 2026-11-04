@@ -810,6 +810,9 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     # <= 6.1e-3 everywhere; in bf16 they deviate from it by 65% / 55% / 12%
     # (cosine 0.85 / 0.89 / 0.99) on A_log / dt_bias / in_proj_a and by
     # <= 9.3e-3 elsewhere.
+    # TODO: Add an fp32 clamped-XLA arm as the reference for the bf16 run, to
+    # tell whether the bf16 A_log / dt_bias / in_proj_a gap comes from the
+    # kernels or from the bf16 XLA recurrence.
     decay_params = ("A_log", "dt_bias", "in_proj_a.weight")
     for name, (vs_xla, clamp_only, vs_clamped, cos) in deviation.items():
       if name in decay_params:

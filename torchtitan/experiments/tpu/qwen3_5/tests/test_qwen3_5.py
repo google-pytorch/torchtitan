@@ -1934,6 +1934,115 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         {"attention.inner_attention": 2},
     )
 
+  def test_tpu_rms_norm_gated_wiring_and_fallback(self):
+    """Tests ``use_tpu_modules`` wiring and ``TpuRMSNormGated`` dispatch/fallback."""
+    cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    norms = [
+        layer.delta_net.norm
+        for layer in cfg.model_spec.model.layers
+        if layer.delta_net is not None
+    ]
+    self.assertLen(norms, 30)
+    for norm_cfg in norms:
+      self.assertIsInstance(norm_cfg, gated_delta.TpuRMSNormGated.Config)
+
+    dev = self.accelerator_device
+    mod = gated_delta.TpuRMSNormGated.Config(dim=128, eps=1e-6).build().to(dev)
+    ref_mod = gated_delta.RMSNormGated.Config(dim=128, eps=1e-6).build().to(dev)
+    with torch.no_grad():
+      mod.weight.uniform_(0.8, 1.2)
+      ref_mod.weight.copy_(mod.weight)
+
+    # Small debug shapes (`rows < 2048`) fall back cleanly to `RMSNormGated`.
+    x_small = torch.randn(
+        16, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g_small = torch.randn(
+        16, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    out_small = mod(x_small, g_small)
+    out_small_ref = ref_mod(x_small.detach(), g_small.detach())
+    torch.testing.assert_close(out_small.cpu(), out_small_ref.cpu())
+
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      return
+
+    self.assertIsNotNone(gated_delta.rms_norm_gated)
+    x_tpu = torch.randn(
+        1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g_tpu = torch.randn(
+        1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    with mock.patch.object(
+        gated_delta.rms_norm_gated,
+        "rms_norm_gated",
+        wraps=gated_delta.rms_norm_gated.rms_norm_gated,
+    ) as spy:
+      out_tpu = mod(x_tpu, g_tpu)
+      self.assertEqual(spy.call_count, 1)
+    out_tpu_ref = ref_mod(x_tpu, g_tpu)
+    torch.testing.assert_close(
+        out_tpu.cpu(), out_tpu_ref.cpu(), rtol=1e-2, atol=1e-2
+    )
+
+  def test_tokamax_gated_delta_selective_remat_and_compile(self):
+    """Tests Tokamax KDA residual-list custom ops under torch.compile on TPU."""
+    if (
+        self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU
+        or not tokamax_gated_delta.supports_current_tpu()
+        or not tokamax_gated_delta.has_tokamax_kda()
+    ):
+      self.skipTest("Requires TPU >= v6 with Tokamax KDA installed.")
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    dev = self.accelerator_device
+    torch.manual_seed(17)
+    kernel = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
+        max_num_segments=4
+    ).build()
+
+    def step(q, k, v, g, beta, seg):
+      y = kernel(q, k, v, g, beta, segment_ids_BS=seg)
+      return y.float().square().mean()
+
+    q = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    k = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    v = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g = -torch.rand(
+        1, 128, 2, device=dev, dtype=torch.float32, requires_grad=True
+    )
+    beta = torch.rand(
+        1, 128, 2, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    seg = torch.cat(
+        [
+            torch.zeros(1, 64, device=dev, dtype=torch.int32),
+            torch.ones(1, 64, device=dev, dtype=torch.int32),
+        ],
+        dim=1,
+    )
+
+    eager_loss = step(q, k, v, g, beta, seg)
+    eager_grads = torch.autograd.grad(eager_loss, (q, k, v, g, beta))
+
+    compiled_step = torch.compile(step, backend="tpu")
+    comp_loss = compiled_step(q, k, v, g, beta, seg)
+    comp_grads = torch.autograd.grad(comp_loss, (q, k, v, g, beta))
+
+    torch.testing.assert_close(
+        comp_loss.cpu(), eager_loss.cpu(), rtol=2e-2, atol=2e-2
+    )
+    for g_comp, g_eager in zip(comp_grads, eager_grads, strict=True):
+      torch.testing.assert_close(
+          g_comp.cpu(), g_eager.cpu(), rtol=3e-2, atol=3e-2
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

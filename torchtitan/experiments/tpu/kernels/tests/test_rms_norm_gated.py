@@ -4,7 +4,13 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
-import torch
+# pyformat: disable
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import when torch autoloads torch_tpu -> torch.distributed.fsdp -> spmd_types.
+import torch  # isort: skip
+import spmd_types as spmd
+from spmd_types.checker import typecheck as spmd_typecheck
+# pyformat: enable
 from torch.distributed.tensor import DTensor
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
@@ -30,13 +36,12 @@ def _reference_fp64(x, gate, weight, eps):
 
 def _relative_l2_error(actual, expected):
   return float(
-      (actual.double() - expected.double()).norm() / expected.double().norm()
+      (actual.double() - expected.double()).norm()
+      / expected.double().norm().clamp_min(1e-12)
   )
 
 
-class RmsNormGatedTest(
-    base_device_test.BaseAcceleratorDeviceTest, parameterized.TestCase
-):
+class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
 
   def _require_tpu(self) -> None:
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
@@ -230,6 +235,86 @@ class RmsNormGatedTest(
     self.assertFalse(rms_norm_gated.supports(fake_dtensor, x_ok, w_ok))
     self.assertFalse(rms_norm_gated.supports(x_ok, fake_dtensor, w_ok))
     self.assertFalse(rms_norm_gated.supports(x_ok, x_ok, fake_dtensor))
+
+  def test_spmd_types_global_and_local_typecheck(self):
+    dp = spmd.MeshAxis.of(2, 4)
+    tp = spmd.MeshAxis.of(4, 1)
+    zero = torch.zeros(4, 4)
+    self.assertEqual(_relative_l2_error(zero, zero), 0.0)
+
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      with spmd.set_current_mesh({"dp": dp, "tp": tp}):
+        x_cpu = torch.zeros(2048, 4, 128)
+        w_cpu = torch.ones(128)
+        spmd.assert_type(x_cpu, {dp: spmd.S(0), tp: spmd.S(2)})
+        spmd.assert_type(w_cpu, {dp: spmd.R, tp: spmd.S(0)})
+        with spmd_typecheck(local=False):
+          self.assertFalse(rms_norm_gated.supports(x_cpu, x_cpu, w_cpu))
+      return
+
+    dev = self.accelerator_device
+    torch.manual_seed(23)
+    with spmd.set_current_mesh({"dp": dp, "tp": tp}):
+      x = torch.randn(
+          1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+      )
+      gate = torch.randn(
+          1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+      )
+      w = torch.ones(128, device=dev, dtype=torch.float32, requires_grad=True)
+      dy = torch.randn(1024, 2, 128, device=dev, dtype=torch.bfloat16)
+      x_bad = torch.randn(1024, 2, 128, device=dev, dtype=torch.bfloat16)
+
+      spmd.assert_type(x, {dp: spmd.S(0), tp: spmd.S(1)})
+      spmd.assert_type(gate, {dp: spmd.S(0), tp: spmd.S(1)})
+      spmd.assert_type(w, {dp: spmd.R, tp: spmd.R})
+      spmd.assert_type(dy, {dp: spmd.S(0), tp: spmd.S(1)})
+      spmd.assert_type(x_bad, {dp: spmd.S(0), tp: spmd.S(2)})
+
+      x_ref = x.detach().clone().requires_grad_(True)
+      g_ref = gate.detach().clone().requires_grad_(True)
+      w_ref = w.detach().clone().requires_grad_(True)
+      out_ref = _reference(x_ref, g_ref, w_ref, 1e-6).to(torch.bfloat16)
+      out_ref.backward(dy)
+
+      with spmd_typecheck(local=False):
+        self.assertTrue(rms_norm_gated.supports(x, gate, w))
+        self.assertFalse(rms_norm_gated.supports(x_bad, gate, w))
+        with self.assertRaises((spmd.SpmdTypeError, ValueError)):
+          rms_norm_gated._RmsNormGatedSpmdFn.apply(x_bad, gate, w, 1e-6)
+        out = rms_norm_gated.rms_norm_gated(x, gate, w, 1e-6)
+        expected_ps = spmd.PartitionSpec(
+            spmd.normalize_axis(dp), spmd.normalize_axis(tp), None
+        )
+        self.assertEqual(spmd.get_partition_spec(out), expected_ps)
+        self.assertEqual(
+            spmd.get_local_type(out),
+            {spmd.normalize_axis(dp): spmd.V, spmd.normalize_axis(tp): spmd.V},
+        )
+        out.backward(dy)
+      self.assertLess(_relative_l2_error(out, out_ref), 1e-2)
+      self.assertLess(_relative_l2_error(x.grad, x_ref.grad), 2e-2)
+      self.assertLess(_relative_l2_error(gate.grad, g_ref.grad), 2e-2)
+      self.assertLess(_relative_l2_error(w.grad, w_ref.grad), 1e-2)
+
+      x_loc = x.detach().clone().requires_grad_(True)
+      g_loc = gate.detach().clone().requires_grad_(True)
+      w_loc = w.detach().clone().requires_grad_(True)
+      dy_loc = dy.detach().clone()
+      spmd.assert_type(x_loc, {dp: spmd.V, tp: spmd.V})
+      spmd.assert_type(g_loc, {dp: spmd.V, tp: spmd.V})
+      spmd.assert_type(w_loc, {dp: spmd.R, tp: spmd.R})
+      spmd.assert_type(dy_loc, {dp: spmd.V, tp: spmd.V})
+      with spmd_typecheck(local=True):
+        out_loc = rms_norm_gated.rms_norm_gated(x_loc, g_loc, w_loc, 1e-6)
+        self.assertEqual(
+            spmd.get_local_type(out_loc),
+            {spmd.normalize_axis(dp): spmd.V, spmd.normalize_axis(tp): spmd.V},
+        )
+        out_loc.backward(dy_loc)
+      torch.testing.assert_close(x_loc.grad, x.grad, rtol=0, atol=0)
+      torch.testing.assert_close(g_loc.grad, gate.grad, rtol=0, atol=0)
+      torch.testing.assert_close(w_loc.grad, w.grad, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

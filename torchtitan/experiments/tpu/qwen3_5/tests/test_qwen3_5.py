@@ -48,6 +48,7 @@ import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
+from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
@@ -1102,6 +1103,20 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       )
       self.assertEqual(kernel_cfg.min_log_decay, -4.0)
       self.assertEqual(kernel_cfg.max_num_segments, 24)
+    # On a TPU that runs the Mosaic kernels, building the recipe's model fails
+    # at once (before initialization or checkpoint loading) without the KDA op.
+    with (
+        mock.patch.object(
+            tokamax_gated_delta, "supports_current_tpu", return_value=True
+        ),
+        mock.patch.object(
+            tokamax_gated_delta,
+            "_import_kda",
+            return_value=(None, ImportError("no KDA")),
+        ),
+    ):
+      with self.assertRaisesRegex(ImportError, r"tokamax>=0\.0\.17"):
+        kernels[0].build()
 
   def test_model_isolates_packed_documents(self):
     """Tests that documents packed into rows equal the documents run alone.

@@ -74,6 +74,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.kernels import ragged_gather_tc
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
@@ -2673,6 +2674,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         self.assertEqual(tuple(dx.shape), (4, 8))
       self.assertEqual(seen_requires_grad, [False, False])
 
+  def test_scale_dscore_d_chunk_fits_vmem(self):
+    """Tests the dScore kernel's feature chunk against the VMEM budget."""
+    mib = 2**20
+    d_chunk = ragged_gather_tc._scale_dscore_d_chunk  # pylint: disable=protected-access
+    # TPU7x (64 MiB): the 35B-A3B hidden size stays one chunk; 4096 (397B,
+    # which overflowed VMEM at 65.16 of 63.94 MiB) splits in two in bf16.
+    self.assertEqual(d_chunk(2048, 1024, 2, 64 * mib), 2048)
+    self.assertEqual(d_chunk(4096, 1024, 2, 64 * mib), 2048)
+    self.assertEqual(d_chunk(4096, 1024, 4, 64 * mib), 1024)
+    # No 128-multiple chunk fits: the caller falls back to XLA.
+    self.assertIsNone(d_chunk(128, 1024, 2, 1 * mib))
+
   @parameterized.named_parameters(
       dict(
           testcase_name="_ep2_balanced",
@@ -2706,6 +2719,19 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           skew_mode="all_rank0",
           use_paired_experts=True,
       ),
+      # The dScore kernel's feature-chunked grid (as wide hidden sizes such as
+      # 4096 need for VMEM): two 128-wide chunks of a 256-wide hidden size,
+      # accumulating the dScore row sums across chunks.
+      dict(
+          testcase_name="_ep2_paired_experts_and_dscore_kernel_d_chunks",
+          ep_size=2,
+          top_k=4,
+          tokens_per_rank=128,
+          skew_mode="all_rank0",
+          use_paired_experts=True,
+          dim=256,
+          dscore_d_chunk=128,
+      ),
   )
   def test_ep_ring_of_experts_dropless_parity_and_fx_trace(
       self,
@@ -2714,13 +2740,24 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       tokens_per_rank: int,
       skew_mode: str,
       use_paired_experts: bool,
+      dim: int | None = None,
+      dscore_d_chunk: int | None = None,
   ):
     """Tests Ring-of-Experts dropless parity, paired GMM, and static FX trace."""
     torch.manual_seed(321 + ep_size + top_k)
     dev = self.accelerator_device
     num_experts = 8
     e_local = num_experts // ep_size
-    dim = 128 if (use_paired_experts or self._is_tpu()) else 16
+    if dim is None:
+      dim = 128 if (use_paired_experts or self._is_tpu()) else 16
+    if dscore_d_chunk is not None:
+      self.enter_context(
+          mock.patch.object(
+              ragged_gather_tc,
+              "_scale_dscore_d_chunk",
+              return_value=dscore_d_chunk,
+          )
+      )
     hidden_dim = 128 if (use_paired_experts or self._is_tpu()) else 24
 
     auto_disp = qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config(

@@ -17,14 +17,18 @@ axis as one stream. This module provides the TPU replacements:
 3. ``TpuGatedDeltaNet``: ``GatedDeltaNet`` that passes ``positions`` down, so
    the causal ``conv1d`` and the recurrence also restart at every document
    packed into a row (``positions == 0``), as upstream's ``cu_seqlens`` kernels
-   do. The document boundaries are static-shape ``[B, S]`` segment-id masks.
+   do. The document boundaries are static-shape ``[B, S]`` segment-id masks;
+   setting ``reset_at_documents=False`` (``document_resets.enabled=False``)
+   turns off the document restarts so pretraining runs over each ``[B, S]`` row
+   as one stream.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
 
+from torchtitan.config.configurable import Configurable
 from torchtitan.config.override import override
 from torchtitan.experiments.tpu import unflatten_shim
 
@@ -338,21 +342,25 @@ def chunked_gated_delta(
 def per_row_segment_ids(
     segment_ids_BS: torch.Tensor, max_num_segments: int
 ) -> torch.Tensor:
-  """Per-row document ids, keeping at most ``max_num_segments`` apart.
+  """Per-row 1-based document ids, keeping at most ``max_num_segments`` apart.
 
   Args:
     segment_ids_BS: ``[B, S]`` document index of each token, non-decreasing
-      along each row in steps of one (``segment_ids_from_positions``, possibly
-      counting on from earlier rows).
+      along each row (e.g. ``segment_ids_from_positions`` or arbitrary sorted
+      document ids).
     max_num_segments: Documents per row kept apart.
 
   Returns:
-    ``[B, S]`` int32 ids that start at 1 in every row. Documents beyond
+    ``[B, S]`` int32 ids that start at 1 in every row and increment by 1 at
+    each document boundary up to ``max_num_segments``. Documents beyond
     ``max_num_segments`` share the last id, so they run as one sequence, as
     without document ids.
   """
-  ids = segment_ids_BS - segment_ids_BS[:, :1] + 1
-  return ids.clamp(min=1, max=max_num_segments).to(torch.int32)
+  if segment_ids_BS.shape[1] <= 1:
+    return torch.ones_like(segment_ids_BS, dtype=torch.int32)
+  changes = (segment_ids_BS[:, 1:] != segment_ids_BS[:, :-1]).to(torch.int32)
+  ids = F.pad(changes.cumsum(dim=1, dtype=torch.int32), (1, 0)) + 1
+  return ids.clamp(max=max_num_segments).to(torch.int32)
 
 
 class TpuGatedDeltaKernel(GatedDeltaKernel):
@@ -531,6 +539,23 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
 
 
+class GatedDeltaDocumentResets(Configurable):
+  """Leaf config controlling packed-document resets in ``TpuGatedDeltaNet``.
+
+  Kept as its own leaf ``Configurable`` so ``gated_delta_document_resets``
+  targets ``layers.{i}.delta_net.document_resets`` without conflicting with
+  ``tokamax_gated_delta_kernel`` at
+  ``layers.{i}.delta_net.inner_gated_delta_net.kernel`` under ``override``.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Configurable.Config):
+    enabled: bool = True
+
+  def __init__(self, config: Config):
+    self.enabled = config.enabled
+
+
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 
@@ -541,11 +566,12 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   document offsets, which ``Qwen35Model`` only builds for the flex and varlen
   attention backends and whose shape changes with the number of documents.
 
-  ``Config.reset_at_documents=False`` drops ``positions`` instead, so the
-  convolution and the recurrence run over each ``[B, S]`` row as one stream,
-  as upstream does without ``cu_seqlens`` (e.g. with SDPA). Pretraining
-  recipes use it: the Tokamax kernels lay every document out from a 64-token
-  chunk boundary to restart at it, which costs time and memory.
+  ``Config.reset_at_documents=False`` (``document_resets.enabled=False``) drops
+  ``positions`` instead, so the convolution and the recurrence run over each
+  ``[B, S]`` row as one stream, as upstream does without ``cu_seqlens`` (e.g.
+  with SDPA). Pretraining recipes use it: the Tokamax kernels lay every
+  document out from a 64-token chunk boundary to restart at it, which costs
+  time and memory.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -553,11 +579,21 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     # Restart the causal convolution and the recurrence at every packed
     # document (`positions == 0`). RL needs this when packing multiple rollouts
     # into one `[B, S]` row; pretraining on packed text may turn it off.
-    reset_at_documents: bool = True
+    document_resets: GatedDeltaDocumentResets.Config = field(
+        default_factory=GatedDeltaDocumentResets.Config
+    )
+
+    @property
+    def reset_at_documents(self) -> bool:
+      return self.document_resets.enabled
+
+    @reset_at_documents.setter
+    def reset_at_documents(self, value: bool) -> None:
+      self.document_resets = replace(self.document_resets, enabled=value)
 
   def __init__(self, config: Config):
     super().__init__(config)
-    self.reset_at_documents = config.reset_at_documents
+    self.reset_at_documents = config.document_resets.build().enabled
 
   def forward(
       self,
@@ -608,11 +644,11 @@ class TpuGatedDeltaNet(GatedDeltaNet):
 
 
 @override(
-    target=TpuGatedDeltaNet.Config,
+    target=GatedDeltaDocumentResets.Config,
     description="Set whether GatedDeltaNet resets at packed documents.",
 )
 def gated_delta_document_resets(
-    cfg: TpuGatedDeltaNet.Config, *, enabled: bool = True
-) -> TpuGatedDeltaNet.Config:
-  """Sets ``reset_at_documents`` on ``TpuGatedDeltaNet.Config``."""
-  return replace(cfg, reset_at_documents=enabled)
+    cfg: GatedDeltaDocumentResets.Config, *, enabled: bool = True
+) -> GatedDeltaDocumentResets.Config:
+  """Sets ``enabled`` on ``GatedDeltaDocumentResets.Config``."""
+  return replace(cfg, enabled=enabled)

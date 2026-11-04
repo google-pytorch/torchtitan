@@ -1362,10 +1362,96 @@ def roe_unsort_combine(
   )
 
 
+class _RoEUnsortReduce(torch.autograd.Function):
+  """Unweighted gather-reduce of ``routed_output_RD`` back to ``[G, D]``.
+
+  The transpose of ``roe_sort_gather``: forward is the TC ragged gather-reduce
+  and backward is the TC ragged gather, so no routing-weight gradient is
+  computed here (weights are applied on the expert activation instead).
+  """
+
+  @staticmethod
+  def forward(
+      ctx,
+      routed_output_RD: torch.Tensor,
+      token_ids_sorted_M: torch.Tensor,
+      start_count_2: torch.Tensor,
+      src_rows: torch.Tensor,
+      tokens: torch.Tensor,
+      blocks: torch.Tensor,
+      num_out_tokens: int,
+      top_k: int,
+      gather_block_size: int,
+      reduce_block_size: int,
+  ) -> torch.Tensor:
+    ctx.save_for_backward(token_ids_sorted_M, start_count_2, src_rows, tokens, blocks)
+    ctx.cap = routed_output_RD.shape[0]
+    ctx.top_k = top_k
+    ctx.gather_block_size = gather_block_size
+    ctx.reduce_block_size = reduce_block_size
+    return _roe_gather_bwd(
+        routed_output_RD.contiguous(),
+        src_rows,
+        tokens,
+        blocks,
+        token_ids_sorted_M.shape[0],
+        num_out_tokens,
+        top_k,
+        reduce_block_size,
+    )
+
+  @staticmethod
+  def backward(ctx, grad_partial_GD: torch.Tensor):
+    token_ids_sorted_M, start_count_2, src_rows, tokens, blocks = ctx.saved_tensors
+    grad_routed_RD = _roe_gather_fwd(
+        grad_partial_GD.contiguous(),
+        token_ids_sorted_M,
+        start_count_2,
+        src_rows,
+        tokens,
+        blocks,
+        ctx.cap,
+        ctx.top_k,
+        ctx.gather_block_size,
+        ctx.reduce_block_size,
+        False,
+    )
+    return (grad_routed_RD,) + (None,) * 9
+
+
+def roe_unsort_reduce(
+    routed_output_RD: torch.Tensor,
+    token_ids_sorted_M: torch.Tensor,
+    start_count_2: torch.Tensor,
+    src_rows: torch.Tensor,
+    tokens: torch.Tensor,
+    blocks: torch.Tensor,
+    *,
+    num_out_tokens: int,
+    top_k: int,
+    gather_block_size: int = 1024,
+    reduce_block_size: int = 896,
+) -> torch.Tensor:
+  """Unweighted FP32 gather-reduce of ``routed_output_RD`` back to ``[G, D]``."""
+  return _RoEUnsortReduce.apply(
+      routed_output_RD,
+      token_ids_sorted_M,
+      start_count_2,
+      src_rows,
+      tokens,
+      blocks,
+      num_out_tokens,
+      top_k,
+      gather_block_size,
+      reduce_block_size,
+  )
+
+
 __all__ = [
     "roe_compute_routing",
     "roe_sort_gather",
     "roe_unsort_combine",
+    "roe_unsort_reduce",
     "safe_gather_block_size",
     "safe_reduce_block_size",
 ]

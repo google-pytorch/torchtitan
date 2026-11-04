@@ -26,6 +26,7 @@ and overlapping chunk ``c`` MXU expert GEMMs with chunk ``c + 1`` SparseCore
 collectives.
 """
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Literal
 import weakref
@@ -348,6 +349,12 @@ class TpuQwen35RoEDispatchMetadata(LocalDispatchMetadata):
   gather_block_size: int = 1024
   reduce_block_size: int = 896
   zero_pad_tail: bool = False
+  # FP32 routing weight per ``[cap]`` buffer row (0 past the valid count).
+  # Set when ``roe_weights_on_activation``: the routed experts multiply their
+  # hidden activation by it before ``w2`` and set ``row_scale_applied`` so the
+  # combine is an unweighted gather-reduce.
+  expert_row_scale_R: torch.Tensor | None = None
+  row_scale_applied: bool = False
 
 
 class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
@@ -360,6 +367,13 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     roe_gather_block_size: int = 1024
     roe_reduce_block_size: int = 896
     roe_zero_pad_tail: bool = False
+    # Apply routing weights on the routed experts' hidden activation (before
+    # ``w2``) instead of in the combine, as MaxText's
+    # ``moe_tc_ragged_weights_on_activation``: the weight scale and its
+    # gradient run over the expert hidden size (e.g. 1024 for 397B-A17B)
+    # instead of the model dim (4096), and the combine is an unweighted
+    # gather-reduce.
+    roe_weights_on_activation: bool = True
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -368,6 +382,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     self.roe_gather_block_size = config.roe_gather_block_size
     self.roe_reduce_block_size = config.roe_reduce_block_size
     self.roe_zero_pad_tail = config.roe_zero_pad_tail
+    self.roe_weights_on_activation = config.roe_weights_on_activation
     self._ep_rank_holder_ref: weakref.ReferenceType | None = None
     self._ep_local_rank_buf: torch.Tensor | None = None
 
@@ -556,6 +571,19 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
             zero_pad_tail=self.roe_zero_pad_tail,
         )
         empty_f32 = topk_scores_TK.new_empty((0,))
+        expert_row_scale_R = None
+        if self.roe_weights_on_activation:
+          scores_flat_M = scores_all_GK.reshape(-1).float()
+          valid_R = (
+              torch.arange(cap, device=x_TD.device, dtype=torch.int32)
+              < start_count_2[1]
+          )
+          slot_R = window_slot_order_cap.clamp(0, scores_flat_M.shape[0] - 1)
+          expert_row_scale_R = torch.where(
+              valid_R,
+              torch.index_select(scores_flat_M, 0, slot_R),
+              torch.zeros((), dtype=torch.float32, device=x_TD.device),
+          )
         metadata = TpuQwen35RoEDispatchMetadata(
             token_indices_experts_sorted_N=token_ids_sorted_M,
             topk_scores_experts_sorted_N=empty_f32,
@@ -570,6 +598,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
             gather_block_size=gather_block,
             reduce_block_size=reduce_block,
             zero_pad_tail=self.roe_zero_pad_tail,
+            expert_row_scale_R=expert_row_scale_R,
         )
         return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
 
@@ -650,8 +679,24 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
         # pylint: disable=g-import-not-at-top
         from torchtitan.experiments.tpu.kernels.ragged_gather_tc import (
             roe_unsort_combine,
+            roe_unsort_reduce,
         )
         # pylint: enable=g-import-not-at-top
+
+        if metadata.row_scale_applied:
+          partial_GD = roe_unsort_reduce(
+              routed_output_RD,
+              metadata.token_indices_experts_sorted_N,
+              metadata.start_count_2,
+              metadata.src_rows,
+              metadata.tokens,
+              metadata.blocks,
+              num_out_tokens=metadata.num_global_tokens,
+              top_k=self.top_k,
+              gather_block_size=metadata.gather_block_size,
+              reduce_block_size=metadata.reduce_block_size,
+          )
+          return _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
 
         assert metadata.scores_flat_M is not None
         assert metadata.window_slot_order_cap is not None
@@ -908,8 +953,14 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
   ) -> torch.Tensor:
     num_chunks = self.num_token_chunks
     ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
+    weights_on_activation = (
+        ep_mesh is not None
+        and isinstance(self.token_dispatcher, TpuQwen35TokenDispatcher)
+        and self.token_dispatcher.roe_weights_on_activation
+        and getattr(self.inner_experts, "use_pallas_grouped_mm", False)
+    )
     if (
-        num_chunks <= 1
+        (num_chunks <= 1 and not weights_on_activation)
         or ep_mesh is None
         or x_TD.shape[0] == 0
         or x_TD.shape[0] % num_chunks != 0
@@ -961,12 +1012,20 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
         routed_input_c, num_tokens_per_expert_e, metadata_c = (
             self.token_dispatcher.dispatch(x_c, scores_c, ids_c, counts_c)
         )
+        row_scale_c = (
+            getattr(metadata_c, "expert_row_scale_R", None)
+            if weights_on_activation
+            else None
+        )
         with maybe_set_sparse_mesh():
           routed_output_c = self.inner_experts(
               routed_input_c,
               num_tokens_per_expert_e,
+              row_scale_R=row_scale_c,
               pre_unsharded_weights=unsharded_weights,
           )
+        if row_scale_c is not None:
+          metadata_c = dataclasses.replace(metadata_c, row_scale_applied=True)
         out_chunks.append(
             self.token_dispatcher.combine(routed_output_c, metadata_c, x_c)
         )

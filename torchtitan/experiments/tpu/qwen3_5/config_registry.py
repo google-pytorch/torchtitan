@@ -234,6 +234,7 @@ def _use_expert_parallel(
     comm_mode: qwen35_token_dispatcher.CommMode = "auto",
     num_token_chunks: int | None = None,
     roe_use_pallas_tc: bool = True,
+    roe_weights_on_activation: bool = True,
     allow_ep_paired_grouped_mm: bool = True,
     enable_sparsecore_offload: bool = True,
 ) -> None:
@@ -256,6 +257,10 @@ def _use_expert_parallel(
       `--parallelism.expert_parallel_degree` is overridden on the CLI).
     roe_use_pallas_tc: Use Pallas TensorCore async-DMA gather / weighted
       gather-reduce kernels for Ring-of-Experts.
+    roe_weights_on_activation: Apply routing weights on the routed experts'
+      hidden activation (before `w2`) and combine with an unweighted
+      gather-reduce, instead of a weighted gather-reduce with a fused
+      scale + dScore backward over the model dim.
     allow_ep_paired_grouped_mm: Keep the paired W1+W3 Pallas grouped matmul
       enabled under EP > 1.
     enable_sparsecore_offload: Add `SPARSECORE_COLLECTIVE_OFFLOAD` and
@@ -320,6 +325,7 @@ def _use_expert_parallel(
       ):
         dispatcher.comm_mode = comm_mode
         dispatcher.roe_use_pallas_tc = roe_use_pallas_tc
+        dispatcher.roe_weights_on_activation = roe_weights_on_activation
 
   if enable_sparsecore_offload:
     cfg.libtpu_init_flags = tpu_flags.merge_flags(

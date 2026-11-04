@@ -15,7 +15,7 @@ submissions) and bridged to PyTorch/TorchTPU via ``@pallas.jax_op``:
 - ``ragged_gather_reduce_tc`` compacts valid slots per output token, optionally
   multiplies each gathered row in VMEM by its FP32 routing weight, and sums in
   FP32 in deterministic buffer order without touching rows ``>= count``.
-- ``_ragged_scale_and_dscore_tc`` runs a dynamic-grid ``(cdiv(count, 1024),)``
+- ``_ragged_scale_and_dscore_tc`` runs a dynamic-grid ``(cdiv(count, 1024), d_chunks)``
   backward pass that simultaneously scales ``grad_routed_output`` by routing
   weights and computes the FP32 ``dScore`` dot product while bitwise-masking
   any uninitialized tail rows ``>= count``.
@@ -802,6 +802,25 @@ def ragged_gather_reduce_tc(
   )(*call_args)
 
 
+def _scale_dscore_d_chunk(
+    d_dim: int, block: int, itemsize: int, vmem_limit: int
+) -> int | None:
+  """Largest 128-multiple divisor of ``d_dim`` whose tiles fit in VMEM.
+
+  Per grid step: three double-buffered ``(block, d_chunk)`` windows (``g``,
+  ``y`` in and ``dy`` out) plus one FP32 ``(block, d_chunk)`` temporary (Mosaic
+  fuses the rest); TPU7x measured 65.16 MiB at ``(1024, 4096)`` in bf16.
+  """
+  budget = int(0.75 * vmem_limit)
+  for num_chunks in range(1, d_dim // 128 + 1):
+    if d_dim % num_chunks or (d_dim // num_chunks) % 128:
+      continue
+    d_chunk = d_dim // num_chunks
+    if block * d_chunk * (2 * 3 * itemsize + 4) <= budget:
+      return d_chunk
+  return None
+
+
 def _ragged_scale_and_dscore_tc(
     g_gathered_RD: jax.Array,
     routed_output_RD: jax.Array,
@@ -809,17 +828,26 @@ def _ragged_scale_and_dscore_tc(
     count: jax.Array,
     zero_pad_tail: bool,
 ) -> tuple[jax.Array, jax.Array]:
-  """Scales ``g_gathered_RD`` by ``w_rows_cap`` and computes FP32 ``dScore`` over ``[0, count)``."""
+  """Scales ``g_gathered_RD`` by ``w_rows_cap`` and computes FP32 ``dScore`` over ``[0, count)``.
+
+  The grid is ``(cdiv(count, 1024), d_dim // d_chunk)``: wide hidden sizes
+  (e.g. 4096) split the feature dimension so the VMEM windows fit, and the
+  ``dScore`` row sums accumulate across feature chunks.
+  """
   cap, d_dim = g_gathered_RD.shape
   block = 1024
   itemsize = jnp.dtype(g_gathered_RD.dtype).itemsize
   vmem_limit = _tpu_vmem_limit_bytes()
+  d_chunk = (
+      _scale_dscore_d_chunk(d_dim, block, itemsize, vmem_limit)
+      if d_dim % 128 == 0
+      else None
+  )
   can_use_pallas = (
       not zero_pad_tail
       and cap >= block
       and cap % block == 0
-      and d_dim % 128 == 0
-      and 3 * block * d_dim * max(itemsize, 4) <= int(0.75 * vmem_limit)
+      and d_chunk is not None
   )
   if not can_use_pallas:
     iota = jnp.arange(cap, dtype=jnp.int32)
@@ -842,13 +870,17 @@ def _ragged_scale_and_dscore_tc(
     start_row = pl.program_id(0) * block
     n_valid = c_ref[0]
 
+    @pl.when(pl.program_id(1) == 0)
+    def _init_dw():
+      dw_ref[...] = jnp.zeros_like(dw_ref)
+
     @pl.when(start_row + block <= n_valid)
     def _full_block():
       g_f32 = g_ref[...].astype(jnp.float32)
       y_f32 = y_ref[...].astype(jnp.float32)
       w_col = jnp.broadcast_to(w_ref[...].reshape(block, 1), g_ref.shape)
       dy_ref[...] = (g_f32 * w_col).astype(dy_ref.dtype)
-      dw_ref[...] = jnp.sum(g_f32 * y_f32, axis=1).reshape(8, 128)
+      dw_ref[...] += jnp.sum(g_f32 * y_f32, axis=1).reshape(8, 128)
 
     @pl.when(start_row < n_valid)
     def _maybe_partial():
@@ -863,7 +895,7 @@ def _ragged_scale_and_dscore_tc(
         w_col = jnp.broadcast_to(w_ref[...].reshape(block, 1), g_ref.shape)
         w_f32 = jnp.where(valid_2d, w_col, 0.0)
         dy_ref[...] = (g_f32 * w_f32).astype(dy_ref.dtype)
-        dw_ref[...] = jnp.sum(g_f32 * y_f32, axis=1).reshape(8, 128)
+        dw_ref[...] += jnp.sum(g_f32 * y_f32, axis=1).reshape(8, 128)
 
   grad_routed_RD, dw_2d = pl.pallas_call(
       _scale_dscore_kernel,
@@ -873,19 +905,19 @@ def _ragged_scale_and_dscore_tc(
       ],
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=1,
-          grid=(pl.cdiv(count_1[0], block),),
+          grid=(pl.cdiv(count_1[0], block), d_dim // d_chunk),
           in_specs=[
-              pl.BlockSpec((block, d_dim), lambda i, c_ref: (i, 0)),
-              pl.BlockSpec((block, d_dim), lambda i, c_ref: (i, 0)),
-              pl.BlockSpec((8, 128), lambda i, c_ref: (i, 0)),
+              pl.BlockSpec((block, d_chunk), lambda i, j, c_ref: (i, j)),
+              pl.BlockSpec((block, d_chunk), lambda i, j, c_ref: (i, j)),
+              pl.BlockSpec((8, 128), lambda i, j, c_ref: (i, 0)),
           ],
           out_specs=[
-              pl.BlockSpec((block, d_dim), lambda i, c_ref: (i, 0)),
-              pl.BlockSpec((8, 128), lambda i, c_ref: (i, 0)),
+              pl.BlockSpec((block, d_chunk), lambda i, j, c_ref: (i, j)),
+              pl.BlockSpec((8, 128), lambda i, j, c_ref: (i, 0)),
           ],
       ),
       compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel",),
+          dimension_semantics=("parallel", "arbitrary"),
           vmem_limit_bytes=vmem_limit,
       ),
       name="ragged_scale_and_dscore_tc",

@@ -1410,6 +1410,36 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertTrue(splitter.enabled)
     self.assertEqual(splitter.n_layers, 40)
 
+  def test_graph_trainer_debug_recipe(self):
+    """Tests the GraphTrainer debug recipe's split and selective remat."""
+    gt_cfg = config_registry.graph_trainer_qwen35_moe_debugmodel()
+    self.assertIsInstance(gt_cfg, TpuGraphTrainer.Config)
+    apply_tpu_graph_trainer_model_transforms(gt_cfg)
+    self.assertIs(
+        gt_cfg.model_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5
+    )
+    self.assertEqual(gt_cfg.model_spec.flavor, "debugmodel_moe")
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, gt_cfg.override.imports
+    )
+    compile_cfg = gt_cfg.compile
+    self.assertEqual(compile_cfg.mode, "aot_fx_trace")
+    self.assertEqual(compile_cfg.memory_policy, "tpu_selective")
+    self.assertEqual(compile_cfg.save_regions, ("moe.routing",))
+    self.assertEqual(compile_cfg.graph_split.forward_layers_per_executable, 1)
+    self.assertEqual(compile_cfg.graph_split.backward_layers_per_executable, 1)
+    splitter = GraphSplitter.from_trainer_config(
+        gt_cfg,
+        optimizer_in_graph=(compile_cfg.optimizer_compile == "in_graph"),
+    )
+    self.assertTrue(splitter.enabled)
+    self.assertEqual(splitter.n_layers, 4)
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+    ])
+    self.assertIsInstance(parsed, TpuGraphTrainer.Config)
+
   def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
     """Tests that TP, CP, PP and EP fail before the model is touched."""
     for name in ("tp", "cp", "pp", "ep"):

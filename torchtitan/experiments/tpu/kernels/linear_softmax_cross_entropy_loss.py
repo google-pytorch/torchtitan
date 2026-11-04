@@ -27,6 +27,7 @@ import inspect
 
 # Workaround for https://github.com/openxla/tokamax/issues/240
 import jaxtyping
+
 # 1. Save the real decorator
 _real_jaxtyped = jaxtyping.jaxtyped
 
@@ -40,9 +41,11 @@ def _dummy_jaxtyped(*args, **kwargs):
     return args[0]
   return decorator
 
+
 # 3. Swap the dummy in, import tokamax, and swap the real one back
 jaxtyping.jaxtyped = _dummy_jaxtyped
 import tokamax  # pylint: disable=g-import-not-at-top
+
 jaxtyping.jaxtyped = _real_jaxtyped
 
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
@@ -193,10 +196,11 @@ def _my_bwd(
 
   bwd_fn = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
   bwd_kwargs = {}
+  bwd_dtype = jax.numpy.result_type(x.dtype, weights.dtype)
   if "buffer_count" in inspect.signature(
       inspect.unwrap(bwd_fn)
   ).parameters and _bwd_vmem_exceeds_capacity(
-      kernel, b_block_size, h_block_size, v_block_size, x.dtype
+      kernel, b_block_size, h_block_size, v_block_size, bwd_dtype
   ):
     # Large single-H tiles such as (1024, 2048, 640) fit TPU7x's 57.6 MiB
     # kernel VMEM budget at 51.9 MiB with single-buffered grad accumulators,

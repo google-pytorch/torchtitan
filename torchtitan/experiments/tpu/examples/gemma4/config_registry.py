@@ -60,12 +60,45 @@ _FUSED_LOSS_OVERRIDE = (
 )
 
 
-def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+def _default_h_block_size(dim: int) -> int:
+  """Pick an h_block_size dividing dim to avoid wasted MXU work on the last tile.
+
+  The kernel default h_block_size=512 divides neither Gemma 4 production model
+  (31B dim=5376 has 11 blocks with the last half-filled; 26B-A4B dim=2816 has
+  6 blocks with the last half-filled), wasting ~4.5% and ~8.3% of the loss
+  matmul on zeroed trailing columns.
+
+  Multiples of 128 that divide each model's hidden dimension without exceeding
+  VMEM capacity (e.g. 32 MiB on TPU v6e):
+    - 31B (dim=5376): 384 (14 blocks) or 256 (21 blocks). 384 minimizes loop
+      iterations while staying within the same VMEM allocation (h_alloc=512).
+    - 26B-A4B (dim=2816): 256 (11 blocks; 1408 exceeds VMEM).
+    - debugmodel (dim=256): 256 (1 block).
+  """
+  if dim % 384 == 0:
+    return 384
+  if dim % 256 == 0:
+    return 256
+  return 512
+
+
+def _enable_pallas_cross_entropy(
+    config: TPUTrainerConfig,
+    *,
+    b_block_size: int = 1024,
+    h_block_size: int | None = None,
+    v_block_size: int = 2048,
+) -> None:
   """Select the soft-capped fused Pallas loss and its LM-head override."""
   assert config.model_spec is not None
   model_config = cast(Gemma4Model.Config, config.model_spec.model)
   lm_head = cast(SoftCappedLinear.Config, model_config.lm_head)
+  if h_block_size is None:
+    h_block_size = _default_h_block_size(model_config.dim)
   config.loss = PallasCrossEntropyLoss.Config(
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
       soft_cap=lm_head.output_soft_cap_temp,
       output_multiplier=lm_head.output_multiplier,
   )

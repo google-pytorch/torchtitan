@@ -1229,16 +1229,25 @@ class TestGemma4FusedCrossEntropyConfig(parameterized.TestCase):
   """Config-level checks for Gemma 4 soft-capped fused Pallas cross-entropy."""
 
   @parameterized.parameters(
-      gemma4_debugmodel_fused_ce,
-      gemma4_moe_debug_fused_ce,
-      gemma4_31b,
-      gemma4_26b_a4b,
+      (gemma4_debugmodel_fused_ce, 256),
+      (gemma4_moe_debug_fused_ce, 256),
+      (gemma4_31b, 384),
+      (gemma4_26b_a4b, 256),
   )
-  def test_recipe_wires_soft_capped_pallas_cross_entropy(self, recipe):
+  def test_recipe_wires_soft_capped_pallas_cross_entropy(
+      self, recipe, expected_h_block_size
+  ):
     cfg = recipe()
     self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(cfg.loss.soft_cap, 30.0)
     self.assertEqual(cfg.loss.output_multiplier, 1.0)
+    self.assertEqual(cfg.loss.h_block_size, expected_h_block_size)
+    model_config = cfg.model_spec.model
+    self.assertEqual(
+        model_config.dim % cfg.loss.h_block_size,
+        0,
+        f"h_block_size={cfg.loss.h_block_size} does not divide dim={model_config.dim}",
+    )
     self.assertIn(
         "torchtitan.experiments.tpu.overrides.fused_loss."
         "fused_loss_soft_capped_lm_head",
@@ -1293,8 +1302,10 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
 
   @parameterized.named_parameters(
       dict(
-          testcase_name="float32",
+          testcase_name="float32_dim256",
           dtype=torch.float32,
+          dim=256,
+          h_block_size=256,
           loss_atol=1e-3,
           loss_rtol=1e-3,
           # Pallas Mosaic TPU kernel uses MXU 1-pass bf16-input dot products
@@ -1303,8 +1314,19 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
           grad_rel_l2=5e-3,
       ),
       dict(
-          testcase_name="bfloat16",
+          testcase_name="bfloat16_dim256",
           dtype=torch.bfloat16,
+          dim=256,
+          h_block_size=256,
+          loss_atol=1.5e-2,
+          loss_rtol=5e-3,
+          grad_rel_l2=1.5e-2,
+      ),
+      dict(
+          testcase_name="bfloat16_dim384",
+          dtype=torch.bfloat16,
+          dim=384,
+          h_block_size=384,
           loss_atol=1.5e-2,
           loss_rtol=5e-3,
           grad_rel_l2=1.5e-2,
@@ -1313,6 +1335,8 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
   def test_fused_cross_entropy_matches_eager_soft_capped_linear(
       self,
       dtype: torch.dtype,
+      dim: int,
+      h_block_size: int,
       loss_atol: float,
       loss_rtol: float,
       grad_rel_l2: float,
@@ -1321,7 +1345,7 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
       self.skipTest("PallasCrossEntropyLoss Mosaic kernel only runs on TPU.")
 
     torch.manual_seed(42)
-    num_tokens, dim, vocab_size = 1024, 256, 2048
+    num_tokens, vocab_size = 1024, 2048
     soft_cap = 30.0
 
     eager_head_cfg = SoftCappedLinear.Config(
@@ -1359,7 +1383,7 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
     eager_loss_fn = CrossEntropyLoss.Config().build()
     fused_loss_fn = PallasCrossEntropyLoss.Config(
         b_block_size=1024,
-        h_block_size=256,
+        h_block_size=h_block_size,
         v_block_size=2048,
         soft_cap=soft_cap,
         output_multiplier=1.0,
@@ -1378,26 +1402,26 @@ class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
         loss_cpu.detach().float().cpu(),
         atol=loss_atol,
         rtol=loss_rtol,
-        check_name=f"Fused CE loss ({dtype})",
+        check_name=f"Fused CE loss ({dtype} dim={dim} h_block={h_block_size})",
     )
     self._check_relative_l2(
         x_tpu.grad,
         x_cpu.grad,
         max_rel_error=grad_rel_l2,
-        check_name=f"Fused CE hidden grad ({dtype})",
+        check_name=f"Fused CE hidden grad ({dtype} dim={dim} h_block={h_block_size})",
     )
     self._check_relative_l2(
         fused_head.weight.grad,
         eager_head.weight.grad,
         max_rel_error=grad_rel_l2,
-        check_name=f"Fused CE lm_head.weight grad ({dtype})",
+        check_name=f"Fused CE lm_head.weight grad ({dtype} dim={dim} h_block={h_block_size})",
     )
 
     # Negative control: running PallasCrossEntropyLoss without soft_cap (None)
     # on the same inputs must diverge well beyond the test tolerances.
     uncapped_loss_fn = PallasCrossEntropyLoss.Config(
         b_block_size=1024,
-        h_block_size=256,
+        h_block_size=h_block_size,
         v_block_size=2048,
         soft_cap=None,
         output_multiplier=1.0,

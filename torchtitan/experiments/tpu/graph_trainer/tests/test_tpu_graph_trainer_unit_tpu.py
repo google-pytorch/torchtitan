@@ -1,5 +1,7 @@
 """Unit tests for TpuGraphTrainer (tracing, loss override, and config wiring)."""
 
+import contextlib
+import copy
 from types import SimpleNamespace
 import typing
 from unittest import mock
@@ -7,6 +9,7 @@ from unittest import mock
 from absl.testing import absltest
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import make_fx_tracer
 from torchtitan.experiments.graph_trainer.common_utils import (
@@ -51,6 +54,30 @@ def _make_dummy_fwd_bwd_step(loss_fn: nn.Module, model: nn.Module):
     return [loss] + list(grads)
 
   return fwd_bwd_fn
+
+
+def _traced_trainer(model: nn.Module, inputs, labels, global_valid_tokens):
+  """A bare TpuGraphTrainer holding one traced fwd+bwd step for these shapes."""
+
+  def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
+    pred = model(inputs)
+    loss = F.cross_entropy(
+        pred.view(-1, 128), labels.view(-1), reduction="sum"
+    ) / global_valid_tokens
+    params = [
+        p
+        for _, p in model.named_parameters(remove_duplicate=False)
+        if p.requires_grad
+    ]
+    return [loss, *torch.autograd.grad(loss, params)]
+
+  trainer = object.__new__(tpu_graph_trainer.TpuGraphTrainer)
+  trainer._traced_step = make_fx_tracer.minimal_fx_tracer(
+      fwd_bwd, module=model
+  )(inputs, labels, global_valid_tokens, {})
+  trainer.train_context = contextlib.nullcontext
+  trainer._collect_moe_routing_metrics = False
+  return trainer
 
 
 class MfuBenchmarkTest(absltest.TestCase):
@@ -286,6 +313,51 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
     loss = outputs[0]
     self.assertEqual(loss.ndim, 0, "Loss output must be a scalar tensor.")
 
+  def test_grad_accumulation_matches_full_batch(self) -> None:
+    """GA=2 at batch 2 matches GA=1 at batch 4, tied weights included."""
+    device = self.accelerator_device
+    model = DummyModule(dim=32, vocab_size=128).to(device)
+    model.lm_head.weight = model.tok_embeddings.weight
+    params = tuple(
+        p
+        for _, p in model.named_parameters(remove_duplicate=False)
+        if p.requires_grad
+    )
+    inputs = torch.randint(0, 128, (4, 16), device=device)
+    labels = torch.randint(0, 128, (4, 16), device=device)
+    tokens = torch.tensor(float(labels.numel()), device=device)
+
+    ref = copy.deepcopy(model)
+    ref_loss = F.cross_entropy(
+        ref(inputs).view(-1, 128), labels.view(-1), reduction="sum"
+    )
+    (ref_loss / tokens).backward()
+    expected = [p.grad for p in ref.parameters()]
+
+    def step_grads(num_microbatches: int) -> list[torch.Tensor]:
+      model.zero_grad(set_to_none=True)
+      mb_inputs = inputs.chunk(num_microbatches)
+      mb_labels = labels.chunk(num_microbatches)
+      trainer = _traced_trainer(model, mb_inputs[0], mb_labels[0], tokens)
+      for x, y in zip(mb_inputs, mb_labels):
+        trainer._make_fx_forward_backward_step(model, x, y, tokens, params, {})
+      return [p.grad.clone() for p in model.parameters()]
+
+    for num_microbatches in (1, 2):
+      for name, got, want in zip(
+          [n for n, _ in model.named_parameters()],
+          step_grads(num_microbatches),
+          expected,
+          strict=True,
+      ):
+        torch.testing.assert_close(
+            got, want, rtol=1e-5, atol=1e-6, msg=f"GA={num_microbatches} {name}"
+        )
+
+  def test_in_graph_optimizer_rejects_grad_accumulation(self) -> None:
+    tpu_graph_trainer._check_in_graph_optimizer_grad_accum(1)
+    with self.assertRaisesRegex(ValueError, "gradient accumulation"):
+      tpu_graph_trainer._check_in_graph_optimizer_grad_accum(2)
 
 
 if __name__ == "__main__":

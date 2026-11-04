@@ -10,7 +10,7 @@ import torch
 from absl.testing import absltest
 import jax
 
-import torchtitan.experiments.tpu.base_device_test as base_device_test
+import torchtitan.experiments.tpu.testing.base_device_test as base_device_test
 import torchtitan.tools.profiler as torchtitan_profiler
 
 

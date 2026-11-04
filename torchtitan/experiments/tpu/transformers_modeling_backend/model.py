@@ -224,7 +224,7 @@ class TPUHFTransformerModel(HFTransformerModel):
       """
       if not getattr(self, "fused_loss", False):
         return
-      from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+      from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 
       loss_config = getattr(job_config, "loss", None)
       if not isinstance(loss_config, PallasCrossEntropyLoss.Config):
@@ -975,8 +975,8 @@ def substitute_tpu_experts(model: nn.Module) -> None:
 
   if utils.device_type != "tpu":
     return
-  from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
-  from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+  from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpertsConverter
+  from torchtitan.experiments.tpu.components.token_dispatcher import TpuTokenDispatcherConverter
 
   converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
   dispatcher = TpuTokenDispatcherConverter(TpuTokenDispatcherConverter.Config())
@@ -1009,7 +1009,7 @@ def _use_pallas_grouped_mm(moe_config) -> None:
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tgmm_tiling = (256, tile, 0)
   """
-  from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+  from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 
   for _, experts, _, _ in moe_config.traverse(TpuGroupedExperts.Config):
     # 0 selects the full dimension, which is small enough below 512.

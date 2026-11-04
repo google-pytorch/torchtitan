@@ -2,7 +2,7 @@
 
 import torch
 from absl.testing import absltest
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
 
 def fill_indices_cpu_original(

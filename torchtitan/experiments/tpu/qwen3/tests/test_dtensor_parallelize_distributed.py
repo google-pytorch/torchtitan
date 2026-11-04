@@ -8,10 +8,10 @@ import torch.nn as nn
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import distributed
-from torchtitan.experiments.tpu import test_utils
-from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import distributed
+from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu.testing.base_distributed_device_test import InputDistribution
 import torchtitan.experiments.tpu.qwen3 as qwen3_tpu
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.experiments.tpu.qwen3.infra import parallelize as qwen3_dtensor_parallelize

@@ -63,7 +63,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_body_remat_window,
 )
-from torchtitan.experiments.tpu.layer_loop import (
+from torchtitan.experiments.tpu.components.layer_loop import (
     model_subclass,
     tpu_model_class,
     runs_layer_loop,
@@ -813,7 +813,7 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
         # Here because every scanning model comes through here. Without the
         # patch the backward reverses by copy and OOMs some steps later, so
         # fail at build time instead.
-        from torchtitan.experiments.tpu.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
+        from torchtitan.experiments.tpu.components.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
             apply_scan_reverse_backward_patch,
         )
 

@@ -21,8 +21,8 @@ from torchtitan.config.configs import (
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.distributed.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
@@ -38,13 +38,13 @@ from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     with_maxtext_flops,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
-from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
 from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuRoutedExperts,
     TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
@@ -56,7 +56,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader, TPUGrainDataLoader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader, TPUGrainDataLoader
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.common.moe import MoE
@@ -1257,7 +1257,7 @@ def qwen3_moe_235b_scan_torchao_float8() -> TpuGraphTrainer.Config:
   cfg = qwen3_moe_235b_scan()
   assert cfg.model_spec is not None
   # Imported here so that only float8 configs require torchao.
-  from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
 
   # Convert only the attention projections (wqkv/wo); the routed experts are
   # grouped matmuls, not linears. filter_fqns entries match as substrings of a

@@ -10,10 +10,10 @@ from typing import Any, Callable, Tuple
 from absl import logging
 import torch
 import torch.distributed as dist
-from torchtitan.experiments.tpu import gdist
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import device_env
-from torchtitan.experiments.tpu import distributed_utils
+from torchtitan.experiments.tpu.distributed import gdist
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.distributed import device_env
+from torchtitan.experiments.tpu.distributed import distributed_utils
 from torchtitan.tools import utils
 
 

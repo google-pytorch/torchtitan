@@ -24,7 +24,7 @@ see it on its own. `.claude/rules/experiments.md` is the repo-wide version of
 this rule.
 
 Read before starting: `torchtitan/experiments/tpu/README.md` (environment,
-VM and cluster setup, launch commands), `torch-tpu-optimization-guide.md`
+VM and cluster setup, launch commands), `docs/torch-tpu-optimization-guide.md`
 (the levers, in order), `.claude/rules/models.md`, `.claude/rules/experiments.md`.
 
 Read the existing TPU models first and reuse what they do; a second

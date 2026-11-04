@@ -28,9 +28,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 import torch.utils._pytree as pytree
 from torch_tpu._internal.compile import scan as tpu_scan
 
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import scan_backward_patch
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.components import scan_backward_patch
 
 
 _SCAN_MODULE = sys.modules["torch._higher_order_ops.scan"]

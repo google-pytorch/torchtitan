@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from torchtitan.experiments.tpu import unflatten_shim
+from torchtitan.experiments.tpu.components import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import

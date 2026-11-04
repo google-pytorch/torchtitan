@@ -31,7 +31,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     disable_active_parametrization,
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
 )
-from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.experiments.transformers_modeling_backend.parallelize import (
     parallelize_hf_transformers,
 )

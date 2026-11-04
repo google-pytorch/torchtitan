@@ -10,7 +10,7 @@ from absl import logging
 from absl.flags import argparse_flags
 import torch.multiprocessing as mp
 import torchtitan.config
-from torchtitan.experiments.tpu import distributed_utils as tpu_distributed_utils
+from torchtitan.experiments.tpu.distributed import distributed_utils as tpu_distributed_utils
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.tools import utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module

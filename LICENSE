@@ -30,7 +30,7 @@ DAMAGE.
 --------------------------------------------------------------------------------
 
 The following files are licensed under the Apache License, Version 2.0:
-  torchtitan/experiments/tpu/cloud_distributed_utils.py
+  torchtitan/experiments/tpu/distributed/cloud_distributed_utils.py
   torchtitan/experiments/tpu/kernels/linear_softmax_ce_softcap_kernel.py
     (derived from Tokamax, Copyright 2025 DeepMind Technologies Limited)
   torchtitan/experiments/tpu/kernels/linear_softmax_cross_entropy_loss.py

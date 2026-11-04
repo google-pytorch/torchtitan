@@ -14,16 +14,16 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from torchtitan.experiments.tpu import gdist
+from torchtitan.experiments.tpu.distributed import gdist
 import torchtitan.config
 import torchtitan.trainer
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import device_env
-from torchtitan.experiments.tpu import distributed_utils
-from torchtitan.experiments.tpu import numerical_validation
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.distributed import device_env
+from torchtitan.experiments.tpu.distributed import distributed_utils
+from torchtitan.experiments.tpu.testing import numerical_validation
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import train_minimal
-from torchtitan.experiments.tpu.cp_attention import revert_tpu_context_parallel
+from torchtitan.experiments.tpu.distributed.cp_attention import revert_tpu_context_parallel
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
@@ -352,7 +352,7 @@ class DistributedUnitTestRunner:
       model.zero_grad()
 
     import contextlib
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     from torchtitan.models.common.decoder import Decoder
 
     loss = None
@@ -963,7 +963,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
 
       try:
         test_utils.run_in_subprocess(
-            module_name="torchtitan.experiments.tpu.base_distributed_device_test",
+            module_name="torchtitan.experiments.tpu.testing.base_distributed_device_test",
             function_name="_run_cpu_verification",
             env=device_env.cpu_only_env(),
             args=[

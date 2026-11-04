@@ -875,7 +875,7 @@ def sbd_splash_attention(
   # TT-UNFLATTEN-SHIM: must stay BELOW the docstring -- code above the string
   # literal would demote it from a docstring to a discarded expression and
   # leave __doc__ as None.
-  from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
+  from torchtitan.experiments.tpu.components.unflatten_shim import unflatten_tensor, flatten_tensor
   # `bias` is batch-shared (H, S, S), so it is never a token stream.
   was_flat = q.ndim == 3
   q = unflatten_tensor(q, expected_flat_ndim=3)

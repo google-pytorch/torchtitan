@@ -15,9 +15,9 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
-from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
-from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import (
     GroupedExperts,
     MoE,

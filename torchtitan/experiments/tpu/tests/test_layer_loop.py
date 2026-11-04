@@ -19,7 +19,7 @@ from torchtitan.config import derive
 from torchtitan.experiments.graph_trainer.common_utils import (
     build_decoder_config_for_backend,
 )
-from torchtitan.experiments.tpu.layer_loop import (
+from torchtitan.experiments.tpu.components.layer_loop import (
     _forward,
     builds_layer_loop,
     runs_layer_loop,

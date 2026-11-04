@@ -179,7 +179,7 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
         if was_3d:
             seq_len = None
             try:
-                from torchtitan.experiments.tpu.unflatten_shim import (
+                from torchtitan.experiments.tpu.components.unflatten_shim import (
                     get_unflatten_seq_len,
                 )
 

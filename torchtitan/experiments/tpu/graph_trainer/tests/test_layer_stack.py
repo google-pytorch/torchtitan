@@ -40,9 +40,9 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 
 # Imported here so it is not first imported under the mocked `call_backward`
 # below: it captures that method at import time.
-from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
-from torchtitan.experiments.tpu.layer_loop import tpu_model_class
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
+from torchtitan.experiments.tpu.components.layer_loop import tpu_model_class
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models import qwen3 as qwen3_models
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common.config_utils import make_aux_loss_config

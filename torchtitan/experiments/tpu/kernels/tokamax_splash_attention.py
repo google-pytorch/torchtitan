@@ -18,7 +18,7 @@ import jax.numpy as jnp
 # the duration of the tokamax import.
 import jaxtyping
 import numpy as np
-from torchtitan.experiments.tpu.headtail import (
+from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
     slice_cp_mask_info,

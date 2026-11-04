@@ -47,9 +47,9 @@ import torch_remat as remat
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from torchtitan.experiments.tpu.qkv import TpuPackedQKVLinear
-from torchtitan.experiments.tpu.unflatten_shim import UnflattenShim
-from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
+from torchtitan.experiments.tpu.components.unflatten_shim import UnflattenShim
+from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common import FusedQKVLinear
 from torchtitan.models.common import GQAttention

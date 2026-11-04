@@ -10,7 +10,7 @@ from typing import Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import unflatten_shim
+from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.examples.mamba3.kernels import mamba3_pallas
 
 try:

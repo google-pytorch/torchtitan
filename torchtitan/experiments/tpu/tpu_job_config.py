@@ -5,7 +5,7 @@ from typing import Literal
 
 import torchtitan.config
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.cp_attention import validate_tpu_context_parallel
+from torchtitan.experiments.tpu.distributed.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
 
 
@@ -17,7 +17,7 @@ class TPUConfig:
   apply_rope_complex_workaround: bool = False
   # Compute dense Llama3/Qwen3 transformer blocks on [B, L, ...] views instead
   # of upstream's folded [T, ...] tensors, which make XLA pick slow TPU layouts
-  # (see experiments/tpu/bld_layout.py). Numerics match to rounding order.
+  # (see experiments/tpu/components/bld_layout.py). Numerics match to rounding order.
   bld_block_layout: bool = True
   use_jax_profiler: bool = False
   # Emit one aggregate MFU measurement after the configured start log step

@@ -63,12 +63,12 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     select_splash_attention,
     SPLASH_ATTENTION_REGION,
 )
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     FEED_FORWARD_W2,
     MOE_ROUTING,
     REMAT_REGION,
 )
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     local_reorder,
     stable_grouped_reduce,
 )

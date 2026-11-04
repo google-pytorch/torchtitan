@@ -324,6 +324,22 @@ def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
   return cfg
 
 
+def graph_trainer_qwen35_moe_debugmodel() -> TpuGraphTrainer.Config:
+  """`qwen35_moe_debugmodel` on TpuGraphTrainer, split as the 35B recipes are.
+
+  `_use_graph_split` with one layer per forward and backward executable and
+  `tpu_selective` rematerialization saving the MoE routing (the 35B benchmark
+  also saves the Splash attention output, which the debug model's SDPA does
+  not produce). Runs on any TPU: no Tokamax GatedDeltaNet.
+  """
+  return _use_graph_split(
+      qwen35_moe_debugmodel(),
+      layers_per_executable=1,
+      memory_policy="tpu_selective",
+      save_regions=("moe.routing",),
+  )
+
+
 def qwen35_moe_35b() -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 

@@ -13,9 +13,10 @@ The JAX functions are bridged to PyTorch with ``torch_tpu``'s ``jax_op``. The
 forward op also returns the backward kernel's residuals (the normalized
 ``q``/``k``, cumulative decays, chunk states, ...: the leaves of the
 ``jax.vjp`` closure), and the backward op runs only the backward kernels on
-them instead of re-running the forward kernel. Under full rematerialization
-the residuals live from the recomputed forward to the backward of the same
-layer.
+them instead of re-running the forward kernel. Without a gradient to compute
+(``no_grad``, inference) the forward kernels run alone. Under full
+rematerialization the residuals live from the recomputed forward to the
+backward of the same layer.
 
 Packed documents: given ``segment_ids``, the recurrence restarts at every
 document through Tokamax's own ``segment_ids`` / ``max_num_segments`` API. The
@@ -33,13 +34,21 @@ kernel computes a slightly different function from the unclamped XLA
 ``chunked_gated_delta`` wherever ``g < -5``. Such a token keeps
 ``exp(-5)`` = 0.7% of the state instead of less, and passes no gradient to
 ``A_log``, ``dt_bias`` and ``in_proj_a`` (the unclamped gradient there is
-proportional to ``exp(g)`` < 0.7%). At initialization many gates are below -5.
+proportional to ``exp(g)`` < 0.7%). At initialization most gates are below -5:
+on a 35B-A3B GatedDeltaNet layer after ``init_states`` (71.5% clamped), the
+clamp moves the output and most gradients by about 1% and the A_log / dt_bias
+/ in_proj_a gradients by 4.5-6.3% (relative L2; measured on TPU7x, see
+``test_decay_clamp_deviation_at_init``). With bf16 inputs the kernels' own
+rounding moves those three gradients further (65% / 55% / 12%, cosine 0.85 /
+0.89 / 0.99, vs <= 5.5e-3 in fp32); a 10-step debug-model run stays within
+4e-4 of the XLA losses (``test_debug_model_losses_match_xla``).
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 import functools
 import re
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -50,24 +59,14 @@ from torchtitan.experiments.tpu.qwen3_5.gated_delta import per_row_segment_ids
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel
 from torchtitan.tools.logging import logger
 
-# Tokamax's private modules (`tokamax._src`), kept for now on purpose: the
-# public `tokamax.ops.kimi_delta_attention` is the same function, but only
-# newer Tokamax builds have the public `tokamax.ops` namespace, and no released
-# wheel has the KDA op. Move to the public API once the pinned Tokamax does.
-# Imported lazily so config validation, override resolution and CPU fallback
-# tests can run without KDA.
-try:
-  from tokamax._src.ops.kda import api as kda_api
-  # Explicitly check that the Mosaic TPU backend imports: `kda_api` catches a
-  # missing Pallas/Mosaic dependency at import time and leaves only `"xla"`.
-  from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
-
-  _TOKAMAX_KDA_IMPORT_ERROR: Exception | None = None
-except (ImportError, SyntaxError) as e:
-  # The Tokamax wheels up to 0.1.0 have no KDA op, and under typeguard >= 3 they
-  # do not import at all (SyntaxError, openxla/tokamax#240).
-  kda_api = None
-  _TOKAMAX_KDA_IMPORT_ERROR = e
+# The minimum Tokamax release with the Kimi Delta Attention op (pinned in
+# `torchtitan/experiments/tpu/requirements.txt`).
+MIN_TOKAMAX_VERSION = "0.0.17"
+_KDA_REQUIREMENT = (
+    f"TokamaxGatedDeltaKernel needs tokamax>={MIN_TOKAMAX_VERSION} (the Kimi"
+    " Delta Attention op with the Mosaic TPU backend): pip install -r"
+    " torchtitan/experiments/tpu/requirements.txt"
+)
 
 # Lower bound on the per-token log decay required by the per-channel Mosaic KDA
 # backward kernel: it re-centers each 16-token sub-block on the sub-block's
@@ -98,24 +97,45 @@ _MIN_TPU_GENERATION = 6
 _KERNEL_DTYPES = (torch.bfloat16, torch.float32)
 
 
+@functools.lru_cache(maxsize=1)
+def _import_kda() -> tuple[Any, Exception | None]:
+  """Imports Tokamax's KDA op on first use: ``(kimi_delta_attention, error)``.
+
+  Imported lazily, so config validation, override resolution and the XLA
+  fallback work without Tokamax.
+  """
+  try:
+    # pylint: disable=g-import-not-at-top
+    from tokamax import ops as tokamax_ops
+    # Check that the Mosaic TPU backend imports: the KDA op catches a missing
+    # Pallas/Mosaic dependency at import time and leaves only `"xla"`.
+    from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
+    # pylint: enable=g-import-not-at-top
+
+    return tokamax_ops.kimi_delta_attention, None
+  except (ImportError, AttributeError, SyntaxError) as e:
+    # Tokamax releases before 0.0.17 have no KDA op, and some do not import
+    # under typeguard >= 3 (SyntaxError, openxla/tokamax#240).
+    return None, e
+
+
 def has_tokamax_kda() -> bool:
   """Whether a Tokamax build with the Mosaic TPU KDA op is installed."""
-  return kda_api is not None
+  return _import_kda()[0] is not None
 
 
 def tokamax_kda_import_error() -> str | None:
   """Reason the Mosaic TPU KDA op failed to import, or None."""
-  if _TOKAMAX_KDA_IMPORT_ERROR is None:
-    return None
-  return str(_TOKAMAX_KDA_IMPORT_ERROR)
+  error = _import_kda()[1]
+  return None if error is None else str(error)
 
 
-def _require_tokamax_kda() -> None:
-  if kda_api is None:
-    raise ImportError(
-        "TokamaxGatedDeltaKernel needs a Tokamax build with the Kimi Delta"
-        " Attention op (tokamax._src.ops.kda): github.com/openxla/tokamax HEAD."
-    ) from _TOKAMAX_KDA_IMPORT_ERROR
+def _require_tokamax_kda():
+  """Returns Tokamax's ``kimi_delta_attention``, or raises ImportError."""
+  kimi_delta_attention, error = _import_kda()
+  if kimi_delta_attention is None:
+    raise ImportError(_KDA_REQUIREMENT) from error
+  return kimi_delta_attention
 
 
 @functools.lru_cache(maxsize=1)
@@ -163,7 +183,7 @@ def _gated_delta(
   q_h, k_h, v_h = _heads_first(q), _heads_first(k), _heads_first(v)
   log_decay = jnp.maximum(_heads_first(g).astype(jnp.float32), min_log_decay)
   gate = jnp.broadcast_to(log_decay[..., None], q_h.shape)
-  out, _ = kda_api.kimi_delta_attention(
+  out, _ = _require_tokamax_kda()(
       q_h,
       k_h,
       v_h,
@@ -239,6 +259,19 @@ def _rebuild_vjp(vjp_struct, residuals: Sequence[jax.Array]):
   )
 
 
+@pallas.jax_op("tt_qwen35::gated_delta_fwd")
+def _gated_delta_fwd(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    min_log_decay: float,
+) -> jax.Array:
+  """Forward only (no residuals), for calls that need no gradient."""
+  return _gated_delta(q, k, v, g, beta, min_log_decay)
+
+
 @pallas.jax_op("tt_qwen35::gated_delta_fwd_res")
 def _gated_delta_fwd_res(
     q: jax.Array,
@@ -298,6 +331,30 @@ def _backward_res(ctx, grad_outputs):
 _gated_delta_fwd_res.register_autograd(
     _backward_res, setup_context=_setup_context_res
 )
+
+
+@pallas.jax_op("tt_qwen35::gated_delta_segments_fwd")
+def _gated_delta_segments_fwd(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    segment_ids: jax.Array,
+    min_log_decay: float,
+    max_num_segments: int,
+) -> jax.Array:
+  """``_gated_delta_fwd``, restarting at every ``segment_ids`` document."""
+  return _gated_delta(
+      q,
+      k,
+      v,
+      g,
+      beta,
+      min_log_decay,
+      segment_ids=segment_ids,
+      max_num_segments=max_num_segments,
+  )
 
 
 @pallas.jax_op("tt_qwen35::gated_delta_segments_fwd_res")
@@ -440,7 +497,14 @@ def tokamax_gated_delta(
   _require_tokamax_kda()
   # `jax_op` reads its operands by shape alone, so they must be dense.
   q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+  # Without a gradient to compute (no_grad, inference, validation), run the
+  # forward kernels alone instead of materializing the backward's residuals.
+  needs_grad = torch.is_grad_enabled() and any(
+      x.requires_grad for x in (q, k, v, g, beta)
+  )
   if segment_ids is None:
+    if not needs_grad:
+      return _gated_delta_fwd(q, k, v, g, beta, float(min_log_decay))
     return _gated_delta_fwd_res(q, k, v, g, beta, float(min_log_decay))[0]
   if max_num_segments is None or max_num_segments < 1:
     raise ValueError(
@@ -449,6 +513,17 @@ def tokamax_gated_delta(
     )
   max_segments = min(int(max_num_segments), max(1, q.shape[1]))
   normalized_ids = tokamax_segment_ids(segment_ids, max_segments).contiguous()
+  if not needs_grad:
+    return _gated_delta_segments_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        normalized_ids,
+        float(min_log_decay),
+        max_segments,
+    )
   return _gated_delta_segments_fwd_res(
       q,
       k,
@@ -512,6 +587,11 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
       raise ValueError(
           f"max_num_segments must be positive, got {config.max_num_segments}"
       )
+    # Fail at model construction, before initialization or checkpoint
+    # loading, rather than at the first traced forward: on a TPU that runs the
+    # Mosaic kernels, a missing KDA op is a broken install, not a fallback.
+    if supports_current_tpu() and not has_tokamax_kda():
+      raise ImportError(_KDA_REQUIREMENT) from _import_kda()[1]
     self.min_log_decay = config.min_log_decay
     self.max_num_segments = config.max_num_segments
 

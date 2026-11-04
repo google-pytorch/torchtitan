@@ -1,13 +1,18 @@
-"""Qwen3.5 attention and transformer block modules for TPU."""
+"""Qwen3.5 attention, transformer block, and model modules for TPU."""
 
 from dataclasses import dataclass
 
 import torch
+import torchtitan.config
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35TransformerBlock
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -106,3 +111,98 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
+
+
+class TpuQwen35Model(Qwen35Model):
+  """``Qwen35Model`` whose config and parallelization wire TPU EP execution.
+
+  Under expert parallelism, ``Config.update_from_config`` switches the MoE
+  layers to ``TpuQwen35TokenDispatcher`` and disables the ``EP == 1`` paired
+  Pallas kernel, and ``parallelize`` enables the unpaired Pallas grouped
+  matmuls on TPU so dynamic or empty expert segments under EP never hit
+  ``torch._grouped_mm``.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Qwen35Model.Config):
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      # Zero-argument super() does not work in slots dataclasses on Python
+      # 3.12 (the class is re-created); call the parent explicitly.
+      Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
+      if config.parallelism.expert_parallel_degree > 1:
+        # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
+        # for the paired (w1 + w3) Pallas kernel; fall back to unpaired Pallas
+        # grouped matmuls under EP > 1.
+        for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
+          experts.use_pallas_paired_grouped_mm = False
+        for _, dispatcher, parent, field_name in list(
+            self.traverse(AllToAllTokenDispatcher.Config)
+        ):
+          if type(dispatcher) in (  # pylint: disable=unidiomatic-typecheck
+              AllToAllTokenDispatcher.Config,
+              TpuAllToAllTokenDispatcher.Config,
+          ):
+            ep_dispatcher = torchtitan.config.derive(
+                dispatcher,
+                token_dispatcher.TpuQwen35TokenDispatcher.Config,
+            )
+            if isinstance(parent, list):
+              parent[field_name] = ep_dispatcher
+            else:
+              setattr(parent, field_name, ep_dispatcher)
+
+  def _init_self_buffers(
+      self, *, buffer_device: torch.device | None = None
+  ) -> None:
+    super()._init_self_buffers(buffer_device=buffer_device)
+    ep_mesh = getattr(self, "_ep_mesh", None)
+    if ep_mesh is not None and "_ep_local_rank" in self._buffers:
+      target_dev = (
+          buffer_device
+          if buffer_device is not None
+          else self._ep_local_rank.device
+      )
+      self._ep_local_rank = torch.tensor(
+          [int(ep_mesh.get_local_rank())], dtype=torch.long
+      ).to(device=target_dev)
+
+  def parallelize(self, parallel_dims) -> None:
+    ep_mesh = parallel_dims.get_optional_mesh("ep")
+    if ep_mesh is not None and getattr(ep_mesh, "device_type", None) == "tpu":
+      # Under EP > 1 on TPU, recipes without `_use_tpu_moe_kernels` leave
+      # `use_pallas_grouped_mm=False`, falling back to `torch._grouped_mm`
+      # (`chlo.ragged_dot`), whose backward reads uninitialized HBM on dynamic
+      # or empty expert segments (torch_tpu#2668). Switch tile-aligned expert
+      # layers to unpaired Pallas grouped matmuls while preserving any explicit
+      # tiling already configured by `_use_tpu_moe_kernels`.
+      for module in self.modules():
+        if (
+            isinstance(module, TpuGroupedExperts)
+            and not module.use_pallas_grouped_mm
+            and hasattr(module, "w1_EFD")
+            and module.w1_EFD.shape[-2] % 128 == 0
+            and module.w1_EFD.shape[-1] % 128 == 0
+        ):
+          module.use_pallas_grouped_mm = True
+          module.pallas_grouped_mm_tile_m = 256
+          module.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    super().parallelize(parallel_dims)
+    if ep_mesh is not None and callable(
+        getattr(ep_mesh, "get_local_rank", None)
+    ):
+      self._ep_mesh = ep_mesh
+      param = next(self.parameters(), None)
+      param_dev = param.device if param is not None else torch.device("cpu")
+      rank_buf = (
+          torch.empty((1,), dtype=torch.long, device="meta")
+          if param_dev.type == "meta"
+          else torch.tensor(
+              [int(ep_mesh.get_local_rank())], dtype=torch.long
+          ).to(device=param_dev)
+      )
+      self.register_buffer("_ep_local_rank", rank_buf, persistent=False)
+      for module in self.modules():
+        dispatcher = getattr(module, "token_dispatcher", None)
+        if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
+          dispatcher.bind_ep_rank_holder(self)

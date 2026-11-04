@@ -542,6 +542,45 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         )
     )
 
+  def _packed_grads(self, q, k, v, grad_out, segment_ids, **attn):
+    q, k, v = (x.to(self.accelerator_device).requires_grad_(True) for x in (q, k, v))
+    out = tokamax_splash_attention.splash_sdpa(
+        q, k, v, segment_ids=segment_ids, enable_gqa=True, **attn
+    )
+    out.backward(grad_out.to(self.accelerator_device))
+    return [x.grad.float().cpu() for x in (q, k, v)]
+
+  @parameterized.named_parameters(("group8", 2), ("group16", 1))
+  def test_transposed_bwd_matches_tokamax_bwd(self, n_kv_heads):
+    """use_transposed_bwd (splash_tbwd) gradients match Tokamax's backward."""
+    torch.manual_seed(7)
+    segment_ids = _packed_segment_ids(_DOCUMENTS).to(self.accelerator_device)
+    b, seq_len = segment_ids.shape
+    q, grad_out = (torch.randn(b, seq_len, 16, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(b, seq_len, n_kv_heads, 128, dtype=torch.bfloat16) for _ in range(2))
+    want = self._packed_grads(q, k, v, grad_out, segment_ids)
+    self._set_tokamax_config(use_transposed_bwd=True)
+    got = self._packed_grads(q, k, v, grad_out, segment_ids)
+    for name, g, w in zip(("dq", "dk", "dv"), got, want):
+      # Both are ~3-4e-3 off a dense f32 reference, in different directions.
+      self.assertLess(((g - w).norm() / w.norm()).item(), 1e-2, name)
+      # No systematic scale difference: a mismatched log2(e) once biased every
+      # gradient by -0.2%.
+      self.assertLess(abs((g.norm() / w.norm()).item() - 1), 1e-3, name)
+
+  @parameterized.named_parameters(
+      ("no_segment_ids", dict(segment_ids=None)),
+      ("non_causal", dict(is_causal=False)),
+      ("window", dict(local_window_size=128)),
+  )
+  def test_transposed_bwd_rejects_unsupported_attention(self, attn):
+    segment_ids = _packed_segment_ids(_DOCUMENTS).to(self.accelerator_device)
+    q = torch.randn(2, 2048, 16, 128, dtype=torch.bfloat16)
+    k = torch.randn(2, 2048, 1, 128, dtype=torch.bfloat16)
+    self._set_tokamax_config(use_transposed_bwd=True)
+    with self.assertRaisesRegex(Exception, "use_transposed_bwd"):
+      self._packed_grads(q, k, k, q, **dict(dict(segment_ids=segment_ids), **attn))
+
   def test_config_change_retraces_kernel(self):
     """A TokamaxConfig change must not reuse a kernel compiled for the old one.
 

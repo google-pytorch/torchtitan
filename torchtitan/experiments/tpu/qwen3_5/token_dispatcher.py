@@ -20,6 +20,10 @@ from torch.distributed._functional_collectives import (
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.fx.traceback import annotate_fn
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
+from torchtitan.experiments.tpu.remat_regions import (
+    MOE_ROUTING,
+    annotate_region,
+)
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     scale_route_weights,
@@ -201,7 +205,15 @@ class _RaggedAllToAll(torch.autograd.Function):
 
 
 @dataclass(frozen=True, kw_only=True)
-class TpuQwen35DispatchMetadata(LocalDispatchMetadata):
+class _EpDispatchMetadata:
+  """Base class for EP > 1 dispatch metadata (distinct from ``LocalDispatchMetadata``)."""
+
+  token_indices_experts_sorted_N: torch.Tensor
+  topk_scores_experts_sorted_N: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True)
+class TpuQwen35DispatchMetadata(_EpDispatchMetadata):
   """Dropless static-shape EP dispatch metadata for ``TpuQwen35TokenDispatcher``."""
 
   routed_rows: int
@@ -352,7 +364,7 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
   ) -> tuple[
       torch.Tensor,
       torch.Tensor,
-      AllToAllDispatchMetadata | LocalDispatchMetadata,
+      AllToAllDispatchMetadata | LocalDispatchMetadata | _EpDispatchMetadata,
   ]:
     if self.ep_mesh is None:
       return super().dispatch(
@@ -376,14 +388,15 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
     with maybe_set_sparse_mesh():
       pg = self.ep_mesh.get_group()
       with torch.no_grad():
-        local_counts_E = num_local_tokens_per_expert_E.to(torch.int32).reshape(
-            -1
-        )
-        all_sizes_SE = (
-            self._gather_expert_counts(local_counts_E, pg, ep_size)
-            .to(torch.int32)
-            .reshape(ep_size, self.num_experts)
-        )
+        with annotate_region(MOE_ROUTING):
+          local_counts_E = num_local_tokens_per_expert_E.to(
+              torch.int32
+          ).reshape(-1)
+          all_sizes_SE = (
+              self._gather_expert_counts(local_counts_E, pg, ep_size)
+              .to(torch.int32)
+              .reshape(ep_size, self.num_experts)
+          )
         counts_SDE = all_sizes_SE.view(ep_size, ep_size, e)
         all_send_offsets_SE = (
             all_sizes_SE.cumsum(dim=-1, dtype=torch.int32) - all_sizes_SE
@@ -472,7 +485,9 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
   def combine(
       self,
       routed_output_RD: torch.Tensor,
-      metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+      metadata: (
+          AllToAllDispatchMetadata | LocalDispatchMetadata | _EpDispatchMetadata
+      ),
       x_TD: torch.Tensor,
   ) -> torch.Tensor:
     if self.ep_mesh is None:

@@ -18,6 +18,7 @@ Covers:
    a static-shape FX trace, and per-mesh optimizer param groups.
 """
 
+import contextlib
 import copy
 import dataclasses
 import functools
@@ -2005,6 +2006,29 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(parsed_ep.parallelism.expert_parallel_degree, 8)
     self.assertFalse(parsed_ep.compile.compile_grad_norm)
 
+    # CLI `--parallelism.expert_parallel_degree > 1` on a base `EP=1` recipe
+    # also disables `compile_grad_norm` and sets `DEFER_AND_FUSE` via
+    # `TpuQwen35Model.Config.update_from_config`.
+    cli_ep_base = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b",
+        "--parallelism.expert_parallel_degree=4",
+        "--compile.no-compile_grad_norm",
+    ])
+    cli_ep_base.compile.compile_grad_norm = True
+    cli_ep_base.tpu_config.eager_mode = None
+    cli_ep_base.model_spec.model.update_from_config(
+        config=cli_ep_base, global_batch_size=8, local_global_batch_size=8
+    )
+    self.assertFalse(cli_ep_base.compile.compile_grad_norm)
+    self.assertEqual(cli_ep_base.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    self.assertFalse(
+        issubclass(
+            qwen35_token_dispatcher.TpuQwen35DispatchMetadata,
+            qwen35_token_dispatcher.LocalDispatchMetadata,
+        )
+    )
+
     # Under EP > 1 on TPU, TpuQwen35Model.parallelize upgrades unconfigured
     # TpuGroupedExperts (use_pallas_grouped_mm=False) to unpaired Pallas
     # (tile_m=256), leaves CPU EP meshes on GroupedExperts.forward, and
@@ -2333,9 +2357,16 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
 
     counts = [count_tokens(idxs[r]) for r in range(ep_size)]
     gathered_counts = torch.cat(counts, dim=0)
+    gather_stack = contextlib.ExitStack()
+    self.addCleanup(gather_stack.close)
     for r in range(ep_size):
-      disp[r]._gather_expert_counts = (  # pylint: disable=protected-access
-          lambda lc, pg, sz, gc=gathered_counts: gc
+      gather_stack.enter_context(
+          mock.patch.object(
+              disp[r],
+              "_gather_expert_counts",
+              autospec=True,
+              side_effect=lambda lc, pg, sz, gc=gathered_counts: gc,
+          )
       )
 
     # Pass 1 + 2 for dispatch forward through real _RaggedAllToAll.apply.
@@ -2645,29 +2676,30 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         self.dense = torch.nn.Parameter(torch.ones(4))
         self.expert = torch.nn.Parameter(torch.ones(4) * 2.0)
 
-    for split_fn in (
+    self.assertIs(
         qwen3_5_tpu._split_optimizer_groups_by_mesh,  # pylint: disable=protected-access
         tpu_gt_mod._split_optimizers_by_mesh,  # pylint: disable=protected-access
-    ):
-      toy = _TwoPartToy()
-      toy.dense._spec = type("Spec", (), {"mesh": object()})()
-      toy.expert._spec = type("Spec", (), {"mesh": object()})()
-      opt_container = default_adamw(lr=1e-3, implementation="for-loop").build(
-          model_parts=[toy]
-      )
-      split_fn(opt_container)
-      opt = opt_container.optimizers[0]
-      self.assertLen(opt.param_groups, 2)
-      self.assertIs(opt.param_groups[0]["params"][0], toy.dense)
-      self.assertEqual(opt.param_groups[0]["param_names"], ["dense"])
-      self.assertIs(opt.param_groups[1]["params"][0], toy.expert)
-      self.assertEqual(opt.param_groups[1]["param_names"], ["expert"])
-      toy.dense.grad = torch.ones_like(toy.dense)
-      toy.expert.grad = torch.ones_like(toy.expert)
-      opt_container.step()
-      sd = opt_container.state_dict()
-      self.assertTrue(any("dense" in k for k in sd))
-      self.assertTrue(any("expert" in k for k in sd))
+    )
+    split_fn = tpu_gt_mod.split_optimizers_by_mesh
+    toy = _TwoPartToy()
+    toy.dense._spec = type("Spec", (), {"mesh": object()})()
+    toy.expert._spec = type("Spec", (), {"mesh": object()})()
+    opt_container = default_adamw(lr=1e-3, implementation="for-loop").build(
+        model_parts=[toy]
+    )
+    self.assertTrue(split_fn(opt_container))
+    opt = opt_container.optimizers[0]
+    self.assertLen(opt.param_groups, 2)
+    self.assertIs(opt.param_groups[0]["params"][0], toy.dense)
+    self.assertEqual(opt.param_groups[0]["param_names"], ["dense"])
+    self.assertIs(opt.param_groups[1]["params"][0], toy.expert)
+    self.assertEqual(opt.param_groups[1]["param_names"], ["expert"])
+    toy.dense.grad = torch.ones_like(toy.dense)
+    toy.expert.grad = torch.ones_like(toy.expert)
+    opt_container.step()
+    sd = opt_container.state_dict()
+    self.assertTrue(any("dense" in k for k in sd))
+    self.assertTrue(any("expert" in k for k in sd))
 
   def test_ep_ragged_all_to_all_detaches_operand_and_caches_rank(self):
     """Tests TPU ragged_all_to_all receives detached operand & rank buffer."""

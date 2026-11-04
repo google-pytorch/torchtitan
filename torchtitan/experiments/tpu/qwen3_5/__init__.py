@@ -97,50 +97,9 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
   return derive(config, TpuQwen35Model.Config, vision_encoder=None)
 
 
-def _split_optimizer_groups_by_mesh(optimizers_container) -> None:
-  """Splits every optimizer param group into one group per DeviceMesh.
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 
-  With Expert Parallelism the routed experts are DTensors on the
-  `(efsdp, ep)` mesh and all other parameters on the `fsdp` mesh; torch_tpu's
-  fused and foreach AdamW take one mesh per param group.
-
-  Args:
-    optimizers_container: The `OptimizersContainer` to update in place.
-  """
-
-  def mesh_key(param: torch.Tensor) -> int | None:
-    spec = getattr(param, "_spec", None)  # A DTensor's `DTensorSpec`.
-    return None if spec is None else id(spec.mesh)
-
-  for opt in optimizers_container.optimizers:
-    new_groups = []
-    for group in opt.param_groups:
-      params = list(group["params"])
-      names = group.get("param_names")
-      if names is not None and len(names) != len(params):
-        raise ValueError(
-            f"param_names length ({len(names)}) != params length"
-            f" ({len(params)})"
-        )
-      options = {
-          k: v for k, v in group.items() if k not in ("params", "param_names")
-      }
-      buckets: dict[int | None, dict[str, list]] = {}
-      for i, param in enumerate(params):
-        bucket = buckets.setdefault(
-            mesh_key(param), {"params": [], "param_names": []}
-        )
-        bucket["params"].append(param)
-        if names is not None:
-          bucket["param_names"].append(names[i])
-      for bucket in buckets.values():
-        if names is None:
-          del bucket["param_names"]
-        new_groups.append({**bucket, **options})
-    if len(new_groups) > len(opt.param_groups):
-      opt.param_groups = []
-      for group in new_groups:
-        opt.add_param_group(group)
+_split_optimizer_groups_by_mesh = split_optimizers_by_mesh
 
 
 def post_optimizer_build_qwen3_5(
@@ -149,7 +108,7 @@ def post_optimizer_build_qwen3_5(
     parallel_dims,
 ) -> None:
   """Splits multi-mesh optimizer param groups, then registers the MoE hook."""
-  _split_optimizer_groups_by_mesh(optimizers)
+  split_optimizers_by_mesh(optimizers)
   register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
 

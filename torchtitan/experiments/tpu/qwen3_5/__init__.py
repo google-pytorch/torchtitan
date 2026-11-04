@@ -32,7 +32,12 @@ from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScale
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
-from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, TpuGatedDeltaNet, TpuInnerGatedDeltaNet
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
+    TpuGatedDeltaKernel,
+    TpuGatedDeltaNet,
+    TpuInnerGatedDeltaNet,
+    TpuRMSNormGated,
+)
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35TransformerBlock
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
@@ -74,6 +79,7 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
           inner_gated_delta_net=TpuInnerGatedDeltaNet.Config(
               kernel=TpuGatedDeltaKernel.Config()
           ),
+          norm=derive(layer.delta_net.norm, TpuRMSNormGated.Config),
       )
       # TPU: SimpleFSDP-safe init; reset_parameters() inits a gathered copy.
       for conv in (

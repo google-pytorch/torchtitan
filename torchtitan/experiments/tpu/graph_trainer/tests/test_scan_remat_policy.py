@@ -1,10 +1,11 @@
-"""The scan body saves its tagged regions, and nothing else changes.
+"""The scan body saves its policy's regions, and nothing else changes.
 
 Checked against a plain budget-0.0 partition (recompute everything): the
 gradients bit for bit, and the backward graph for what it stopped (and did
 not stop) recomputing.
 """
 
+import types
 import unittest
 from unittest import mock
 
@@ -12,26 +13,24 @@ from absl.testing import absltest
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-from torch import fx
 from torch._functorch import config as functorch_config, partitioners
-from torch._higher_order_ops import partitioner as hop_partitioner
+from torch._guards import tracing, TracingContext
 from torch._higher_order_ops.scan import scan
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import make_fx
 
 # Imported for the same reason as in `test_layer_stack`: production scans run
 # with it installed, so these do too.
 from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
 from torchtitan.experiments.tpu.graph_trainer import scan_remat_policy
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
-    scan_body_remat_window,
-    tag_scan_body_joint_graph,
+    scan_with_remat_policy,
 )
 from torchtitan.experiments.tpu.remat_regions import (
     annotate_moe_expert_counts,
     annotate_region,
     ATTENTION_INNER_ATTENTION,
-    LAYER_INPUT,
     MOE_EXPERT_COUNTS,
-    REMAT_REGION,
 )
 from torchtitan.models.common import moe
 from torchtitan.models.common.moe import _batch_wise_load_balance_loss
@@ -134,13 +133,15 @@ def _body(h: torch.Tensor, w: torch.Tensor, *, extra):
     return out, out.new_zeros(())
 
 
-def _run(window, *, extra=_aux_term):
-    """Forward and backward one scan; returns grads and the body's partitions."""
-    torch._dynamo.reset()
+def _inputs():
     torch.manual_seed(SEED)
     h = torch.randn(TOKENS, DIM, requires_grad=True)
     w = torch.randn(N_LAYERS, DIM, EXPERTS, requires_grad=True)
+    return h, w
 
+
+def _capturing():
+    """Patch min-cut to record (budget, backward graph) of each partition."""
     captured = []
     partition = partitioners.min_cut_rematerialization_partition
 
@@ -149,20 +150,65 @@ def _run(window, *, extra=_aux_term):
         captured.append((functorch_config.activation_memory_budget, backward))
         return forward, backward
 
+    patch = mock.patch.object(
+        partitioners, "min_cut_rematerialization_partition", capture
+    )
+    return patch, captured
+
+
+def _run(run_scan, *, extra=_aux_term):
+    """Forward and backward one scan; returns grads and the body's partitions.
+
+    ``run_scan(body, init, xs)`` runs the scan.
+    """
+    torch._dynamo.reset()
+    h, w = _inputs()
+
     def body(carry, x):
         return _body(carry, x, extra=extra)
 
-    with mock.patch.object(
-        partitioners, "min_cut_rematerialization_partition", capture
-    ):
-        with window():
-            carry, _ = scan(body, h, w)
+    patch, captured = _capturing()
+    with patch:
+        carry, _ = run_scan(body, h, w)
     carry.square().sum().backward()
     return (carry.detach(), h.grad, w.grad), captured
 
 
-def _legacy_window():
-    return functorch_config.patch(activation_memory_budget=0.0)
+def _run_non_strict(run_scan, *, extra=_aux_term):
+    """``_run``, traced as the graph trainer does: non-strict ``make_fx``."""
+    torch._dynamo.reset()
+    h, w = _inputs()
+
+    def body(carry, x):
+        return _body(carry, x, extra=extra)
+
+    def step(h, w):
+        carry, _ = run_scan(body, h, w)
+        return (carry, *torch.autograd.grad(carry.square().sum(), (h, w)))
+
+    fake = FakeTensorMode(allow_non_fake_inputs=True)
+    patch, captured = _capturing()
+    with (
+        patch,
+        fake,
+        tracing(TracingContext(fake)),
+        torch.compiler._non_strict_tracing_context(),
+        torch.compiler._patch_autograd_grad(),
+    ):
+        gm = make_fx(step)(fake.from_tensor(h), fake.from_tensor(w))
+    with torch.no_grad():
+        return tuple(gm(h.detach(), w.detach())), captured
+
+
+def _legacy(body, init, xs):
+    with functorch_config.patch(activation_memory_budget=0.0):
+        return scan(body, init, xs)
+
+
+def _saving(*regions):
+    return lambda body, init, xs: scan_with_remat_policy(
+        body, init, xs, frozenset(regions)
+    )
 
 
 def _ops(graph_module) -> list[str]:
@@ -189,8 +235,8 @@ class TestScanBodyRematWindow(unittest.TestCase):
             torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)
 
     def test_saves_the_counts_and_recomputes_the_rest(self):
-        want, legacy = _run(_legacy_window)
-        got, captured = _run(scan_body_remat_window)
+        want, legacy = _run(_legacy)
+        got, captured = _run(_saving())
         self.assertTrue(captured, "the scan body was never partitioned")
         self._check_same_grads(got, want)
 
@@ -210,8 +256,8 @@ class TestScanBodyRematWindow(unittest.TestCase):
     def test_the_real_aux_loss_over_two_groups(self):
         """`_batch_wise_load_balance_loss` itself, with its in-place all-reduces."""
         extra = _real_aux_term(dist.new_group([0]), dist.new_group([0]))
-        want, legacy = _run(_legacy_window, extra=extra)
-        got, captured = _run(scan_body_remat_window, extra=extra)
+        want, legacy = _run(_legacy, extra=extra)
+        got, captured = _run(_saving(), extra=extra)
         self.assertEqual(
             _ops(legacy[0][1]).count("_c10d_functional.all_reduce.default"),
             2,
@@ -229,8 +275,8 @@ class TestScanBodyRematWindow(unittest.TestCase):
         self.assertFalse(hasattr(wrapped.__wrapped__, "__wrapped__"))
 
     def test_a_body_without_regions_recomputes_everything(self):
-        want, legacy = _run(_legacy_window, extra=None)
-        got, captured = _run(scan_body_remat_window, extra=None)
+        want, legacy = _run(_legacy, extra=None)
+        got, captured = _run(_saving(), extra=None)
         self.assertEqual(_ops(captured[0][1]), _ops(legacy[0][1]))
         self._check_same_grads(got, want)
 
@@ -241,60 +287,52 @@ class TestScanBodyRematWindow(unittest.TestCase):
             return (_routing_counts(scores).sum().to(scores.dtype) * scores).sum()
 
         extra = _both(_aux_term, routing_scaled)
-        want, _ = _run(_legacy_window, extra=extra)
-        got, captured = _run(scan_body_remat_window, extra=extra)
+        want, _ = _run(_legacy, extra=extra)
+        got, captured = _run(_saving(), extra=extra)
         ops = _ops(captured[0][1])
         self.assertIn("_c10d_functional.all_to_all_single.default", ops)
         self.assertNotIn("_c10d_functional.all_reduce.default", ops)
         self._check_same_grads(got, want)
 
     def test_a_selected_region_is_saved(self):
-        want, _ = _run(_legacy_window, extra=_attention_term)
-        _, unselected = _run(scan_body_remat_window, extra=_attention_term)
+        want, _ = _run(_legacy, extra=_attention_term)
+        _, unselected = _run(_saving(), extra=_attention_term)
         got, selected = _run(
-            lambda: scan_body_remat_window({ATTENTION_INNER_ATTENTION}),
-            extra=_attention_term,
+            _saving(ATTENTION_INNER_ATTENTION), extra=_attention_term
         )
         self.assertIn("aten.sigmoid.default", _ops(unselected[0][1]))
         self.assertNotIn("aten.sigmoid.default", _ops(selected[0][1]))
         self._check_same_grads(got, want)
 
-    def test_raises_when_the_region_meta_is_lost(self):
-        with mock.patch.object(scan_remat_policy, "_keeping_meta", lambda fn: fn):
-            with self.assertRaisesRegex(Exception, "no remat_region meta"):
-                _run(scan_body_remat_window)
+    def test_the_policy_holds_under_non_strict_tracing(self):
+        """The graph trainer's tracer: checkpoint must still tag the body."""
+        extra = _both(_aux_term, _attention_term)
+        want, legacy = _run(_legacy, extra=extra)
+        got, captured = _run_non_strict(
+            _saving(ATTENTION_INNER_ATTENTION), extra=extra
+        )
+        self.assertIn("_c10d_functional.all_reduce.default", _ops(legacy[0][1]))
+        ops = _ops(captured[0][1])
+        self.assertNotIn("_c10d_functional.all_reduce.default", ops)
+        self.assertNotIn("aten.sigmoid.default", ops)
+        self.assertIn("aten.mm.default", ops)
+        self._check_same_grads(got, want)
 
-    def test_tags_the_carry_as_the_layer_input(self):
-        graph = fx.Graph()
-        carry, x = graph.placeholder("carry"), graph.placeholder("x")
-        shared = {"module_fqn": "layers"}
-        carry.meta["custom"] = x.meta["custom"] = shared
-        graph.output(graph.call_function(torch.mul, (carry, x)))
-        tag_scan_body_joint_graph(graph, frozenset())
-        self.assertEqual(carry.meta["custom"][REMAT_REGION], LAYER_INPUT)
-        # Placeholder meta is shared between graphs; the tag must not leak.
-        self.assertNotIn(REMAT_REGION, shared)
+    def test_raises_on_a_torch_whose_checkpoint_skips_scan_bodies(self):
+        with mock.patch.object(
+            scan_remat_policy, "checkpoint_module", types.SimpleNamespace()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "non-strict"):
+                _run(_saving())
 
     def test_refuses_an_unknown_save_region(self):
         with self.assertRaises(ValueError):
-            with scan_body_remat_window({"moe.routing"}):
-                pass
+            _run(_saving("moe.routing"))
 
-    def test_the_window_closes(self):
-        before = (
-            functorch_config.activation_memory_budget,
-            partitioners.min_cut_rematerialization_partition,
-            hop_partitioner.create_bw_fn,
-            torch.func.functionalize,
-        )
-        _run(scan_body_remat_window)
-        after = (
-            functorch_config.activation_memory_budget,
-            partitioners.min_cut_rematerialization_partition,
-            hop_partitioner.create_bw_fn,
-            torch.func.functionalize,
-        )
-        self.assertEqual(after, before)
+    def test_the_budget_is_restored(self):
+        before = functorch_config.activation_memory_budget
+        _run(_saving())
+        self.assertEqual(functorch_config.activation_memory_budget, before)
 
 
 if __name__ == "__main__":

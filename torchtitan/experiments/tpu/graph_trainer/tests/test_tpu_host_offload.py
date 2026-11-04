@@ -2,7 +2,7 @@
 
 `_pair()` builds the graph the joint-graph tracer produces for scanned layers:
 
-    fwd body: (carry, x) -> (out, clone(carry) [layer_input], attn)
+    fwd body: (carry, x) -> (out, clone(carry), attn)
     layer_stack = getitem(fwd_scan, 1)   # [6, 2, 512, 256]
     attn_stack  = getitem(fwd_scan, 2)   # [6, 2, 1024, 256], larger
     bwd_scan(init=[grad], xs=[counter], additional_inputs=[layer_stack, attn_stack])
@@ -20,7 +20,6 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import (
 )
 from torchtitan.experiments.tpu.remat_regions import (
     ATTENTION_INNER_ATTENTION,
-    LAYER_INPUT,
     REMAT_REGION,
 )
 
@@ -56,15 +55,15 @@ def _mm(graph, src, shape, **kwargs):
     return _op(graph, torch.ops.aten.mm.default, src, shape, **kwargs)
 
 
-def _fwd_body(tag):
+def _fwd_body(saves_carry):
     g = torch.fx.Graph()
     for name in ("carry", "x"):
         g.placeholder(name).meta["val"] = torch.empty(4, 4)
-    carry = next(iter(g.nodes))
-    saved = g.call_function(torch.ops.aten.clone.default, args=(carry,))
+    carry, x = g.nodes
+    saved = g.call_function(
+        torch.ops.aten.clone.default, args=(carry if saves_carry else x,)
+    )
     saved.meta["val"] = torch.empty(_STACK[1:])
-    if tag:
-        saved.meta["custom"] = {REMAT_REGION: LAYER_INPUT}
     attn = _mm(g, carry, _ATTN[1:], region=ATTENTION_INNER_ATTENTION)
     g.output((_mm(g, carry, (4, 4)), saved, attn))
     return g
@@ -112,12 +111,12 @@ class ScanOffloadTest(absltest.TestCase):
         self.root.add_module(name, torch.fx.GraphModule(torch.nn.Module(), body))
         return self.graph.get_attr(name)
 
-    def _pair(self, reads="row", tag=True):
+    def _pair(self, reads="row", saves_carry=True):
         g = self.graph
         carry = _mm(g, self.x, (4, 4), name="carry_init")
         xs = _mm(g, self.x, (6, 4, 4), name="xs_in")
         fwd = g.call_function(
-            _SCAN, args=(self._attach(_fwd_body(tag)), [carry], [xs], ())
+            _SCAN, args=(self._attach(_fwd_body(saves_carry)), [carry], [xs], ())
         )
         fwd.meta["autograd_backward"] = False
         stacks = []
@@ -142,7 +141,7 @@ class ScanOffloadTest(absltest.TestCase):
         self.assertEqual(_ao_targets(_body_of(gm, fwd).graph), [])
         self.assertEqual(_ao_targets(_body_of(gm, bwd).graph), [])
 
-    def test_only_the_tagged_layer_input_goes_to_host(self):
+    def test_only_the_saved_carry_goes_to_host(self):
         fwd, stack, bwd = self._pair()
         self.graph.output(bwd)
 
@@ -152,7 +151,7 @@ class ScanOffloadTest(absltest.TestCase):
         fwd_body = _body_of(gm, fwd).graph
         bwd_body = _body_of(gm, bwd).graph
         self.assertEqual(_ao_targets(gm.graph), [])
-        # One offload, on the tagged clone; the larger attention save stays.
+        # One offload, on the carry's clone; the larger attention save stays.
         (offload,) = [n for n in fwd_body.nodes if n.target is _OFFLOAD]
         self.assertIs(offload.args[0].target, torch.ops.aten.clone.default)
         self.assertEqual(stack.meta["val"].device.type, "cpu")
@@ -195,8 +194,8 @@ class ScanOffloadTest(absltest.TestCase):
             offload_scan_activations(gm)
         self._assert_untouched(gm, fwd, bwd)
 
-    def test_an_untagged_save_raises_rather_than_guessing(self):
-        fwd, _, bwd = self._pair(tag=False)
+    def test_a_body_that_does_not_save_its_carry_raises(self):
+        fwd, _, bwd = self._pair(saves_carry=False)
         self.graph.output(bwd)
 
         gm = self._gm()

@@ -1078,9 +1078,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     # Config.reset_at_documents=False (pretraining) ignores positions in both
     # forward and backward: whole rows match gdn(x, positions=None).
-    gdn_no_reset = dataclasses.replace(
-        config.layers[0].delta_net, reset_at_documents=False
-    ).build()
+    gdn_no_reset_cfg = dataclasses.replace(
+        config.layers[0].delta_net,
+        document_resets=gated_delta.GatedDeltaDocumentResets.Config(
+            enabled=False
+        ),
+    )
+    self.assertFalse(gdn_no_reset_cfg.reset_at_documents)
+    gdn_no_reset = gdn_no_reset_cfg.build()
     gdn_no_reset.init_states(buffer_device=torch.device("cpu"))
     gdn_no_reset.load_state_dict(gdn.state_dict())
     gdn_no_reset = gdn_no_reset.to(self.accelerator_device)
@@ -1136,6 +1141,22 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         gated_delta.per_row_segment_ids(stream_ids, 8)[0],
         torch.tensor([1, 1, 2, 3, 3, 3, 4, 4], dtype=torch.int32),
     )
+    # Non-unit document-id steps (e.g. caller-supplied sorted ids with gaps)
+    # still assign 1-based contiguous segment indices instead of collapsing into
+    # max_num_segments prematurely.
+    gapped_ids = torch.tensor(
+        [[0, 0, 5, 5, 10, 10], [7, 7, 7, 20, 20, 20]], dtype=torch.int64
+    )
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(gapped_ids, 4),
+        torch.tensor(
+            [[1, 1, 2, 2, 3, 3], [1, 1, 1, 2, 2, 2]], dtype=torch.int32
+        ),
+    )
+    torch.testing.assert_close(
+        gated_delta.per_row_segment_ids(torch.tensor([[5], [9]]), 4),
+        torch.tensor([[1], [1]], dtype=torch.int32),
+    )
 
   def test_gated_delta_net_document_ids_reach_conv_and_recurrence(self):
     """Tests that the kernel's document ids drive the conv and recurrence."""
@@ -1154,10 +1175,15 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with torch.no_grad(), set_unflatten_seq_len(seq_len):
       expected = gdn(x, positions=merged)
       uncapped = gdn(x, positions=positions)
-      gdn.inner_gated_delta_net.kernel.document_ids = functools.partial(
-          gated_delta.per_row_segment_ids, max_num_segments=cap
-      )
-      capped = gdn(x, positions=positions)
+      with mock.patch.object(
+          gdn.inner_gated_delta_net.kernel,
+          "document_ids",
+          autospec=True,
+          side_effect=functools.partial(
+              gated_delta.per_row_segment_ids, max_num_segments=cap
+          ),
+      ):
+        capped = gdn(x, positions=positions)
 
     tol = 5e-3 if self._is_tpu() else 1e-5
     test_utils.check_equivalence(
@@ -1723,16 +1749,30 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(resets(bench_cfg), [False] * 30)
     self.assertEqual(resets(config_registry.qwen35_moe_35b()), [True] * 30)
     re_enabled_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    doc_resets_override = (
+        "torchtitan.experiments.tpu.qwen3_5.gated_delta."
+        "gated_delta_document_resets"
+    )
+    # Combining with the recipe's own overrides (including Tokamax KDA) keeps
+    # both FusedLossLinearWrapper and TokamaxGatedDeltaKernel active without
+    # nested-override conflicts.
     apply_overrides(
         OverrideConfig(
-            imports=[
-                "torchtitan.experiments.tpu.qwen3_5.gated_delta."
-                "gated_delta_document_resets"
-            ]
+            imports=[*re_enabled_cfg.override.imports, doc_resets_override]
         ),
         re_enabled_cfg,
     )
     self.assertEqual(resets(re_enabled_cfg), [True] * 30)
+    for layer in re_enabled_cfg.model_spec.model.layers:
+      if layer.delta_net is not None:
+        self.assertEqual(
+            type(layer.delta_net.inner_gated_delta_net.kernel).__qualname__,
+            "TokamaxGatedDeltaKernel.Config",
+        )
+    self.assertEqual(
+        type(re_enabled_cfg.model_spec.model.lm_head).__qualname__,
+        "FusedLossLinearWrapper.Config",
+    )
     self.assertEqual(
         bench_cfg.override.imports,
         [
@@ -1856,7 +1896,31 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self._assert_uses_tpu_moe_kernels(parsed.model_spec.model, tile_m=512)
 
-    # The README's 96K split=1 + selective save_last_n_layers flags also parse.
+    # CLI `--override.imports` can re-enable document resets alongside the
+    # recipe's fused-loss and Tokamax KDA overrides (with custom segments).
+    parsed_rl = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--override.imports",
+        config_registry.FUSED_LOSS_OVERRIDE,
+        (
+            f'{config_registry.TOKAMAX_GATED_DELTA_OVERRIDE}={{"max_num_segments":'
+            " 32}"
+        ),
+        doc_resets_override,
+    ])
+    apply_overrides(parsed_rl.override, parsed_rl)
+    self.assertEqual(resets(parsed_rl), [True] * 30)
+    first_gdn_kernel = parsed_rl.model_spec.model.layers[
+        0
+    ].delta_net.inner_gated_delta_net.kernel
+    self.assertEqual(
+        type(first_gdn_kernel).__qualname__, "TokamaxGatedDeltaKernel.Config"
+    )
+    self.assertEqual(first_gdn_kernel.max_num_segments, 32)
+
+    # 1-layer split + selective save_last_n_layers CLI flags (used at 96K
+    # tokens/rank) also parse.
     parsed_96k = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
         "--config=qwen35_moe_35b_split_tokamax_benchmark",
@@ -2666,6 +2730,115 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         (dx,) = torch.autograd.grad(y.sum(), (operand,))
         self.assertEqual(tuple(dx.shape), (4, 8))
       self.assertEqual(seen_requires_grad, [False, False])
+
+  def test_tpu_rms_norm_gated_wiring_and_fallback(self):
+    """Tests ``use_tpu_modules`` wiring and ``TpuRMSNormGated`` dispatch/fallback."""
+    cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    norms = [
+        layer.delta_net.norm
+        for layer in cfg.model_spec.model.layers
+        if layer.delta_net is not None
+    ]
+    self.assertLen(norms, 30)
+    for norm_cfg in norms:
+      self.assertIsInstance(norm_cfg, gated_delta.TpuRMSNormGated.Config)
+
+    dev = self.accelerator_device
+    mod = gated_delta.TpuRMSNormGated.Config(dim=128, eps=1e-6).build().to(dev)
+    ref_mod = gated_delta.RMSNormGated.Config(dim=128, eps=1e-6).build().to(dev)
+    with torch.no_grad():
+      mod.weight.uniform_(0.8, 1.2)
+      ref_mod.weight.copy_(mod.weight)
+
+    # Small debug shapes (`rows < 2048`) fall back cleanly to `RMSNormGated`.
+    x_small = torch.randn(
+        16, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g_small = torch.randn(
+        16, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    out_small = mod(x_small, g_small)
+    out_small_ref = ref_mod(x_small.detach(), g_small.detach())
+    torch.testing.assert_close(out_small.cpu(), out_small_ref.cpu())
+
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      return
+
+    self.assertIsNotNone(gated_delta.rms_norm_gated)
+    x_tpu = torch.randn(
+        1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g_tpu = torch.randn(
+        1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    with mock.patch.object(
+        gated_delta.rms_norm_gated,
+        "rms_norm_gated",
+        wraps=gated_delta.rms_norm_gated.rms_norm_gated,
+    ) as spy:
+      out_tpu = mod(x_tpu, g_tpu)
+      self.assertEqual(spy.call_count, 1)
+    out_tpu_ref = ref_mod(x_tpu, g_tpu)
+    torch.testing.assert_close(
+        out_tpu.cpu(), out_tpu_ref.cpu(), rtol=1e-2, atol=1e-2
+    )
+
+  def test_tokamax_gated_delta_selective_remat_and_compile(self):
+    """Tests Tokamax KDA residual-list custom ops under torch.compile on TPU."""
+    if (
+        self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU
+        or not tokamax_gated_delta.supports_current_tpu()
+        or not tokamax_gated_delta.has_tokamax_kda()
+    ):
+      self.skipTest("Requires TPU >= v6 with Tokamax KDA installed.")
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    dev = self.accelerator_device
+    torch.manual_seed(17)
+    kernel = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
+        max_num_segments=4
+    ).build()
+
+    def step(q, k, v, g, beta, seg):
+      y = kernel(q, k, v, g, beta, segment_ids_BS=seg)
+      return y.float().square().mean()
+
+    q = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    k = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    v = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g = -torch.rand(
+        1, 128, 2, device=dev, dtype=torch.float32, requires_grad=True
+    )
+    beta = torch.rand(
+        1, 128, 2, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    seg = torch.cat(
+        [
+            torch.zeros(1, 64, device=dev, dtype=torch.int32),
+            torch.ones(1, 64, device=dev, dtype=torch.int32),
+        ],
+        dim=1,
+    )
+
+    eager_loss = step(q, k, v, g, beta, seg)
+    eager_grads = torch.autograd.grad(eager_loss, (q, k, v, g, beta))
+
+    compiled_step = torch.compile(step, backend="tpu")
+    comp_loss = compiled_step(q, k, v, g, beta, seg)
+    comp_grads = torch.autograd.grad(comp_loss, (q, k, v, g, beta))
+
+    torch.testing.assert_close(
+        comp_loss.cpu(), eager_loss.cpu(), rtol=2e-2, atol=2e-2
+    )
+    for g_comp, g_eager in zip(comp_grads, eager_grads, strict=True):
+      torch.testing.assert_close(
+          g_comp.cpu(), g_eager.cpu(), rtol=3e-2, atol=3e-2
+      )
 
 
 if __name__ == "__main__":

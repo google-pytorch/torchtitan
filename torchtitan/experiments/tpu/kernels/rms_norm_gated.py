@@ -13,8 +13,14 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-import torch
+# pyformat: disable
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import when torch autoloads torch_tpu -> torch.distributed.fsdp -> spmd_types.
+import torch  # isort: skip
+import spmd_types as spmd
+# pyformat: enable
 from torch.distributed.tensor import DTensor
+import torch.nn.functional as F
 from torch_tpu._internal import pallas
 
 _BLOCK_ROWS = 2048
@@ -164,6 +170,81 @@ def _backward(ctx, dy):
 _fwd_op.register_autograd(_backward, setup_context=_setup_context)
 
 
+@torch._dynamo.assume_constant_result
+def _is_spmd_type_checking() -> bool:
+  return spmd.is_type_checking()
+
+
+def _native_rms_norm_gated(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+  dtype = x.dtype
+  xf = x.float()
+  xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+  out = (weight.float() * xf).to(dtype)
+  return (out * F.silu(gate.float())).to(dtype)
+
+
+class _RmsNormGatedSpmdFn(torch.autograd.Function):
+  """``rms_norm_gated`` wrapper registered with ``spmd.register_decomposition``."""
+
+  @staticmethod
+  def forward(
+      ctx,
+      x: torch.Tensor,
+      gate: torch.Tensor,
+      weight: torch.Tensor,
+      eps: float,
+  ) -> torch.Tensor:
+    ctx.set_materialize_grads(False)
+    dim = x.shape[-1]
+    ctx.orig_shape = x.shape
+    ctx.weight_shape = weight.shape
+    ctx.weight_dtype = weight.dtype
+    ctx.eps = float(eps)
+    with spmd.no_typecheck():
+      x_2d = x.reshape(-1, dim).contiguous()
+      gate_2d = gate.reshape(-1, dim).contiguous()
+      w_2d = weight.to(torch.float32).reshape(1, dim).contiguous()
+      out = _fwd_op(x_2d, gate_2d, w_2d, ctx.eps).reshape(x.shape)
+    ctx.save_for_backward(x_2d, gate_2d, w_2d)
+    return out
+
+  @staticmethod
+  def backward(ctx, dy):
+    need_dx, need_dg, need_dw, _ = ctx.needs_input_grad
+    if dy is None or not (need_dx or need_dg or need_dw):
+      return None, None, None, None
+    x_2d, gate_2d, w_2d = ctx.saved_tensors
+    dim = ctx.orig_shape[-1]
+    with spmd.no_typecheck():
+      dx_2d, dg_2d, dw_2d = _bwd_op(
+          x_2d, gate_2d, w_2d, dy.reshape(-1, dim).contiguous(), ctx.eps
+      )
+      dx = dx_2d.reshape(ctx.orig_shape) if need_dx else None
+      dg = dg_2d.reshape(ctx.orig_shape) if need_dg else None
+      dw = (
+          dw_2d.reshape(ctx.weight_shape).to(ctx.weight_dtype)
+          if need_dw
+          else None
+      )
+    return dx, dg, dw, None
+
+
+spmd.register_decomposition(_RmsNormGatedSpmdFn, _native_rms_norm_gated)
+
+
+def _has_sharded_norm_dim(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor
+) -> bool:
+  for t in (x, gate):
+    ps = spmd.get_partition_spec(t)
+    if ps is not None and len(ps) > 0 and ps[-1] is not None:
+      return True
+  w_ps = spmd.get_partition_spec(weight)
+  return w_ps is not None and len(w_ps) > 0 and w_ps[0] is not None
+
+
 def supports(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor) -> bool:
   """Whether ``(x, gate, weight)`` satisfy the Pallas kernel limits."""
   if (
@@ -171,6 +252,8 @@ def supports(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor) -> bool:
       or isinstance(gate, DTensor)
       or isinstance(weight, DTensor)
   ):
+    return False
+  if _is_spmd_type_checking() and _has_sharded_norm_dim(x, gate, weight):
     return False
   if (
       x.device.type != "tpu"
@@ -208,6 +291,8 @@ def rms_norm_gated(
     )
   if eps < 0:
     raise ValueError(f"eps must be non-negative, got {eps}")
+  if _is_spmd_type_checking():
+    return _RmsNormGatedSpmdFn.apply(x, gate, weight, float(eps))
   dim = x.shape[-1]
   w = weight.to(torch.float32).reshape(1, dim).contiguous()
   out = _fwd_op(

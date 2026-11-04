@@ -112,6 +112,11 @@ class LinearSoftmaxCrossEntropyLossTest(
 ):
   """Tests for LinearSoftmaxCrossEntropyLoss."""
 
+  def setUp(self):
+    super().setUp()
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Pallas LCE kernel requires a TPU device.")
+
   @parameterized.parameters(
       (torch.float32, "sum", "mosaic_tpu", 1e-4, 1e-5),
       (torch.float32, "sum", "xla", 1e-4, 1e-5),

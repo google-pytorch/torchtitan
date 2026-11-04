@@ -150,7 +150,7 @@ def _tpu_generation() -> int | None:
     name = get_props().name.lower()
   except RuntimeError:
     return None
-  match = re.search(r"(?:v|tpu[- ])(\d+)", name)
+  match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
   return int(match.group(1)) if match else None
 
 
@@ -181,6 +181,10 @@ def _gated_delta(
   every document, with at most ``max_num_segments`` documents per row.
   """
   q_h, k_h, v_h = _heads_first(q), _heads_first(k), _heads_first(v)
+  # NOTE: Post-0.0.17 Tokamax (`openxla/tokamax@eeb06e7`) adds scalar-gate
+  # `per_channel_gate=False` (`gate` shape `[H, B, T, 1]`), bypassing the
+  # per-channel backward `exp2(g_max - g_b)` re-centering. Revisit dropping
+  # both the `-5` clamp and `[H, B, T, K]` broadcast on the next release.
   log_decay = jnp.maximum(_heads_first(g).astype(jnp.float32), min_log_decay)
   gate = jnp.broadcast_to(log_decay[..., None], q_h.shape)
   out, _ = _require_tokamax_kda()(
@@ -495,6 +499,11 @@ def tokamax_gated_delta(
     ``seq_len`` must be a multiple of 64 (the kernel's chunk size).
   """
   _require_tokamax_kda()
+  if not MIN_SUPPORTED_LOG_DECAY <= min_log_decay < 0:
+    raise ValueError(
+        f"min_log_decay must be in [{MIN_SUPPORTED_LOG_DECAY}, 0), got"
+        f" {min_log_decay}: the kernels overflow below it."
+    )
   # `jax_op` reads its operands by shape alone, so they must be dense.
   q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
   # Without a gradient to compute (no_grad, inference, validation), run the
@@ -555,10 +564,13 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
   apply. With packed documents (``segment_ids_BS``), the convolution and the
   recurrence restart at each of the first ``max_num_segments`` documents of
   every row (see ``document_ids``). Log decays are clamped to at least
-  ``min_log_decay`` (see the module docstring). Inputs the kernels do not take
-  (not on TPU >= v6, empty batch/sequence, not bf16/fp32, head dims above 256,
-  or rows without document ids that are not a multiple of 64 tokens) run the
-  parent's XLA recurrence, unclamped.
+  ``min_log_decay`` (see the module docstring). Inputs the Mosaic kernels do
+  not take (not on TPU >= v6, empty dimensions, mixed or non-bf16/fp32 dtypes,
+  K/V head dims above 256 or not multiples of 128, or rows without document ids
+  that are not a multiple of 64 tokens) run the parent's XLA recurrence with
+  the same ``min_log_decay`` clamp and ``document_ids`` segment budget so CPU,
+  TPU < v6, and TPU v6+ evaluate the same function (use
+  ``TpuGatedDeltaKernel`` directly for unclamped, uncapped XLA).
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -608,7 +620,11 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
     )
 
   def _unsupported(
-      self, q_BSHK: torch.Tensor, segment_ids_BS: torch.Tensor | None
+      self,
+      q_BSHK: torch.Tensor,
+      k_BSHK: torch.Tensor,
+      v_BSHV: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None,
   ) -> str | None:
     """Why the Mosaic kernels cannot run these inputs, or None."""
     if q_BSHK.device.type != "tpu":
@@ -616,12 +632,22 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
     gen = _tpu_generation()
     if gen is not None and gen < _MIN_TPU_GENERATION:
       return f"TPU v{gen} (needs >= v{_MIN_TPU_GENERATION})"
-    if q_BSHK.shape[0] == 0 or q_BSHK.shape[1] == 0:
+    if 0 in q_BSHK.shape or 0 in v_BSHV.shape:
       return f"empty shape {tuple(q_BSHK.shape)}"
-    if q_BSHK.dtype not in _KERNEL_DTYPES:
-      return f"dtype {q_BSHK.dtype}"
-    if q_BSHK.shape[-1] > _MAX_KERNEL_HEAD_DIM:
-      return f"head dim {q_BSHK.shape[-1]}"
+    if (
+        q_BSHK.dtype not in _KERNEL_DTYPES
+        or k_BSHK.dtype != q_BSHK.dtype
+        or v_BSHV.dtype != q_BSHK.dtype
+    ):
+      return f"dtypes {(q_BSHK.dtype, k_BSHK.dtype, v_BSHV.dtype)}"
+    d_k, d_v = q_BSHK.shape[-1], v_BSHV.shape[-1]
+    if (
+        d_k > _MAX_KERNEL_HEAD_DIM
+        or d_v > _MAX_KERNEL_HEAD_DIM
+        or d_k % 128 != 0
+        or d_v % 128 != 0
+    ):
+      return f"head dims ({d_k}, {d_v})"
     if segment_ids_BS is None and q_BSHK.shape[1] % _KERNEL_CHUNK:
       return f"{q_BSHK.shape[1]}-token rows"
     return None
@@ -635,11 +661,24 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
       beta_BSH: torch.Tensor,
       segment_ids_BS: torch.Tensor | None = None,
   ) -> torch.Tensor:
-    reason = self._unsupported(q_BSHK, segment_ids_BS)
+    reason = self._unsupported(q_BSHK, k_BSHK, v_BSHV, segment_ids_BS)
     if reason is not None:
       _log_fallback_once(reason)
+      if 0 in q_BSHK.shape or 0 in v_BSHV.shape:
+        zero_touch = 0.0 * (
+            q_BSHK.float().sum()
+            + k_BSHK.float().sum()
+            + g_BSH.float().sum()
+            + beta_BSH.float().sum()
+        )
+        return v_BSHV.to(q_BSHK.dtype) * 0.0 + zero_touch.to(q_BSHK.dtype)
       return super().recurrence(
-          q_BSHK, k_BSHK, v_BSHV, g_BSH, beta_BSH, segment_ids_BS
+          q_BSHK,
+          k_BSHK,
+          v_BSHV,
+          g_BSH.clamp(min=self.min_log_decay),
+          beta_BSH,
+          segment_ids_BS,
       )
     if segment_ids_BS is None:
       return tokamax_gated_delta(

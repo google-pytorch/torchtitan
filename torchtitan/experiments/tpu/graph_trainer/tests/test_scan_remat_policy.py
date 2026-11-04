@@ -223,6 +223,28 @@ class TestCountCollectives(unittest.TestCase):
         )
         self.assertEqual(count_collectives(graph), [])
 
+    def test_finds_the_ep_count_all_gather(self):
+        """TPU EP exchanges `histc` counts via `all_gather_into_tensor`."""
+
+        def f(scores):
+            ids = scores.topk(TOP_K, dim=-1).indices
+            counts = torch.histc(
+                ids.reshape(-1).float(), bins=EXPERTS, min=0, max=EXPERTS
+            ).to(torch.int32)
+            return funcol.all_gather_tensor(
+                counts, gather_dim=0, group=dist.group.WORLD
+            )
+
+        graph = make_fx(f)(torch.randn(TOKENS, EXPERTS).softmax(-1)).graph
+        found = count_collectives(graph)
+        self.assertEqual(
+            {str(n.target) for n in found},
+            {
+                "_c10d_functional.all_gather_into_tensor.default",
+                "_c10d_functional.wait_tensor.default",
+            },
+        )
+
 
 class TestScanBodyRematWindow(unittest.TestCase):
 
@@ -314,6 +336,76 @@ class TestScanBodyRematWindow(unittest.TestCase):
         _run(scan_body_remat_window)
         self.assertEqual(functorch_config.activation_memory_budget, default_budget)
         self.assertIs(partitioners.min_cut_rematerialization_partition, partition)
+
+    def test_backward_starts_with_forward_collective_group(self):
+        """Recomputed FSDP parameter gathers stay ahead of EP combine backward."""
+        fsdp_group = dist.new_group([0])
+        ep_group = dist.new_group([0])
+
+        class _CombineLike(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, gate):
+                ctx.save_for_backward(gate)
+                return x * gate
+
+            @staticmethod
+            def backward(ctx, grad_out):
+                (gate,) = ctx.saved_tensors
+                # Mirrors `_CombineTokens.backward`: an EP all-gather on
+                # `grad_out` that depends only on `tangents_*`, before the
+                # first op that consumes a recomputed forward tensor (`gate`).
+                gathered_grad = funcol.all_gather_tensor(
+                    grad_out, gather_dim=0, group=ep_group
+                )
+                return gathered_grad * gate, gathered_grad * gate
+
+        def ep_layer(carry, w_shard):
+            w_full = funcol.all_gather_tensor(
+                w_shard, gather_dim=0, group=fsdp_group
+            )
+            gate = torch.tanh(carry @ w_full)
+            out = carry + _CombineLike.apply(carry, gate)
+            return out, out.new_zeros(())
+
+        def run_with(window):
+            torch._dynamo.reset()
+            torch.manual_seed(SEED)
+            h = torch.randn(TOKENS, DIM, requires_grad=True)
+            w = torch.randn(N_LAYERS, DIM, DIM, requires_grad=True)
+            partitioned = []
+
+            with window():
+                current = partitioners.min_cut_rematerialization_partition
+
+                def wrapped(joint, inputs, *args, **kwargs):
+                    fw_gm, bw_gm = current(joint, inputs, *args, **kwargs)
+                    partitioned.append((fw_gm, bw_gm))
+                    return fw_gm, bw_gm
+
+                with mock.patch.object(
+                    partitioners, "min_cut_rematerialization_partition", wrapped
+                ):
+                    carry, _ = scan(ep_layer, h, w)
+            carry.square().sum().backward()
+            return (carry.detach(), h.grad, w.grad), partitioned[-1]
+
+        want, (legacy_fw, legacy_bw) = run_with(_legacy_window)
+        got, (fw_gm, bw_gm) = run_with(scan_body_remat_window)
+
+        def collective_groups(gm):
+            return [
+                group
+                for node in gm.graph.nodes
+                if (group := scan_remat_policy._collective_group_name(node))
+                is not None
+            ]
+
+        self.assertEqual(collective_groups(legacy_fw)[0], fsdp_group.group_name)
+        self.assertEqual(collective_groups(legacy_bw)[0], ep_group.group_name)
+        self.assertEqual(collective_groups(fw_gm)[0], fsdp_group.group_name)
+        self.assertEqual(collective_groups(bw_gm)[0], fsdp_group.group_name)
+        for name, g, w in zip(("out", "h.grad", "w.grad"), got, want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)
 
 
 if __name__ == "__main__":

@@ -254,9 +254,13 @@ class Gemma4Attention(GQAttention):
             type(config.inner_attention)
             is ScaledDotProductInnerAttention.Config
         ):
-            # Plain SDPA is causal-only and would silently drop both the
-            # sliding window and packed-document boundaries (positions /
-            # segment_ids).
+            # Plain ScaledDotProductInnerAttention is causal-only and ignores
+            # positions / segment_ids, silently attending across packed-document
+            # boundaries on global layers (and only applying the sliding-window
+            # band mask on sliding layers). All Gemma 4 recipes use packed C4 rows
+            # where documents are delimited by positions resetting to 0. Wrapping
+            # all layers in SlidingWindowScaledDotProductAttention aligns the
+            # SDPA training baseline with Splash/Tokamax packed-document masking.
             config = dataclasses.replace(
                 config,
                 inner_attention=SlidingWindowScaledDotProductAttention.Config(

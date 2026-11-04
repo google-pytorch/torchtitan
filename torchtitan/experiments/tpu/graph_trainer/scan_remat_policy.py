@@ -87,6 +87,7 @@ _COUNT_COLLECTIVES = frozenset(
     {
         torch.ops._c10d_functional.all_reduce.default,
         torch.ops._c10d_functional.all_reduce_.default,
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
         torch.ops._c10d_functional.wait_tensor.default,
     }
 )
@@ -231,6 +232,110 @@ def tag_scan_body_joint_graph(graph: fx.Graph) -> list[fx.Node]:
     return to_save
 
 
+def _collective_group_name(node: fx.Node) -> str | None:
+    """Return the process-group name of a non-wait `_c10d_functional` op."""
+    if not _is_collective(node) or (
+        node.target is torch.ops._c10d_functional.wait_tensor.default
+    ):
+        return None
+    for arg in reversed(node.args):
+        if isinstance(arg, str):
+            return arg
+    return None
+
+
+def _hoist_initial_group_collectives(
+    fw_module: fx.GraphModule,
+    bw_module: fx.GraphModule,
+) -> None:
+    """Ensure `bw_module` starts with the same collective group as `fw_module`.
+
+    TorchTPU resolves a scan body's XLA device assignment from the first
+    collective in creation (FX node) order and requires forward and backward
+    scans in the same program to resolve to the same device assignment. In
+    `min_cut_rematerialization_partition`, `reordering_to_mimic_autograd_engine`
+    walks from the first user of `tangents_*`, which for an EP MoE layer is the
+    combine backward's EP `all_gather_into_tensor` (depending only on
+    `tangents_*`), placing that EP collective before the recomputed FSDP
+    parameter `all_gather_into_tensor`s (which depend only on `bw_module`
+    placeholders). Hoisting the independent `fw_group` collectives (and their
+    `wait_tensor`s and input chains) to right after `bw_module`'s placeholders
+    restores the forward collective group ordering without disturbing the
+    per-chunk rematerialization schedule.
+    """
+    fw_group = next(
+        (
+            group
+            for node in fw_module.graph.nodes
+            if (group := _collective_group_name(node)) is not None
+        ),
+        None,
+    )
+    if fw_group is None:
+        return
+
+    bw_first_group = next(
+        (
+            group
+            for node in bw_module.graph.nodes
+            if (group := _collective_group_name(node)) is not None
+        ),
+        None,
+    )
+    if bw_first_group is None or bw_first_group == fw_group:
+        return
+
+    blocked: set[fx.Node] = _depends_on_tangents(bw_module.graph)
+    for node in bw_module.graph.nodes:
+        group = _collective_group_name(node)
+        if (group is not None and group != fw_group) or any(
+            inp in blocked for inp in node.all_input_nodes
+        ):
+            blocked.add(node)
+
+    targets: list[fx.Node] = []
+    for node in bw_module.graph.nodes:
+        if node in blocked or _collective_group_name(node) != fw_group:
+            continue
+        targets.append(node)
+        for user in node.users:
+            if (
+                user not in blocked
+                and user.op == "call_function"
+                and user.target
+                is torch.ops._c10d_functional.wait_tensor.default
+            ):
+                targets.append(user)
+    if not targets:
+        return
+
+    closure: set[fx.Node] = set()
+    stack = list(targets)
+    while stack:
+        node = stack.pop()
+        if node in closure or node.op in ("placeholder", "get_attr"):
+            continue
+        closure.add(node)
+        stack.extend(node.all_input_nodes)
+
+    ordered = [node for node in bw_module.graph.nodes if node in closure]
+    anchor = next(
+        (
+            node
+            for node in reversed(bw_module.graph.nodes)
+            if node.op in ("placeholder", "get_attr")
+        ),
+        None,
+    )
+    if anchor is None or not ordered:
+        return
+    for node in ordered:
+        anchor.append(node)
+        anchor = node
+    bw_module.graph.lint()
+    bw_module.recompile()
+
+
 @contextlib.contextmanager
 def scan_body_remat_window() -> Iterator[None]:
     """Fully rematerialize a scan body, except for its expert counts.
@@ -243,12 +348,19 @@ def scan_body_remat_window() -> Iterator[None]:
     def partition(joint_module: fx.GraphModule, joint_inputs, *args, **kwargs):
         if not tag_scan_body_joint_graph(joint_module.graph):
             # No counts to keep: exactly the old path, at the window's 0.0.
-            return inner(joint_module, joint_inputs, *args, **kwargs)
-        # Every forward node now carries a tag, so the min-cut has nothing
-        # left to choose; 1.0 just stops the 0.0 early return from ignoring
-        # the tags.
-        with functorch_config.patch(activation_memory_budget=1.0):
-            return inner(joint_module, joint_inputs, *args, **kwargs)
+            fw_module, bw_module = inner(
+                joint_module, joint_inputs, *args, **kwargs
+            )
+        else:
+            # Every forward node now carries a tag, so the min-cut has nothing
+            # left to choose; 1.0 just stops the 0.0 early return from ignoring
+            # the tags.
+            with functorch_config.patch(activation_memory_budget=1.0):
+                fw_module, bw_module = inner(
+                    joint_module, joint_inputs, *args, **kwargs
+                )
+        _hoist_initial_group_collectives(fw_module, bw_module)
+        return fw_module, bw_module
 
     with functorch_config.patch(activation_memory_budget=0.0):
         partitioners.min_cut_rematerialization_partition = partition

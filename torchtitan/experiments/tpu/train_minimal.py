@@ -23,6 +23,7 @@ from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
+import torchtitan.experiments.tpu.examples.flint  # trigger model registration
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround

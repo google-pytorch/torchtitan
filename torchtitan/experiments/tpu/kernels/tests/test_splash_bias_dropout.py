@@ -264,6 +264,66 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     if cap <= 2.0:
       self.assertGreater(float((uncapped.cpu() - out.cpu()).abs().max()), 1e-2, "cap had no effect")
 
+  # -------- attention sinks (gpt-oss, Flint) --------
+
+  @parameterized.named_parameters(
+      ("mha", 4, None, False),
+      ("gqa", 2, None, False),
+      ("mqa", 1, None, False),
+      ("gqa_window", 2, 128, False),
+      ("gqa_base2", 2, None, True),
+  )
+  def test_attention_sinks(self, h_kv, window, base2):
+    """One learned logit per head as an extra softmax column (HF's ``s_aux``):
+    output, dq/dk/dv and the sink gradient vs a math reference."""
+    device = self.accelerator_device
+    b, s, h, d = 2, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h_kv, d, device, seed=83)
+    k, v = k.to(device), v.to(device)
+    g = torch.Generator().manual_seed(84)
+    # Sinks near the logits' scale, so the sink takes a sizeable share.
+    sinks = (torch.randn(h, generator=g) * 2.0).to(device)
+    cot = torch.randn(b, s, h, d, generator=g)
+    scale = d ** -0.5
+
+    q_ref, k_ref, v_ref, s_ref = (
+        t.cpu().clone().requires_grad_(True) for t in (q, k, v, sinks)
+    )
+    k_e, v_e = self._expand_kv(k_ref, v_ref, h)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_e) * scale
+    keep = torch.ones(s, s, dtype=torch.bool).tril()
+    if window is not None:
+      keep &= ~torch.ones(s, s, dtype=torch.bool).tril(-window - 1)
+    scores = scores.masked_fill(~keep, float("-inf"))
+    col = s_ref.reshape(1, h, 1, 1).expand(b, h, s, 1)
+    probs = torch.softmax(torch.cat([scores, col], -1), -1)[..., :-1]
+    out_ref = torch.einsum("bhqk,bkhd->bqhd", probs, v_e)
+    (out_ref * cot).sum().backward()
+
+    old_base2 = splash_bias_dropout.SbdConfig.use_base2_exp
+    splash_bias_dropout.SbdConfig.use_base2_exp = base2
+    try:
+      q_t, k_t, v_t, s_t = (t.clone().requires_grad_(True) for t in (q, k, v, sinks))
+      out = splash_bias_dropout.sbd_splash_attention(
+          q_t, k_t, v_t, is_causal=True, scale=scale, local_window_size=window,
+          sinks=s_t,
+      )
+      (out * cot.to(device)).sum().backward()
+      no_sink = splash_bias_dropout.sbd_splash_attention(
+          q, k, v, is_causal=True, scale=scale, local_window_size=window
+      )
+    finally:
+      splash_bias_dropout.SbdConfig.use_base2_exp = old_base2
+    torch.testing.assert_close(out.detach().cpu(), out_ref.detach(), rtol=5e-2, atol=5e-2)
+    for name, got, want in (("dq", q_t.grad, q_ref.grad), ("dk", k_t.grad, k_ref.grad),
+                            ("dv", v_t.grad, v_ref.grad)):
+      torch.testing.assert_close(got.cpu(), want, rtol=8e-2, atol=8e-2, msg=name)
+    torch.testing.assert_close(s_t.grad.cpu(), s_ref.grad, rtol=5e-2, atol=5e-2,
+                               msg="dsinks")
+    # Guard against a vacuous pass: the sinks must change the output.
+    self.assertGreater(float((no_sink.cpu() - out.detach().cpu()).abs().max()), 1e-1,
+                       "sinks had no effect")
+
   # -------- Gemma-4 attention shapes --------
 
   @parameterized.named_parameters(

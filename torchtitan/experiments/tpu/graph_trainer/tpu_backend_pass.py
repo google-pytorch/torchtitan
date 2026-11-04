@@ -335,6 +335,29 @@ def tpu_backend_compile_pass(
 
     output_node = next(n for n in gm.graph.nodes if n.op == "output")
     original_outs = output_node.args[0]
+    # StaticCompiler returns tensor values but does not write an input buffer
+    # back merely because make_fx recorded add_ on it. MoE usage counters are
+    # otherwise dead outputs, silently disabling the optimizer's balancer.
+    # Lift direct additive buffer updates into explicit executable outputs,
+    # then restore them at the Python boundary. Leave parameter/view mutation
+    # handling unchanged; this contract is for direct, non-grad input buffers.
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    input_positions = {n: i for i, n in enumerate(placeholders)}
+    buffer_updates = {}
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target is torch.ops.aten.add_.Tensor:
+            source = node.args[0]
+            value = (
+                source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+            )
+            if (
+                source in input_positions
+                and isinstance(value, torch.Tensor)
+                and not value.requires_grad
+            ):
+                buffer_updates[input_positions[source]] = node
+    if buffer_updates:
+        logger.info("Preserving %d additive input-buffer updates", len(buffer_updates))
     tensor_outs: list = []
     non_tensor_slots: list[tuple[int, object]] = []
     for i, out in enumerate(original_outs):
@@ -348,13 +371,15 @@ def tpu_backend_compile_pass(
                 non_tensor_slots.append((i, val))
         else:
             non_tensor_slots.append((i, out))
+    num_tensor_outputs = len(tensor_outs)
     if non_tensor_slots:
         logger.info(
             f"[tpu_backend_pass] filtering {len(non_tensor_slots)} non-Tensor "
             f"output(s) before TpuBackend lowering: positions "
             f"{[p for p, _ in non_tensor_slots]}"
         )
-        output_node.args = (tuple(tensor_outs),)
+    if non_tensor_slots or buffer_updates:
+        output_node.args = (tuple(tensor_outs) + tuple(buffer_updates.values()),)
         gm.graph.lint()
         gm.recompile()
 
@@ -383,9 +408,15 @@ def tpu_backend_compile_pass(
 
     gm._tpu_executable = executable
 
-    if non_tensor_slots:
+    if non_tensor_slots or buffer_updates:
         def _compiled_forward(*flat_inputs):
             outs = list(executable(*flat_inputs))
+            with torch.no_grad():
+                for position, value in zip(
+                    buffer_updates, outs[num_tensor_outputs:], strict=True
+                ):
+                    flat_inputs[position].copy_(value)
+            del outs[num_tensor_outputs:]
             for pos, val in non_tensor_slots:
                 outs.insert(pos, val)
             return tuple(outs)

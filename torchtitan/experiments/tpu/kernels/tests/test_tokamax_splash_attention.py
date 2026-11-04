@@ -542,6 +542,65 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         )
     )
 
+  def _packed_grads(self, q, k, v, grad_out, segment_ids, **attn):
+    q, k, v = (x.to(self.accelerator_device).requires_grad_(True) for x in (q, k, v))
+    out = tokamax_splash_attention.splash_sdpa(
+        q, k, v, segment_ids=segment_ids, enable_gqa=True, **attn
+    )
+    out.backward(grad_out.to(self.accelerator_device))
+    return [x.grad.float().cpu() for x in (q, k, v)]
+
+  @parameterized.named_parameters(("group8", 2), ("group16", 1))
+  def test_transposed_bwd_matches_reference(self, n_kv_heads):
+    """use_transposed_bwd (splash_tbwd) gradients match dense f32 attention and Tokamax's backward.
+
+    _DOCUMENTS yields both tile kinds: boundaries inside 512-token blocks (masked tiles) and a 1154-token document
+    spanning whole blocks below the diagonal (full tiles, no element mask).
+    """
+    torch.manual_seed(7)
+    segment_ids = _packed_segment_ids(_DOCUMENTS)
+    b, seq_len = segment_ids.shape
+    q, grad_out = (torch.randn(b, seq_len, 16, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(b, seq_len, n_kv_heads, 128, dtype=torch.bfloat16) for _ in range(2))
+
+    # Dense f32 reference, [B, H, S, D]: causal and same-document.
+    mask = (segment_ids[:, :, None] == segment_ids[:, None, :]) & torch.ones(
+        seq_len, seq_len, dtype=torch.bool
+    ).tril()
+    ref = [x.float().transpose(1, 2).requires_grad_(True) for x in (q, k, v)]
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      out_ref = F.scaled_dot_product_attention(
+          ref[0],
+          *(x.repeat_interleave(16 // n_kv_heads, dim=1) for x in ref[1:]),
+          attn_mask=mask[:, None],
+      )
+    out_ref.backward(grad_out.float().transpose(1, 2))
+    dense = [x.grad.transpose(1, 2) for x in ref]
+
+    segment_ids = segment_ids.to(self.accelerator_device)
+    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids)
+    self._set_tokamax_config(use_transposed_bwd=True)
+    got = self._packed_grads(q, k, v, grad_out, segment_ids)
+    for name, g, d, t in zip(("dq", "dk", "dv"), got, dense, tokamax):
+      # bf16 inputs and bf16 P / dS on the MXU: ~3e-3 off the dense reference.
+      self.assertLess(((g - d).norm() / d.norm()).item(), 1e-2, name)
+      # No systematic scale difference from Tokamax's backward: a log2(e) that did not match the forward's once
+      # biased every gradient by -0.2%.
+      self.assertLess(abs((g.norm() / t.norm()).item() - 1), 1e-3, name)
+
+  @parameterized.named_parameters(
+      ("no_segment_ids", dict(segment_ids=None)),
+      ("non_causal", dict(is_causal=False)),
+      ("window", dict(local_window_size=128)),
+  )
+  def test_transposed_bwd_rejects_unsupported_attention(self, attn):
+    segment_ids = _packed_segment_ids(_DOCUMENTS).to(self.accelerator_device)
+    q = torch.randn(2, 2048, 16, 128, dtype=torch.bfloat16)
+    k = torch.randn(2, 2048, 1, 128, dtype=torch.bfloat16)
+    self._set_tokamax_config(use_transposed_bwd=True)
+    with self.assertRaisesRegex(Exception, "use_transposed_bwd"):
+      self._packed_grads(q, k, k, q, **dict(dict(segment_ids=segment_ids), **attn))
+
   def test_config_change_retraces_kernel(self):
     """A TokamaxConfig change must not reuse a kernel compiled for the old one.
 

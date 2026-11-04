@@ -18,6 +18,7 @@ import jax.numpy as jnp
 # the duration of the tokamax import.
 import jaxtyping
 import numpy as np
+from torchtitan.experiments.tpu.kernels import splash_tbwd
 from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
@@ -91,6 +92,7 @@ class TokamaxConfig:
   v_layout: str = "HEAD_DIM_MINOR"
   num_stacked_q_heads: int = 1
   use_batch_loop_fwd: bool = False
+  use_transposed_bwd: bool = False
 
   @classmethod
   def update(cls, **kwargs):
@@ -352,6 +354,7 @@ def jax_attention_fwd(
     v_layout: str,
     num_stacked_q_heads: int,
     use_batch_loop_fwd: bool,
+    use_transposed_bwd: bool,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward attention in JAX using Pallas.
 
@@ -360,6 +363,7 @@ def jax_attention_fwd(
   documents. The tiling/layout fields arrive as arguments (see
   _kernel_config_args) so they are part of the jax_op compile-cache key.
   """
+  del use_transposed_bwd  # backward only
   seq_len = q.shape[1]
   kv_seq_len = k.shape[1]
   n_heads = q.shape[2]
@@ -440,14 +444,56 @@ def jax_attention_bwd(
     v_layout: str,
     num_stacked_q_heads: int,
     use_batch_loop_fwd: bool,
+    use_transposed_bwd: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-  """Backward attention in JAX calling direct Pallas kernel backward."""
+  """Backward attention in JAX calling direct Pallas kernel backward.
+
+  With ``use_transposed_bwd`` the gradients come from splash_tbwd (one call
+  for the whole batch, see splash_tbwd.py) instead of Tokamax's dkv kernel;
+  the forward residuals are the same.
+  """
   seq_len = q.shape[1]
   kv_seq_len = k.shape[1]
   n_heads = q.shape[2]
   n_kv_heads = k.shape[2]
 
   local_window_size_opt = local_window_size if local_window_size != -1 else None
+
+  if use_transposed_bwd:
+    # splash_tbwd checks shapes and dtypes itself; these attention settings are not its inputs.
+    if segment_ids is None:
+      raise ValueError("use_transposed_bwd needs segment_ids [B, S] (packed documents); got None.")
+    if not is_causal or local_window_size_opt is not None:
+      raise ValueError(
+          "use_transposed_bwd implements causal attention without a window; got"
+          f" is_causal={is_causal}, local_window_size={local_window_size_opt}."
+      )
+    if kv_seq_len != seq_len:
+      raise ValueError(
+          "use_transposed_bwd does not support context parallelism (kv_seq_len"
+          f" {kv_seq_len} != seq_len {seq_len})."
+      )
+    # Tokamax's logsumexp residual is already in the log2 domain splash_tbwd
+    # takes (SplashConfig.use_base2_exp, the default): it is the log2-sum-exp2
+    # of q_scaled.k * log2(e). splash_tbwd applies the scale itself (so q stays
+    # unscaled and dq needs no chain-rule factor), but it must be the scale the
+    # forward actually used: splash_fn multiplies q by 1/sqrt(head_dim) held in
+    # q.dtype, and bf16(1/sqrt(128)) is 1.1e-4 below the exact value. With the
+    # exact value P would no longer match the saved lse and the gradients
+    # would carry a systematic bias (measured: step-1 grad-norm 1.1e-3 rel).
+    default_scale = 1.0 / math.sqrt(q.shape[-1])
+    forward_scale = float(np.asarray(default_scale, dtype=q.dtype)) * (
+        scale / default_scale
+    )
+    # Likewise the Tokamax forward kernel (use_base2_exp) multiplies bf16 q by
+    # log2(e), i.e. by bf16(log2(e)) = 1.4453125, 1.8e-3 above log2(e). The
+    # exact constant left P 0.2% low against the saved lse (measured: dq/dk/dv
+    # biased by -2.1e-3, step-1 grad-norm 1.2e-3 rel off the Tokamax backward).
+    forward_log2e = float(np.asarray(math.log2(math.e), dtype=q.dtype))
+    return splash_tbwd.transposed_attention_bwd(
+        q, k, v, out, logsumexp, grad_out, segment_ids, scale=forward_scale,
+        log2e=forward_log2e,
+    )
 
   # 1. Transpose/Squeeze inputs inside JAX
   q_tr = jnp.transpose(q, (0, 2, 1, 3))
@@ -538,6 +584,7 @@ _KERNEL_CONFIG_FIELDS = (
     "v_layout",
     "num_stacked_q_heads",
     "use_batch_loop_fwd",
+    "use_transposed_bwd",
 )
 
 

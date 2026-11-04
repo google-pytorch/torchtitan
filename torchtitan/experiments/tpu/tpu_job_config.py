@@ -122,6 +122,14 @@ class SplashAttentionKernelConfig:
   # Tokamax skips tiles with no same-document pair, but a vmapped call must keep
   # every tile that any example in the batch needs.
   use_batch_loop_fwd: bool = False
+  # Tokamax only. Compute the backward with the transposed Splash kernel
+  # (kernels/splash_tbwd.py: one call for the whole batch, dK/dV produced
+  # transposed so P and dS fill the MXU) instead of Tokamax's dkv kernel; the
+  # forward is unchanged. Takes precedence over use_vmap_bwd. Supports causal
+  # self-attention with packed-document segment ids, head_dim 128, 8 or 16
+  # query heads per KV head, seq_len a multiple of 512 up to 4096, no window
+  # and no context parallelism; anything else raises.
+  use_transposed_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

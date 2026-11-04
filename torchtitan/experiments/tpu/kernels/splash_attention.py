@@ -1,7 +1,7 @@
 """Splash Attention integration for torch_tpu via Pallas.
 
 Wraps JAX's splash_attention_kernel for use with PyTorch tensors on TPU.
-Uses torch_tpu._internal.pallas.custom_jax_kernel() to bridge JAX -> PyTorch.
+Uses torch.tpu.pallas.jax_op to bridge JAX -> PyTorch.
 """
 
 import functools
@@ -22,13 +22,6 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
-from torchtitan.experiments.tpu.headtail import (
-    make_cp_segment_ids,
-    make_headtail_splash_mask,
-    slice_cp_mask_info,
-)
-from torchtitan.models.common.attention import segment_ids_from_positions
-from torchtitan.tools.logging import logger
 
 custom_jax_kernel = pallas.custom_jax_kernel
 
@@ -301,6 +294,12 @@ def _make_splash_attention_fn(
       )
       return out_b, logsumexp_b
 
+  @jax.jit
+  def splash_fn(q, k, v, segment_ids=None):
+    """Forward: returns (out, logsumexp) for the whole batch."""
+    head_dim = q.shape[-1]
+    scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
+    q_scaled = q * scale
     if segment_ids is None:
       out, logsumexp = jax.vmap(_single_fwd_with_lse, in_axes=(0, 0, 0, None))(
           q_scaled, k, v, None
@@ -402,6 +401,29 @@ def _make_splash_attention_fn(
       )
       return carry, (dq_scaled_b, dk_b, dv_b)
 
+  @jax.jit
+  def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None):
+    """Backward: uses saved (out, logsumexp) — no extra forward pass.
+
+    Supports both `jax.vmap` and `jax.lax.scan` over the batch dimension.
+    By default, it uses `jax.lax.scan` to be memory safe, sizing the XLA
+    backward program for one element at a time to avoid O(batch) growth in
+    program size. `jax.vmap` can be enabled for better throughput but may
+    hit memory limits for large batches.
+
+    Args:
+      q: Query tensor.
+      k: Key tensor.
+      v: Value tensor.
+      out: Output of the forward pass.
+      logsumexp: Logsumexp values from the forward pass.
+      g: Gradient of the loss with respect to the output (`out`).
+      segment_ids: Segment IDs.
+    """
+    head_dim = q.shape[-1]
+    scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
+    q_scaled = q * scale
+
     if use_vmap_bwd:
       if segment_ids is None:
         dq_scaled, dk, dv = jax.vmap(
@@ -440,20 +462,18 @@ def _get_splash_op_names(**splash_kwargs):
     return _splash_op_name_cache[cache_key]
 
   splash_fn, splash_bwd_fn = _make_splash_attention_fn(**splash_kwargs)
-  torch_fwd_fn = custom_jax_kernel(splash_fn, name="splash_attention")
-  torch_bwd_fn = custom_jax_kernel(splash_bwd_fn, name="splash_attention_bwd")
 
   # Truncate SHA-256 to 16 hex characters (64 bits) for op name readability.
   identifier = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:16]
   op_fwd_name = f"splash_attn_fwd_{identifier}"
   op_bwd_name = f"splash_attn_bwd_{identifier}"
-  torch_fwd_fn = torch.library.custom_op(
+  torch_fwd_fn = pallas.jax_op(
       f"pallas::{op_fwd_name}",
       torch_fwd_fn,
       mutates_args=(),
       schema=(
-          "(Tensor q, Tensor k, Tensor v, Tensor? segment_ids, Tensor?"
-          " cp_rank=None) -> (Tensor, Tensor)"
+          "(Tensor q, Tensor k, Tensor v, Tensor? segment_ids) -> (Tensor,"
+          " Tensor)"
       ),
   )
   torch_fwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
@@ -470,14 +490,13 @@ def _get_splash_op_names(**splash_kwargs):
       )
   )
 
-  torch_bwd_fn = torch.library.custom_op(
+  torch_bwd_fn = pallas.jax_op(
       f"pallas::{op_bwd_name}",
       torch_bwd_fn,
       mutates_args=(),
       schema=(
           "(Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor"
-          " grad_out, Tensor? segment_ids, Tensor? cp_rank=None) -> (Tensor,"
-          " Tensor, Tensor)"
+          " grad_out, Tensor? segment_ids) -> (Tensor, Tensor, Tensor)"
       ),
   )
   torch_bwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]

@@ -29,7 +29,6 @@ import sys
 import argparse
 import typing
 import torch
-from torch_tpu._internal.sync import synchronize
 
 from torchtitan.config import ConfigManager
 from torchtitan.config import TORCH_DTYPE_MAP
@@ -133,9 +132,7 @@ def main():
             )
 
             # Sync TPU tensors
-            for v in processed_dict.values():
-                if isinstance(v, torch.Tensor) and v.device.type == "tpu":
-                    synchronize(v, wait=True)
+            torch.accelerator.synchronize()
 
             # Move to CPU for saving
             save_dict = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) 

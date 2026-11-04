@@ -3,7 +3,8 @@
 import jax
 import jax.numpy as jnp
 import torch
-from torch_tpu._internal import pallas as torch_pallas
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas as torch_pallas  # pyrefly: ignore[missing-import]
 
 _fill_indices_kernel_cache = {}
 
@@ -38,7 +39,9 @@ def fill_indices(
   if cache_key not in _fill_indices_kernel_cache:
 
     @jax.jit
-    def fill_indices_jax(tpeg, siv, wo):
+    def fill_indices_jax(
+        tpeg: jax.Array, siv: jax.Array, wo: jax.Array
+    ) -> jax.Array:
       tpeg = tpeg.astype(jnp.int32)
       siv = siv.astype(jnp.int32)
       wo = wo.astype(jnp.int32)
@@ -83,9 +86,12 @@ def fill_indices(
       out = jax.lax.fori_loop(0, total_elements, segment_body, out)
       return out
 
-    _fill_indices_kernel_cache[cache_key] = torch_pallas.custom_jax_kernel(
+    op_name = (
+        f"pallas::fill_indices_tpu_{experts_per_rank}_{num_ranks}_{max_len}"
+    )
+    _fill_indices_kernel_cache[cache_key] = torch_pallas.jax_op(
+        op_name,
         fill_indices_jax,
-        name="fill_indices_tpu",
     )
 
   return _fill_indices_kernel_cache[cache_key](

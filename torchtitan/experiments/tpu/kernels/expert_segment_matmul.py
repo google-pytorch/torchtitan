@@ -19,8 +19,9 @@ from jax.experimental.pallas.ops.tpu.megablox.gmm import (
     gmm as megablox_gmm,
     tgmm as megablox_tgmm,
 )
-from torch_tpu._internal import pallas
 from torchtitan.experiments.tpu.kernels.pallas_naming import call_named
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 
 def _tiling(

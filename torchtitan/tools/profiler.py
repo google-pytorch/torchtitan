@@ -358,7 +358,7 @@ class Profiler(Configurable):
         experimental_config = None
         if device_type == "tpu":
             activities.append(torch.profiler.ProfilerActivity.TPU)  # type: ignore
-            from torch_tpu._internal.profiler import TpuProfilerConfig  # pylint: disable=g-import-not-at-top
+            from torch.tpu.profiler import TpuProfilerConfig  # pyrefly: ignore[missing-import]  # pylint: disable=g-import-not-at-top
             import pathlib  # pylint: disable=g-import-not-at-top
 
             tpu_trace_dir = os.path.join(trace_dir, f"rank_{rank}")

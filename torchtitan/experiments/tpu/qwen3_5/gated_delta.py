@@ -264,8 +264,15 @@ def chunked_gated_delta(
       x.reshape(bs, n_heads, num_chunks, chunk, x.shape[-1]) for x in (q, k, v)
   ]
   beta = beta.reshape(bs, n_heads, num_chunks, chunk, 1)
-  g = g.reshape(bs, n_heads, num_chunks, chunk).cumsum(dim=-1)
-  g_last = g[..., -1:]
+  g = g.reshape(bs, n_heads, num_chunks, chunk)
+  # Each chunk's total log decay, from the per-token decays rather than as
+  # `g.cumsum(-1)[..., -1:]`: under torch.compile(backend="tpu") (as in
+  # TpuGraphTrainer), the gradient through a slice of a cumsum output that is
+  # also used elementwise comes out wrong on TPU (v5e and TPU7x; dg off by
+  # 3x, NaN losses at initialization decays). See
+  # test_chunked_gated_delta_compiled_grads_match_eager.
+  g_last = g.sum(dim=-1, keepdim=True)
+  g = g.cumsum(dim=-1)
 
   # decay[i, j] = exp(g_i - g_j) for i >= j and 0 otherwise. Masking before
   # exp keeps the positive upper-triangle exponents from overflowing.

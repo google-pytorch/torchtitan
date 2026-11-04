@@ -1,6 +1,10 @@
 """Tests for linear_softmax_cross_entropy_loss."""
 
+import functools
 import importlib
+import inspect
+import os
+from types import SimpleNamespace
 from unittest import mock
 
 from absl import logging
@@ -46,6 +50,61 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
       )
 
     self.assertEqual(backward.call_args.args[0].shape, ())
+
+  def test_backward_uses_single_buffer_when_double_buffering_exceeds_vmem(self):
+    dout = jnp.ones((1,), dtype=jnp.float32)
+    lse = jnp.zeros((1024,), dtype=jnp.float32)
+    x = jnp.zeros((1024, 2048), dtype=jnp.bfloat16)
+    labels = jnp.zeros((1024,), dtype=jnp.int32)
+    weights = jnp.zeros((2048, 1280), dtype=jnp.bfloat16)
+    kernel = importlib.import_module(
+        "tokamax._src.ops.linear_softmax_cross_entropy_loss."
+        "pallas_mosaic_tpu_kernel"
+    )
+    orig_bwd = inspect.unwrap(
+        kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
+    )
+    if (
+        not hasattr(kernel, "_calculate_bwd_vmem_bytes")
+        or "buffer_count" not in inspect.signature(orig_bwd).parameters
+    ):
+      self.skipTest("Installed tokamax does not expose buffer_count.")
+    from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
+
+    fake_info = SimpleNamespace(vmem_capacity_bytes=64 * 1024 * 1024)
+    calls = []
+
+    @functools.wraps(orig_bwd)
+    def spy_bwd(*args, **kwargs):
+      calls.append((args, kwargs))
+      return jnp.zeros_like(args[2]), jnp.zeros_like(args[4])
+
+    with (
+        mock.patch.object(pltpu, "get_tpu_info", return_value=fake_info),
+        mock.patch.object(
+            kernel,
+            "linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu",
+            new=spy_bwd,
+        ),
+    ):
+      # pylint: disable=protected-access
+      linear_softmax_cross_entropy_loss._my_bwd(
+          dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
+      )
+      self.assertEqual(calls[-1][1].get("buffer_count"), 1)
+      linear_softmax_cross_entropy_loss._my_bwd(
+          dout[:1],
+          lse[:128],
+          x[:128, :128],
+          labels[:128],
+          weights[:128, :128],
+          "sum",
+          "mosaic_tpu",
+          128,
+          128,
+          128,
+      )
+      self.assertNotIn("buffer_count", calls[-1][1])
 
 
 class LinearSoftmaxCrossEntropyLossTest(
@@ -221,6 +280,66 @@ class LinearSoftmaxCrossEntropyLossTest(
         "Gradient %s test passed for %s.",
         reduction,
         dtype,
+    )
+
+  def test_single_hidden_block_non_pow2_vocab_tile_640(self):
+    """Tests single-H-block Mosaic LCE with non-power-of-2 v_block_size=640."""
+    device = self.accelerator_device
+    if device.type != "tpu":
+      self.skipTest("Mosaic TPU kernel test requires a TPU device.")
+    from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
+
+    vmem_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    has_64m_scoped = "65472" in os.environ.get("LIBTPU_INIT_ARGS", "")
+    if vmem_bytes >= 64 * 1024 * 1024 and has_64m_scoped:
+      # Exact Qwen3.5 35B benchmark tile: (1024, 2048, 640) at H=2048.
+      b, h, v = 2048, 2048, 1280
+      b_blk, h_blk, v_blk = 1024, 2048, 640
+    else:
+      # Fits 16-32 MiB default scoped VMEM while exercising num_h_blocks == 1
+      # and non-power-of-2 v_block_size == 640.
+      b, h, v = 512, 512, 1280
+      b_blk, h_blk, v_blk = 256, 512, 640
+
+    torch.manual_seed(0)
+    x = torch.randn(b, h, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(h, v, dtype=torch.bfloat16, device=device) * (h**-0.5)
+    labels = torch.randint(0, v, (b,), dtype=torch.int64, device=device)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    w_ref = weights.detach().clone().requires_grad_(True)
+    ref_out = torch.nn.functional.cross_entropy(
+        (x_ref @ w_ref).float(), labels, reduction="sum"
+    )
+    ref_out.backward()
+
+    x_act = x.detach().clone().requires_grad_(True)
+    w_act = weights.detach().clone().requires_grad_(True)
+    act_out = (
+        linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
+            x_act,
+            labels,
+            w_act,
+            reduction="sum",
+            implementation="mosaic_tpu",
+            b_block_size=b_blk,
+            h_block_size=h_blk,
+            v_block_size=v_blk,
+        )
+    )
+    act_out.backward()
+
+    torch.testing.assert_close(
+        act_out.cpu(),
+        ref_out.detach().cpu().view_as(act_out.cpu()),
+        rtol=1.6e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        x_act.grad.cpu(), x_ref.grad.cpu(), rtol=5e-2, atol=5e-2
+    )
+    torch.testing.assert_close(
+        w_act.grad.cpu(), w_ref.grad.cpu(), rtol=5e-2, atol=0.5
     )
 
 

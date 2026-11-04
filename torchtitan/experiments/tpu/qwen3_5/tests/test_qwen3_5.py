@@ -2743,7 +2743,11 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       dim: int | None = None,
       dscore_d_chunk: int | None = None,
   ):
-    """Tests Ring-of-Experts dropless parity, paired GMM, and static FX trace."""
+    """Tests Ring-of-Experts dropless parity, paired GMM, and static FX trace.
+
+    The paired cases on TPU also check the weights-on-activation combine
+    (`roe_weights_on_activation`): outputs and the scores' gradient.
+    """
     torch.manual_seed(321 + ep_size + top_k)
     dev = self.accelerator_device
     num_experts = 8
@@ -3102,6 +3106,83 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           _relative_l2_error(actual, expected),
           tol,
           msg=f"RoE EP{ep_size} backward mismatch on {name}",
+      )
+
+    if use_paired_experts and self._is_tpu():
+      # Weights on activation (`roe_weights_on_activation`, the default of
+      # the Pallas path in TpuQwen35RoutedExperts): each buffer row's routing
+      # weight scales the experts' hidden activation (`row_scale_R`), and the
+      # combine is the unweighted `roe_unsort_reduce`. The scores' gradient
+      # then flows through the row scales, one buffer row per (token, k) slot.
+      row_scales = [
+          metas[r].expert_row_scale_R.detach().clone().requires_grad_(True)
+          for r in range(ep_size)
+      ]
+      woa_ys = [
+          ep_experts_mods[r](hs_leaf[r], gss[r], row_scale_R=row_scales[r])
+          for r in range(ep_size)
+      ]
+      woa_metas = [
+          dataclasses.replace(m, row_scale_applied=True) for m in metas
+      ]
+      woa_partials = [None] * ep_size
+      for r in range(ep_size):
+        with mock.patch.object(
+            qwen35_token_dispatcher,
+            "_ep_reduce_scatter_sum_impl",
+            side_effect=lambda op, _m, _p, rk=r: (
+                woa_partials.__setitem__(rk, op.detach().clone())
+                or op.detach().new_zeros((tokens_per_rank, dim))
+            ),
+        ):
+          disp[r].combine(woa_ys[r], woa_metas[r], xs[r])
+      woa_recvs = list(
+          torch.stack(woa_partials, dim=0).sum(dim=0).split(tokens_per_rank, 0)
+      )
+      dscores_flat = torch.zeros(
+          ep_size * tokens_per_rank * top_k, dtype=torch.float32, device=dev
+      )
+      for r in range(ep_size):
+        with mock.patch.object(
+            qwen35_token_dispatcher,
+            "_ep_reduce_scatter_sum_impl",
+            side_effect=lambda op, _m, _p, rv=woa_recvs[r]: rv.detach().clone(),
+        ):
+          out_woa = disp[r].combine(woa_ys[r], woa_metas[r], xs[r])
+        self.assertTrue(bool(torch.isfinite(out_woa).all()))
+        # The weight scales the bf16 hidden activation before w2 here, but the
+        # fp32 sum of expert outputs in the reference, so compare in norm.
+        self.assertLessEqual(
+            _relative_l2_error(out_woa, outs_ref[r]),
+            tol,
+            msg=f"RoE EP{ep_size} weights-on-activation out{r}",
+        )
+        with mock.patch.object(
+            qwen35_token_dispatcher,
+            "_ep_all_gather_impl",
+            side_effect=lambda op, _m, _p: grad_outs_cat.clone(),
+        ):
+          (drow_r,) = torch.autograd.grad(
+              out_woa, (row_scales[r],), grad_outs[r]
+          )
+        cap = drow_r.shape[0]
+        valid = (
+            (torch.arange(cap, device=dev) < metas[r].start_count_2[1])
+            .nonzero()
+            .squeeze(-1)
+        )
+        dscores_flat.index_add_(
+            0,
+            metas[r].window_slot_order_cap[valid].long(),
+            drow_r[valid].float(),
+        )
+      expected_dscores = torch.cat([s.grad for s in scores_ref], dim=0)
+      self.assertLessEqual(
+          _relative_l2_error(
+              dscores_flat.reshape(expected_dscores.shape), expected_dscores
+          ),
+          tol,
+          msg=f"RoE EP{ep_size} weights-on-activation dscores",
       )
 
     # Verify static-shape make_fx + FakeTensorMode trace for Ring-of-Experts and

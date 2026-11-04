@@ -611,6 +611,54 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         # Negative control: autograd of the forward does use them.
         self.assertNotEmpty(backward_ops(autograd_conv_silu, seg) & scatter_ops)
 
+  @parameterized.named_parameters(
+      # Slow decays: every token's gradient matters.
+      dict(testcase_name="_slow_decays", max_decay_rate=0.2),
+      # Qwen3.5's initialization: A_log = log(U(0.01, 16)).
+      dict(testcase_name="_init_decays", max_decay_rate=16.0),
+  )
+  def test_chunked_gated_delta_compiled_grads_match_eager(
+      self, max_decay_rate: float
+  ):
+    """Tests chunked_gated_delta's gradients under torch.compile vs eager.
+
+    TpuGraphTrainer compiles the joint graph. On TPU, the gradient through a
+    slice of the decays' cumsum (`cumsum(-1)[..., -1:]`, the chunk totals)
+    that is also used elementwise came out wrong when compiled (dg relative
+    error 3.8, and NaN losses at step 1 on the debug model), while eager was
+    right.
+    """
+    torch.manual_seed(0)
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    dev = self.accelerator_device
+    shape = (2, 128, 4)
+    q, k, v = (torch.randn(*shape, 128, device=dev) for _ in range(3))
+    rate = torch.empty(shape[-1], device=dev).uniform_(0.01, max_decay_rate)
+    g = -rate * F.softplus(torch.randn(*shape, device=dev) + 1.0)
+    beta = torch.sigmoid(torch.randn(*shape, device=dev))
+    grad_out = torch.randn(*shape, 128, device=dev)
+
+    def run(fn):
+      inputs = [x.detach().clone().requires_grad_() for x in (q, k, v, g, beta)]
+      out = fn(*inputs)
+      return [out, *torch.autograd.grad(out, inputs, grad_out)]
+
+    backend = "tpu" if self._is_tpu() else "aot_eager"
+    expected = run(gated_delta.chunked_gated_delta)
+    actual = run(
+        torch.compile(
+            gated_delta.chunked_gated_delta, backend=backend, fullgraph=True
+        )
+    )
+    for name, a_t, e_t in zip(
+        ("out", "dq", "dk", "dv", "dg", "dbeta"), actual, expected, strict=True
+    ):
+      self.assertTrue(torch.isfinite(a_t).all().item(), msg=name)
+      # TPU7x / v5e: <= 5e-7 with the fix.
+      self.assertLessEqual(
+          _relative_l2_error(a_t, e_t), 1e-4, msg=f"compiled {name}"
+      )
+
   def test_causal_conv_silu_compiles_fullgraph(self):
     """Tests causal_conv_silu under torch.compile(fullgraph=True).
 

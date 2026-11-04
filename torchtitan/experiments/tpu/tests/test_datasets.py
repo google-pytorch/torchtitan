@@ -175,6 +175,8 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
 
 class FluxRandomDataloaderTest(absltest.TestCase):
 
+  _TOKENIZER_PATH = "tests/assets/tokenizer"
+
   def test_random_dataloader_config_builds_stateful_loader(self) -> None:
     from torchtitan.models.flux.random_loader import RandomDataloader
 
@@ -205,6 +207,7 @@ class FluxRandomDataloaderTest(absltest.TestCase):
     from unittest import mock
     import datasets as hf_datasets
     from torchtitan.experiments.tpu import train as tpu_train
+    from torchtitan.models.flux import trainer as flux_trainer
     from torchtitan.models.flux.config_registry import flux_dev, model_registry
     from torchtitan.models.flux.random_loader import RandomDataloader
     from torchtitan.models.flux.tokenizer import FluxTokenizer
@@ -237,6 +240,11 @@ class FluxRandomDataloaderTest(absltest.TestCase):
 
     with (
         mock.patch.object(Trainer, "__init__", _fake_super_init),
+        # FluxTrainer's default is relative to the repo root; use this file's
+        # tokenizer path, which follows any remapping of test asset paths.
+        mock.patch.object(
+            flux_trainer, "_LOCAL_TOKENIZER_PATH", self._TOKENIZER_PATH
+        ),
         mock.patch.object(
             hf_datasets,
             "load_dataset",
@@ -252,6 +260,8 @@ class FluxRandomDataloaderTest(absltest.TestCase):
       trainer = FluxTrainer(config)
 
     self.assertTrue(config.tokenizer.test_mode)
+    self.assertEqual(config.tokenizer.t5_tokenizer_path, self._TOKENIZER_PATH)
+    self.assertEqual(config.tokenizer.clip_tokenizer_path, self._TOKENIZER_PATH)
     self.assertIsInstance(trainer.dataloader, RandomDataloader)
     self.assertEqual(trainer.dataloader.bsz, 2)
     self.assertEqual(trainer.dataloader.img_size, 1024)

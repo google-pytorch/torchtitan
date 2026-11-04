@@ -34,6 +34,11 @@ from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
+# Tokenizer asset that FluxTrainer builds instead of the Hugging Face T5/CLIP
+# tokenizers when random or precomputed embeddings make text tokenization
+# unnecessary. The path is relative to the repository root.
+_LOCAL_TOKENIZER_PATH = "tests/assets/tokenizer"
+
 
 class FluxTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
@@ -68,8 +73,8 @@ class FluxTrainer(Trainer):
                 config.tokenizer = replace(
                     config.tokenizer,
                     test_mode=True,
-                    t5_tokenizer_path="tests/assets/tokenizer",
-                    clip_tokenizer_path="tests/assets/tokenizer",
+                    t5_tokenizer_path=_LOCAL_TOKENIZER_PATH,
+                    clip_tokenizer_path=_LOCAL_TOKENIZER_PATH,
                 )
             if random_dataset:
                 logger.info("Using RandomDataloader for embeddings")

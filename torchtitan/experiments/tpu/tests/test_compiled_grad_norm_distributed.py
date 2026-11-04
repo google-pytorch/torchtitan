@@ -69,10 +69,19 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       with self.subTest(recipe=recipe.__name__):
         self.assertTrue(recipe().compile.compile_grad_norm)
 
+  def test_expert_parallel_is_supported_with_compiled_grad_norm(self) -> None:
+    cfg = TPUTrainerConfig(
+        model_spec=model_registry("debugmodel", attn_backend="sdpa"),
+        parallelism=ParallelismConfig(expert_parallel_degree=2),
+        compile=TpuTrainerCompileConfig(
+            compile_grad_norm=True,
+        ),
+    )
+    self.assertTrue(cfg.compile.compile_grad_norm)
+
   def test_unsupported_training_topologies_are_rejected(self) -> None:
     cases = (
-        ({"expert_parallel_degree": 2}, "EP1 and PP1"),
-        ({"pipeline_parallel_degree": 2}, "EP1 and PP1"),
+        ({"pipeline_parallel_degree": 2}, "PP1"),
     )
     for parallelism, message in cases:
       with self.subTest(parallelism=parallelism), self.assertRaisesRegex(
@@ -99,29 +108,37 @@ def _run_clip_parity(
     world_size: int,
 ) -> None:
   del rank
-  mesh = torch.distributed.DeviceMesh(
+  mesh_2d = torch.distributed.DeviceMesh(
       device.type,
       torch.arange(world_size).reshape(2, world_size // 2),
+      mesh_dim_names=("efsdp", "ep"),
+  )
+  mesh_1d = torch.distributed.DeviceMesh(
+      device.type,
+      torch.arange(world_size),
+      mesh_dim_names=("fsdp",),
   )
   max_norm = 5.0
 
   def make_parameters() -> list[torch.Tensor]:
     parameters = []
-    for size, scale, placements in (
-        (2 * world_size + 1, 1.0, [Shard(0), Replicate()]),
-        (3 * world_size + 1, 0.5, [Replicate(), Shard(0)]),
-        (1, 2.0, [Replicate(), Replicate()]),
+    for target_mesh, size, scale, placements in (
+        (mesh_1d, 2 * world_size + 1, 0.75, [Shard(0)]),
+        (mesh_2d, 2 * world_size + 1, 1.0, [Shard(0), Replicate()]),
+        (mesh_2d, 3 * world_size + 1, 0.5, [Replicate(), Shard(0)]),
+        (mesh_2d, 4 * world_size, 0.25, [Shard(0), Shard(0)]),
+        (mesh_2d, 1, 2.0, [Replicate(), Replicate()]),
     ):
       parameter = torch.nn.Parameter(
           distribute_tensor(
               torch.zeros(size, device=device),
-              mesh,
+              target_mesh,
               placements,
           )
       )
       parameter.grad = distribute_tensor(
           scale * torch.arange(1, size + 1, device=device),
-          mesh,
+          target_mesh,
           placements,
       )
       parameters.append(parameter)
@@ -130,7 +147,7 @@ def _run_clip_parity(
   reference = make_parameters()
   candidate = make_parameters()
 
-  reference_norm = dist_utils.clip_grad_norm_(
+  reference_norm = grad_norm.clip_grad_norm_(
       reference,
       max_norm,
       foreach=True,
@@ -171,8 +188,8 @@ def _run_clip_parity(
         reference_parameter.grad.to_local(),
     )
 
-  candidate[0].grad = candidate[0].grad.redistribute(
-      mesh,
+  candidate[1].grad = candidate[1].grad.redistribute(
+      mesh_2d,
       [Replicate(), Shard(0)],
   )
   try:

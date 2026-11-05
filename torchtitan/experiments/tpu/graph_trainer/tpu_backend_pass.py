@@ -34,6 +34,9 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
+from torchtitan.experiments.tpu.graph_trainer.passes.recompute_gather_chunks import (
+    apply_recompute_gather_chunks,
+)
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_fsdp_rs_deadline_schedule,
     apply_tpu_remat_fsdp_all_gather_schedule,
@@ -571,6 +574,7 @@ def construct_tpu_transform_passes(
             )
         )
         passes.append(selective_activation_remat_pass)
+        passes.append(apply_recompute_gather_chunks)
         if config.compile.enable_remat_barriers:
             passes.append(
                 functools.partial(

@@ -9,9 +9,11 @@ from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
+    down_proj_combine_pallas_2d,
     segment_matmul_pallas_2d,
 )
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
+    gather_paired_segment_matmul_pallas_2d,
     paired_segment_matmul_pallas_2d,
 )
 from torchtitan.models.common.moe import GroupedExperts
@@ -290,11 +292,20 @@ class TpuGroupedExperts(GroupedExperts):
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
         row_scale_R: torch.Tensor | None = None,
+        token_gather: tuple[torch.Tensor, torch.Tensor, int, int] | None = None,
+        combine_top_k: int = 0,
     ) -> torch.Tensor:
         """Run the experts on expert-sorted rows.
 
         ``row_scale_R``, if given, multiplies each row's hidden activation
-        before the down projection (W2).
+        before the down projection (W2). ``token_gather``, if given, is
+        ``(token_indices_R, inverse_R, chunks, recompute_chunks)``: ``x_RD``
+        then holds the tokens, and the paired W1/W3 kernel gathers row ``r``
+        from token ``token_indices_R[r]`` itself, in ``chunks`` pipelined
+        pieces (``recompute_chunks``, if nonzero, when rematerialized). With
+        ``combine_top_k``, the result is instead summed over each token's
+        routes, ``(T, D)``, and the backward gathers token gradients the same
+        way.
         """
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
@@ -327,8 +338,17 @@ class TpuGroupedExperts(GroupedExperts):
         # The kernels need a row count divisible by tile_m. Append zero rows to
         # the last expert's group: they add nothing to dWeight and are sliced
         # off the output. A no-op for tile-aligned batches.
-        num_rows = x_bf16.shape[0]
+        num_rows = (
+            x_bf16.shape[0] if token_gather is None else token_gather[0].shape[0]
+        )
         pad_rows = -num_rows % tile_m
+        if token_gather is not None and (
+            pad_rows or not self.use_pallas_paired_grouped_mm
+        ):
+            raise ValueError(
+                "token_gather requires the paired W1/W3 kernel and "
+                "tile-aligned rows"
+            )
         if pad_rows:
             x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
             num_tokens_per_expert_E = torch.cat(
@@ -342,7 +362,22 @@ class TpuGroupedExperts(GroupedExperts):
             w2_tgmm_tiling = (
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
-        if self.use_pallas_paired_grouped_mm:
+        if token_gather is not None:
+            token_indices_R, inverse_R, chunks, recompute_chunks = token_gather
+            gate_RF, up_RF = gather_paired_segment_matmul_pallas_2d(
+                x_bf16,
+                token_indices_R,
+                inverse_R,
+                w1_EKN.bfloat16(),
+                w3_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                tile_m=tile_m,
+                tgmm_tile_m=tgmm_tiling[0],
+                tgmm_tile_k=tgmm_tiling[1],
+                chunks=chunks,
+                recompute_chunks=recompute_chunks,
+            )
+        elif self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16
             # reductions consume them as-is.
@@ -381,6 +416,22 @@ class TpuGroupedExperts(GroupedExperts):
             hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
                 hidden_RF.dtype
             )
+        if combine_top_k:
+            if token_gather is None or tile_k or tile_n:
+                raise ValueError(
+                    "combine_top_k requires token_gather and full K/N tiles"
+                )
+            return down_proj_combine_pallas_2d(
+                hidden_RF,
+                w2_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                token_gather[0],
+                top_k=combine_top_k,
+                tile_m=tile_m,
+                tgmm_tiling=w2_tgmm_tiling,
+                transpose_rhs=self._use_transposed_w2_rhs,
+                chunks=token_gather[2],
+            ).type_as(x_RD)
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),

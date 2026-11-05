@@ -219,6 +219,36 @@ class _LocalReorder(torch.autograd.Function):
     return grad_x_TD, grad_scores_TK, None, None
 
 
+class _LocalRouteOrder(torch.autograd.Function):
+  """``_LocalReorder`` without the token gather, for experts that gather
+  their own rows. Returns token indices, the inverse permutation and the
+  expert-sorted scores; the score VJP is the same inverse gather."""
+
+  @staticmethod
+  def forward(ctx, scores_TK, permutation_N, top_k):
+    ctx.set_materialize_grads(False)
+    inverse_N = torch.argsort(permutation_N)
+    token_indices_N = permutation_N // top_k
+    ctx.save_for_backward(inverse_N)
+    ctx.score_shape = scores_TK.shape
+    ctx.mark_non_differentiable(token_indices_N, inverse_N)
+    return (
+        token_indices_N,
+        inverse_N,
+        torch.index_select(scores_TK.reshape(-1), 0, permutation_N),
+    )
+
+  @staticmethod
+  def backward(ctx, _grad_token_indices_N, _grad_inverse_N, grad_scores_N):
+    (inverse_N,) = ctx.saved_tensors
+    grad_scores_TK = None
+    if grad_scores_N is not None:
+      grad_scores_TK = torch.index_select(
+          grad_scores_N, 0, inverse_N
+      ).reshape(ctx.score_shape)
+    return grad_scores_TK, None, None
+
+
 def local_reorder(
     x_TD: torch.Tensor,
     scores_TK: torch.Tensor,
@@ -305,10 +335,31 @@ class TpuRoutedExperts(RoutedExperts):
   @dataclass(kw_only=True, slots=True)
   class Config(RoutedExperts.Config):
     scale_before_down_proj: bool = False
+    # > 0: skip the dispatcher's token gather; the paired W1/W3 kernel gathers
+    # its rows in this many pieces, each overlapping the previous piece's
+    # matmul. Requires scale_before_down_proj (EP=1).
+    gather_in_expert_chunks: int = 0
+    # Chunks for the backward's rematerialized copy of that gather; 0 means
+    # gather_in_expert_chunks.
+    gather_in_expert_recompute_chunks: int = 0
+    # With gather_in_expert_chunks: fuse the token combine into the W2 op so
+    # its backward also gathers token gradients in pipelined chunks.
+    combine_in_experts: bool = False
 
   def __init__(self, config: Config):
     super().__init__(config)
     self.scale_before_down_proj = config.scale_before_down_proj
+    self.gather_in_expert_chunks = config.gather_in_expert_chunks
+    self.gather_in_expert_recompute_chunks = (
+        config.gather_in_expert_recompute_chunks
+    )
+    self.combine_in_experts = config.combine_in_experts
+    if self.combine_in_experts and not self.gather_in_expert_chunks:
+      raise ValueError("combine_in_experts requires gather_in_expert_chunks")
+    if self.gather_in_expert_chunks and not self.scale_before_down_proj:
+      raise ValueError(
+          "gather_in_expert_chunks requires scale_before_down_proj"
+      )
     if not self.scale_before_down_proj:
       return
     if not isinstance(self.token_dispatcher, TpuAllToAllTokenDispatcher):
@@ -332,6 +383,13 @@ class TpuRoutedExperts(RoutedExperts):
       return super().forward(
           x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
       )
+    if self.gather_in_expert_chunks:
+      return self._forward_gather_in_experts(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+      )
     routed_input_RD, num_tokens_per_expert_e, metadata = (
         self.token_dispatcher.dispatch(
             x_TD,
@@ -353,6 +411,38 @@ class TpuRoutedExperts(RoutedExperts):
         metadata.token_indices_experts_sorted_N,
         self.token_dispatcher.top_k,
     )
+
+  def _forward_gather_in_experts(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+  ) -> torch.Tensor:
+    if self.token_dispatcher.ep_mesh is not None:
+      raise ValueError("gather_in_expert_chunks requires EP=1 local dispatch")
+    top_k = self.token_dispatcher.top_k
+    with annotate_region(MOE_ROUTING):
+      permutation_N = torch.argsort(topk_expert_ids_TK.reshape(-1), stable=True)
+    token_indices_N, inverse_N, scores_N = _LocalRouteOrder.apply(
+        topk_scores_TK, permutation_N, top_k
+    )
+    with maybe_set_sparse_mesh():
+      routed_output_ND = self.inner_experts(
+          x_TD,
+          num_local_tokens_per_expert_E,
+          row_scale_R=scores_N,
+          token_gather=(
+              token_indices_N,
+              inverse_N,
+              self.gather_in_expert_chunks,
+              self.gather_in_expert_recompute_chunks,
+          ),
+          combine_top_k=top_k if self.combine_in_experts else 0,
+      )
+    if self.combine_in_experts:
+      return routed_output_ND
+    return stable_grouped_reduce(routed_output_ND, token_indices_N, top_k)
 
 
 class TpuRoutedExpertsConverter(ModelConfigConverter):

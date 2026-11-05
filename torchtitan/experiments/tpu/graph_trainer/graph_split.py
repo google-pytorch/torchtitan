@@ -335,7 +335,12 @@ class GraphSplitter:
       raise RuntimeError("GraphSplitter is disabled")
 
     if self.config.expert_all_gathers_under_splash:
-      apply_expert_all_gathers_under_splash(traced.gm)
+      apply_expert_all_gathers_under_splash(
+          traced.gm,
+          saved_splash_layers=(
+              self.config.expert_all_gathers_in_saved_splash_layers
+          ),
+      )
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
     # Host-slot recurrence belongs to the top-level forward signature, whether

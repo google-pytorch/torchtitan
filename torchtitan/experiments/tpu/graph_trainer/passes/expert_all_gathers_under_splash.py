@@ -20,7 +20,12 @@ either way, so the barrier changes no values.
 
 Each layer copy that runs Splash gets its own barrier: the forward, and the
 backward copy that recomputes it. A backward copy that reuses a saved Splash
-output has no Splash to anchor on and is left alone.
+output has no Splash to anchor on. With ``saved_splash_layers`` its barrier
+anchors on the recomputed router top-k ids instead, so the gathers start with
+the executable rather than behind the routed-token gathers; otherwise the copy
+is left alone. The anchor is integer-valued: a floating-point anchor such as
+the MoE input could lose a fusion's excess precision at the barrier and change
+the recomputed routing.
 
 The pass applies to any model whose MoE weights live under a ``moe`` module
 (TorchTitan's decoder convention) and whose attention runs Splash: it matches
@@ -57,7 +62,7 @@ from torchtitan.tools.logging import logger
 
 def _is_gathered_expert_weight(node: torch.fx.Node) -> bool:
     """A gathered expert weight: TorchTPU's dim-d all-gather, or a funcol wait."""
-    if node.op != "call_function" or ".moe." not in _get_module_fqn(node) + ".":
+    if node.op != "call_function" or not _is_moe(node):
         return False
     if is_wait_tensor(node):
         return isinstance(node.args[0], torch.fx.Node) and is_all_gather_into_tensor(
@@ -88,21 +93,61 @@ def _layer_copy(node: torch.fx.Node) -> tuple[int, bool, bool]:
     )
 
 
-def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def _is_moe(node: torch.fx.Node) -> bool:
+    return ".moe." in _get_module_fqn(node) + "."
+
+
+def _top_k_ids(nodes: list[torch.fx.Node]) -> torch.fx.Node | None:
+    """The indices of the last router top-k among ``nodes``."""
+    topks = [
+        node
+        for node in nodes
+        if node.target is torch.ops.aten.topk.default
+        and ".moe.router" in _get_module_fqn(node)
+    ]
+    if not topks:
+        return None
+    return next(
+        (
+            user
+            for user in topks[-1].users
+            if user.target is operator.getitem and user.args[1] == 1
+        ),
+        None,
+    )
+
+
+def apply_expert_all_gathers_under_splash(
+    gm: torch.fx.GraphModule, *, saved_splash_layers: bool = False
+) -> torch.fx.GraphModule:
     gathered: dict[tuple, list[torch.fx.Node]] = defaultdict(list)
     splash: dict[tuple, torch.fx.Node] = {}
+    copy_nodes: dict[tuple, list[torch.fx.Node]] = defaultdict(list)
     for node in gm.graph.nodes:
         if _get_layer_id(node) == _NOT_IN_LAYERS:
             continue
+        copy_nodes[_layer_copy(node)].append(node)
         if _is_gathered_expert_weight(node):
             gathered[_layer_copy(node)].append(node)
         elif _is_splash_output(node):
             splash[_layer_copy(node)] = node
+    splash_layers = {layer_copy[0] for layer_copy in splash}
 
     order = {node: index for index, node in enumerate(gm.graph.nodes)}
     barriers = 0
     for layer_copy, weights in gathered.items():
         anchor = splash.get(layer_copy)
+        # A Splash anchor gates its own layer copy. Recomputed top-k ids gate
+        # every later node of their layer, recomputed or backward; the forward
+        # copy precedes them.
+        same_copy = anchor is not None
+        if (
+            anchor is None
+            and saved_splash_layers
+            and _is_recomputed(weights[0])
+            and layer_copy[0] in splash_layers
+        ):
+            anchor = _top_k_ids(copy_nodes[layer_copy])
         if anchor is None:
             continue
         values = [anchor, *weights]
@@ -135,8 +180,9 @@ def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.
             for user in users[value]:
                 if (
                     _layer_copy(user) == layer_copy
-                    and order.get(user, len(order)) > order[anchor]
-                ):
+                    or not same_copy
+                    and _get_layer_id(user) == layer_copy[0]
+                ) and order.get(user, len(order)) > order[anchor]:
                     user.replace_input_with(value, output)
         barriers += 1
 
@@ -148,7 +194,8 @@ def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.
     gm.graph.lint()
     gm.recompile()
     logger.info(
-        "Joined the expert all-gathers of %d layer copies with their Splash output",
+        "Joined the expert all-gathers of %d layer copies with their Splash "
+        "output or router top-k ids",
         barriers,
     )
     return gm

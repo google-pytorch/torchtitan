@@ -1,3 +1,4 @@
+import functools
 import itertools
 from types import SimpleNamespace
 from unittest import mock
@@ -30,6 +31,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _full_memory_policy_pass,
 )
+from torchtitan.experiments.graph_trainer.registry import MEMORY_POLICY_REGISTRY
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
@@ -57,6 +59,7 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _optimization_barrier,
 )
 from torchtitan.experiments.tpu.graph_trainer.tests.test_tpu_memory_policy import (
+    _MoEToy,
     _SplashCore,
     _STOCK_STYLE_SPLASH,
 )
@@ -199,6 +202,18 @@ class _AttentionMoEToy(_ToyTransformer):
     self.layers = nn.ModuleList(_AttentionMoELayer() for _ in range(n_layers))
 
 
+class _RoutedMoEToy(_MoEToy):
+  """Splash attention, then upstream routing into the TPU local reorder."""
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__(
+        tuple(
+            _SplashCore(_STOCK_STYLE_SPLASH, model_layout=False)
+            for _ in range(n_layers)
+        )
+    )
+
+
 class GraphSplitTest(absltest.TestCase):
 
   def _build_toy_model(
@@ -240,18 +255,26 @@ class GraphSplitTest(absltest.TestCase):
       *,
       fsdp_reshard_after_forward: str,
       before_split=None,
+      saved_splash_layers: int = 0,
   ):
-    """Apply full remat, then split the real joint trace at fwd/bwd."""
-    _full_memory_policy_pass(
-        traced.gm,
-        config=SimpleNamespace(
-            compile=SimpleNamespace(full_recompute_save_ops=""),
-            parallelism=SimpleNamespace(
-                fsdp_reshard_after_forward=fsdp_reshard_after_forward,
-                pipeline_parallel_degree=1,
-            ),
+    """Apply full remat (keeping the Splash output of the last
+    ``saved_splash_layers`` layers), then split the real joint trace at fwd/bwd.
+    """
+    config = SimpleNamespace(
+        compile=SimpleNamespace(
+            full_recompute_save_ops="",
+            save_regions=(),
+            save_last_n_layers={"attention.inner_attention": saved_splash_layers},
+        ),
+        parallelism=SimpleNamespace(
+            fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+            pipeline_parallel_degree=1,
         ),
     )
+    if saved_splash_layers:
+      MEMORY_POLICY_REGISTRY["tpu_selective"](traced.gm, config=config)
+    else:
+      _full_memory_policy_pass(traced.gm, config=config)
     selective_activation_remat_pass(traced.gm)
     if before_split is not None:
       before_split(traced.gm)
@@ -266,6 +289,7 @@ class GraphSplitTest(absltest.TestCase):
       model_cls: type[nn.Module] = _ToyTransformer,
       before_split=None,
       dim_collectives: bool = False,
+      saved_splash_layers: int = 0,
   ):
     """Trace the shared model through real SimpleFSDP with fake collectives.
 
@@ -300,6 +324,7 @@ class GraphSplitTest(absltest.TestCase):
             fsdp_reshard_after_forward=fsdp_reshard_after_forward,
             model_cls=model_cls,
             before_split=before_split,
+            saved_splash_layers=saved_splash_layers,
         )
 
     self.assertFalse(dist.is_initialized())
@@ -327,6 +352,7 @@ class GraphSplitTest(absltest.TestCase):
         traced,
         fsdp_reshard_after_forward=fsdp_reshard_after_forward,
         before_split=before_split,
+        saved_splash_layers=saved_splash_layers,
     )
 
   def _assert_collective_chains_are_atomic(
@@ -787,8 +813,12 @@ class GraphSplitTest(absltest.TestCase):
   def test_expert_all_gathers_under_splash(self):
     barriers = []
 
-    def apply_deadline(gm: torch.fx.GraphModule) -> None:
-      under_splash_lib.apply_expert_all_gathers_under_splash(gm)
+    def apply_deadline(
+        gm: torch.fx.GraphModule, saved_splash_layers: bool = False
+    ) -> None:
+      under_splash_lib.apply_expert_all_gathers_under_splash(
+          gm, saved_splash_layers=saved_splash_layers
+      )
       barriers.extend(
           node for node in gm.graph.nodes if node.target is _optimization_barrier
       )
@@ -810,6 +840,29 @@ class GraphSplitTest(absltest.TestCase):
     # A model without MoE layers or Splash has nothing to join.
     with self.assertRaisesRegex(ValueError, "no layer with both"):
       self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
+
+    # Layer 1 saves its Splash output, so its backward copy has no Splash.
+    # It is skipped by default and anchored on its router top-k ids on
+    # request.
+    for saved_splash_layers in (False, True):
+      barriers.clear()
+      self._trace_simple_fsdp(
+          n_layers=2,
+          model_cls=_RoutedMoEToy,
+          saved_splash_layers=1,
+          before_split=functools.partial(
+              apply_deadline, saved_splash_layers=saved_splash_layers
+          ),
+      )
+      anchors = [barrier.args[0] for barrier in barriers]
+      self.assertLen(anchors, 3 + saved_splash_layers)
+      top_k_ids = [
+          a for a in anchors if not under_splash_lib._is_splash_output(a)
+      ]
+      self.assertLen(top_k_ids, saved_splash_layers)
+      for anchor in top_k_ids:
+        self.assertEqual(_get_layer_id(anchor), 1)
+        self.assertIs(anchor.args[0].target, torch.ops.aten.topk.default)
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

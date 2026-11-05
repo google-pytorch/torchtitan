@@ -63,12 +63,18 @@ def _bwd_kernel(eps, x_ref, g_ref, w_ref, dy_ref, dx_ref, dg_ref, dw_ref):
   dx_ref[...] = dx.astype(dx_ref.dtype)
 
 
+def _vmem_limit_bytes() -> int:
+  """Scoped VMEM limit for both kernels: 90% of the core's VMEM."""
+  return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
 def _block_rows(dim: int, *dtypes) -> int:
   """Row block size (``<= 2048``, power of 2) keeping tile buffers <= 1 MiB."""
   elem_bytes = max(jnp.dtype(dt).itemsize for dt in dtypes)
-  # Keep each (block_rows, dim) buffer <= 1 MiB so 5 double-buffered backward
-  # arrays (x, gate, dy, dx, dg = 10 buffers) stay <= 10 MiB, fitting TPU
-  # v5e/v6e's 16 MiB default scoped VMEM while keeping 2048 rows at dim=128.
+  # Keep each (block_rows, dim) buffer <= 1 MiB: the backward's 5
+  # double-buffered arrays (x, gate, dy, dx, dg) take <= 10 MiB, plus ~8 fp32
+  # (block_rows, dim) temporaries (<= 8 MiB at 2048 x 128). The kernels request
+  # `_vmem_limit_bytes()`, so this does not rely on the default scoped VMEM.
   block = _BLOCK_ROWS
   while block > 128 and block * dim * elem_bytes > 1024 * 1024:
     block //= 2
@@ -95,7 +101,10 @@ def rms_norm_gated_fwd_jax(
       ],
       out_specs=row_spec,
       out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-      compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel",),
+          vmem_limit_bytes=_vmem_limit_bytes(),
+      ),
       name="rms_norm_gated_fwd",
   )(x, gate, w)
 
@@ -126,7 +135,10 @@ def rms_norm_gated_bwd_jax(
           jax.ShapeDtypeStruct(gate.shape, gate.dtype),
           jax.ShapeDtypeStruct((1, dim), jnp.float32),
       ],
-      compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("arbitrary",),
+          vmem_limit_bytes=_vmem_limit_bytes(),
+      ),
       name="rms_norm_gated_bwd",
   )(x, gate, w, dy)
 

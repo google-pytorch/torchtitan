@@ -3,7 +3,6 @@
 import functools
 import importlib
 import inspect
-import os
 from types import SimpleNamespace
 from unittest import mock
 
@@ -294,9 +293,11 @@ class LinearSoftmaxCrossEntropyLossTest(
       self.skipTest("Mosaic TPU kernel test requires a TPU device.")
     from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
 
+    # Tokamax sets the kernel's VMEM limit (90% of capacity) itself, so the
+    # exact recipe tile runs on any chip with >= 64 MiB VMEM (on TPU7x via the
+    # `buffer_count=1` fallback).
     vmem_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    has_64m_scoped = "65472" in os.environ.get("LIBTPU_INIT_ARGS", "")
-    if vmem_bytes >= 64 * 1024 * 1024 and has_64m_scoped:
+    if vmem_bytes >= 64 * 1024 * 1024:
       # Exact Qwen3.5 35B benchmark tile: (1024, 2048, 640) at H=2048.
       b, h, v = 2048, 2048, 1280
       b_blk, h_blk, v_blk = 1024, 2048, 640

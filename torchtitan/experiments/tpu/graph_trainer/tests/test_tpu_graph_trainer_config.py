@@ -1061,6 +1061,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(maxtext.compile.memory_policy, "full_and_offload")
     self.assertEqual(maxtext.compile.save_regions, ())
 
+  def test_235b_splitter_fuses_qk_norm_rope(self) -> None:
+    for recipe in (
+        qwen3_moe_235b_fsdp_activation_offload_4x4x4,
+        qwen3_moe_235b_fsdp_activation_offload_maxtext,
+    ):
+      self.assertTrue(recipe().tpu_config.fused_qk_norm_rope)
+
   def test_235b_4x4x4_reduce_scatter_policy(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
 

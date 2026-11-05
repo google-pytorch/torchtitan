@@ -1027,6 +1027,7 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   cfg.compile.optimizer_compile = "eager"
   cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
   cfg.metrics.log_freq = 1
+  cfg.tpu_config.fused_qk_norm_rope = True
   return cfg
 
 

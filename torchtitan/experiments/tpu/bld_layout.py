@@ -47,6 +47,7 @@ import torch_remat as remat
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from torchtitan.experiments.tpu.kernels.qk_norm_rope import qk_norm_rope
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.unflatten_shim import UnflattenShim
 from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
@@ -132,16 +133,30 @@ class _BLDGQAttention(GQAttention):
         xv.reshape(b, l, -1, hd),
     )
 
-  def _bld_rope(self, xq, xk, positions):
+  def _bld_rope_cache(self, xq, positions):
     b, l, _, head_dim = xq.shape
     # Upstream [T, 1, W] cache (gathered by positions) -> [B, L, 1, W].
     cache = self.rope._reshape_cache(xq.reshape(b * l, -1, head_dim), positions)
-    cache = cache.view(b, l, *cache.shape[1:])
+    return cache.view(b, l, *cache.shape[1:])
+
+  def _bld_rope(self, xq, xk, positions):
+    head_dim = xq.shape[-1]
+    cache = self._bld_rope_cache(xq, positions)
     if type(self.rope).apply_rotary_emb is CosSinRoPE.apply_rotary_emb:
       cos_h = cache[..., : head_dim // 2]
       sin_h = cache[..., head_dim : head_dim + head_dim // 2]
       return cossin_rotate(xq, cos_h, sin_h), cossin_rotate(xk, cos_h, sin_h)
     return self.rope.apply_rotary_emb(xq, xk, cache)
+
+  def _bld_fused_qk_norm_rope(self, xq, xk, positions):
+    b, l, _, head_dim = xq.shape
+    cache = self._bld_rope_cache(xq, positions)
+    cos_h = cache[..., : head_dim // 2].reshape(b, l, -1)
+    sin_h = cache[..., head_dim : head_dim + head_dim // 2].reshape(b, l, -1)
+    return tuple(
+        qk_norm_rope(x, norm.weight, cos_h, sin_h, norm.eps)
+        for x, norm in ((xq, self.q_norm), (xk, self.k_norm))
+    )
 
   def forward(
       self,
@@ -160,13 +175,16 @@ class _BLDGQAttention(GQAttention):
     )(x_TD)
     remat.recompute_needs_tensor(xq, xk, xv)
 
-    if self.q_norm is not None or self.k_norm is not None:
-      assert self.q_norm is not None and self.k_norm is not None
-      xq = self.q_norm(xq)
-      xk = self.k_norm(xk)
+    if getattr(self, "fused_qk_norm_rope", False) and xq.device.type == "tpu":
+      xq, xk = self._bld_fused_qk_norm_rope(xq, xk, positions)
+    else:
+      if self.q_norm is not None or self.k_norm is not None:
+        assert self.q_norm is not None and self.k_norm is not None
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
 
-    if self.rope is not None:
-      xq, xk = self._bld_rope(xq, xk, positions)
+      if self.rope is not None:
+        xq, xk = self._bld_rope(xq, xk, positions)
 
     # The TT-UNFLATTEN-SHIM passes 4-D q/k/v through (and unflattens the 1-D
     # positions/segment_ids). Other inner attentions take upstream [T, H, K].
@@ -271,6 +289,20 @@ def _attention_eligible(attn: nn.Module) -> bool:
   )
 
 
+def _fused_qk_norm_rope_eligible(attn: nn.Module) -> bool:
+  norms = (attn.q_norm, attn.k_norm)
+  return (
+      type(attn.rope).apply_rotary_emb is CosSinRoPE.apply_rotary_emb
+      and all(
+          isinstance(n, nn.RMSNorm)
+          and type(n).forward is nn.RMSNorm.forward
+          and n.weight is not None
+          and n.eps is not None
+          for n in norms
+      )
+  )
+
+
 def bld_skip_reason(parallelism) -> str | None:
   """Why the [B, L] layout must stay off for this recipe, or None."""
   if (
@@ -283,13 +315,18 @@ def bld_skip_reason(parallelism) -> str | None:
 
 
 def apply_bld_layout(
-    model: nn.Module, *, skip_reason: str | None = None
+    model: nn.Module,
+    *,
+    skip_reason: str | None = None,
+    fused_qk_norm_rope: bool = False,
 ) -> int:
   """Patch eligible dense blocks in ``model`` in place; returns how many.
 
   Args:
     model: The built model.
     skip_reason: From ``bld_skip_reason``; if set, patch nothing and log it.
+    fused_qk_norm_rope: Run QK-norm and exact ``CosSinRoPE`` through
+      ``kernels/qk_norm_rope.py`` where both are present.
   """
   if skip_reason is not None:
     logger.info(f"TPU [B, L] block layout skipped: {skip_reason}")
@@ -314,6 +351,8 @@ def apply_bld_layout(
     else:
       _swap_class(module.attention, _BLDGQAttention)
     _swap_class(module, _BLDBlock)
+    if fused_qk_norm_rope and _fused_qk_norm_rope_eligible(module.attention):
+      module.attention.fused_qk_norm_rope = True
     patched += 1
   logger.info(f"TPU [B, L] block layout applied to {patched} transformer blocks")
   return patched

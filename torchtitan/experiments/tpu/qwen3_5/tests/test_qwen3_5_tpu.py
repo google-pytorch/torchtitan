@@ -2007,21 +2007,34 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertFalse(parsed_ep.compile.compile_grad_norm)
 
     # CLI `--parallelism.expert_parallel_degree > 1` on a base `EP=1` recipe
-    # also disables `compile_grad_norm` and sets `DEFER_AND_FUSE` via
-    # `TpuQwen35Model.Config.update_from_config`.
+    # is rejected at parse time unless `compile_grad_norm` is turned off; with
+    # it off, `TpuQwen35Model.Config.update_from_config` swaps in the dropless
+    # EP dispatcher and leaves the trainer settings alone.
+    with self.assertRaises((ValueError, SystemExit)):
+      ConfigManager().parse_args([
+          "--module=torchtitan.experiments.tpu.qwen3_5",
+          "--config=qwen35_moe_35b",
+          "--parallelism.expert_parallel_degree=4",
+      ])
     cli_ep_base = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
         "--config=qwen35_moe_35b",
         "--parallelism.expert_parallel_degree=4",
         "--compile.no-compile_grad_norm",
     ])
-    cli_ep_base.compile.compile_grad_norm = True
-    cli_ep_base.tpu_config.eager_mode = None
+    eager_mode_before = cli_ep_base.tpu_config.eager_mode
     cli_ep_base.model_spec.model.update_from_config(
         config=cli_ep_base, global_batch_size=8, local_global_batch_size=8
     )
     self.assertFalse(cli_ep_base.compile.compile_grad_norm)
-    self.assertEqual(cli_ep_base.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    self.assertEqual(cli_ep_base.tpu_config.eager_mode, eager_mode_before)
+    self.assertNotEmpty(
+        list(
+            cli_ep_base.model_spec.model.traverse(
+                qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
+            )
+        )
+    )
     self.assertFalse(
         issubclass(
             qwen35_token_dispatcher.TpuQwen35DispatchMetadata,

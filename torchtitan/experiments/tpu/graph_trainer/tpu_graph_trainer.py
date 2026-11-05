@@ -454,16 +454,26 @@ class TpuGraphTrainer(GraphTrainer):
         # A tied weight is listed once per name, each time with its full
         # gradient, so add it only once.
         seen: set[int] = set()
-        unique_params, unique_grads = [], []
+        new_params, new_grads = [], []
+        # Keyed by grad type: one foreach call cannot mix DTensor and Tensor.
+        to_add: dict[type, tuple[list, list]] = {}
         for param, grad in zip(params, grads, strict=True):
-            if param.requires_grad and id(param) not in seen:
-                seen.add(id(param))
-                unique_params.append(param)
-                unique_grads.append(grad)
+            if not param.requires_grad or grad is None or id(param) in seen:
+                continue
+            seen.add(id(param))
+            if param.grad is None:
+                new_params.append(param)
+                new_grads.append(grad)
+            else:
+                dsts, srcs = to_add.setdefault(type(param.grad), ([], []))
+                dsts.append(param.grad)
+                srcs.append(grad)
         # Sum, not assign, so gradient accumulation keeps every microbatch.
         # Each microbatch loss is divided by the whole step's token count, so
         # the sum is the full-batch mean.
-        accumulate_param_grads_(unique_params, unique_grads)
+        accumulate_param_grads_(new_params, new_grads)
+        for dsts, srcs in to_add.values():
+            torch._foreach_add_(dsts, srcs)
 
         return loss
 

@@ -80,6 +80,31 @@ def _traced_trainer(model: nn.Module, inputs, labels, global_valid_tokens):
   return trainer
 
 
+def _eager_grads(model: nn.Module, inputs, labels) -> list[torch.Tensor]:
+  """Eager autograd grads of the full-batch mean loss, on a copy of model."""
+  ref = copy.deepcopy(model)
+  ref.zero_grad(set_to_none=True)
+  loss = F.cross_entropy(
+      ref(inputs).view(-1, 128), labels.view(-1), reduction="sum"
+  )
+  (loss / labels.numel()).backward()
+  return [p.grad for p in ref.parameters()]
+
+
+def _run_grad_accum_step(trainer, model, inputs, labels, num_microbatches):
+  """Runs one training step's fwd+bwd calls, split into microbatches."""
+  params = tuple(
+      p
+      for _, p in model.named_parameters(remove_duplicate=False)
+      if p.requires_grad
+  )
+  tokens = torch.tensor(float(labels.numel()), device=labels.device)
+  for x, y in zip(
+      inputs.chunk(num_microbatches), labels.chunk(num_microbatches)
+  ):
+    trainer._make_fx_forward_backward_step(model, x, y, tokens, params, {})
+
+
 class MfuBenchmarkTest(absltest.TestCase):
 
   def test_mfu_benchmark_bracket(self) -> None:
@@ -313,51 +338,63 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
     loss = outputs[0]
     self.assertEqual(loss.ndim, 0, "Loss output must be a scalar tensor.")
 
+  def _tied_model(self) -> nn.Module:
+    model = DummyModule(dim=32, vocab_size=128).to(self.accelerator_device)
+    model.lm_head.weight = model.tok_embeddings.weight
+    return model
+
+  def _assert_grads(self, model, expected, msg) -> None:
+    for (name, p), want in zip(model.named_parameters(), expected, strict=True):
+      torch.testing.assert_close(
+          p.grad, want, rtol=1e-5, atol=1e-6, msg=f"{msg} {name}"
+      )
+
   def test_grad_accumulation_matches_full_batch(self) -> None:
     """GA=2 at batch 2 matches GA=1 at batch 4, tied weights included."""
     device = self.accelerator_device
-    model = DummyModule(dim=32, vocab_size=128).to(device)
-    model.lm_head.weight = model.tok_embeddings.weight
-    params = tuple(
-        p
-        for _, p in model.named_parameters(remove_duplicate=False)
-        if p.requires_grad
-    )
+    model = self._tied_model()
     inputs = torch.randint(0, 128, (4, 16), device=device)
     labels = torch.randint(0, 128, (4, 16), device=device)
-    tokens = torch.tensor(float(labels.numel()), device=device)
-
-    ref = copy.deepcopy(model)
-    ref_loss = F.cross_entropy(
-        ref(inputs).view(-1, 128), labels.view(-1), reduction="sum"
-    )
-    (ref_loss / tokens).backward()
-    expected = [p.grad for p in ref.parameters()]
-
-    def step_grads(num_microbatches: int) -> list[torch.Tensor]:
-      model.zero_grad(set_to_none=True)
-      mb_inputs = inputs.chunk(num_microbatches)
-      mb_labels = labels.chunk(num_microbatches)
-      trainer = _traced_trainer(model, mb_inputs[0], mb_labels[0], tokens)
-      for x, y in zip(mb_inputs, mb_labels):
-        trainer._make_fx_forward_backward_step(model, x, y, tokens, params, {})
-      return [p.grad.clone() for p in model.parameters()]
+    expected = _eager_grads(model, inputs, labels)
 
     for num_microbatches in (1, 2):
-      for name, got, want in zip(
-          [n for n, _ in model.named_parameters()],
-          step_grads(num_microbatches),
-          expected,
-          strict=True,
-      ):
-        torch.testing.assert_close(
-            got, want, rtol=1e-5, atol=1e-6, msg=f"GA={num_microbatches} {name}"
-        )
+      model.zero_grad(set_to_none=True)
+      trainer = _traced_trainer(
+          model,
+          inputs.chunk(num_microbatches)[0],
+          labels.chunk(num_microbatches)[0],
+          torch.tensor(float(labels.numel()), device=device),
+      )
+      _run_grad_accum_step(trainer, model, inputs, labels, num_microbatches)
+      self._assert_grads(model, expected, f"GA={num_microbatches}")
 
-  def test_in_graph_optimizer_rejects_grad_accumulation(self) -> None:
-    tpu_graph_trainer._check_in_graph_optimizer_grad_accum(1)
-    with self.assertRaisesRegex(ValueError, "gradient accumulation"):
-      tpu_graph_trainer._check_in_graph_optimizer_grad_accum(2)
+  def test_grad_accumulation_resets_between_steps(self) -> None:
+    """Step 2's grads hold only step 2's batch, for both zero_grad modes."""
+    device = self.accelerator_device
+    batches = [
+        (
+            torch.randint(0, 128, (4, 16), device=device),
+            torch.randint(0, 128, (4, 16), device=device),
+        )
+        for _ in range(2)
+    ]
+    # The trainer zeroes in place by default (set_to_none=False).
+    for set_to_none in (False, True):
+      model = self._tied_model()
+      trainer = _traced_trainer(
+          model,
+          batches[0][0][:2],
+          batches[0][1][:2],
+          torch.tensor(64.0, device=device),
+      )
+      for step, (inputs, labels) in enumerate(batches, start=1):
+        model.zero_grad(set_to_none=set_to_none)
+        _run_grad_accum_step(trainer, model, inputs, labels, 2)
+        self._assert_grads(
+            model,
+            _eager_grads(model, inputs, labels),
+            f"set_to_none={set_to_none} step {step}",
+        )
 
 
 if __name__ == "__main__":

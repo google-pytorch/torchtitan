@@ -153,11 +153,13 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
   def test_ctx8k_strip_on_tpu7x(self):
     """Tests S=8192 bf16 strips on TPU7x (skipped on smaller-VMEM TPUs)."""
     dev = self._require_tpu()
+    gen = causal_conv1d._tpu_generation()  # pylint: disable=protected-access
+    if gen is None or gen < 7:
+      self.skipTest("S=8192 bf16 causal_conv1d requires TPU >= v7 VMEM.")
     torch.manual_seed(2)
     x_dev = torch.randn(2, 8192, 128, device=dev, dtype=torch.bfloat16)
     w_dev = torch.randn(128, 1, 4, device=dev, dtype=torch.bfloat16) * 0.5
-    if not causal_conv1d.supports(x_dev, w_dev):
-      self.skipTest("S=8192 bf16 causal_conv1d requires TPU >= v7 VMEM.")
+    self.assertTrue(causal_conv1d.supports(x_dev, w_dev))
     x_ref = x_dev.double().cpu().requires_grad_()
     w_ref = w_dev.double().cpu().requires_grad_()
     grad = torch.randn(2, 8192, 128, dtype=torch.bfloat16)

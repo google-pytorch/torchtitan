@@ -573,11 +573,17 @@ class TpuRMSNormGated(RMSNormGated):
     pass
 
   def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    weight = self.weight
     if rms_norm_gated is not None and rms_norm_gated.supports(
-        x, gate, self.weight
+        x, gate, weight
     ):
-      return rms_norm_gated.rms_norm_gated(x, gate, self.weight, self.eps)
-    return super().forward(x, gate)
+      return rms_norm_gated.rms_norm_gated(x, gate, weight, self.eps)
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + self.eps)
+    x = weight * x.to(input_dtype)
+    return (x.float() * F.silu(gate.float())).to(input_dtype)
 
 
 class GatedDeltaDocumentResets(Configurable):

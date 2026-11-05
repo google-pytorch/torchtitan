@@ -206,6 +206,9 @@ class TrainerMinimal:
     )
     self.model_config = model_config
 
+    # TODO(jerryx99): Consider stop widening model_config.vocab_size to the
+    # tokenizer's here and fail fast instead/always give the debug configs a
+    # vocab that matches the tokenizer they run with (see #158 review)
     if (
         hasattr(self.model_config, "vocab_size")
         and self.model_config.vocab_size is not None
@@ -244,6 +247,11 @@ class TrainerMinimal:
         f"size: {model_param_count:,} total parameters"
     )
 
+    # Fill ``global_vocab_size`` from the final model config (the vocab may
+    # have been widened to the tokenizer's above).
+    from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+    set_global_vocab_size(job_config.loss, self.model_config)
     self.loss_fn = job_config.loss.build(compile_config=job_config.compile)
 
     # Apply TPU-specific patches/workarounds

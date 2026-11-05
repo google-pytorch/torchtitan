@@ -53,6 +53,14 @@ class TPUTrainer(torchtitan.train.Trainer):
   """
 
   def __init__(self, job_config: Configurable.Config):
+    if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
+      # Trainer.__init__ builds `loss_fn` from `job_config.loss` (and, under
+      # pipeline parallelism, binds it into the PP schedule), so fill
+      # `global_vocab_size` from the final model config first.
+      from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+      if job_config.model_spec is not None:
+        set_global_vocab_size(job_config.loss, job_config.model_spec.model)
     super().__init__(job_config)
 
     self._compiled_grad_norm: CompiledGradNorm | None = None

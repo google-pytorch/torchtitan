@@ -9,9 +9,11 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
-    data_parallel as simple_fsdp_data_parallel,
+from torchtitan.experiments.graph_trainer.common_utils import (
+    apply_simple_fsdp,
+)
+from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
+    install_tpu_replicate_computation,
 )
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.llama3 import parallelize as dtensor_parallelize
@@ -73,23 +75,12 @@ def parallelize_llama(
           skip_dp=True,
       )
 
-    dp_mesh_names = (
-          ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-      )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-
-    dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
-    mp_policy = SimpleFSDPMixedPrecisionPolicy(
-          param_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_param],
-          reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-      )
-    model = simple_fsdp_data_parallel(
-          model,
-          dp_mesh,
-          mode=dp_mode,
-          mp_policy=mp_policy,
-      )
-    logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
+    model = apply_simple_fsdp(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+    )
+    install_tpu_replicate_computation(model)
   else:
     dtensor_parallelize.parallelize_llama(
           model,  # pyrefly: ignore[bad-argument-type]

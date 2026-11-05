@@ -160,6 +160,13 @@ class TpuGraphTrainer(GraphTrainer):
         # Ensure the 'tpu' pass pipeline is registered before GraphTrainer traces/compiles
         register_tpu_pipeline()
 
+        # Trainer.__init__ builds `self.loss_fn` from `config.loss`; fill
+        # `global_vocab_size` (spmd_types loss-parallel CE under TP) from the
+        # final model config first, as TPUTrainer.__init__ does.
+        from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+        set_global_vocab_size(config.loss, config.model_spec.model)
+
         super().__init__(config)
 
         if _split_optimizers_by_mesh(self.optimizers):

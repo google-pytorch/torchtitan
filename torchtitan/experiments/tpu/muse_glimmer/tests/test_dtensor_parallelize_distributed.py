@@ -26,17 +26,16 @@ TEST_SEQ_LEN = 128
 TEST_TRAINING_STEPS = 3
 
 
-def _get_model_config(*, with_tp_sharding: bool = False) -> MuseGlimmerModel.Config:
-  """Returns a copy of the TPU ``testmodel`` config.
+def _get_model_config() -> MuseGlimmerModel.Config:
+  """Returns a copy of the TPU ``testmodel`` config with TP sharding attached.
 
-  Args:
-    with_tp_sharding: Attach the upstream TP sharding configs. The trainer does
-      this via ``MuseGlimmerModel.Config.update_from_config``; without them
-      ``Module.parallelize`` is a no-op.
+  The trainer attaches the sharding config via
+  ``MuseGlimmerModel.Config.update_from_config``; without it
+  ``Module.parallelize`` is a no-op under spmd_types. Deepcopy keeps the shared
+  registry entry unchanged. SP is off because the test feeds unsharded inputs.
   """
   config = copy.deepcopy(muse_glimmer_tpu.muse_glimmer_configs["testmodel"])
-  if with_tp_sharding:
-    set_muse_glimmer_sharding_config(config, enable_sp=False)
+  set_muse_glimmer_sharding_config(config, enable_sp=False)
   return config
 
 
@@ -64,17 +63,25 @@ def _gather_dtensor_output(module, args, output):
   return output
 
 
-def _tp_wrapper(world_size: int):
+def _tp_wrapper(world_size: int, parallel_dims: ParallelDims):
   def apply_tp(model):
+    # Under spmd_types ``parallelize_muse_glimmer`` applies FSDP even with no
+    # DP axis (it is what turns the annotated params into DTensors), and FSDP's
+    # MixedPrecisionPolicy would then cast params to bf16. Keep fp32 so this
+    # TP-only test still compares against the fp32 CPU reference at the
+    # tolerance it always used.
+    training = TrainingConfig()
+    training.mixed_precision_param = "float32"
+    training.mixed_precision_reduce = "float32"
     # pytype: disable=wrong-arg-types
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
         ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
-        parallel_dims=_parallel_dims(world_size=world_size, tp=world_size),
+        parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
-        training=TrainingConfig(),
+        training=training,
     )
     # pytype: enable=wrong-arg-types
     model.register_forward_hook(_gather_dtensor_output)
@@ -85,13 +92,15 @@ def _tp_wrapper(world_size: int):
 
 def _verify_tp_forward_worker(device: torch.device, rank: int, world_size: int):
   """Forward parity of the TP model against a single-device reference."""
+  parallel_dims = _parallel_dims(world_size=world_size, tp=world_size)
   runner = base_distributed_device_test.DistributedUnitTestRunner(
       device=device,
       rank=rank,
       world_size=world_size,
       model_class=MuseGlimmerModel,
-      model_args=_get_model_config(with_tp_sharding=True),
-      parallelism_func=_tp_wrapper(world_size),
+      model_args=_get_model_config(),
+      parallelism_func=_tp_wrapper(world_size, parallel_dims),
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -100,13 +109,15 @@ def _verify_tp_forward_worker(device: torch.device, rank: int, world_size: int):
 
 def _verify_tp_backward_worker(device: torch.device, rank: int, world_size: int):
   """Loss/grad parity of the TP model against a single-device reference."""
+  parallel_dims = _parallel_dims(world_size=world_size, tp=world_size)
   runner = base_distributed_device_test.DistributedUnitTestRunner(
       device=device,
       rank=rank,
       world_size=world_size,
       model_class=MuseGlimmerModel,
-      model_args=_get_model_config(with_tp_sharding=True),
-      parallelism_func=_tp_wrapper(world_size),
+      model_args=_get_model_config(),
+      parallelism_func=_tp_wrapper(world_size, parallel_dims),
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -124,6 +135,8 @@ def _verify_fsdp_training_loop_worker(
 ):
   """Multi-step loss/grad parity with FSDP2."""
 
+  parallel_dims = _parallel_dims(world_size=world_size, dp_shard=world_size)
+
   def apply_fsdp(model):
     # pytype: disable=wrong-arg-types
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
@@ -131,7 +144,7 @@ def _verify_fsdp_training_loop_worker(
         ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
-        parallel_dims=_parallel_dims(world_size=world_size, dp_shard=world_size),
+        parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(data_parallel_shard_degree=world_size),
         training=TrainingConfig(),
     )
@@ -144,6 +157,7 @@ def _verify_fsdp_training_loop_worker(
       model_class=MuseGlimmerModel,
       model_args=_get_model_config(),
       parallelism_func=apply_fsdp,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.SPLIT_BATCH,
       use_meta_init=True,
   )
@@ -163,7 +177,14 @@ def _verify_simple_fsdp_training_loop_worker(
 ):
   """Multi-step loss/grad parity with SimpleFSDP (the Ironwood target path)."""
 
+  parallel_dims = _parallel_dims(world_size=world_size, dp_shard=world_size)
+
   def apply_simple_fsdp(model):
+    # Under spmd_types ``parallelize_muse_glimmer`` applies FSDP even with no
+    # DP axis (it is what turns the annotated params into DTensors), and FSDP's
+    # MixedPrecisionPolicy would then cast params to bf16. Keep fp32 so this
+    # TP-only test still compares against the fp32 CPU reference at the
+    # tolerance it always used.
     training = TrainingConfig()
     training.mixed_precision_param = "float32"
     training.mixed_precision_reduce = "float32"
@@ -173,7 +194,7 @@ def _verify_simple_fsdp_training_loop_worker(
         ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
-        parallel_dims=_parallel_dims(world_size=world_size, dp_shard=world_size),
+        parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=world_size, use_simple_fsdp=True
         ),
@@ -188,6 +209,7 @@ def _verify_simple_fsdp_training_loop_worker(
       model_class=MuseGlimmerModel,
       model_args=_get_model_config(),
       parallelism_func=apply_simple_fsdp,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.SPLIT_BATCH,
       use_meta_init=False,
   )

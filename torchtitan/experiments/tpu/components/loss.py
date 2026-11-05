@@ -199,4 +199,11 @@ def build_cross_entropy_loss(
     return _legacy_pallas_loss_config(job_config).build(
         compile_config=job_config.compile
     )
-  return components_loss.CrossEntropyLoss(components_loss.CrossEntropyLoss.Config())
+  # A fresh Config is built here, so carry over ``global_vocab_size``, which
+  # ``BaseTPUTrainerConfig.__post_init__`` fills in from the model config for
+  # spmd_types loss-parallel CE. Not every loss config has the field.
+  return components_loss.CrossEntropyLoss(
+      components_loss.CrossEntropyLoss.Config(
+          global_vocab_size=getattr(job_config.loss, "global_vocab_size", None)
+      )
+  )

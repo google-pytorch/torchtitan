@@ -192,6 +192,26 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # after decoration, leaving the ``__class__`` cell that zero-arg
     # ``super()`` relies on pointing at a stale class. See bpo-46404.
     super(BaseTPUTrainerConfig, self).__post_init__()
+    # spmd_types loss-parallel CE sees only the local vocab shard, so it needs
+    # the full vocab size. Fill it in from the model config wherever a loss
+    # config exposes it: ``CrossEntropyLoss.Config`` carries it directly, the
+    # chunked loss wrapper carries it on its inner ``loss_fn``; losses without
+    # a vocab (e.g. MSE) have neither.
+    if self.model_spec is not None:
+      vocab_size = getattr(self.model_spec.model, "vocab_size", None)
+      if vocab_size is not None:
+        if (
+            hasattr(self.loss, "global_vocab_size")
+            and self.loss.global_vocab_size is None
+        ):
+          self.loss.global_vocab_size = vocab_size
+        loss_fn_cfg = getattr(self.loss, "loss_fn", None)
+        if (
+            loss_fn_cfg is not None
+            and hasattr(loss_fn_cfg, "global_vocab_size")
+            and loss_fn_cfg.global_vocab_size is None
+        ):
+          loss_fn_cfg.global_vocab_size = vocab_size
     if (
         self.model_spec is not None
         and self.parallelism.context_parallel_degree > 1

@@ -500,6 +500,25 @@ def get_transformer_block_buckets(model) -> list[list[str] | str]:
     return module_fqns
 
 
+def get_simple_fsdp_mesh(parallel_dims: ParallelDims) -> DeviceMesh:
+    """Return the flattened DP-shard/CP mesh used by SimpleFSDP.
+
+    Mirrors upstream ``get_simple_fsdp_mesh``: ``spmd_types`` keeps ``dp_shard``
+    and ``cp`` as separate axes, so flatten them (singleton axes included) into
+    an ``fsdp`` axis with the same name and extent as the one ``partial_dtensor``
+    builds into its dense mesh. ``DeviceMesh._flatten`` returns the existing
+    mesh when called again with the same dims and name. The ``partial_dtensor``
+    branch goes away with the next upstream sync.
+    """
+    if get_spmd_backend() != "spmd_types":
+        return parallel_dims.get_mesh("fsdp")
+    fsdp_mesh = parallel_dims.get_optional_mesh(
+        ["dp_shard", "cp"], include_singleton_axes=True
+    )
+    assert fsdp_mesh is not None
+    return fsdp_mesh._flatten("fsdp")
+
+
 def apply_simple_fsdp(
     model: nn.Module,
     *,
@@ -515,30 +534,21 @@ def apply_simple_fsdp(
     A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis.
     """
     use_spmd_types = get_spmd_backend() == "spmd_types"
-    fsdp_mesh: DeviceMesh | None = None
-    if use_spmd_types:
-        fsdp_mesh = parallel_dims.get_optional_mesh(
-            ["dp_shard", "cp"], include_singleton_axes=True
-        )
-        assert fsdp_mesh is not None
-        fsdp_mesh = fsdp_mesh._flatten("fsdp")
+    fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
 
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
-            if use_spmd_types:
-                dp_replicate_mesh = parallel_dims.get_optional_mesh(
-                    "dp_replicate", include_singleton_axes=True
-                )
-                assert dp_replicate_mesh is not None
-                dp_mesh = DeviceMesh._concatenate([dp_replicate_mesh, fsdp_mesh])
-            else:
-                dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
+            dp_replicate_mesh = parallel_dims.get_optional_mesh(
+                "dp_replicate", include_singleton_axes=True
+            )
+            assert dp_replicate_mesh is not None
+            dp_mesh = DeviceMesh._concatenate([dp_replicate_mesh, fsdp_mesh])
             dp_mode = "hybrid_shard"
         else:
             dp_mesh = parallel_dims.get_mesh("dp_replicate")
             dp_mode = "replicate"
     else:
-        dp_mesh = fsdp_mesh if use_spmd_types else parallel_dims.get_mesh("fsdp")
+        dp_mesh = fsdp_mesh
         dp_mode = "fully_shard"
 
     mp_policy = MixedPrecisionPolicy(

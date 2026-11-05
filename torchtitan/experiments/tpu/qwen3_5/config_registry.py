@@ -235,8 +235,11 @@ def _use_expert_parallel(cfg: TPUTrainerConfig, *, ep_degree: int) -> None:
   """
   cfg.parallelism.expert_parallel_degree = ep_degree
   # `CompiledGradNorm` needs a single mesh; the eager norm reduces over the
-  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes.
+  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes. `DEFER_AND_FUSE` avoids
+  # per-op eager dispatch stalls in that multi-mesh reduction.
   cfg.compile.compile_grad_norm = False
+  if not cfg.tpu_config.eager_mode:
+    cfg.tpu_config.eager_mode = "DEFER_AND_FUSE"
   if (
       isinstance(cfg.compile, TpuGraphTrainerCompileConfig)
       and cfg.compile.graph_split.enabled

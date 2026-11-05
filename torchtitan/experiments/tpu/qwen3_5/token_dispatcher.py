@@ -79,7 +79,6 @@ def _ragged_all_to_all_impl(
 
   if (
       ep_mesh is not None
-      and pg is not None
       and get_proxy_mode() is None
       and not isinstance(src, torch._subclasses.FakeTensor)
   ):
@@ -93,49 +92,50 @@ def _ragged_all_to_all_impl(
           out_off = int(output_offsets[k].item())
           output[out_off : out_off + sz] = src[in_off : in_off + sz]
       return output
+    if pg is not None:
 
-    in_rows_t = torch.tensor(
-        [src.shape[0]], dtype=torch.int64, device=src.device
-    )
-    all_in_rows = _wait(
-        all_gather_single(in_rows_t, gather_dim=0, group=ep_mesh)
-    )
-    max_in_rows = int(all_in_rows.max().item())
-    if src.shape[0] < max_in_rows:
-      pad_src = src.new_zeros((max_in_rows, *src.shape[1:]))
-      pad_src[: src.shape[0]] = src
-    else:
-      pad_src = src
-    gathered_src = _wait(
-        all_gather_single(pad_src, gather_dim=0, group=ep_mesh)
-    ).view(ep_size, max_in_rows, *src.shape[1:])
+      in_rows_t = torch.tensor(
+          [src.shape[0]], dtype=torch.int64, device=src.device
+      )
+      all_in_rows = _wait(
+          all_gather_single(in_rows_t, gather_dim=0, group=ep_mesh)
+      )
+      max_in_rows = int(all_in_rows.max().item())
+      if src.shape[0] < max_in_rows:
+        pad_src = src.new_zeros((max_in_rows, *src.shape[1:]))
+        pad_src[: src.shape[0]] = src
+      else:
+        pad_src = src
+      gathered_src = _wait(
+          all_gather_single(pad_src, gather_dim=0, group=ep_mesh)
+      ).view(ep_size, max_in_rows, *src.shape[1:])
 
-    meta_local = torch.stack(
-        [
-            input_offsets.to(torch.int64),
-            send_sizes.to(torch.int64),
-            output_offsets.to(torch.int64),
-        ],
-        dim=0,
-    ).contiguous()
-    gathered_meta = _wait(
-        all_gather_single(meta_local, gather_dim=0, group=ep_mesh)
-    ).view(ep_size, 3, -1)
+      meta_local = torch.stack(
+          [
+              input_offsets.to(torch.int64),
+              send_sizes.to(torch.int64),
+              output_offsets.to(torch.int64),
+          ],
+          dim=0,
+      ).contiguous()
+      gathered_meta = _wait(
+          all_gather_single(meta_local, gather_dim=0, group=ep_mesh)
+      ).view(ep_size, 3, -1)
 
-    num_blocks = input_offsets.numel()
-    updates_per_peer = num_blocks // ep_size
-    local_rank = ep_mesh.get_local_rank()
-    for src_rank in range(ep_size):
-      for k in range(updates_per_peer):
-        b = local_rank * updates_per_peer + k
-        sz = int(gathered_meta[src_rank, 1, b].item())
-        if sz > 0:
-          in_off = int(gathered_meta[src_rank, 0, b].item())
-          out_off = int(gathered_meta[src_rank, 2, b].item())
-          output[out_off : out_off + sz] = gathered_src[
-              src_rank, in_off : in_off + sz
-          ]
-    return output
+      num_blocks = input_offsets.numel()
+      updates_per_peer = num_blocks // ep_size
+      local_rank = ep_mesh.get_local_rank()
+      for src_rank in range(ep_size):
+        for k in range(updates_per_peer):
+          b = local_rank * updates_per_peer + k
+          sz = int(gathered_meta[src_rank, 1, b].item())
+          if sz > 0:
+            in_off = int(gathered_meta[src_rank, 0, b].item())
+            out_off = int(gathered_meta[src_rank, 2, b].item())
+            output[out_off : out_off + sz] = gathered_src[
+                src_rank, in_off : in_off + sz
+            ]
+      return output
 
   # Tracing (make_fx / Dynamo) off TPU, or no process group: there is no
   # traceable exchange here, and returning the zero-initialized buffer would

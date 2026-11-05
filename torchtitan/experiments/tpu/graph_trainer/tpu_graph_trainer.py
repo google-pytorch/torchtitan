@@ -154,20 +154,24 @@ class TpuGraphTrainer(GraphTrainer):
             kwargs.pop("tpu_compile_mode", None)
             return parallelize_fn(model, *args, **kwargs)
 
+        post_optimizer_build_fn = config.model_spec.post_optimizer_build_fn
+
+        def tpu_graph_post_optimizer_build(
+            optimizers, model_parts, parallel_dims
+        ):
+            if post_optimizer_build_fn is not None:
+                post_optimizer_build_fn(optimizers, model_parts, parallel_dims)
+            split_optimizers_by_mesh(optimizers)
+
         config.model_spec = dataclasses.replace(
-            config.model_spec, parallelize_fn=tpu_graph_parallelize
+            config.model_spec,
+            parallelize_fn=tpu_graph_parallelize,
+            post_optimizer_build_fn=tpu_graph_post_optimizer_build,
         )
         # Ensure the 'tpu' pass pipeline is registered before GraphTrainer traces/compiles
         register_tpu_pipeline()
 
         super().__init__(config)
-
-        if split_optimizers_by_mesh(self.optimizers):
-            self.lr_schedulers = config.lr_scheduler.build(
-                optimizers=self.optimizers,
-                training_steps=config.training.steps,
-            )
-            self.metrics_processor.lr_schedulers = self.lr_schedulers
 
         self._optimizer_in_graph = (
             config.compile.optimizer_compile == "in_graph"

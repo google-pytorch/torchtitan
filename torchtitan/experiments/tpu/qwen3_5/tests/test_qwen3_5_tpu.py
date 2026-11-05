@@ -1956,6 +1956,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertEqual(ep_cfg.training.dtype, "float32")
       self.assertEqual(ep_cfg.parallelism.expert_parallel_degree, 4)
       self.assertFalse(ep_cfg.compile.compile_grad_norm)
+      self.assertEqual(ep_cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
       self.assertEqual(ep_cfg.compile.memory_policy, "full")
       self.assertEqual(ep_cfg.compile.save_regions, ())
       self.assertEqual(ep_cfg.compile.save_last_n_layers, {})

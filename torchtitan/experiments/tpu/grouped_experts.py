@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -324,16 +325,6 @@ class TpuGroupedExperts(GroupedExperts):
         # model is FP32, and the final result is restored to the caller's dtype.
         x_bf16 = x_RD.bfloat16()
         tile_m = self.pallas_grouped_mm_tile_m
-        # The kernels need a row count divisible by tile_m. Append zero rows to
-        # the last expert's group: they add nothing to dWeight and are sliced
-        # off the output. A no-op for tile-aligned batches.
-        num_rows = x_bf16.shape[0]
-        pad_rows = -num_rows % tile_m
-        if pad_rows:
-            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
-            num_tokens_per_expert_E = torch.cat(
-                [num_tokens_per_expert_E[:-1], num_tokens_per_expert_E[-1:] + pad_rows]
-            )
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
@@ -342,6 +333,28 @@ class TpuGroupedExperts(GroupedExperts):
             w2_tgmm_tiling = (
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
+        # Forward and backward Pallas kernels require lhs.shape[0] to be a
+        # multiple of tile_m and both dWeight TGMM M tiles. Under ragged EP > 1
+        # (unpaired segment_matmul_pallas_2d), pad only the buffer rows so
+        # unrouted tail rows [count : num_rows] are not swept into the last
+        # expert; under EP == 1 exact-row paired GEMM, include the zero-padded
+        # rows in the last expert's count.
+        row_align = math.lcm(
+            tile_m,
+            max(1, tgmm_tiling[0]),
+            max(1, w2_tgmm_tiling[0]),
+        )
+        num_rows = x_bf16.shape[0]
+        pad_rows = -num_rows % row_align
+        if pad_rows:
+            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
+            if self.use_pallas_paired_grouped_mm:
+                num_tokens_per_expert_E = torch.cat(
+                    [
+                        num_tokens_per_expert_E[:-1],
+                        num_tokens_per_expert_E[-1:] + pad_rows,
+                    ]
+                )
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16

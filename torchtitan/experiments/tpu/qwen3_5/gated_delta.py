@@ -591,11 +591,11 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   document offsets, which ``Qwen35Model`` only builds for the flex and varlen
   attention backends and whose shape changes with the number of documents.
 
-  ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the convolution and the recurrence run over each
-  ``[B, S]`` row as one stream, as upstream does without ``cu_seqlens`` (e.g.
-  with SDPA). Pretraining recipes use it: the Tokamax kernels lay every
-  document out from a 64-token chunk boundary to restart at it, which costs
-  time and memory.
+  ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the
+  convolution and the recurrence run over each ``[B, S]`` row as one stream, as
+  upstream does without ``cu_seqlens`` (e.g. with SDPA). Pretraining recipes use
+  it: the Tokamax kernels lay every document out from a 64-token chunk boundary
+  to restart at it, which costs time and memory.
   """
 
   @dataclass(kw_only=True, slots=True)

@@ -179,6 +179,10 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+  # Have the Pallas expert dWeight kernels store their BF16-rounded result as
+  # FP32 wherever an FP32 gradient reduction would widen it next, removing a
+  # full-size HBM pass per expert weight. Values are bit-identical.
+  fp32_expert_dweight: bool = False
 
 
 def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:

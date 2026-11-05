@@ -173,5 +173,104 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
     self.assertIn("only apply to chat datasets", "\n".join(logs.output))
 
 
+class FluxRandomDataloaderTest(absltest.TestCase):
+
+  _TOKENIZER_PATH = "tests/assets/tokenizer"
+
+  def test_random_dataloader_config_builds_stateful_loader(self) -> None:
+    from torchtitan.models.flux.random_loader import RandomDataloader
+
+    cfg = RandomDataloader.Config(
+        bsz=2,
+        max_steps=4,
+        img_size=256,
+        max_t5_len=64,
+        t5_dim=128,
+        clip_dim=32,
+    )
+    loader = cfg.build(
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=None,
+        max_context_length=320,
+        num_tokens_per_batch=640,
+    )
+    self.assertIsInstance(loader, RandomDataloader)
+    self.assertEqual(loader.state_dict(), {})
+    loader.load_state_dict({})
+    batch = next(iter(loader))
+    self.assertEqual(batch["labels"].shape, (2, 16, 32, 32))
+    self.assertEqual(batch["t5_encodings"].shape, (2, 64, 128))
+    self.assertEqual(batch["clip_encodings"].shape, (2, 32))
+
+  def test_flux_trainer_random_dataset_avoids_hf_hub(self) -> None:
+    from unittest import mock
+    import datasets as hf_datasets
+    from torchtitan.experiments.tpu import train as tpu_train
+    from torchtitan.models.flux import trainer as flux_trainer
+    from torchtitan.models.flux.config_registry import flux_dev, model_registry
+    from torchtitan.models.flux.random_loader import RandomDataloader
+    from torchtitan.models.flux.tokenizer import FluxTokenizer
+    from torchtitan.models.flux.trainer import FluxTrainer
+    from torchtitan.trainer import Trainer
+
+    config = flux_dev()
+    config.model_spec = model_registry("flux-test")
+    config.flux.random_dataset = True
+    config.flux.img_size = 1024
+    config.training.num_tokens_per_microbatch_per_dp_rank = 9216
+    config.training.steps = 2
+    tpu_train._apply_flux_img_size(config)
+
+    def _fake_super_init(trainer_self, cfg):
+      trainer_self.tokenizer = cfg.tokenizer.build(
+          tokenizer_path=cfg.hf_assets_path
+      )
+      trainer_self.dataloader = cfg.dataloader.build(
+          dp_world_size=1,
+          dp_rank=0,
+          tokenizer=trainer_self.tokenizer,
+          max_context_length=cfg.training.max_context_length,
+          num_tokens_per_batch=(
+              cfg.training.num_tokens_per_microbatch_per_dp_rank
+          ),
+      )
+      trainer_self.parallel_dims = mock.MagicMock(dp_shard_enabled=False)
+      trainer_self.device = "cpu"
+
+    with (
+        mock.patch.object(Trainer, "__init__", _fake_super_init),
+        # FluxTrainer's default is relative to the repo root; use this file's
+        # tokenizer path, which follows any remapping of test asset paths.
+        mock.patch.object(
+            flux_trainer, "_LOCAL_TOKENIZER_PATH", self._TOKENIZER_PATH
+        ),
+        mock.patch.object(
+            hf_datasets,
+            "load_dataset",
+            side_effect=AssertionError("Should not call datasets.load_dataset"),
+        ),
+        mock.patch.object(
+            FluxTokenizer,
+            "__init__",
+            side_effect=AssertionError("Should not call FluxTokenizer.__init__"),
+        ),
+        mock.patch("torchtitan.distributed.utils.set_determinism"),
+    ):
+      trainer = FluxTrainer(config)
+
+    self.assertTrue(config.tokenizer.test_mode)
+    self.assertEqual(config.tokenizer.t5_tokenizer_path, self._TOKENIZER_PATH)
+    self.assertEqual(config.tokenizer.clip_tokenizer_path, self._TOKENIZER_PATH)
+    self.assertIsInstance(trainer.dataloader, RandomDataloader)
+    self.assertEqual(trainer.dataloader.bsz, 2)
+    self.assertEqual(trainer.dataloader.img_size, 1024)
+    self.assertEqual(trainer.dataloader.max_t5_len, 512)
+    self.assertIsNone(trainer.autoencoder)
+    self.assertIsNone(trainer.clip_encoder)
+    self.assertIsNone(trainer.t5_encoder)
+
+
 if __name__ == "__main__":
   absltest.main()
+

@@ -455,6 +455,7 @@ class TpuGraphTrainer(GraphTrainer):
         # gradient, so add it only once.
         seen: set[int] = set()
         new_params, new_grads = [], []
+        assigned: set[int] = set()
         # Keyed by grad type: one foreach call cannot mix DTensor and Tensor.
         to_add: dict[type, tuple[list, list]] = {}
         for param, grad in zip(params, grads, strict=True):
@@ -462,6 +463,11 @@ class TpuGraphTrainer(GraphTrainer):
                 continue
             seen.add(id(param))
             if param.grad is None:
+                # The graph can return one tensor as two params' grads; each
+                # param needs its own, or the next add lands in both.
+                if id(grad) in assigned:
+                    grad = grad.clone()
+                assigned.add(id(grad))
                 new_params.append(param)
                 new_grads.append(grad)
             else:

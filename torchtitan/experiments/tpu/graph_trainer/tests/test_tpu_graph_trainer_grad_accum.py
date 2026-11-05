@@ -15,6 +15,7 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.graph_trainer.tests.test_tpu_graph_trainer_unit_tpu import (
+    _eager_grads,
     _run_grad_accum_step,
     _traced_trainer,
 )
@@ -39,6 +40,18 @@ class _ShardedModel(nn.Module):
     linear = self.linear.redistribute(placements=[Replicate()]).to_local()
     h = torch.relu(F.embedding(x, embed) @ linear.T) * self.scale
     return h @ embed.T
+
+
+class _SharedGradModel(nn.Module):
+  """a and b get the same grad tensor back from the traced step."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.a = nn.Parameter(torch.randn(128, 128))
+    self.b = nn.Parameter(torch.randn(128, 128))
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return F.embedding(x, self.a + self.b)
 
 
 def _full(t: torch.Tensor) -> torch.Tensor:
@@ -74,6 +87,22 @@ class GradAccumulationTest(absltest.TestCase):
       torch.testing.assert_close(
           _full(got.grad), _full(want.grad), rtol=1e-5, atol=1e-6, msg=name
       )
+
+  def test_params_sharing_one_grad_tensor_match_full_batch(self) -> None:
+    """Two params handed one grad tensor each sum it once per microbatch."""
+    model = _SharedGradModel()
+    inputs = torch.randint(0, 128, (4, 16))
+    labels = torch.randint(0, 128, (4, 16))
+    expected = _eager_grads(model, inputs, labels)
+
+    trainer = _traced_trainer(
+        model, inputs[:2], labels[:2], torch.tensor(float(labels.numel()))
+    )
+    grad_a, grad_b = trainer._traced_step.gm.graph.output_node().args[0][1:3]
+    self.assertIs(grad_a, grad_b, "the traced graph no longer aliases grads")
+    _run_grad_accum_step(trainer, model, inputs, labels, 2)
+    for (name, p), want in zip(model.named_parameters(), expected, strict=True):
+      torch.testing.assert_close(p.grad, want, rtol=1e-5, atol=1e-6, msg=name)
 
   def test_in_graph_optimizer_rejects_grad_accumulation(self) -> None:
     config = ConfigManager().parse_args([

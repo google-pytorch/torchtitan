@@ -378,7 +378,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         )
         for _ in range(2)
     ]
-    # The trainer zeroes in place by default (set_to_none=False).
+    # The TPU lane sets grads to None (set_to_none=True); test both modes.
     for set_to_none in (False, True):
       model = self._tied_model()
       trainer = _traced_trainer(

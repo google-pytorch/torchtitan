@@ -61,7 +61,7 @@ EXCLUDED_DIR_NAMES = {
 DISABLED_TESTS = {
     "torchtitan.experiments.tpu.kernels.tests.test_segment_matmul",
     # RL Ray non-colocated tests (require multi-host Ray TPU cluster)
-    "torchtitan.experiments.tpu.rl_nc_ray.tests.test_mini_rl",
+    "torchtitan.experiments.tpu.rl_nc_ray.tests.test_mini_rl_tpu",
     "torchtitan.experiments.tpu.rl_nc_ray.tests.test_varlen_attn_tpu",
     # TODO: add copybara handling for this test
     "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism_distributed",

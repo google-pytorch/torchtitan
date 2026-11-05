@@ -66,16 +66,23 @@ def apply_ep_chunk_barrier_pass(
     by_layer_phase: dict[tuple[int, bool], dict[int, list[torch.fx.Node]]] = (
         defaultdict(lambda: defaultdict(list))
     )
+    # Unchunked nodes of each (layer, phase) in graph order: the only
+    # candidates for "completed after chunk k - W", so each chunk scans its own
+    # layer's bucket instead of the whole joint graph.
+    unchunked: dict[tuple[int, bool], list[torch.fx.Node]] = defaultdict(list)
     for node in nodes:
         if node.op != "call_function":
-            continue
-        cidx = _chunk_idx(node)
-        if cidx is None:
             continue
         layer_id = _get_layer_id(node)
         if layer_id < 0:
             continue
-        by_layer_phase[(layer_id, _is_backward_node(node))][cidx].append(node)
+        key = (layer_id, _is_backward_node(node))
+        cidx = _chunk_idx(node)
+        if cidx is None:
+            if node.all_input_nodes:
+                unchunked[key].append(node)
+            continue
+        by_layer_phase[key][cidx].append(node)
 
     if not by_layer_phase:
         return gm
@@ -112,18 +119,11 @@ def apply_ep_chunk_barrier_pass(
             completed_curr: set[torch.fx.Node] = set().union(
                 *ordered_chunks[: seq_pos - max_inflight + 1]
             )
-            for candidate in nodes[:first_curr_pos]:
-                if (
-                    candidate not in completed_curr
-                    and candidate.op == "call_function"
-                    and _is_backward_node(candidate) == is_bwd
-                    and _get_layer_id(candidate) == layer_id
-                    and _chunk_idx(candidate) is None
-                    and bool(candidate.all_input_nodes)
-                    and all(
-                        inp in completed_curr
-                        for inp in candidate.all_input_nodes
-                    )
+            for candidate in unchunked[(layer_id, is_bwd)]:
+                if order[candidate] >= first_curr_pos:
+                    break
+                if candidate not in completed_curr and all(
+                    inp in completed_curr for inp in candidate.all_input_nodes
                 ):
                     completed_curr.add(candidate)
 

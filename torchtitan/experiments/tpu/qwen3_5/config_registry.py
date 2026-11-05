@@ -6,7 +6,6 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
-from torchtitan.config import derive
 from torchtitan.config.configs import (
     CommConfig,
     CompileConfig,
@@ -37,7 +36,6 @@ from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher as qwen35_token_
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
-    TpuRoutedExperts,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
@@ -46,8 +44,6 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
-from torchtitan.models.common.moe import RoutedExperts
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 _TPU_MOE_CONVERTERS = [
     TpuTokenDispatcherConverter.Config(),
@@ -275,7 +271,7 @@ def _use_expert_parallel(
     cfg.tpu_config.eager_mode = "DEFER_AND_FUSE"
 
   resolved_chunks = (
-      max(4, min(ep_degree, 16))
+      qwen35_token_dispatcher.default_num_token_chunks(ep_degree)
       if num_token_chunks is None
       else num_token_chunks
   )
@@ -287,45 +283,16 @@ def _use_expert_parallel(
       experts.allow_ep_paired_grouped_mm = allow_ep_paired_grouped_mm
       if not allow_ep_paired_grouped_mm:
         experts.use_pallas_paired_grouped_mm = False
-    for _, routed, parent, field_name in list(
-        model_cfg.traverse(RoutedExperts.Config)
-    ):
-      if type(routed) in (  # pylint: disable=unidiomatic-typecheck
-          RoutedExperts.Config,
-          TpuRoutedExperts.Config,
-      ):
-        routed = derive(
-            routed, qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
-        )
-        if isinstance(parent, list):
-          parent[field_name] = routed
-        else:
-          setattr(parent, field_name, routed)
-      if isinstance(
-          routed, qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
-      ):
-        routed.num_token_chunks = resolved_chunks
-        routed.auto_scale_token_chunks = auto_scale_chunks
-    for _, dispatcher, parent, field_name in list(
-        model_cfg.traverse(AllToAllTokenDispatcher.Config)
-    ):
-      if type(dispatcher) in (  # pylint: disable=unidiomatic-typecheck
-          AllToAllTokenDispatcher.Config,
-          TpuAllToAllTokenDispatcher.Config,
-      ):
-        dispatcher = derive(
-            dispatcher, qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
-        )
-        if isinstance(parent, list):
-          parent[field_name] = dispatcher
-        else:
-          setattr(parent, field_name, dispatcher)
-      if isinstance(
-          dispatcher, qwen35_token_dispatcher.TpuQwen35TokenDispatcher.Config
-      ):
-        dispatcher.comm_mode = comm_mode
-        dispatcher.roe_use_pallas_tc = roe_use_pallas_tc
-        dispatcher.roe_weights_on_activation = roe_weights_on_activation
+    routed_cfgs, dispatcher_cfgs = qwen35_token_dispatcher.use_ep_modules(
+        model_cfg
+    )
+    for routed in routed_cfgs:
+      routed.num_token_chunks = resolved_chunks
+      routed.auto_scale_token_chunks = auto_scale_chunks
+    for dispatcher in dispatcher_cfgs:
+      dispatcher.comm_mode = comm_mode
+      dispatcher.roe_use_pallas_tc = roe_use_pallas_tc
+      dispatcher.roe_weights_on_activation = roe_weights_on_activation
 
   if enable_sparsecore_offload:
     cfg.libtpu_init_flags = tpu_flags.merge_flags(
@@ -531,6 +498,11 @@ def qwen35_moe_35b_split_tokamax_benchmark(
   (without packed-document resets), Pallas paired grouped matmuls for the
   experts, Splash attention, and the Pallas fused linear cross-entropy. 32K
   tokens per rank (16 sequences of 2048).
+
+  Args:
+    flavor: Model flavor. The 397B-A17B EP recipe reuses this base with
+      `"397B-A17B"` (60 layers, 512 experts) and then overrides the batch,
+      dtypes and parallelism.
   """
   base_cfg = qwen35_moe_35b(flavor)
   base_cfg.dataloader = c4_test_dataloader()

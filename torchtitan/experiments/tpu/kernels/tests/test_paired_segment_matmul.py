@@ -300,7 +300,7 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             )
 
     def test_padded_tail_rows_with_nans_are_ignored(self):
-        """Rows past sum(group_sizes) (partial boundary tile + tail tiles) are ignored."""
+        """Rows past sum(group_sizes) (boundary and tail tiles) are ignored."""
         device = self.accelerator_device
         group_sizes = torch.tensor([0, 91, 45, 0], dtype=torch.int32)
         valid_m = int(group_sizes.sum().item())  # 136: 1 full tile + 8 rows of tile 1

@@ -31,7 +31,7 @@ collectives.
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Literal
+from typing import get_args, Literal
 import weakref
 
 import torch
@@ -43,6 +43,7 @@ from torch.distributed._functional_collectives import (
 )
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.fx.traceback import annotate, annotate_fn
+import torchtitan.config
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.experiments.tpu.remat_regions import (
     MOE_EP_DISPATCH,
@@ -56,11 +57,13 @@ from torchtitan.experiments.tpu.token_dispatcher import (
     scale_route_weights,
     stable_grouped_reduce,
 )
-from torchtitan.models.common.moe import _tokens_per_expert
+from torchtitan.models.common.moe import _tokens_per_expert, RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
+    AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
+from torchtitan.tools.logging import logger
 
 CommMode = Literal["auto", "ring_of_experts", "ragged_all_to_all"]
 
@@ -79,9 +82,10 @@ def _ep_all_gather_impl(
 ) -> torch.Tensor:
   """All-gathers ``operand`` along dim 0 over ``ep_mesh``.
 
-  On TPU, uses ``torch.tpu.ops.all_gather_dim`` (``tpu::_all_gather_dim``) so
-  ``GraphTrainer``'s FSDP bucketing pass (``_collect_bucketed_fsdp_comms``)
-  never misclassifies EP activation collectives as FSDP weight collectives.
+  On TPU, uses SparseCore ``torch.tpu.ops.all_gather_dim``. GraphTrainer's
+  FSDP passes classify collectives by role (parameter gather / gradient
+  reduction), so these activation collectives are left in place; that is also
+  why EP needs ``backward_partition_mode="by_layer"``.
   """
   src = operand.detach().contiguous()
   if ep_mesh is None:
@@ -93,6 +97,8 @@ def _ep_all_gather_impl(
     return torch.tpu.ops.all_gather_dim(src, 0, group=pg)
   if pg is not None:
     return _wait(all_gather_single(src, gather_dim=0, group=ep_mesh))
+  # No process group: single-process test stand-in in which every EP rank
+  # holds the same shard.
   return src.repeat(ep_size, *([1] * (src.ndim - 1)))
 
 
@@ -114,6 +120,7 @@ def _ep_reduce_scatter_sum_impl(
     return _wait(
         reduce_scatter_single(src, reduceOp="sum", scatter_dim=0, group=ep_mesh)
     )
+  # No process group: single-process test stand-in (see `_ep_all_gather_impl`).
   chunk = src.shape[0] // ep_size
   return src.view(ep_size, chunk, *src.shape[1:]).sum(dim=0)
 
@@ -392,6 +399,11 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
 
   def __init__(self, config: Config):
     super().__init__(config)
+    if config.comm_mode not in get_args(CommMode):
+      raise ValueError(
+          f"comm_mode must be one of {get_args(CommMode)}, got"
+          f" {config.comm_mode!r}"
+      )
     self.comm_mode: CommMode = config.comm_mode
     self.roe_use_pallas_tc = config.roe_use_pallas_tc
     self.roe_gather_block_size = config.roe_gather_block_size
@@ -553,6 +565,10 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
           ids_i32_TK = topk_expert_ids_TK.to(torch.int32).contiguous()
           with annotate_region(MOE_ROUTING):
             ids_all_GK = _ep_all_gather_impl(ids_i32_TK, self.ep_mesh, pg)
+          # TODO: `roe_compute_routing` (packed sort + gather/reduce metadata)
+          # is outside `moe.routing`, so `tpu_selective` recomputes it in
+          # backward for every chunk. Saving it trades that compute for HBM,
+          # which is tight at 397B 24K tokens/rank; measure before moving it.
           routing_tuple = roe_compute_routing(
               ids_all_GK.reshape(-1),
               rank_idx_i32,
@@ -960,6 +976,7 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
       )
     self.num_token_chunks = config.num_token_chunks
     self.max_inflight_chunks = config.max_inflight_chunks
+    self._warned_chunk_snap: set[tuple[int, int]] = set()
 
   def forward(
       self,
@@ -976,6 +993,15 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
           for d in range(min(num_chunks, num_tokens), 0, -1)
           if num_tokens % d == 0
       )
+      if (num_tokens, num_chunks) not in self._warned_chunk_snap:
+        self._warned_chunk_snap.add((num_tokens, num_chunks))
+        logger.warning(
+            "%d tokens are not divisible by num_token_chunks=%d; using %d"
+            " chunks (fewer chunks keep more EP buffers live).",
+            num_tokens,
+            self.num_token_chunks,
+            num_chunks,
+        )
     ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
     weights_on_activation = (
         ep_mesh is not None
@@ -995,6 +1021,11 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
           num_local_tokens_per_expert_E,
       )
 
+    if self.scale_before_down_proj:
+      raise ValueError(
+          "scale_before_down_proj requires EP=1 local dispatch; under EP use"
+          " roe_weights_on_activation instead"
+      )
     needs_chunk_counts = True
     if isinstance(self.token_dispatcher, TpuQwen35TokenDispatcher):
       needs_chunk_counts = (
@@ -1011,6 +1042,10 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
           num_local_tokens_per_expert_E,
           unshard_only=True,
       )
+    if getattr(self.inner_experts, "use_pallas_grouped_mm", False):
+      # The Pallas expert matmuls run in BF16: cast FP32 master weights once
+      # here rather than once per chunk.
+      unsharded_weights = tuple(w.bfloat16() for w in unsharded_weights)
 
     x_chunks = x_TD.chunk(num_chunks, dim=0)
     score_chunks = topk_scores_TK.chunk(num_chunks, dim=0)
@@ -1051,3 +1086,54 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
             self.token_dispatcher.combine(routed_output_c, metadata_c, x_c)
         )
     return torch.cat(out_chunks, dim=0)
+
+
+def default_num_token_chunks(ep_degree: int) -> int:
+  """Default EP sequence chunks per MoE layer: ``ep_degree`` clamped to 4..16."""
+  return max(4, min(ep_degree, 16))
+
+
+def use_ep_modules(
+    model_cfg,
+) -> tuple[
+    list[TpuQwen35RoutedExperts.Config], list[TpuQwen35TokenDispatcher.Config]
+]:
+  """Swaps in the dropless EP routed experts and token dispatchers, in place.
+
+  Plain and TPU ``RoutedExperts`` / all-to-all dispatcher configs are replaced
+  with ``TpuQwen35RoutedExperts`` / ``TpuQwen35TokenDispatcher``; other
+  subclasses are left alone (they keep their own dispatch).
+
+  Returns:
+    Every ``TpuQwen35RoutedExperts.Config`` and ``TpuQwen35TokenDispatcher.Config``
+    in ``model_cfg`` after the swap.
+  """
+  for cfg_type, new_type, swap_types in (
+      (
+          RoutedExperts.Config,
+          TpuQwen35RoutedExperts.Config,
+          (RoutedExperts.Config, TpuRoutedExperts.Config),
+      ),
+      (
+          AllToAllTokenDispatcher.Config,
+          TpuQwen35TokenDispatcher.Config,
+          (AllToAllTokenDispatcher.Config, TpuAllToAllTokenDispatcher.Config),
+      ),
+  ):
+    for _, sub_cfg, parent, field_name in list(model_cfg.traverse(cfg_type)):
+      if type(sub_cfg) not in swap_types:  # pylint: disable=unidiomatic-typecheck
+        continue
+      new_cfg = torchtitan.config.derive(sub_cfg, new_type)
+      if isinstance(parent, list):
+        parent[field_name] = new_cfg
+      else:
+        setattr(parent, field_name, new_cfg)
+  routed = [
+      cfg
+      for _, cfg, _, _ in model_cfg.traverse(TpuQwen35RoutedExperts.Config)
+  ]
+  dispatchers = [
+      cfg
+      for _, cfg, _, _ in model_cfg.traverse(TpuQwen35TokenDispatcher.Config)
+  ]
+  return routed, dispatchers

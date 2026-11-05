@@ -3,19 +3,13 @@
 from dataclasses import dataclass
 
 import torch
-import torchtitan.config
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
-from torchtitan.experiments.tpu.token_dispatcher import (
-    TpuAllToAllTokenDispatcher,
-    TpuRoutedExperts,
-)
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.common.moe import MoE, RoutedExperts
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
 
@@ -163,41 +157,12 @@ class TpuQwen35Model(Qwen35Model):
         for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
           if not experts.allow_ep_paired_grouped_mm:
             experts.use_pallas_paired_grouped_mm = False
-        for _, routed, parent, field_name in list(
-            self.traverse(RoutedExperts.Config)
-        ):
-          if type(routed) in (  # pylint: disable=unidiomatic-typecheck
-              RoutedExperts.Config,
-              TpuRoutedExperts.Config,
-          ):
-            routed = torchtitan.config.derive(
-                routed,
-                token_dispatcher.TpuQwen35RoutedExperts.Config,
+        routed_cfgs, _ = token_dispatcher.use_ep_modules(self)
+        for routed in routed_cfgs:
+          if routed.auto_scale_token_chunks:
+            routed.num_token_chunks = token_dispatcher.default_num_token_chunks(
+                ep_deg
             )
-            if isinstance(parent, list):
-              parent[field_name] = routed
-            else:
-              setattr(parent, field_name, routed)
-          if (
-              isinstance(routed, token_dispatcher.TpuQwen35RoutedExperts.Config)
-              and routed.auto_scale_token_chunks
-          ):
-            routed.num_token_chunks = max(4, min(ep_deg, 16))
-        for _, dispatcher, parent, field_name in list(
-            self.traverse(AllToAllTokenDispatcher.Config)
-        ):
-          if type(dispatcher) in (  # pylint: disable=unidiomatic-typecheck
-              AllToAllTokenDispatcher.Config,
-              TpuAllToAllTokenDispatcher.Config,
-          ):
-            ep_dispatcher = torchtitan.config.derive(
-                dispatcher,
-                token_dispatcher.TpuQwen35TokenDispatcher.Config,
-            )
-            if isinstance(parent, list):
-              parent[field_name] = ep_dispatcher
-            else:
-              setattr(parent, field_name, ep_dispatcher)
 
   def _init_self_buffers(
       self, *, buffer_device: torch.device | None = None

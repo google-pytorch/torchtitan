@@ -34,6 +34,9 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
+from torchtitan.experiments.tpu.graph_trainer.passes.fp32_expert_dweight import (
+    apply_fp32_expert_dweight_pass,
+)
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_fsdp_rs_deadline_schedule,
     apply_tpu_remat_fsdp_all_gather_schedule,
@@ -531,6 +534,8 @@ def construct_tpu_transform_passes(
     split mode compiles each resulting child graph independently.
     """
     passes: list[Callable] = [remove_parameter_gradient_markers_pass]
+    if config.compile.fp32_expert_dweight:
+        passes.append(apply_fp32_expert_dweight_pass)
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
     fsdp_barrier_policy = config.compile.fsdp_barrier_policy

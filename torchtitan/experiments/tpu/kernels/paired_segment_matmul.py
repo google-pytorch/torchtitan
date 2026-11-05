@@ -271,29 +271,41 @@ def _dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
     return _accumulate_dinput(dout3, rhs3, grad_lhs, group_sizes, tile_m=tile_m)
 
 
-def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
-    """Traverse each expert's routed rows once to produce two weight grads.
+def grouped_dweight(
+    lhs, douts, group_sizes, *, tile_m, tile_k=0, out_dtype=jnp.bfloat16, name
+):
+    """Traverse each expert's routed rows once to produce one dWeight per dout.
 
     This follows upstream MegaBlox TGMM's structure: use its group metadata,
     visit tiles in expert order, reset the accumulator on an expert's first
     tile, mask partial boundary tiles, and store on its final tile. The only
-    material extension is carrying two dOutput operands and two FP32
-    accumulators, duplicating the dot and store within one traversal so both
+    material extension is carrying several dOutput operands and FP32
+    accumulators, duplicating the dot and store within one traversal so all
     gradients share the lhs load and metadata work. Empty experts are visited
     so every output slab is written.
+
+    ``out_dtype=jnp.float32`` stores the same BF16-rounded values widened to
+    FP32, for an FP32 consumer that would otherwise widen a BF16 result in a
+    separate pass. The FP32 output blocks then serve as the accumulators.
     """
     if tile_m <= 0:
         raise ValueError("tile_m must be positive")
-    if dout1.shape != dout3.shape or lhs.shape[0] != dout1.shape[0]:
+    if any(d.shape != douts[0].shape for d in douts) or (
+        lhs.shape[0] != douts[0].shape[0]
+    ):
         raise ValueError("Invalid paired dWeight dimensions")
+    if out_dtype not in (jnp.bfloat16, jnp.float32):
+        raise ValueError("dWeight output must be bfloat16 or float32")
     m, k = lhs.shape
-    n = dout1.shape[1]
+    n = douts[0].shape[1]
+    num_douts = len(douts)
     groups = group_sizes.shape[0]
     if m % tile_m:
         raise ValueError("The total row count must be divisible by tile_m")
     tile_k = tile_k or k
     if tile_k <= 0 or k % tile_k:
         raise ValueError("tile_k must divide K")
+    accumulate_in_out = out_dtype == jnp.float32
     group_metadata, num_active_tiles = _metadata(
         group_sizes,
         m=m,
@@ -303,18 +315,11 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     )
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    def kernel(
-        group_metadata,
-        group_offset,
-        lhs,
-        dout1,
-        dout3,
-        out1,
-        out3,
-        acc1,
-        acc3,
-    ):
+    def kernel(group_metadata, group_offset, lhs, *refs):
         del group_offset
+        douts = refs[:num_douts]
+        outs = refs[num_douts : 2 * num_douts]
+        accs = outs if accumulate_in_out else refs[2 * num_douts :]
         # Grid axis 1 walks the K slabs; each slab replays the full row
         # traversal below with its own accumulator, so nothing here depends
         # on the slab index except the block specs.
@@ -328,8 +333,8 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
 
         @pl.when(group_has_changed)
         def _zero_accumulators():
-            acc1[...] = jnp.zeros_like(acc1)
-            acc3[...] = jnp.zeros_like(acc3)
+            for acc in accs:
+                acc[...] = jnp.zeros_like(acc)
 
         group_has_rows = (
             _get_group_size(grid_id=grid_id, group_metadata=group_metadata) > 0
@@ -354,31 +359,21 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
                 lhs[...],
                 jnp.zeros_like(lhs),
             )
-            loaded_dout1 = lax.select(
-                dout_mask[...],
-                dout1[...],
-                jnp.zeros_like(dout1),
-            )
-            loaded_dout3 = lax.select(
-                dout_mask[...],
-                dout3[...],
-                jnp.zeros_like(dout3),
-            )
-            # All three inputs are already BF16. Mask them without a
+            # All inputs are already BF16. Mask them without a
             # BF16->FP32->BF16 round trip, and contract the row dimensions
             # directly instead of transposing lhs only to express X.T @ dY.
-            acc1[...] += lax.dot_general(
-                loaded_lhs,
-                loaded_dout1,
-                preferred_element_type=jnp.float32,
-                dimension_numbers=(((0,), (0,)), ((), ())),
-            )
-            acc3[...] += lax.dot_general(
-                loaded_lhs,
-                loaded_dout3,
-                preferred_element_type=jnp.float32,
-                dimension_numbers=(((0,), (0,)), ((), ())),
-            )
+            for dout, acc in zip(douts, accs):
+                loaded_dout = lax.select(
+                    dout_mask[...],
+                    dout[...],
+                    jnp.zeros_like(dout),
+                )
+                acc[...] += lax.dot_general(
+                    loaded_lhs,
+                    loaded_dout,
+                    preferred_element_type=jnp.float32,
+                    dimension_numbers=(((0,), (0,)), ((), ())),
+                )
 
         is_last_grid_id = grid_id == pl.num_programs(2) - 1
         next_grid_id = jnp.where(is_last_grid_id, grid_id, grid_id + 1)
@@ -388,8 +383,8 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
 
         @pl.when(group_is_changing)
         def _store_accumulators():
-            out1[...] = acc1[...].astype(jnp.bfloat16)
-            out3[...] = acc3[...].astype(jnp.bfloat16)
+            for acc, out in zip(accs, outs):
+                out[...] = acc[...].astype(jnp.bfloat16).astype(out_dtype)
 
     def lhs_indices(n_i, k_i, grid_id, group_metadata, group_offset):
         del n_i, group_offset
@@ -408,25 +403,37 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     out_spec = pl.BlockSpec((None, tile_k, n), out_indices)
     return pl.pallas_call(
         kernel,
-        out_shape=[
-            jax.ShapeDtypeStruct((groups, k, n), jnp.bfloat16),
-            jax.ShapeDtypeStruct((groups, k, n), jnp.bfloat16),
-        ],
+        out_shape=[jax.ShapeDtypeStruct((groups, k, n), out_dtype)] * num_douts,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=[lhs_spec, dout_spec, dout_spec],
-            out_specs=[out_spec, out_spec],
+            in_specs=[lhs_spec] + [dout_spec] * num_douts,
+            out_specs=[out_spec] * num_douts,
             grid=(1, k // tile_k, num_active_tiles),
-            scratch_shapes=[
-                pltpu.VMEM((tile_k, n), jnp.float32),
-                pltpu.VMEM((tile_k, n), jnp.float32),
-            ],
+            scratch_shapes=(
+                []
+                if accumulate_in_out
+                else [pltpu.VMEM((tile_k, n), jnp.float32)] * num_douts
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary")
         ),
+        name=name,
+    )(group_metadata, group_offset, lhs, *douts)
+
+
+def _paired_dweight(
+    lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0, out_dtype=jnp.bfloat16
+):
+    return grouped_dweight(
+        lhs,
+        (dout1, dout3),
+        group_sizes,
+        tile_m=tile_m,
+        tile_k=tile_k,
+        out_dtype=out_dtype,
         name="moe_tgmm_w13_wgrad",
-    )(group_metadata, group_offset, lhs, dout1, dout3)
+    )
 
 
 @pallas.jax_op("tt_experts::paired_grouped_mm")
@@ -460,6 +467,39 @@ def _paired_grouped_mm_bwd(
     )
     grad_rhs1, grad_rhs3 = _paired_dweight(
         lhs, dout1, dout3, group_sizes, tile_m=tgmm_tile_m, tile_k=tgmm_tile_k
+    )
+    return grad_lhs, grad_rhs1, grad_rhs3
+
+
+@pallas.jax_op("tt_experts::paired_grouped_mm_bwd_fp32_dweight")
+def _paired_grouped_mm_bwd_fp32_dweight(
+    dout1: jax.Array,
+    dout3: jax.Array,
+    lhs: jax.Array,
+    rhs1: jax.Array,
+    rhs3: jax.Array,
+    group_sizes: jax.Array,
+    tile_m: int,
+    tgmm_tile_m: int,
+    tgmm_tile_k: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``paired_grouped_mm_bwd`` with the BF16-rounded dWeights stored as FP32.
+
+    Autograd never selects this op: it would round the FP32 dWeights back to
+    the BF16 weight dtype. The FP32-dWeight graph pass swaps it in where that
+    rounding is immediately undone by an FP32 widening.
+    """
+    grad_lhs = _dinput(
+        dout1, dout3, rhs1, rhs3, group_sizes, tile_m=tile_m
+    )
+    grad_rhs1, grad_rhs3 = _paired_dweight(
+        lhs,
+        dout1,
+        dout3,
+        group_sizes,
+        tile_m=tgmm_tile_m,
+        tile_k=tgmm_tile_k,
+        out_dtype=jnp.float32,
     )
     return grad_lhs, grad_rhs1, grad_rhs3
 

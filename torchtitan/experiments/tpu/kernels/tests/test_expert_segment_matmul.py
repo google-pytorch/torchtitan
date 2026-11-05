@@ -105,6 +105,34 @@ class ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             atol=1e-3,
         )
 
+    def test_fp32_dweight_widens_the_bf16_dweight_bit_for_bit(self):
+        """Both layouts, a masked multi-tile jagged routing, and empty experts."""
+        device = self.accelerator_device
+        generator = torch.Generator().manual_seed(0)
+        group_sizes = torch.tensor(
+            [37, 0, 219, 12, 0, 244], dtype=torch.int32, device=device
+        )
+        m, k, n = 512, 256, 384
+
+        def randn(*shape):
+            return torch.randn(shape, generator=generator).bfloat16().to(device)
+
+        lhs, dout = randn(m, k), randn(m, n)
+        for transpose_rhs, rhs, tgmm_tiling in (
+            (False, randn(6, k, n), (128, 128, 0)),
+            (True, randn(6, n, k), (128, 0, 128)),
+        ):
+            args = (dout, lhs, rhs, group_sizes, 128, 0, 0, *tgmm_tiling)
+            want_lhs, want_rhs = expert_segment_matmul._grouped_mm_bwd(
+                *args, transpose_rhs
+            )
+            got_lhs, got_rhs = expert_segment_matmul._grouped_mm_bwd_fp32_dweight(
+                *args, transpose_rhs
+            )
+            self.assertEqual(got_rhs.dtype, torch.float32)
+            torch.testing.assert_close(got_lhs, want_lhs, rtol=0, atol=0)
+            torch.testing.assert_close(got_rhs, want_rhs.float(), rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     absltest.main()

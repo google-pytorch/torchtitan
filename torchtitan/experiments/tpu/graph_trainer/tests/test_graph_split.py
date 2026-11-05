@@ -1,5 +1,6 @@
 import functools
 import itertools
+import operator
 from types import SimpleNamespace
 from unittest import mock
 
@@ -50,6 +51,9 @@ from torchtitan.experiments.tpu.graph_trainer import simple_fsdp as tpu_simple_f
 from torchtitan.experiments.tpu.graph_trainer.passes import (
     expert_all_gathers_under_splash as under_splash_lib,
 )
+from torchtitan.experiments.tpu.graph_trainer.passes.fp32_expert_dweight import (
+    apply_fp32_expert_dweight_pass,
+)
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
     split_forward_graph_by_layer,
@@ -66,6 +70,13 @@ from torchtitan.experiments.tpu.graph_trainer.tests.test_tpu_memory_policy impor
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
     thread_host_offload_donors,
 )
+from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
+    segment_matmul_pallas_2d,
+)
+from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
+    paired_segment_matmul_pallas_2d,
+)
+from torch_tpu._internal.pallas import pallas as pallas_lib
 
 
 if not hasattr(torch.ops.tpu, "_all_gather_dim"):
@@ -212,6 +223,50 @@ class _RoutedMoEToy(_MoEToy):
             for _ in range(n_layers)
         )
     )
+
+
+class _PallasExpertLayer(nn.Module):
+  """Paired W1/W3 and W2 Pallas expert matmuls, W2 optionally transposed."""
+
+  def __init__(self, transpose_w2: bool) -> None:
+    super().__init__()
+    self.transpose_w2 = transpose_w2
+    self.w1 = nn.Parameter(torch.randn(4, 256, 128))
+    self.w3 = nn.Parameter(torch.randn(4, 256, 128))
+    self.w2 = nn.Parameter(torch.randn(4, 128, 256))
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    rows = inputs.reshape(1, 16).repeat(256, 16)
+    group_sizes = torch.full((4,), 64, dtype=torch.int32)
+    gate, up = paired_segment_matmul_pallas_2d(
+        rows, self.w1, self.w3, group_sizes, tile_m=128, tgmm_tile_m=128
+    )
+    w2 = self.w2.transpose(-2, -1) if self.transpose_w2 else self.w2
+    out = segment_matmul_pallas_2d(
+        torch.relu(gate) * up,
+        w2,
+        group_sizes,
+        tile_m=128,
+        tgmm_tiling=(128, 0, 0),
+        transpose_rhs=self.transpose_w2,
+    )
+    return out.reshape(2, 8, -1).sum(-1)
+
+
+class _PallasExpertToy(_ToyTransformer):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__(n_layers)
+    self.layers = nn.ModuleList(
+        _PallasExpertLayer(transpose_w2=i % 2 == 0) for i in range(n_layers)
+    )
+
+
+def _cpu_pallas_placeholder(array, mesh=None, partition_spec=None):
+  del mesh, partition_spec
+  return torch.empty(
+      array.shape, dtype=pallas_lib.JAX_TO_TORCH_DTYPE_MAP[array.dtype]
+  )
 
 
 class GraphSplitTest(absltest.TestCase):
@@ -863,6 +918,52 @@ class GraphSplitTest(absltest.TestCase):
       for anchor in top_k_ids:
         self.assertEqual(_get_layer_id(anchor), 1)
         self.assertIs(anchor.args[0].target, torch.ops.aten.topk.default)
+
+  def test_fp32_expert_dweight(self):
+    """FP32 reductions take the expert dWeights straight from the kernels."""
+    fp32_ops = (
+        torch.ops.tt_experts.paired_grouped_mm_bwd_fp32_dweight.default,
+        torch.ops.tt_experts.grouped_mm_bwd_fp32_dweight.default,
+    )
+    reductions = (
+        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        torch.ops.tpu._reduce_scatter_dim.default,
+    )
+
+    def check(gm: torch.fx.GraphModule, rewrites: int) -> None:
+      apply_fp32_expert_dweight_pass(gm, ())
+      rewritten = [n for n in gm.graph.nodes if n.target in fp32_ops]
+      self.assertLen(rewritten, rewrites)
+      for node in gm.graph.nodes:
+        if node.target in reductions and rewrites:
+          self.assertEqual(node.args[0].meta["val"].dtype, torch.float32)
+      for dweight in (u for n in rewritten for u in n.users if u.args[1] > 0):
+        # The FP32 dWeight reaches its consumer through views alone.
+        while getattr(dweight.target, "is_view", False) or (
+            dweight.target is operator.getitem
+        ):
+          self.assertEqual(dweight.meta["val"].dtype, torch.float32)
+          (dweight,) = dweight.users
+        self.assertIsNot(dweight.target, torch.ops.aten._to_copy.default)
+
+    with mock.patch.object(
+        pallas_lib, "torch_placeholder", _cpu_pallas_placeholder
+    ):
+      # A paired and a W2 backward per layer; layer 0 has the transposed W2.
+      for dim_collectives in (False, True):
+        self._trace_simple_fsdp(
+            n_layers=2,
+            model_cls=_PallasExpertToy,
+            dim_collectives=dim_collectives,
+            before_split=lambda gm: check(gm, 4),
+        )
+      # BF16 reductions consume the BF16 dWeights; nothing to rewrite.
+      self._trace_simple_fsdp(
+          n_layers=2,
+          model_cls=_PallasExpertToy,
+          reduce_dtype=torch.bfloat16,
+          before_split=lambda gm: check(gm, 0),
+      )
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

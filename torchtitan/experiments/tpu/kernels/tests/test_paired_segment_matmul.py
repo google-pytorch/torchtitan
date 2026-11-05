@@ -276,6 +276,35 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         )
         torch.testing.assert_close(got_lhs, want_lhs, rtol=0, atol=0)
 
+    def test_fp32_dweight_widens_the_bf16_dweight_bit_for_bit(self):
+        device = self.accelerator_device
+        generator = torch.Generator().manual_seed(0)
+        group_sizes = torch.tensor(
+            [37, 0, 219, 12, 0, 244], dtype=torch.int32, device=device
+        )
+        groups, m, k, n = 6, 512, 256, 384
+
+        def randn(*shape):
+            return torch.randn(shape, generator=generator).bfloat16().to(device)
+
+        args = (
+            randn(m, n),
+            randn(m, n),
+            randn(m, k),
+            randn(groups, k, n),
+            randn(groups, k, n),
+            group_sizes,
+            128,
+            128,
+            128,
+        )
+        want = paired_segment_matmul._paired_grouped_mm_bwd(*args)
+        got = paired_segment_matmul._paired_grouped_mm_bwd_fp32_dweight(*args)
+        torch.testing.assert_close(got[0], want[0], rtol=0, atol=0)
+        for got_rhs, want_rhs in zip(got[1:], want[1:]):
+            self.assertEqual(got_rhs.dtype, torch.float32)
+            torch.testing.assert_close(got_rhs, want_rhs.float(), rtol=0, atol=0)
+
     def test_rejects_k_tile_that_does_not_divide_k(self):
         device = self.accelerator_device
         lhs = torch.ones((128, 128), device=device, dtype=torch.bfloat16, requires_grad=True)

@@ -425,7 +425,8 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   # backward; v=640 divides the 248320 vocabulary (388 blocks). Requires bf16
   # activations and xla_tpu_scoped_vmem_limit_kib=65472 (~51.9 MiB VMEM
   # single-buffered; fp32 hidden states would need ~69.9 MiB). On one TPU7x
-  # core at 64K tokens: 564 vs 633 ms forward + backward with (1024, 512, 2048).
+  # core at 64K tokens (measured with 8 x 8192 tokens/rank): 564 vs 633 ms
+  # forward + backward with (1024, 512, 2048).
   _enable_pallas_cross_entropy(
       base_cfg, b_block_size=1024, h_block_size=2048, v_block_size=640
   )

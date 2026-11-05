@@ -137,9 +137,7 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
       self.assertEqual(calls[-1][1].get("buffer_count"), 1)
       self.assertEqual(log_info.call_count, 2)
       # Missing _calculate_bwd_vmem_bytes logs a warning once and keeps (2, 2).
-      with mock.patch.object(
-          kernel, "_calculate_bwd_vmem_bytes", None
-      ):
+      with mock.patch.object(kernel, "_calculate_bwd_vmem_bytes", None):
         linear_softmax_cross_entropy_loss._my_bwd(
             dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
         )

@@ -1986,8 +1986,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         out_tpu.cpu(), out_tpu_ref.cpu(), rtol=1e-2, atol=1e-2
     )
 
-  def test_tokamax_gated_delta_selective_remat_and_compile(self):
-    """Tests Tokamax KDA residual-list custom ops under torch.compile on TPU."""
+  def test_tokamax_gated_delta_compile_matches_eager(self):
+    """Tokamax KDA residual-list custom ops: torch.compile matches eager."""
     if (
         self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU
         or not tokamax_gated_delta.supports_current_tpu()

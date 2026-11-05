@@ -54,14 +54,18 @@ def _tpu_generation() -> int | None:
   return gen
 
 
-def _vmem_limit_bytes() -> int:
+def _vmem_limit_bytes() -> int | None:
   """Scoped VMEM limit for both kernels: 90% of the core's VMEM.
 
   Set explicitly so the kernels do not depend on the caller's
   ``xla_tpu_scoped_vmem_limit_kib`` (the backward keeps several fp32
-  ``[seq_len, 128]`` strips live).
+  ``[seq_len, 128]`` strips live). Returns ``None`` when TPU device info is
+  unavailable (e.g. CPU shape evaluation).
   """
-  return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  try:
+    return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  except (AttributeError, RuntimeError, ValueError):
+    return None
 
 
 def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:

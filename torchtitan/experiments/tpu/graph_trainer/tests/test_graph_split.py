@@ -1,9 +1,11 @@
+import itertools
 from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -13,6 +15,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
+    _get_module_fqn,
     annotate_module_fqns,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
@@ -33,20 +36,65 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
+    ReplicateComputation,
 )
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
 
 # Importing `scan_fsdp` installs `_movedim_reduce_scatter_tensor` on `funcol`,
 # matching real `TpuGraphTrainer` runs.
 import torchtitan.experiments.tpu.graph_trainer.scan_fsdp  # pylint: disable=unused-import
+from torchtitan.experiments.tpu.graph_trainer import simple_fsdp as tpu_simple_fsdp
+from torchtitan.experiments.tpu.graph_trainer.passes import (
+    expert_all_gathers_under_splash as under_splash_lib,
+)
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
     split_forward_graph_by_layer,
     split_forward_backward_graph,
 )
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    _optimization_barrier,
+)
+from torchtitan.experiments.tpu.graph_trainer.tests.test_tpu_memory_policy import (
+    _SplashCore,
+    _STOCK_STYLE_SPLASH,
+)
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
     thread_host_offload_donors,
 )
+
+
+if not hasattr(torch.ops.tpu, "_all_gather_dim"):
+  # CPU stand-ins with TorchTPU's schemas, so SimpleFSDP traces its dim-d
+  # collectives off TPU.
+  def _all_gather_dim(
+      shard: torch.Tensor, dim: int, group_size: int, group_name: str
+  ) -> torch.Tensor:
+    return torch.cat([shard] * group_size, dim)
+
+  def _reduce_scatter_dim(
+      grad: torch.Tensor,
+      reduce_op: str,
+      dim: int,
+      group_size: int,
+      group_name: str,
+  ) -> torch.Tensor:
+    return grad.chunk(group_size, dim)[0].clone()
+
+  for _impl in (_all_gather_dim, _reduce_scatter_dim):
+    torch.library.custom_op(
+        f"tpu::{_impl.__name__}", mutates_args=()
+    )(_impl).register_fake(_impl)
+
+
+def _tpu_dim_replicate_compute(self, x):
+  return tpu_simple_fsdp.replicate_sharded_tensor(
+      x.to_local(),
+      group_name=self.device_mesh.get_group().group_name,
+      shard_dim=0,
+      param_dtype=self.param_dtype,
+      reduce_dtype=self.reduce_dtype,
+  )
 
 
 class _ToyTransformer(nn.Module):
@@ -130,11 +178,33 @@ class _RowFoldedToyTransformer(nn.Module):
     return inputs
 
 
+class _AttentionMoELayer(nn.Module):
+  """A decoder-like layer: a projection into a Splash-like op, then experts."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.attention = nn.Linear(8, 8, bias=False)
+    self.splash = _SplashCore(_STOCK_STYLE_SPLASH, model_layout=False)
+    self.moe = nn.Linear(8, 8, bias=False)
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    return torch.relu(self.moe(self.splash(self.attention(inputs))))
+
+
+class _AttentionMoEToy(_ToyTransformer):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__(n_layers)
+    self.layers = nn.ModuleList(_AttentionMoELayer() for _ in range(n_layers))
+
+
 class GraphSplitTest(absltest.TestCase):
 
-  def _build_toy_model(self, n_layers: int) -> _ToyTransformer:
+  def _build_toy_model(
+      self, n_layers: int, model_cls: type[nn.Module] = _ToyTransformer
+  ) -> nn.Module:
     """Build the shared prefix-plus-transformer-layer test model."""
-    model = _ToyTransformer(n_layers)
+    model = model_cls(n_layers)
     annotate_module_fqns(model)
     return model
 
@@ -168,6 +238,7 @@ class GraphSplitTest(absltest.TestCase):
       traced,
       *,
       fsdp_reshard_after_forward: str,
+      before_split=None,
   ):
     """Apply full remat, then split the real joint trace at fwd/bwd."""
     _full_memory_policy_pass(
@@ -181,6 +252,8 @@ class GraphSplitTest(absltest.TestCase):
         ),
     )
     selective_activation_remat_pass(traced.gm)
+    if before_split is not None:
+      before_split(traced.gm)
     return split_forward_backward_graph(traced.gm, traced.example_inputs)
 
   def _trace_simple_fsdp(
@@ -189,15 +262,51 @@ class GraphSplitTest(absltest.TestCase):
       n_layers: int,
       reduce_dtype: torch.dtype = torch.float32,
       fsdp_reshard_after_forward: str = "always",
+      model_cls: type[nn.Module] = _ToyTransformer,
+      before_split=None,
+      dim_collectives: bool = False,
   ):
-    """Trace the shared model through real SimpleFSDP with fake collectives."""
+    """Trace the shared model through real SimpleFSDP with fake collectives.
+
+    ``dim_collectives`` routes the gathers and reductions through TorchTPU's
+    dim-d collective ops, as at world 512.
+    """
+    if dim_collectives:
+      with (
+          mock.patch.object(
+              ReplicateComputation,
+              "replicate_compute",
+              _tpu_dim_replicate_compute,
+          ),
+          mock.patch.object(
+              tpu_simple_fsdp,
+              "_all_gather_on_dim",
+              lambda shard, dim, group: torch.ops.tpu._all_gather_dim(
+                  shard, dim, c10d._get_group_size_by_name(group), group
+              ),
+          ),
+          mock.patch.object(
+              tpu_simple_fsdp,
+              "_reduce_scatter_on_dim",
+              lambda grad, dim, group: torch.ops.tpu._reduce_scatter_dim(
+                  grad, "sum", dim, c10d._get_group_size_by_name(group), group
+              ),
+          ),
+      ):
+        return self._trace_simple_fsdp(
+            n_layers=n_layers,
+            reduce_dtype=reduce_dtype,
+            fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+            model_cls=model_cls,
+            before_split=before_split,
+        )
 
     self.assertFalse(dist.is_initialized())
     dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
     try:
       mesh = DeviceMesh("cpu", [0, 1])
       with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
-        model = self._build_toy_model(n_layers)
+        model = self._build_toy_model(n_layers, model_cls)
         model = data_parallel(
             model,
             device_mesh=mesh,
@@ -216,6 +325,7 @@ class GraphSplitTest(absltest.TestCase):
     return self._apply_passes_and_split(
         traced,
         fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+        before_split=before_split,
     )
 
   def _assert_collective_chains_are_atomic(
@@ -639,6 +749,7 @@ class GraphSplitTest(absltest.TestCase):
             backward_layers_per_executable=1,
             cpu_offload_prefetch_executables=0,
             donate_internal_buffers=False,
+            expert_all_gathers_under_splash=False,
         ),
         n_layers=3,
     )
@@ -672,6 +783,33 @@ class GraphSplitTest(absltest.TestCase):
         )
     )
 
+  def test_expert_all_gathers_under_splash(self):
+    barriers = []
+
+    def apply_deadline(gm: torch.fx.GraphModule) -> None:
+      under_splash_lib.apply_expert_all_gathers_under_splash(gm)
+      barriers.extend(
+          node for node in gm.graph.nodes if node.target is _optimization_barrier
+      )
+
+    # The forward and the recomputed backward copy of each of the 2 layers.
+    split = self._trace_simple_fsdp(
+        n_layers=2, model_cls=_AttentionMoEToy, before_split=apply_deadline
+    )
+    self.assertLen(barriers, 4)
+    for barrier in barriers:
+      anchor, *weights = barrier.args
+      self.assertTrue(under_splash_lib._is_splash_output(anchor))
+      self.assertNotEmpty(weights)
+      for weight in weights:
+        self.assertIn(".moe", _get_module_fqn(weight))
+        # Only the barrier reads the gathered weight in its copy of the layer.
+        self.assertEqual(list(weight.users), [barrier])
+    self.assertIsNotNone(split.backward_graph)
+    # A model without MoE layers or Splash has nothing to join.
+    with self.assertRaisesRegex(ValueError, "no layer with both"):
+      self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
+
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.
 
@@ -682,6 +820,9 @@ class GraphSplitTest(absltest.TestCase):
     split = self._trace_simple_fsdp(n_layers=4)
     forward = split.forward_graph
     backward = split.backward_graph
+    # TorchTPU's dim-d collectives have no wait nodes; they must take the same
+    # places as SimpleFSDP's functional collectives.
+    dim_split = self._trace_simple_fsdp(n_layers=4, dim_collectives=True)
     self.assertFalse(
         any("fsdp_bucket" in node.meta for node in backward.graph.nodes)
     )
@@ -692,14 +833,16 @@ class GraphSplitTest(absltest.TestCase):
         # [prefix] [L0] [L1] [L2] [L3]
         (1, True, {0: 1, 1: 2, 2: 3, 3: 4}),
     )
-    for layers_per_executable, isolate_prefix, expected in forward_scenarios:
+    for graph, (layers_per_executable, isolate_prefix, expected) in (
+        itertools.product((forward, dim_split.forward_graph), forward_scenarios)
+    ):
       with self.subTest(
           direction="forward",
           layers_per_executable=layers_per_executable,
           isolate_prefix=isolate_prefix,
       ):
         chunked = split_forward_graph_by_layer(
-            forward,
+            graph,
             layers_per_executable,
             isolate_prefix=isolate_prefix,
         )
@@ -745,10 +888,13 @@ class GraphSplitTest(absltest.TestCase):
             by_layer_three,
         ),
     )
-    for name, width, pipeline, compute, ag, rs in backward_scenarios:
-      with self.subTest(name):
+    graphs = {"functional": backward, "dim": dim_split.backward_graph}
+    for (collectives, graph), (name, width, pipeline, compute, ag, rs) in (
+        itertools.product(graphs.items(), backward_scenarios)
+    ):
+      with self.subTest(name, collectives=collectives):
         chunked = split_backward_graph_by_layer(
-            backward,
+            graph,
             n_layers=4,
             layers_per_executable=width,
             pipeline_collectives=pipeline,
@@ -767,8 +913,32 @@ class GraphSplitTest(absltest.TestCase):
             dict(zip(layer_ids, rs, strict=True)),
         )
         self._assert_collective_chains_are_atomic(
-            backward, chunked.partition_map
+            graph, chunked.partition_map
         )
+        # An FP32 reduction carries the BF16 gradient across the boundary and
+        # casts it in the RS executable.
+        for node in graph.graph.nodes:
+          if graph_split_lib._is_reduce_scatter(node):
+            cast = node.args[0]
+            self.assertEqual(cast.meta["val"].dtype, torch.float32)
+            self.assertEqual(
+                cast.all_input_nodes[0].meta["val"].dtype, torch.bfloat16
+            )
+            self.assertEqual(
+                chunked.partition_map[cast], chunked.partition_map[node]
+            )
+
+    # Pipelining only RS keeps each AG with its layer's compute.
+    rs_only = split_backward_graph_by_layer(
+        backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=("rs",)
+    )
+    self.assertEqual(
+        rs_only.collective_layer_to_partition["ag"], rs_only.layer_to_partition
+    )
+    self.assertEqual(
+        rs_only.collective_layer_to_partition["rs"],
+        {layer: part + 1 for layer, part in rs_only.layer_to_partition.items()},
+    )
 
     # A real Zero2-like trace has RS but no backward AG ownership.
     zero2_backward = self._trace_simple_fsdp(
@@ -921,80 +1091,36 @@ class GraphSplitTest(absltest.TestCase):
       self.assertEqual(chunked.partition_map[view], chunked.partition_map[wait])
       self.assertEqual(chunked.partition_map[cast], chunked.partition_map[wait])
 
-  def test_reduce_scatter_chain_stops_at_resizing_views_and_compute(self):
-    """Only casts and size-preserving views after an RS wait join its chain."""
-    for resize_kind in ("expand", "slice"):
-      with self.subTest(resize_kind=resize_kind):
-        gm = self._trace_simple_fsdp(
-            n_layers=2,
-            reduce_dtype=torch.bfloat16,
-        ).backward_graph
-        graph = gm.graph
-        reduce_casts = [
-            node
-            for node in graph.nodes
-            if node.op == "call_function"
-            and node.target is torch.ops.aten._to_copy.default
-            and len(node.all_input_nodes) == 1
-            and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
-        ]
-        self.assertLen(reduce_casts, 2)
-        waits = [cast.all_input_nodes[0] for cast in reduce_casts]
+  def test_reduce_scatter_chain_stops_at_compute(self):
+    """Compute after an RS wait stays out of its chain and fails closed."""
+    gm = self._trace_simple_fsdp(
+        n_layers=2,
+        reduce_dtype=torch.bfloat16,
+    ).backward_graph
+    graph = gm.graph
+    reduce_casts = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.aten._to_copy.default
+        and len(node.all_input_nodes) == 1
+        and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+    ]
+    self.assertLen(reduce_casts, 2)
+    cast = reduce_casts[0]
+    wait = cast.all_input_nodes[0]
+    with graph.inserting_before(cast):
+      mul = graph.call_function(torch.ops.aten.mul.Tensor, (wait, 2.0))
+    mul.meta["val"] = wait.meta["val"]
+    cast.replace_input_with(wait, mul)
+    gm.recompile()
 
-        def insert_before(cast, target, args, shape, *, g=graph):
-          """Makes ``target(<cast's input>, *args)`` the cast's input."""
-          source = cast.all_input_nodes[0]
-          with g.inserting_before(cast):
-            node = g.call_function(target, (source, *args))
-          node.meta["val"] = torch.empty(
-              shape, dtype=source.meta["val"].dtype, device="meta"
-          )
-          cast.replace_input_with(source, node)
-          return node
-
-        # Layer 1 (pipelined RS): wait -> view -> resizing view -> cast.
-        shape = list(waits[1].meta["val"].shape)
-        view = insert_before(
-            reduce_casts[1], torch.ops.aten.view.default, (shape,), shape
-        )
-        if resize_kind == "expand":
-          resized = insert_before(
-              reduce_casts[1],
-              torch.ops.aten.expand.default,
-              ([2, *shape],),
-              [2, *shape],
-          )
-        else:
-          half = max(1, shape[0] // 2)
-          resized = insert_before(
-              reduce_casts[1],
-              torch.ops.aten.slice.Tensor,
-              (0, 0, half),
-              [half, *shape[1:]],
-          )
-        # Layer 0: wait -> mul (compute) -> cast.
-        mul = insert_before(
-            reduce_casts[0],
-            torch.ops.aten.mul.Tensor,
-            (2.0,),
-            list(waits[0].meta["val"].shape),
-        )
-        gm.recompile()
-
-        chains = graph_split_lib._collect_collective_chains(gm)
-        chain0, chain1 = (
-            next(chain for chain in chains.values() if wait in chain)
-            for wait in waits
-        )
-        self.assertIn(view, chain1)
-        self.assertNotIn(resized, chain1)
-        self.assertNotIn(reduce_casts[1], chain1)
-        self.assertNotIn(mul, chain0)
-        self.assertNotIn(reduce_casts[0], chain0)
-        with self.assertRaisesRegex(ValueError, "reverse dependency"):
-          split_backward_graph_by_layer(
-              gm, n_layers=2, pipeline_collectives=True
-          )
+    chains = graph_split_lib._collect_collective_chains(gm)
+    chain = next(chain for chain in chains.values() if wait in chain)
+    self.assertNotIn(mul, chain)
+    self.assertNotIn(cast, chain)
+    with self.assertRaisesRegex(ValueError, "reverse dependency"):
+      split_backward_graph_by_layer(gm, n_layers=2, pipeline_collectives=True)
 
 
 if __name__ == "__main__":

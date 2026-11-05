@@ -52,6 +52,10 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     GraphSplitter,
 )
+from torchtitan.experiments.tpu.graph_trainer.input_mutations import (
+    CopyBackInputMutations,
+    functionalize_input_mutations,
+)
 from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     PASS_PIPELINE_REGISTRY,
@@ -406,6 +410,20 @@ class TpuGraphTrainer(GraphTrainer):
                         global_valid_tokens,
                         extra_kwargs,
                     )
+            # The TPU compiler drops in-place writes to graph inputs, such as
+            # the MoE token counts, so they become outputs and are copied back.
+            mutated_inputs = (
+                []
+                if self.config.compile.precompile_artifact_dir
+                else functionalize_input_mutations(self._traced_step.gm)
+            )
+            if mutated_inputs:
+                logger.info(
+                    "Traced step writes %d graph inputs in place (flat input "
+                    "positions %s); copying them back after each step",
+                    len(mutated_inputs),
+                    mutated_inputs,
+                )
             if self.config.compile.enable_passes:
                 if self._graph_splitter.enabled:
                     # Remat and FSDP transforms annotate the joint graph and must
@@ -432,6 +450,10 @@ class TpuGraphTrainer(GraphTrainer):
             if self._graph_splitter.enabled:
                 self._traced_step.gm = self._graph_splitter.split_and_compile(
                     self._traced_step
+                )
+            if mutated_inputs:
+                self._traced_step.gm = CopyBackInputMutations(
+                    self._traced_step.gm, mutated_inputs
                 )
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(

@@ -13,11 +13,12 @@ Covers:
 3. Row isolation in the GatedDeltaNet and packed-document isolation in the
    causal convolution, the GatedDeltaNet, the attention and the whole model
    (with negative controls), plus Splash parity on TPU.
-4. Flavor, registry and recipe checks.
+4. Flavor, registry, recipe and MFU-accounting checks.
 """
 
 import copy
 import functools
+from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
@@ -32,6 +33,10 @@ from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import workarounds
+from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
+from torchtitan.experiments.tpu.graph_trainer.config import apply_tpu_graph_trainer_model_transforms
+from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -605,6 +610,54 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         )
         # Negative control: autograd of the forward does use them.
         self.assertNotEmpty(backward_ops(autograd_conv_silu, seg) & scatter_ops)
+
+  @parameterized.named_parameters(
+      # Slow decays: every token's gradient matters.
+      dict(testcase_name="_slow_decays", max_decay_rate=0.2),
+      # Qwen3.5's initialization: A_log = log(U(0.01, 16)).
+      dict(testcase_name="_init_decays", max_decay_rate=16.0),
+  )
+  def test_chunked_gated_delta_compiled_grads_match_eager(
+      self, max_decay_rate: float
+  ):
+    """Tests chunked_gated_delta's gradients under torch.compile vs eager.
+
+    TpuGraphTrainer compiles the joint graph. On TPU, the gradient through a
+    slice of the decays' cumsum (`cumsum(-1)[..., -1:]`, the chunk totals)
+    that is also used elementwise came out wrong when compiled (dg relative
+    error 3.8, and NaN losses at step 1 on the debug model), while eager was
+    right.
+    """
+    torch.manual_seed(0)
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    dev = self.accelerator_device
+    shape = (2, 128, 4)
+    q, k, v = (torch.randn(*shape, 128, device=dev) for _ in range(3))
+    rate = torch.empty(shape[-1], device=dev).uniform_(0.01, max_decay_rate)
+    g = -rate * F.softplus(torch.randn(*shape, device=dev) + 1.0)
+    beta = torch.sigmoid(torch.randn(*shape, device=dev))
+    grad_out = torch.randn(*shape, 128, device=dev)
+
+    def run(fn):
+      inputs = [x.detach().clone().requires_grad_() for x in (q, k, v, g, beta)]
+      out = fn(*inputs)
+      return [out, *torch.autograd.grad(out, inputs, grad_out)]
+
+    backend = "tpu" if self._is_tpu() else "aot_eager"
+    expected = run(gated_delta.chunked_gated_delta)
+    actual = run(
+        torch.compile(
+            gated_delta.chunked_gated_delta, backend=backend, fullgraph=True
+        )
+    )
+    for name, a_t, e_t in zip(
+        ("out", "dq", "dk", "dv", "dg", "dbeta"), actual, expected, strict=True
+    ):
+      self.assertTrue(torch.isfinite(a_t).all().item(), msg=name)
+      # TPU7x / v5e: <= 5e-7 with the fix.
+      self.assertLessEqual(
+          _relative_l2_error(a_t, e_t), 1e-4, msg=f"compiled {name}"
+      )
 
   def test_causal_conv_silu_compiles_fullgraph(self):
     """Tests causal_conv_silu under torch.compile(fullgraph=True).
@@ -1316,8 +1369,15 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with self.assertRaisesRegex(ValueError, "exceeds max context length"):
       qwen3_5_tpu.model_registry("debugmodel", seq_len=262145)
 
-  def _assert_uses_tpu_moe_kernels(self, model_config) -> None:
-    """Asserts that `_use_tpu_moe_kernels` reached every MoE layer."""
+  def _assert_uses_tpu_moe_kernels(
+      self, model_config, *, tile_m: int = 256
+  ) -> None:
+    """Asserts that `_use_tpu_moe_kernels` reached every MoE layer.
+
+    Args:
+      model_config: The model config to check.
+      tile_m: The expected grouped-matmul and dWeight row tile.
+    """
     num_moe = sum(layer.moe is not None for layer in model_config.layers)
     experts = [
         c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)
@@ -1336,9 +1396,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertTrue(experts_config.use_pallas_grouped_mm)
       self.assertTrue(experts_config.use_pallas_paired_grouped_mm)
       self.assertTrue(experts_config.use_kernel_native_weight_layout)
-      self.assertEqual(experts_config.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(experts_config.pallas_grouped_mm_tile_m, tile_m)
       self.assertEqual(
-          experts_config.pallas_grouped_mm_tgmm_tiling, (256, 0, 0)
+          experts_config.pallas_grouped_mm_tgmm_tiling, (tile_m, 0, 0)
       )
     for dispatcher in dispatchers:
       self.assertTrue(dispatcher.fuse_route_score_backward)
@@ -1398,6 +1458,201 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(
         parsed.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
     )
+
+  def test_35b_benchmark_graph_trainer_config(self):
+    """Tests the benchmark recipe as train.py hands it to TpuGraphTrainer."""
+    gt_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    self.assertIsInstance(gt_cfg, TpuGraphTrainer.Config)
+    self.assertIs(type(gt_cfg)._owner, TpuGraphTrainer)
+    apply_tpu_graph_trainer_model_transforms(gt_cfg)
+    self.assertIs(
+        gt_cfg.model_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5
+    )
+    self.assertIsNone(gt_cfg.model_spec.pipelining_fn)
+    self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
+    # The conversion re-wraps the model config: the kernels must survive it.
+    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
+    splitter = GraphSplitter.from_trainer_config(
+        gt_cfg,
+        optimizer_in_graph=(gt_cfg.compile.optimizer_compile == "in_graph"),
+    )
+    self.assertTrue(splitter.enabled)
+    self.assertEqual(splitter.n_layers, 40)
+
+  def test_graph_trainer_debug_recipe(self):
+    """Tests the GraphTrainer debug recipe's split and selective remat."""
+    gt_cfg = config_registry.graph_trainer_qwen35_moe_debugmodel()
+    self.assertIsInstance(gt_cfg, TpuGraphTrainer.Config)
+    apply_tpu_graph_trainer_model_transforms(gt_cfg)
+    self.assertIs(
+        gt_cfg.model_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5
+    )
+    self.assertEqual(gt_cfg.model_spec.flavor, "debugmodel_moe")
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, gt_cfg.override.imports
+    )
+    compile_cfg = gt_cfg.compile
+    self.assertEqual(compile_cfg.mode, "aot_fx_trace")
+    self.assertEqual(compile_cfg.memory_policy, "tpu_selective")
+    self.assertEqual(compile_cfg.save_regions, ("moe.routing",))
+    self.assertEqual(compile_cfg.graph_split.forward_layers_per_executable, 1)
+    self.assertEqual(compile_cfg.graph_split.backward_layers_per_executable, 1)
+    splitter = GraphSplitter.from_trainer_config(
+        gt_cfg,
+        optimizer_in_graph=(compile_cfg.optimizer_compile == "in_graph"),
+    )
+    self.assertTrue(splitter.enabled)
+    self.assertEqual(splitter.n_layers, 4)
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+    ])
+    self.assertIsInstance(parsed, TpuGraphTrainer.Config)
+
+  def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
+    """Tests that TP, CP, PP and EP fail before the model is touched."""
+    for name in ("tp", "cp", "pp", "ep"):
+      enabled = dict(
+          tp_enabled=False,
+          cp_enabled=False,
+          pp_enabled=False,
+          ep_enabled=False,
+      )
+      enabled[f"{name}_enabled"] = True
+      with self.subTest(name), self.assertRaisesRegex(
+          NotImplementedError, "TP, CP, PP or EP"
+      ):
+        gt_qwen3_5.parallelize_qwen3_5(
+            None,
+            parallel_dims=SimpleNamespace(**enabled),
+            training=None,
+            parallelism=None,
+            compile_config=None,
+            ac_config=None,
+            dump_folder="",
+        )
+
+  def test_35b_recipes(self):
+    """Tests the 35B-A3B recipes, their TPU kernels and MFU accounting."""
+    gt_spec = gt_qwen3_5.model_registry("35B-A3B")
+    self.assertEqual(gt_spec.name, "qwen3_5")
+    self.assertIs(gt_spec.parallelize_fn, gt_qwen3_5.parallelize_qwen3_5)
+
+    self.assertNotIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
+        config_registry.qwen35_moe_35b().override.imports,
+    )
+
+    # The benchmark recipe: ZeRO-3, graph split (2 layers per executable),
+    # fused AdamW outside the graph, Tokamax GatedDeltaNet, Pallas MoE / CE
+    # kernels, and Splash attention.
+    bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    self.assertIsInstance(bench_cfg, TpuGraphTrainer.Config)
+    self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+    self.assertEqual(
+        bench_cfg.override.imports,
+        [
+            config_registry.FUSED_LOSS_OVERRIDE,
+            config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
+        ],
+    )
+    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model)
+    self.assertEqual(bench_cfg.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertEqual(bench_cfg.parallelism.expert_parallel_degree, 1)
+    self.assertTrue(bench_cfg.parallelism.enable_tpu_topo_mesh)
+    self.assertEqual(
+        bench_cfg.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
+    )
+    self.assertEqual(bench_cfg.training.dtype, "float32")
+    self.assertEqual(bench_cfg.training.mixed_precision_param, "bfloat16")
+    self.assertEqual(bench_cfg.training.mixed_precision_reduce, "float32")
+    self.assertEqual(bench_cfg.metrics.log_freq, 5)
+    self.assertEqual(
+        bench_cfg.xla_flags, {"xla_enable_hlo_sharding_v3": "false"}
+    )
+    self.assertEqual(
+        bench_cfg.libtpu_init_flags["xla_tpu_scoped_vmem_limit_kib"], "65472"
+    )
+    self.assertEqual(bench_cfg.libtpu_init_flags["xla_tpu_dvfs_p_state"], "7")
+    compile_cfg = bench_cfg.compile
+    self.assertTrue(compile_cfg.enable)
+    self.assertEqual(compile_cfg.mode, "aot_fx_trace")
+    self.assertEqual(compile_cfg.memory_policy, "tpu_selective")
+    self.assertEqual(
+        compile_cfg.save_regions,
+        ("moe.routing", "attention.inner_attention"),
+    )
+    self.assertFalse(compile_cfg.enable_remat_barriers)
+    self.assertEqual(compile_cfg.fsdp_barrier_policy, "none")
+    self.assertTrue(compile_cfg.graph_split.enabled)
+    self.assertTrue(compile_cfg.graph_split.forward_isolate_prefix)
+    self.assertEqual(compile_cfg.graph_split.forward_layers_per_executable, 2)
+    self.assertEqual(compile_cfg.graph_split.backward_layers_per_executable, 2)
+    self.assertEqual(
+        compile_cfg.graph_split.backward_partition_mode, "fsdp_pipeline"
+    )
+    self.assertEqual(compile_cfg.optimizer_compile, "eager")
+    self.assertTrue(compile_cfg.compile_grad_norm)
+    self.assertFalse(bench_cfg.tpu_config.enable_amp)
+    self.assertFalse(bench_cfg.tpu_config.enable_mfu_benchmark)
+    self.assertEqual(bench_cfg.optimizer.implementation, "fused")
+    self.assertTrue(
+        bench_cfg.splash_attention_kernel.use_splash_attention_kernel
+    )
+    self.assertIsInstance(bench_cfg.loss, PallasCrossEntropyLoss.Config)
+
+    # Apply both recipe overrides (`tokamax_gated_delta` imports KDA lazily).
+    apply_overrides(bench_cfg.override, bench_cfg)
+    gdn_kernels = [
+        layer.delta_net.inner_gated_delta_net.kernel
+        for layer in bench_cfg.model_spec.model.layers
+        if layer.delta_net is not None
+    ]
+    self.assertLen(gdn_kernels, 30)
+    for kernel_cfg in gdn_kernels:
+      self.assertEqual(
+          type(kernel_cfg).__qualname__, "TokamaxGatedDeltaKernel.Config"
+      )
+    with torch.device("meta"):
+      meta_model = bench_cfg.model_spec.model.build()
+    workarounds._check_fused_loss_logit_transform(meta_model, bench_cfg)  # pylint: disable=protected-access
+    inner_experts = meta_model.layers["0"].moe.routed_experts.inner_experts
+    self.assertIsInstance(inner_experts, TpuGroupedExperts)
+
+    # 35B-A3B parameter and MFU accounting. Active params exclude the input
+    # embedding and count the top-8 of 256 routed experts. FLOPs per token are
+    # 6 * active params, plus 10 quadratic attention layers
+    # (6 * 16 heads * (256 + 256) * seq_len each), plus 30 delta-rule layers
+    # (6 * 3 * 32 value heads * 128 * 128 each).
+    seq_len = bench_cfg.training.max_context_length
+    self.assertEqual(seq_len, 2048)
+    total_params, flops_per_token = (
+        bench_cfg.model_spec.model.get_nparams_and_flops(meta_model, seq_len)
+    )
+    self.assertEqual(total_params, 34_660_610_688)
+    self.assertEqual(
+        flops_per_token,
+        6 * 2_946_429_568
+        + 10 * 6 * 16 * (256 + 256) * seq_len
+        + 30 * 6 * 3 * 32 * 128 * 128,
+    )
+
+    # The recipes parse from the command line.
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--training.steps=20",
+        "--training.max_context_length=8192",
+        "--training.num_tokens_per_microbatch_per_dp_rank=65536",
+    ])
+    self.assertIsInstance(parsed, TpuGraphTrainer.Config)
+    self.assertEqual(parsed.training.steps, 20)
+    self.assertEqual(parsed.training.max_context_length, 8192)
+    self.assertEqual(
+        parsed.training.num_tokens_per_microbatch_per_dp_rank, 65536
+    )
+    self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
+    self.assertEqual(parsed.model_spec.max_context_length, 262144)
 
 
 if __name__ == "__main__":

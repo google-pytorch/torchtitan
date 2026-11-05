@@ -1058,6 +1058,19 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     graph_split = config.compile.graph_split
     self.assertEqual(graph_split.backward_partition_mode, "fsdp_pipeline")
     self.assertEqual(graph_split.pipeline_kinds, ("rs",))
+    apply_tpu_graph_trainer_model_transforms(config)
+    # Knobs that would leave the split unchanged are rejected.
+    for mode, kinds, message in (
+        ("by_layer", ("rs",), "applies only to"),
+        ("fsdp_pipeline", (), "is empty"),
+    ):
+      with self.subTest(mode=mode, kinds=kinds):
+        config.compile.graph_split = dataclasses.replace(
+            graph_split, backward_partition_mode=mode, pipeline_kinds=kinds
+        )
+        with self.assertRaisesRegex(ValueError, message):
+          apply_tpu_graph_trainer_model_transforms(config)
+    config.compile.graph_split = graph_split
 
     self.assertEqual(
         {
@@ -1963,6 +1976,19 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         optimizer_in_graph=(split_cfg.compile.optimizer_compile == "in_graph"),
     )
     self.assertTrue(splitter.enabled)
+
+    pipeline_cfg = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.examples.gemma4",
+        "--config=graph_trainer_gemma4_debugmodel",
+        "--parallelism.use_simple_fsdp",
+        "--parallelism.fsdp_reshard_after_forward=always",
+        "--compile.graph_split.enabled",
+        "--compile.graph_split.backward_partition_mode=fsdp_pipeline",
+        "--compile.graph_split.pipeline_kinds",
+        "rs",
+    ])
+    self.assertEqual(pipeline_cfg.compile.graph_split.pipeline_kinds, ("rs",))
+    apply_tpu_graph_trainer_model_transforms(pipeline_cfg)
 
 
 if __name__ == "__main__":

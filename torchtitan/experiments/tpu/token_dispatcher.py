@@ -121,20 +121,17 @@ class _StableGroupedReduce(torch.autograd.Function):
   already learned a row-scatter lowering; that did not fix this backward
   gather. Saving only ``index_N`` makes the VJP a row gather with no collision.
 
-  We also tried reusing dispatch's inverse permutation, fusing score scaling
-  into this function, replacing the gather/reduce with an opaque Pallas op,
-  and replacing stable sorts with exact composite keys. Some won isolated
-  microbenchmarks, but none produced a material whole-model improvement after
-  accounting for metadata, scheduling, or changed accumulation order. This is
-  therefore the best measured whole-graph implementation, not a proof that no
-  faster formulation exists.
+  EP=1 dispatch passes the stable token order, derived from its inverse
+  permutation by ``combine_order``, which replaces a global stable sort of
+  int64 keys with a sort within each token's ``top_k`` positions.
   """
 
   @staticmethod
-  def forward(ctx, src_ND, index_N, top_k):
+  def forward(ctx, src_ND, index_N, top_k, permutation_N):
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(index_N)
-    permutation_N = torch.argsort(index_N, stable=True)
+    if permutation_N is None:
+      permutation_N = torch.argsort(index_N, stable=True)
     return route_sum(src_ND, permutation_N, top_k)
 
   @staticmethod
@@ -143,16 +140,51 @@ class _StableGroupedReduce(torch.autograd.Function):
     grad_src_ND = None
     if grad_output_TD is not None:
       grad_src_ND = torch.index_select(grad_output_TD, 0, index_N)
-    return grad_src_ND, None, None
+    return grad_src_ND, None, None, None
 
 
 def stable_grouped_reduce(
     src_ND: torch.Tensor,
     index_N: torch.Tensor,
     top_k: int,
+    permutation_N: torch.Tensor | None = None,
 ) -> torch.Tensor:
-  """Reduce fixed-K routes by token with FP32 accumulation."""
-  return _StableGroupedReduce.apply(src_ND, index_N, top_k)
+  """Reduce fixed-K routes by token with FP32 accumulation.
+
+  ``permutation_N``, if given, must equal ``argsort(index_N, stable=True)``,
+  e.g. from ``combine_order``.
+  """
+  return _StableGroupedReduce.apply(src_ND, index_N, top_k, permutation_N)
+
+
+def stable_expert_order(
+    expert_ids_N: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+  """``argsort(expert_ids_N, stable=True)`` as int32, from one int32 key sort.
+
+  TorchTPU sorts an int64 stable argsort as five 32-bit arrays: two key words,
+  two index words and XLA's stability tiebreak. Packing
+  ``expert << bits | position`` into one int32 makes every key unique, so an
+  unstable sort of the keys alone gives the same order, and the low bits are
+  the permutation. That sort is ~5x faster at 524,288 routes.
+  """
+  n = expert_ids_N.numel()
+  bits = max(1, (n - 1).bit_length())
+  if num_experts << bits > 2**31:
+    return torch.argsort(expert_ids_N, stable=True).to(torch.int32)
+  positions = torch.arange(n, dtype=torch.int32, device=expert_ids_N.device)
+  keys = (expert_ids_N.to(torch.int32) << bits) | positions
+  return torch.sort(keys).values & ((1 << bits) - 1)
+
+
+def combine_order(inverse_N: torch.Tensor, top_k: int) -> torch.Tensor:
+  """``argsort(permutation_N // top_k, stable=True)`` from the inverse.
+
+  Token ``t``'s routes sit at positions ``inverse_N[t * top_k:(t + 1) * top_k]``
+  of the expert order, so the stable token order lists each token's positions
+  ascending: a sort within each row of ``top_k`` instead of a global sort.
+  """
+  return torch.sort(inverse_N.reshape(-1, top_k), dim=1).values.reshape(-1)
 
 
 class _LocalReorder(torch.autograd.Function):
@@ -172,32 +204,35 @@ class _LocalReorder(torch.autograd.Function):
   The generated backward and native ``index_add`` both express a collision
   reduction over repeated token rows. We tested those paths in BF16 and FP32,
   inverse permutation by generic scatter, inverse argsort plus row gathers,
-  unstable expert sorting, and exact composite-key stable sorting. FP32
-  ``index_add`` removed the visible row gather but regressed two full-model
-  brackets; generic inverse scatter was substantially worse on TPU. Composite
-  keys improved isolated sorts but not the full step. Inverse argsort plus row
-  gathers is therefore retained. The forward sort remains stable because
-  changing equal-expert route order changes BF16 expert dWeight accumulation
-  and produced an unacceptable training-trajectory shift.
+  and unstable expert sorting. FP32 ``index_add`` removed the visible row
+  gather but regressed two full-model brackets; generic inverse scatter was
+  substantially worse on TPU. Inverse argsort plus row gathers is therefore
+  retained. The forward order remains stable because changing equal-expert
+  route order changes BF16 expert dWeight accumulation and produced an
+  unacceptable training-trajectory shift; ``stable_expert_order`` computes the
+  same order with a cheaper sort.
   """
 
   @staticmethod
   def forward(ctx, x_TD, scores_TK, permutation_N, top_k):
     ctx.set_materialize_grads(False)
-    inverse_N = torch.argsort(permutation_N)
+    inverse_N = torch.argsort(permutation_N).to(permutation_N.dtype)
     token_indices_N = permutation_N // top_k
     ctx.save_for_backward(inverse_N)
     ctx.score_shape = scores_TK.shape
     ctx.top_k = top_k
-    ctx.mark_non_differentiable(token_indices_N)
+    ctx.mark_non_differentiable(token_indices_N, inverse_N)
     return (
         torch.index_select(x_TD, 0, token_indices_N),
         token_indices_N,
         torch.index_select(scores_TK.reshape(-1), 0, permutation_N),
+        inverse_N,
     )
 
   @staticmethod
-  def backward(ctx, grad_routed_ND, _grad_token_indices_N, grad_scores_N):
+  def backward(
+      ctx, grad_routed_ND, _grad_token_indices_N, grad_scores_N, _grad_inverse_N
+  ):
     (inverse_N,) = ctx.saved_tensors
     grad_x_TD = None
     if grad_routed_ND is not None:
@@ -215,20 +250,43 @@ def local_reorder(
     scores_TK: torch.Tensor,
     expert_ids_TK: torch.Tensor,
     top_k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Sort routes by expert while keeping all gathers row-indexed."""
+    num_experts: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Sort routes by expert while keeping all gathers row-indexed.
+
+  Returns the routed rows, their token indices, their scores and the inverse
+  of the expert permutation. Given ``num_experts``, the indices are int32.
+  """
   # Marked so that a selective memory policy can save the sort order.
   with annotate_region(MOE_ROUTING):
-    permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
+    if num_experts is None:
+      permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
+    else:
+      permutation_N = stable_expert_order(
+          expert_ids_TK.reshape(-1), num_experts
+      )
   return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TpuLocalDispatchMetadata(LocalDispatchMetadata):
+  """EP=1 metadata that also carries the combine's stable token order."""
+
+  combine_order_N: torch.Tensor  # noqa: N815
+
+
+def _combine_order(metadata: LocalDispatchMetadata) -> torch.Tensor | None:
+  if isinstance(metadata, TpuLocalDispatchMetadata):
+    return metadata.combine_order_N
+  return None
 
 
 class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
   """Standard dispatcher with TPU-local permutation VJPs.
 
-  ``_local_reorder`` is shared by EP=1 and EP>1 and is optimized in both
-  cases. ``combine`` selects the fixed-K reduction only when ``ep_mesh`` is
-  absent. The standard dropless EP path should also admit fixed-K reduction,
+  The local reorder VJP serves both EP=1 and EP>1. EP=1 ``dispatch`` also
+  uses int32 indices and passes the combine its token order. ``combine``
+  selects the fixed-K reduction only when ``ep_mesh`` is absent. The standard dropless EP path should also admit fixed-K reduction,
   but must retain its return all-to-all and separately handle SP-local rows in
   the global output layout. It intentionally delegates until that path has its
   own correctness and performance gate.
@@ -248,12 +306,41 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       topk_scores_TK: torch.Tensor,
       topk_expert_ids_TK: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return local_reorder(
+    # Only the EP>1 path calls this; its unpermute scatters need int64.
+    routed_ND, token_indices_N, scores_N, _ = local_reorder(
         x_TD,
         topk_scores_TK,
         topk_expert_ids_TK,
         self.top_k,
     )
+    return routed_ND, token_indices_N, scores_N
+
+  def dispatch(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+  ) -> tuple[
+      torch.Tensor, torch.Tensor, AllToAllDispatchMetadata | LocalDispatchMetadata
+  ]:
+    if self.ep_mesh is not None:
+      return super().dispatch(
+          x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+      )
+    routed_ND, token_indices_N, scores_N, inverse_N = local_reorder(
+        x_TD,
+        topk_scores_TK,
+        topk_expert_ids_TK,
+        self.top_k,
+        self.num_experts,
+    )
+    metadata = TpuLocalDispatchMetadata(
+        token_indices_experts_sorted_N=token_indices_N,
+        topk_scores_experts_sorted_N=scores_N,
+        combine_order_N=combine_order(inverse_N, self.top_k),
+    )
+    return routed_ND, num_local_tokens_per_expert_E, metadata
 
   def combine(
       self,
@@ -279,6 +366,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         routed_output_ND,
         metadata.token_indices_experts_sorted_N,
         self.top_k,
+        _combine_order(metadata),
     )
 
 
@@ -343,6 +431,7 @@ class TpuRoutedExperts(RoutedExperts):
         routed_output_RD,
         metadata.token_indices_experts_sorted_N,
         self.token_dispatcher.top_k,
+        _combine_order(metadata),
     )
 
 
@@ -402,10 +491,13 @@ class TpuTokenDispatcherConverter(ModelConfigConverter):
 
 __all__ = [
     "TpuAllToAllTokenDispatcher",
+    "TpuLocalDispatchMetadata",
     "TpuRoutedExperts",
     "TpuRoutedExpertsConverter",
     "TpuTokenDispatcherConverter",
+    "combine_order",
     "local_reorder",
     "scale_route_weights",
+    "stable_expert_order",
     "stable_grouped_reduce",
 ]

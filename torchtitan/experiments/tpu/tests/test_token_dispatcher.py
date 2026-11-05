@@ -12,6 +12,7 @@ from torchtitan.experiments.tpu.token_dispatcher import (
     TpuRoutedExperts,
     TpuTokenDispatcherConverter,
     scale_route_weights,
+    stable_expert_order,
     stable_grouped_reduce,
 )
 from torchtitan.models.common.moe import GroupedExperts
@@ -236,6 +237,33 @@ def test_local_combine_matches_standard_dispatcher():
         actual_grads[0], reference_grads[0], rtol=0.05, atol=0.125
     )
     torch.testing.assert_close(actual_grads[1], reference_grads[1])
+
+
+def test_ep1_dispatch_orders_match_stable_argsort_exactly():
+    generator = torch.Generator().manual_seed(2024)
+    num_experts, top_k, tokens = 5, 4, 37
+    expert_ids = torch.randint(0, num_experts, (tokens, top_k), generator=generator)
+    permutation = torch.argsort(expert_ids.reshape(-1), stable=True)
+    # The packed single-key sort, and the fallback when keys do not fit int32.
+    for experts in (num_experts, 2**20):
+        order = stable_expert_order(expert_ids.reshape(-1), experts)
+        assert order.dtype == torch.int32
+        assert torch.equal(order.long(), permutation)
+
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=num_experts, top_k=top_k
+    ).build()
+    x = torch.randn(tokens, 3, generator=generator)
+    scores = torch.randn(tokens, top_k, generator=generator)
+    counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
+    routed, _, metadata = dispatcher.dispatch(x, scores, expert_ids, counts)
+    token_indices = permutation // top_k
+    assert torch.equal(metadata.token_indices_experts_sorted_N.long(), token_indices)
+    assert torch.equal(metadata.topk_scores_experts_sorted_N, scores.reshape(-1)[permutation])
+    assert torch.equal(routed, x[token_indices])
+    assert torch.equal(
+        metadata.combine_order_N.long(), torch.argsort(token_indices, stable=True)
+    )
 
 
 def test_ep_combine_delegates_to_standard_dispatcher():

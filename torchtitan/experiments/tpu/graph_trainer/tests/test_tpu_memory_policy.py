@@ -236,8 +236,8 @@ class _MoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         top_scores, expert_ids, _ = self.router(x)
-        routed, token_indices, routed_scores = local_reorder(
-            x, top_scores, expert_ids, _TOP_K
+        routed, token_indices, routed_scores, _ = local_reorder(
+            x, top_scores, expert_ids, _TOP_K, _EXPERTS
         )
         expert_out = (routed @ self.expert.to(x.dtype)).float()
         weighted = (expert_out * routed_scores.reshape(-1, 1)).to(x.dtype)

@@ -27,7 +27,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     resolve_save_regions,
 )
-from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
+from torchtitan.experiments.tpu.components.layer_loop import builds_layer_loop
 
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
@@ -135,7 +135,7 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # ``tpu_selective`` and ``tpu_selective_and_offload`` only: full recompute,
   # except these save regions, whose values are saved for backward in every
   # layer: "moe.routing", "attention.inner_attention" and "feed_forward.w2"
-  # (see ``experiments/tpu/remat_regions.py``).
+  # (see ``experiments/tpu/components/remat_regions.py``).
   save_regions: tuple[str, ...] = ()
   # ``tpu_selective`` and ``tpu_selective_and_offload`` only: save regions to
   # save only in their last N transformer layers, which backward reaches

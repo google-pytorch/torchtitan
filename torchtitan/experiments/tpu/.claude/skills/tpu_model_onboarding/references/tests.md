@@ -30,7 +30,7 @@ Contract, for any reference: identical weights and inputs through the
 reference and the TorchTitan model, one forward and one backward, logits,
 loss and every parameter gradient compared with stated tolerances, and the
 weight mapping checked both ways (no missing, no unexpected keys). One class
-on `BaseAcceleratorDeviceTest` (`tpu/base_device_test.py`): CI runs it on one
+on `BaseAcceleratorDeviceTest` (`tpu/testing/base_device_test.py`): CI runs it on one
 chip; it also runs on CPU with `--device=cpu`, but only when you invoke it
 that way (CI has no CPU copy of single-TPU modules). What changes with the
 reference is where its half runs.

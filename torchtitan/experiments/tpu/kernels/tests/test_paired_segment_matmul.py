@@ -5,7 +5,7 @@ import math
 from absl.testing import absltest
 import torch
 
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels import expert_segment_matmul
 from torchtitan.experiments.tpu.kernels import paired_segment_matmul
 

@@ -10,11 +10,11 @@ from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from types import SimpleNamespace
 
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
-from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.transformers_modeling_backend import model as hf_model
 from torchtitan.models.common.config_utils import make_routed_experts_config
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher

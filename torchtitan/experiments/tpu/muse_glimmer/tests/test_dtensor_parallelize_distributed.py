@@ -9,10 +9,10 @@ from torch.distributed.tensor import DTensor
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import distributed
-from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import distributed
+from torchtitan.experiments.tpu.testing.base_distributed_device_test import InputDistribution
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer.infra import parallelize as muse_glimmer_parallelize
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel

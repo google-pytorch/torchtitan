@@ -9,7 +9,7 @@
 import torch
 from absl.testing import absltest
 
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 
 

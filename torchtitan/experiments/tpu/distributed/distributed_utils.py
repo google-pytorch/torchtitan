@@ -3,7 +3,7 @@
 import os
 from absl import logging
 
-from torchtitan.experiments.tpu import cloud_distributed_utils
+from torchtitan.experiments.tpu.distributed import cloud_distributed_utils
 
 
 def maybe_init_distributed(num_devices: int | None = None) -> bool:

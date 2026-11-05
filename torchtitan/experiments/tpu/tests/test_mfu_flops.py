@@ -13,7 +13,7 @@ from torchtitan.experiments.tpu.examples.gemma4 import gemma4_configs
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     MaxTextTpuGraphTrainerQwen3Model,
 )
-from torchtitan.experiments.tpu.mfu_flops import (
+from torchtitan.experiments.tpu.profiling.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
 from torchtitan.experiments.tpu.qwen3 import (

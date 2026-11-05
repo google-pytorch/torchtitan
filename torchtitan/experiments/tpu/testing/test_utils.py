@@ -9,8 +9,8 @@ from typing import Any
 from absl import flags
 from absl import logging
 import torch
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import device_env
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.distributed import device_env
 
 
 _DEVICE = flags.DEFINE_enum_class(

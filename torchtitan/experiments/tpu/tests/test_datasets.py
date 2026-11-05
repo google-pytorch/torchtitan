@@ -1,4 +1,4 @@
-"""Tests for TPU dataset selection in `experiments/tpu/datasets.py`."""
+"""Tests for TPU dataset selection in `experiments/tpu/components/datasets.py`."""
 
 import json
 import os
@@ -9,7 +9,7 @@ from absl.testing import absltest
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.experiments.tpu import datasets
+from torchtitan.experiments.tpu.components import datasets
 from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.tools.logging import logger
 

@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import unflatten_shim
+from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.examples.mamba2.kernels import mamba2_pallas
 from torchtitan.protocols import model as model_protocol
 from torchtitan.protocols import module

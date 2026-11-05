@@ -31,7 +31,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
     MOE_ROUTING,

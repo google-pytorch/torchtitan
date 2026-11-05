@@ -4,7 +4,7 @@ from absl import logging
 from absl.testing import absltest
 import torch
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels import gmm
 
 

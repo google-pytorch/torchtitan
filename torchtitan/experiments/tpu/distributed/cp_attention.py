@@ -46,8 +46,8 @@ from torchtitan.distributed.context_parallel.api import (
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.distributed.utils import get_spmd_backend
-from torchtitan.experiments.tpu.headtail import headtail_chunk_order
-from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
+from torchtitan.experiments.tpu.distributed.headtail import headtail_chunk_order
+from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common.attention import (
     BaseAttention,
     ScaledDotProductInnerAttention,

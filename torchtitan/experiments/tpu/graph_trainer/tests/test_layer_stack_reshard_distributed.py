@@ -37,7 +37,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
 from torchtitan.experiments.tpu.graph_trainer.tests import test_layer_stack
-from torchtitan.experiments.tpu.layer_loop import tpu_model_class
+from torchtitan.experiments.tpu.components.layer_loop import tpu_model_class
 from torchtitan.models.llama3 import model_registry
 
 

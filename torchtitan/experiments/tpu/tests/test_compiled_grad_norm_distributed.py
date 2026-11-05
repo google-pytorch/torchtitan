@@ -17,11 +17,9 @@ from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.experiments.tpu import (
-  base_distributed_device_test,
-  distributed,
-  grad_norm,
-)
+from torchtitan.experiments.tpu.components import grad_norm
+from torchtitan.experiments.tpu.distributed import distributed
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.graph_trainer.config import (
   apply_tpu_graph_trainer_model_transforms,

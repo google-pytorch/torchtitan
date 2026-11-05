@@ -4,8 +4,9 @@ Wraps upstream ``torchtitan.models.qwen3_5`` for the TPU lane
 (``use_tpu_modules``):
 
 * Drops the vision encoder (text-only training).
-* Swaps every GatedDeltaNet's inner module for ``TpuInnerGatedDeltaNet``;
-  upstream's runs CUDA/Triton ``attn_gym`` kernels.
+* Swaps every GatedDeltaNet's inner module for ``TpuInnerGatedDeltaNet`` and
+  its output norm for ``TpuRMSNormGated``; upstream's inner module runs
+  CUDA/Triton ``attn_gym`` kernels.
 * Swaps every layer for ``TpuQwen35TransformerBlock`` and every GatedDeltaNet
   for ``TpuGatedDeltaNet``, which pass ``positions`` down to
   ``TpuInnerGatedDeltaNet``, so packed documents restart the causal

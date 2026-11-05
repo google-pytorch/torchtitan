@@ -82,6 +82,8 @@ def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:
     base = 8192 if dtype == torch.bfloat16 else 4096
   else:
     # TPU v5/v6 default to 16 MiB scoped VMEM.
+    # TODO(jialeic): Benchmark and raise the v5/v6 sequence-length caps now
+    # that _vmem_limit_bytes() requests 90% of physical VMEM.
     base = 2048 if dtype == torch.bfloat16 else 1024
   return base // 2 if width > 4 else base
 
@@ -242,31 +244,60 @@ def _backward(ctx, grad_out):
 _fwd_op.register_autograd(_backward, setup_context=_setup_context)
 
 
-def supports(x_BSC: torch.Tensor, weight_C1W: torch.Tensor) -> bool:
-  """Whether ``x_BSC`` and ``weight_C1W`` satisfy the Pallas kernel limits."""
+def unsupported_reason(
+    x_BSC: torch.Tensor, weight_C1W: torch.Tensor
+) -> str | None:
+  """Reason ``x_BSC`` and ``weight_C1W`` cannot use Pallas, or ``None``."""
   if isinstance(x_BSC, DTensor) or isinstance(weight_C1W, DTensor):
-    return False
+    return "DTensor inputs are not supported"
   if x_BSC.device.type != "tpu" or weight_C1W.device != x_BSC.device:
-    return False
+    return (
+        f"inputs must be on the same TPU device, got {x_BSC.device} and"
+        f" {weight_C1W.device}"
+    )
   if (
       x_BSC.dtype not in _SUPPORTED_DTYPES
       or weight_C1W.dtype not in _SUPPORTED_DTYPES
   ):
-    return False
+    return (
+        f"unsupported dtype x={x_BSC.dtype}, weight={weight_C1W.dtype}"
+        f" (supported: {_SUPPORTED_DTYPES})"
+    )
   if x_BSC.ndim != 3 or weight_C1W.ndim != 3:
-    return False
+    return (
+        f"expected 3D x_BSC and weight_C1W, got {x_BSC.ndim}D and"
+        f" {weight_C1W.ndim}D"
+    )
   batch, seq_len, channels = x_BSC.shape
   width = weight_C1W.shape[2]
   max_s = _max_supported_seq_len(x_BSC.dtype, width)
-  return (
-      batch > 0
-      and 0 < seq_len <= max_s
-      and seq_len % 8 == 0
-      and channels > 0
-      and channels % _BLOCK_C == 0
-      and weight_C1W.shape == (channels, 1, width)
-      and 1 <= width <= min(seq_len, _MAX_WIDTH)
-  )
+  if batch <= 0:
+    return f"batch size must be positive, got {batch}"
+  if not (0 < seq_len <= max_s and seq_len % 8 == 0):
+    return (
+        f"seq_len={seq_len} must be a positive multiple of 8 and <="
+        f" {max_s} for dtype={x_BSC.dtype}, width={width}"
+    )
+  if channels <= 0 or channels % _BLOCK_C != 0:
+    return (
+        f"channels={channels} must be a positive multiple of {_BLOCK_C}"
+    )
+  if weight_C1W.shape != (channels, 1, width):
+    return (
+        f"weight shape {tuple(weight_C1W.shape)} must match"
+        f" (channels={channels}, 1, width={width})"
+    )
+  if not 1 <= width <= min(seq_len, _MAX_WIDTH):
+    return (
+        f"kernel width={width} must be in [1, min(seq_len={seq_len},"
+        f" {_MAX_WIDTH})]"
+    )
+  return None
+
+
+def supports(x_BSC: torch.Tensor, weight_C1W: torch.Tensor) -> bool:
+  """Whether ``x_BSC`` and ``weight_C1W`` satisfy the Pallas kernel limits."""
+  return unsupported_reason(x_BSC, weight_C1W) is None
 
 
 def causal_conv_silu(
@@ -282,9 +313,10 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output in ``x_BSC.dtype``.
   """
-  if not supports(x_BSC, weight_C1W):
+  reason = unsupported_reason(x_BSC, weight_C1W)
+  if reason is not None:
     raise ValueError(
-        "Unsupported inputs for Pallas causal_conv_silu:"
+        f"Unsupported inputs for Pallas causal_conv_silu ({reason}):"
         f" x={tuple(x_BSC.shape)} ({x_BSC.dtype}, {x_BSC.device}),"
         f" weight={tuple(weight_C1W.shape)} ({weight_C1W.dtype},"
         f" {weight_C1W.device})"

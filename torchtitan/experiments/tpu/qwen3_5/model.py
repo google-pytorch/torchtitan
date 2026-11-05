@@ -142,6 +142,21 @@ class TpuQwen35Model(Qwen35Model):
         # under EP > 1 by `TPUTrainerConfig.__post_init__` at parse time) and
         # `tpu_config.eager_mode` (applied by `gmain` before the trainer is
         # built) must be set in the recipe or on the command line.
+        graph_split = getattr(
+            getattr(config, "compile", None), "graph_split", None
+        )
+        if (
+            graph_split is not None
+            and graph_split.enabled
+            and graph_split.backward_partition_mode != "by_layer"
+        ):
+          raise ValueError(
+              "Expert parallelism needs"
+              " --compile.graph_split.backward_partition_mode=by_layer: the EP"
+              " activation collectives cannot be moved by"
+              f" {graph_split.backward_partition_mode!r}. Use a *_ep_* recipe"
+              " or pass the flag."
+          )
         # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
         # for the paired (w1 + w3) Pallas kernel unless the experts opt in to
         # the EP-aware paired kernel; otherwise fall back to unpaired Pallas.

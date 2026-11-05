@@ -12,11 +12,9 @@ transport modes:
    (``roe_sort_gather``), fuses route-weight scaling + FP32 token reduction in
    VMEM (``roe_unsort_combine``), and sums partial outputs across ``ep_mesh``
    via SparseCore ``torch.tpu.ops.reduce_scatter_dim``. When ``ep_size <= K``,
-   this cuts activation ICI traffic by up to ``2 * K / (ep_size - 1)``
-   (``2.67x``
+   this cuts activation ICI traffic by up to ``K / (ep_size - 1)`` (``2.67x``
    at ``EP=4, K=8``, ``1.14x`` at ``EP=8, K=8``) and eliminates
-   ``ragged_all_to_all``
-   gather/scatter stalls.
+   ``ragged_all_to_all`` gather/scatter stalls.
 2. ``"ragged_all_to_all"`` (default via ``"auto"`` when ``ep_size > top_k``):
    gathers ``int32[E]`` per-expert token counts via ``all_gather_dim`` and
    exchanges only the routed token slices via

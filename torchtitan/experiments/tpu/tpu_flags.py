@@ -26,9 +26,11 @@ only make sense together are the named bundles below, composed with
 import os
 from typing import Iterable, Mapping, MutableMapping
 
+import tyro
+
 from torchtitan.config.manager import custom_registry
 from torchtitan.tools.logging import logger
-import tyro
+
 
 FlagValue = bool | int | float | str
 
@@ -73,9 +75,7 @@ def merge_flags(
   """Merges bundles then keyword overrides, later arguments winning."""
   merged = FlagMap()
   for layer in (*bundles, overrides):
-    merged.update(
-        {name: _flag_value_str(value) for name, value in layer.items()}
-    )
+    merged.update({name: _flag_value_str(value) for name, value in layer.items()})
   return merged
 
 

@@ -338,9 +338,17 @@ def _use_expert_parallel(
       isinstance(cfg.compile, TpuGraphTrainerCompileConfig)
       and cfg.compile.graph_split.enabled
   ):
+    # Chunked dropless EP bounds the live EP buffers, so `tpu_selective` can
+    # keep the router top-k ids and Splash outputs instead of the full remat
+    # that unchunked EP needed.
     cfg.compile.memory_policy = "tpu_selective"
     cfg.compile.save_regions = ("moe.routing", "attention.inner_attention")
     cfg.compile.save_last_n_layers = {}
+    # `by_layer` is required: the EP collectives (Ring-of-Experts all-gather /
+    # reduce-scatter, ragged all-to-all) are activation collectives that
+    # `fsdp_pipeline` cannot move between children. One layer per child also
+    # keeps the 3:1 GatedDeltaNet:Attention cycle at 3 distinct backward
+    # children instead of 6.
     graph_split = cfg.compile.graph_split
     graph_split.forward_layers_per_executable = 1
     graph_split.backward_layers_per_executable = 1

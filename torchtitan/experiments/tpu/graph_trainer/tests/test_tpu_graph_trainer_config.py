@@ -434,6 +434,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       model = self._qwen3_graph_config(config).model_spec.model.build()
     self.assertEqual(model.layers.save_regions, ("attention.inner_attention",))
 
+  def test_scanning_saves_regions_under_the_offload_policy(self) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "tpu_selective_and_offload"
+    config.compile.save_regions = ("attention.inner_attention",)
+
+    with torch.device("meta"):
+      model = self._qwen3_graph_config(config).model_spec.model.build()
+    self.assertEqual(model.layers.save_regions, ("attention.inner_attention",))
+
   @parameterized.parameters(
       "default", "full", "eager", "sac_and_offload", "full_and_offload"
   )

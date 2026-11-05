@@ -12,6 +12,7 @@ from absl.testing import absltest
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
+from torch import fx
 from torch._functorch import config as functorch_config, partitioners
 from torch._higher_order_ops import partitioner as hop_partitioner
 from torch._higher_order_ops.scan import scan
@@ -22,12 +23,15 @@ from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint
 from torchtitan.experiments.tpu.graph_trainer import scan_remat_policy
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_body_remat_window,
+    tag_scan_body_joint_graph,
 )
 from torchtitan.experiments.tpu.remat_regions import (
     annotate_moe_expert_counts,
     annotate_region,
     ATTENTION_INNER_ATTENTION,
+    LAYER_INPUT,
     MOE_EXPERT_COUNTS,
+    REMAT_REGION,
 )
 from torchtitan.models.common import moe
 from torchtitan.models.common.moe import _batch_wise_load_balance_loss
@@ -259,6 +263,17 @@ class TestScanBodyRematWindow(unittest.TestCase):
         with mock.patch.object(scan_remat_policy, "_keeping_meta", lambda fn: fn):
             with self.assertRaisesRegex(Exception, "no remat_region meta"):
                 _run(scan_body_remat_window)
+
+    def test_tags_the_carry_as_the_layer_input(self):
+        graph = fx.Graph()
+        carry, x = graph.placeholder("carry"), graph.placeholder("x")
+        shared = {"module_fqn": "layers"}
+        carry.meta["custom"] = x.meta["custom"] = shared
+        graph.output(graph.call_function(torch.mul, (carry, x)))
+        tag_scan_body_joint_graph(graph, frozenset())
+        self.assertEqual(carry.meta["custom"][REMAT_REGION], LAYER_INPUT)
+        # Placeholder meta is shared between graphs; the tag must not leak.
+        self.assertNotIn(REMAT_REGION, shared)
 
     def test_refuses_an_unknown_save_region(self):
         with self.assertRaises(ValueError):

@@ -2,7 +2,7 @@
 
 Checks the sliding-window mask semantics, the splash-attention window
 convention, the registered layer patterns (SWA/RoPE vs. global/NoPE) and the
-TPU model registry. CPU vs. device parity lives in test_muse_glimmer.py.
+TPU model registry. CPU vs. device parity lives in test_muse_glimmer_tpu.py.
 """
 
 import dataclasses

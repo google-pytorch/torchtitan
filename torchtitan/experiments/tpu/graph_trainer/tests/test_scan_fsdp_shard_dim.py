@@ -131,15 +131,109 @@ class TestShardDimPicker(unittest.TestCase):
         shard = torch.arange(3 * 4 * 6).reshape(3, 4, 6).float()
         ranks = 4
 
-        def fake_all_gather(x, gather_dim, group):
+        def fake_all_gather(x, gather_dim, group, tag=""):
             self.assertEqual(gather_dim, 0, "gathered off dim 0")
             return torch.cat([x] * ranks, dim=0)
 
         with unittest.mock.patch.object(
-            scan_fsdp.funcol, "all_gather_tensor", fake_all_gather
+            scan_fsdp, "_orig_all_gather_single", fake_all_gather
         ):
-            out = scan_fsdp._gather_on(shard, 2, "group")
+            out = scan_fsdp._movedim_all_gather_tensor(shard, 2, "group")
         self.assertTrue(torch.equal(out, torch.cat([shard] * ranks, dim=2)))
+
+    def test_gather_slice_reaches_funcol_through_spmd_types(self):
+        # The body's real path is `gather_slice -> spmd.all_gather ->
+        # funcol.all_gather_tensor`, and the TPU transpose/fold lives in the
+        # `funcol` override. `spmd_types` has to still arrive there -- by
+        # attribute, at call time -- or the override silently stops applying.
+        # Gather off dim 0 so the transpose is observable, and check the
+        # backward lands in `funcol.reduce_scatter_tensor` the same way.
+        ranks = 4
+        shard = (
+            torch.arange(3 * 4 * 6, dtype=torch.float32)
+            .reshape(3, 4, 6)
+            .requires_grad_(True)
+        )
+        seen = []
+
+        def fake_all_gather(x, gather_dim, group, tag=""):
+            seen.append(("all_gather", gather_dim, group))
+            return torch.cat([x] * ranks, dim=0)
+
+        def fake_reduce_scatter(x, reduceOp, scatter_dim, group, tag=""):
+            seen.append(("reduce_scatter", scatter_dim, group))
+            return x.chunk(ranks, dim=0)[0] * ranks
+
+        with _fake_pg(ranks):
+            mesh = init_device_mesh("cpu", (ranks,), mesh_dim_names=("fsdp",))
+            group = mesh.get_group(0)
+            spec = scan_fsdp.ScanFSDPSpec(
+                group_name=group.group_name,
+                group=group,
+                param_dtype=None,
+                reduce_dtype=None,
+                sharded=True,
+                gather_dim=2,
+            )
+            with (
+                unittest.mock.patch.object(
+                    scan_fsdp, "_orig_all_gather_single", fake_all_gather
+                ),
+                unittest.mock.patch.object(
+                    scan_fsdp, "_orig_reduce_scatter_single", fake_reduce_scatter
+                ),
+            ):
+                whole = scan_fsdp.gather_slice(shard, spec)
+                self.assertTrue(
+                    torch.equal(whole, torch.cat([shard] * ranks, dim=2))
+                )
+                grad_out = torch.randn_like(whole)
+                whole.backward(grad_out)
+
+        # Both collectives went through the override: on dim 0, with the
+        # group `spmd_types` was handed (not a name it resolved itself).
+        self.assertEqual(
+            [(kind, dim) for kind, dim, _ in seen],
+            [("all_gather", 0), ("reduce_scatter", 0)],
+        )
+        for _, _, seen_group in seen:
+            self.assertIs(seen_group, group)
+        self.assertTrue(
+            torch.equal(shard.grad, grad_out.chunk(ranks, dim=2)[0] * ranks)
+        )
+
+    def test_a_spec_without_its_resolved_group_is_refused(self):
+        # Resolving a group by name is the C++ call Dynamo cannot trace inside
+        # the scan body, so a spec that would force the body to do it has to
+        # fail here, at construction, not later at trace time.
+        with _fake_pg(2):
+            mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("fsdp",))
+            group = mesh.get_group(0)
+            with self.assertRaisesRegex(ValueError, "group_name and group"):
+                scan_fsdp.ScanFSDPSpec(
+                    group_name=group.group_name,
+                    group=None,
+                    param_dtype=None,
+                    reduce_dtype=None,
+                    sharded=True,
+                )
+            with self.assertRaisesRegex(ValueError, "replicate_group_name"):
+                scan_fsdp.ScanFSDPSpec(
+                    group_name=group.group_name,
+                    group=group,
+                    param_dtype=None,
+                    reduce_dtype=None,
+                    sharded=True,
+                    replicate_group_name=group.group_name,
+                )
+            # And the no-mesh spec is still spellable.
+            scan_fsdp.ScanFSDPSpec(
+                group_name="",
+                group=None,
+                param_dtype=None,
+                reduce_dtype=None,
+                sharded=False,
+            )
 
     def test_fold_survives_strides_that_change_between_trace_and_replay(self):
         # TorchTPU traces against fake strides and replays with its own. The
@@ -249,7 +343,7 @@ class TestShardDimPicker(unittest.TestCase):
         ranks = 4
         with _fake_pg(ranks):
             mesh = init_device_mesh("cpu", (ranks,), mesh_dim_names=("fsdp",))
-            group_name = mesh.get_group(0).group_name
+            group = mesh.get_group(0)
             for shape, gather_dim, expected_folded in (
                 ((26, 1024), 0, (104, 256)),
                 ((9, 1024), 0, (72, 128)),
@@ -276,7 +370,8 @@ class TestShardDimPicker(unittest.TestCase):
                     return x.chunk(ranks, dim=0)[0] * ranks
 
                 spec = scan_fsdp.ScanFSDPSpec(
-                    group_name=group_name,
+                    group_name=group.group_name,
+                    group=group,
                     param_dtype=None,
                     reduce_dtype=None,
                     sharded=True,

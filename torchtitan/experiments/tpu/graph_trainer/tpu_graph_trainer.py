@@ -34,6 +34,7 @@ from torchtitan.components.optimizer.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     to_graph_trainer_config,
@@ -269,7 +270,6 @@ class TpuGraphTrainer(GraphTrainer):
     ) -> None:
         """Run the TPU/PJRT joint fwd+loss+bwd+optimizer training loop."""
         from torchtitan.components.loss import IGNORE_INDEX
-        from torchtitan.distributed import utils as dist_utils
         from torchtitan.models.common.aux_loss import AuxLoss
 
         self._register_optimizer_buffers()
@@ -394,7 +394,11 @@ class TpuGraphTrainer(GraphTrainer):
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
                 maybe_register_blockmask_pytree_node()
-                with self.train_context():
+                trace_context = dist_utils.get_spmd_context(
+                    parallel_dims=self.parallel_dims,
+                    spmd_typechecking=False,
+                )
+                with self.train_context(), trace_context():
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
@@ -515,7 +519,11 @@ class TpuGraphTrainer(GraphTrainer):
                 collect_moe_routing_metrics=self._collect_moe_routing_metrics,
             )
 
-            with self.train_context():
+            trace_context = dist_utils.get_spmd_context(
+                parallel_dims=self.parallel_dims,
+                spmd_typechecking=False,
+            )
+            with self.train_context(), trace_context():
                 self._traced_step = minimal_fx_tracer(
                     fwd_bwd_adamw,
                     module=model,

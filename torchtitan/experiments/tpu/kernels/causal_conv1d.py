@@ -54,8 +54,23 @@ def _tpu_generation() -> int | None:
   return gen
 
 
+def _vmem_limit_bytes() -> int:
+  """Scoped VMEM limit for both kernels: 90% of the core's VMEM.
+
+  Set explicitly so the kernels do not depend on the caller's
+  ``xla_tpu_scoped_vmem_limit_kib`` (the backward keeps several fp32
+  ``[seq_len, 128]`` strips live).
+  """
+  return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
 def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:
-  """Maximum whole-strip ``seq_len`` that fits default scoped VMEM."""
+  """Maximum whole-strip ``seq_len`` the kernels support (conservative).
+
+  The bounds were measured against the default scoped VMEM (16 MiB on v5/v6,
+  >= 32 MiB on TPU7x); the kernels request ``_vmem_limit_bytes()``, which is
+  larger, so the bounds keep headroom.
+  """
   gen = _tpu_generation()
   if gen is not None and gen >= 7:
     # TPU7x has >= 32 MiB default scoped VMEM (63.94 MiB in 35B recipes);
@@ -95,7 +110,9 @@ def _conv(x: jax.Array, w: jax.Array, rows: jax.Array) -> jax.Array:
 
 def _fwd_kernel(x_ref, w_ref, o_ref):
   x = x_ref[0].astype(jnp.float32)
-  rows = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+  # `[S, 1]` row ids broadcast across lanes; a full `[S, 128]` int32 iota
+  # would be one more live strip.
+  rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
   z = _conv(x, w_ref[...], rows)
   o_ref[0] = (z * jax.nn.sigmoid(z)).astype(o_ref.dtype)
 
@@ -105,7 +122,9 @@ def _bwd_kernel(x_ref, w_ref, g_ref, dx_ref, dw_ref):
   w = w_ref[...]
   width = w.shape[0]
   x = x_ref[0].astype(jnp.float32)
-  rows = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+  # `[S, 1]` row ids broadcast across lanes; a full `[S, 128]` int32 iota
+  # would be one more live strip.
+  rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
   z = _conv(x, w, rows)
   sig = jax.nn.sigmoid(z)
   gz = g_ref[0].astype(jnp.float32) * (sig * (1.0 + z * (1.0 - sig)))
@@ -157,7 +176,8 @@ def causal_conv_silu_fwd_jax(x: jax.Array, w_WC: jax.Array) -> jax.Array:
       out_specs=strip,
       out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
       compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel", "parallel")
+          dimension_semantics=("parallel", "parallel"),
+          vmem_limit_bytes=_vmem_limit_bytes(),
       ),
       name="causal_conv1d_silu_fwd",
   )(x, w_WC)
@@ -180,7 +200,8 @@ def causal_conv_silu_bwd_jax(
           jax.ShapeDtypeStruct(w_WC.shape, jnp.float32),
       ],
       compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel", "arbitrary")
+          dimension_semantics=("parallel", "arbitrary"),
+          vmem_limit_bytes=_vmem_limit_bytes(),
       ),
       name="causal_conv1d_silu_bwd",
   )(x, w_WC, g)

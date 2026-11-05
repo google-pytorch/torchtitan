@@ -36,15 +36,20 @@ from torchtitan.experiments.tpu import unflatten_shim
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
 from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
+from torchtitan.tools.logging import logger
 
 try:
   from torchtitan.experiments.tpu.kernels import causal_conv1d
-except ImportError:
+except ImportError as e:
+  # Expected without torch_tpu / Pallas (CPU, GPU); on TPU this means the
+  # ~2x slower slice-based convolution is used instead.
+  logger.info("Pallas causal_conv1d unavailable (%s); using the XLA path.", e)
   causal_conv1d = None
 
 try:
   from torchtitan.experiments.tpu.kernels import rms_norm_gated
-except ImportError:
+except ImportError as e:
+  logger.info("Pallas rms_norm_gated unavailable (%s); using the XLA path.", e)
   rms_norm_gated = None
 
 

@@ -85,25 +85,69 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
             "linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu",
             new=spy_bwd,
         ),
+        mock.patch.object(
+            linear_softmax_cross_entropy_loss.logger, "info"
+        ) as log_info,
+        mock.patch.object(
+            linear_softmax_cross_entropy_loss.logger, "warning"
+        ) as log_warn,
     ):
       # pylint: disable=protected-access
+      linear_softmax_cross_entropy_loss._logged_bwd_buffer_events.clear()
+      # Single-H benchmark tile (1024, 2048, 640) bf16 -> buffer_count=1,
+      # logged once across repeated calls.
+      linear_softmax_cross_entropy_loss._my_bwd(
+          dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
+      )
       linear_softmax_cross_entropy_loss._my_bwd(
           dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
       )
       self.assertEqual(calls[-1][1].get("buffer_count"), 1)
+      self.assertEqual(log_info.call_count, 1)
+      # Default tile (1024, 512, 2048) bf16 on TPU7x (64 MiB VMEM) stays on
+      # default (2, 2) buffering without overriding buffer_count.
       linear_softmax_cross_entropy_loss._my_bwd(
-          dout[:1],
-          lse[:128],
-          x[:128, :128],
-          labels[:128],
-          weights[:128, :128],
+          dout,
+          lse,
+          x[:, :512],
+          labels,
+          weights[:512, :2048],
           "sum",
           "mosaic_tpu",
-          128,
-          128,
-          128,
+          1024,
+          512,
+          2048,
       )
       self.assertNotIn("buffer_count", calls[-1][1])
+      self.assertEqual(log_info.call_count, 1)
+      # In fp32, (1024, 512, 2048) exceeds 57.6 MiB at (2, 2) (62.4 MiB) but
+      # fits at (2, 1) (56.4 MiB), so (2, 1) is selected before 1.
+      linear_softmax_cross_entropy_loss._my_bwd(
+          dout,
+          lse,
+          x[:, :512].astype(jnp.float32),
+          labels,
+          weights[:512, :2048].astype(jnp.float32),
+          "sum",
+          "mosaic_tpu",
+          1024,
+          512,
+          2048,
+      )
+      self.assertEqual(calls[-1][1].get("buffer_count"), (2, 1))
+      self.assertEqual(log_info.call_count, 2)
+      # Missing _calculate_bwd_vmem_bytes logs a warning once and keeps (2, 2).
+      with mock.patch.object(
+          kernel, "_calculate_bwd_vmem_bytes", None
+      ):
+        linear_softmax_cross_entropy_loss._my_bwd(
+            dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
+        )
+        linear_softmax_cross_entropy_loss._my_bwd(
+            dout, lse, x, labels, weights, "sum", "mosaic_tpu", 1024, 2048, 640
+        )
+      self.assertNotIn("buffer_count", calls[-1][1])
+      self.assertEqual(log_warn.call_count, 1)
 
 
 class LinearSoftmaxCrossEntropyLossTest(

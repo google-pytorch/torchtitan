@@ -58,34 +58,96 @@ def _has_logit_transform(soft_cap, output_multiplier) -> bool:
   return soft_cap is not None or output_multiplier != 1.0
 
 
-def _bwd_vmem_exceeds_capacity(
+_logged_bwd_buffer_events: set[tuple[object, ...]] = set()
+
+
+def _select_bwd_buffer_count(
     kernel,
     b_block_size: int,
     h_block_size: int,
     v_block_size: int,
     dtype,
-) -> bool:
-  """Whether default (2, 2) grad buffering exceeds the kernel's VMEM budget."""
+) -> tuple[int, int] | int | None:
+  """Selects backward ``buffer_count`` that fits VMEM, or ``None`` for ``(2, 2)``.
+
+  Tokamax's ``_calculate_bwd_vmem_bytes`` sums ``compute_s``'s ``(B, V)`` fp32
+  stack temporary (``4 * B * V``) and the subsequent ``dot_general`` fp32
+  temporaries in ``accumulate_{x,w}_grad`` (``4 * H_alloc * (B + V)``) as if
+  both stages were live simultaneously. Because ``compute_s`` finishes before
+  the gradient GEMMs start, at most ``max(4 * B * V, 4 * H_alloc * (B + V))``
+  of those stack temporaries are live at once; subtracting the non-overlapping
+  ``min(...)`` keeps the default ``(1024, 512, 2048)`` bf16 tiles on TPU7x at
+  ``(2, 2)`` (52.4 MiB <= 57.6 MiB) while stepping larger tiles down through
+  ``(2, 1)`` to ``1`` (e.g. ``(1024, 2048, 640)`` bf16 -> ``1`` at 49.4 MiB).
+  """
   calc_fn = getattr(kernel, "_calculate_bwd_vmem_bytes", None)
   if calc_fn is None:
-    return False
+    event_key = ("missing_calc_fn",)
+    if event_key not in _logged_bwd_buffer_events:
+      _logged_bwd_buffer_events.add(event_key)
+      logger.warning(
+          "Tokamax kernel is missing _calculate_bwd_vmem_bytes; keeping"
+          " default (2, 2) gradient buffering."
+      )
+    return None
   try:
     from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
 
-    vmem_22 = calc_fn(
-        b_block_size,
-        h_block_size,
-        v_block_size,
-        dtype=dtype,
-        buffer_count=(2, 2),
-    )
     limit_fn = getattr(kernel, "_get_vmem_limit_bytes", None)
     vmem_limit = (
         limit_fn()
         if limit_fn is not None
         else int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
     )
-    return vmem_22 > vmem_limit
+    h_alloc = 1 << (h_block_size - 1).bit_length()
+    non_overlapping_stack_bytes = min(
+        4 * b_block_size * v_block_size,
+        4 * h_alloc * (b_block_size + v_block_size),
+    )
+
+    def estimate_vmem(buf_count: tuple[int, int] | int) -> int:
+      return (
+          calc_fn(
+              b_block_size,
+              h_block_size,
+              v_block_size,
+              dtype=dtype,
+              buffer_count=buf_count,
+          )
+          - non_overlapping_stack_bytes
+      )
+
+    vmem_22 = estimate_vmem((2, 2))
+    if vmem_22 <= vmem_limit:
+      return None
+    chosen: tuple[int, int] | int = (
+        (2, 1) if estimate_vmem((2, 1)) <= vmem_limit else 1
+    )
+    vmem_chosen = estimate_vmem(chosen)
+    event_key = (
+        "buffer_count",
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        str(jax.numpy.dtype(dtype)),
+        chosen,
+    )
+    if event_key not in _logged_bwd_buffer_events:
+      _logged_bwd_buffer_events.add(event_key)
+      logger.info(
+          "Fused CE backward tiles (%d, %d, %d) (%s) exceed VMEM limit"
+          " %.1f MiB at buffer_count=(2, 2) (est. %.1f MiB); using"
+          " buffer_count=%s (est. %.1f MiB).",
+          b_block_size,
+          h_block_size,
+          v_block_size,
+          jax.numpy.dtype(dtype),
+          vmem_limit / (1024 * 1024),
+          vmem_22 / (1024 * 1024),
+          chosen,
+          vmem_chosen / (1024 * 1024),
+      )
+    return chosen
   except Exception:  # pylint: disable=broad-exception-caught
     # Keep (2, 2) buffering, but say why: a Tokamax API change here silently
     # disables the fallback and surfaces as a compile-time VMEM OOM.
@@ -97,7 +159,7 @@ def _bwd_vmem_exceeds_capacity(
         v_block_size,
         exc_info=True,
     )
-    return False
+    return None
 
 
 def _my_fwd(
@@ -208,15 +270,12 @@ def _my_bwd(
   bwd_fn = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
   bwd_kwargs = {}
   bwd_dtype = jax.numpy.result_type(x.dtype, weights.dtype)
-  if "buffer_count" in inspect.signature(
-      inspect.unwrap(bwd_fn)
-  ).parameters and _bwd_vmem_exceeds_capacity(
-      kernel, b_block_size, h_block_size, v_block_size, bwd_dtype
-  ):
-    # Large single-H tiles such as (1024, 2048, 640) fit TPU7x's 57.6 MiB
-    # kernel VMEM budget at 51.9 MiB with single-buffered grad accumulators,
-    # whereas jax >= 0.12's (2, 2) triple-buffering reaches 77.9 MiB and OOMs.
-    bwd_kwargs["buffer_count"] = 1
+  if "buffer_count" in inspect.signature(inspect.unwrap(bwd_fn)).parameters:
+    buf_count = _select_bwd_buffer_count(
+        kernel, b_block_size, h_block_size, v_block_size, bwd_dtype
+    )
+    if buf_count is not None:
+      bwd_kwargs["buffer_count"] = buf_count
   grad_x, grad_w = bwd_fn(
       dout,
       lse,

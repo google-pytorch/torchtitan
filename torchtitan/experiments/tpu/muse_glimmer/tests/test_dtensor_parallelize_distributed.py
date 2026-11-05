@@ -26,7 +26,7 @@ TEST_SEQ_LEN = 128
 TEST_TRAINING_STEPS = 3
 
 
-def _get_model_config(*, with_tp_sharding: bool = False) -> MuseGlimmerModel.Config:
+def _get_model_config(*, with_tp_sharding: bool = True) -> MuseGlimmerModel.Config:
   """Returns a copy of the TPU ``testmodel`` config.
 
   Args:
@@ -66,6 +66,9 @@ def _gather_dtensor_output(module, args, output):
 
 def _tp_wrapper(world_size: int):
   def apply_tp(model):
+    training = TrainingConfig()
+    training.mixed_precision_param = "float32"
+    training.mixed_precision_reduce = "float32"
     # pytype: disable=wrong-arg-types
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
@@ -74,7 +77,7 @@ def _tp_wrapper(world_size: int):
         dump_folder="",
         parallel_dims=_parallel_dims(world_size=world_size, tp=world_size),
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
-        training=TrainingConfig(),
+        training=training,
     )
     # pytype: enable=wrong-arg-types
     model.register_forward_hook(_gather_dtensor_output)

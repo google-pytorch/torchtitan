@@ -97,6 +97,7 @@ class DistributedUnitTestRunner:
 
     # Apply parallelism to the model.
     self.parallel_model = None
+    self.parallel_dims = None
     self._create_parallel_model(parallelism_func)
 
     # Create CPU reference model.
@@ -277,14 +278,33 @@ class DistributedUnitTestRunner:
     else:
       self.parallel_model = self.model_class(self.model_args).to(self.device)
 
-    # Capture return value if parallelism_func does not make change in place.
-    modified_model = func(self.parallel_model)
+    from torchtitan.distributed import utils as dist_utils
+    from torchtitan.distributed.parallel_dims import ParallelDims
+
+    orig_post_init = ParallelDims.__post_init__
+
+    def _capturing_post_init(pdims):
+      orig_post_init(pdims)
+      self.parallel_dims = pdims
+      dist_utils.set_spmd_backend(pdims.spmd_backend)
+
+    ParallelDims.__post_init__ = _capturing_post_init
+    try:
+      # Capture return value if parallelism_func does not make change in place.
+      modified_model = func(self.parallel_model)
+    finally:
+      ParallelDims.__post_init__ = orig_post_init
     if modified_model is not None:
       self.parallel_model = modified_model
 
     # Materialize weights if they are still on Meta device
     if any(p.device.type == "meta" for p in self.parallel_model.parameters()):
       self.parallel_model.to_empty(device=self.device)
+      torch.manual_seed(0)
+      if self.parallel_dims is not None and self.parallel_dims.world_size > 1:
+        torch.distributed.tensor._random.manual_seed(
+            0, self.parallel_dims.world_mesh
+        )
       with torch.device(self.device):
         self.parallel_model.init_weights()
 
@@ -369,8 +389,36 @@ class DistributedUnitTestRunner:
       ctx = contextlib.nullcontext()
       call_fn = lambda: model(inputs)
 
-    with ctx:
+    from torchtitan.distributed import utils as dist_utils
+
+    is_parallel = model is self.parallel_model and self.parallel_dims is not None
+    spmd_ctx = (
+        dist_utils.get_spmd_context(parallel_dims=self.parallel_dims)()
+        if is_parallel
+        else contextlib.nullcontext()
+    )
+    with ctx, spmd_ctx:
       output = call_fn()
+      if is_parallel:
+        if isinstance(output, DTensor):
+          output = output.full_tensor()
+        elif (
+            self.parallel_dims.spmd_backend == "spmd_types"
+            and self.parallel_dims.tp_enabled
+            and hasattr(self.model_args, "vocab_size")
+            and output.shape[-1] != self.model_args.vocab_size
+        ):
+          import spmd_types as spmd
+          from torchtitan.distributed.spmd_types import current_spmd_mesh
+
+          mesh = current_spmd_mesh()
+          if mesh is not None:
+            output = spmd.all_gather(
+                output,
+                mesh.get_group("tp"),
+                src=spmd.S(-1),
+                dst=spmd.I,
+            )
       if backward and targets is not None:
         if targets.dtype != output.dtype:
           targets = targets.to(output.dtype)

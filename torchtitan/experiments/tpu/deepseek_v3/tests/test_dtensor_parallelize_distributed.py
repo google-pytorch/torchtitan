@@ -38,7 +38,12 @@ def _get_deepseek_v3_model_config(
   Defaults to 'testmodel' (which specifies dim=128, n_layers=3,
   n_dense_layers=3, vocab_size=2048).
   """
-  return deepseek_v3_tpu.deepseekv3_configs[model_name]
+  import copy
+  from torchtitan.models.deepseek_v3.sharding import set_deepseek_v3_sharding_config
+
+  config = copy.deepcopy(deepseek_v3_tpu.deepseekv3_configs[model_name])
+  set_deepseek_v3_sharding_config(config, enable_sp=False, enable_ep=False)
+  return config
 
 
 def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(

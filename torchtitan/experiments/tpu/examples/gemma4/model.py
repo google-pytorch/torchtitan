@@ -17,7 +17,6 @@ from torchtitan.models.common.attention import (
     GQAttention,
     QKVLinear,
     ScaledDotProductInnerAttention,
-    segment_ids_from_positions,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
@@ -131,11 +130,12 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
     Upstream SDPA only supports plain causal attention. When
     ``sliding_window_size`` is set, each query attends to itself and the
     ``sliding_window_size`` previous keys, via an explicit band mask. When
-    ``positions`` or ``segment_ids`` are provided, queries also only attend to
-    keys from the same packed document. This matches the attribute and
-    packed-document convention the TPU splash and tokamax patches use, and the
-    class name keeps matching their ``"ScaledDotProduct"`` lookup, so enabling
-    a splash kernel still replaces this module.
+    ``segment_ids`` is provided, queries also only attend to keys from the same
+    packed document (computed once per step in ``Decoder.forward``). This
+    matches the attribute and packed-document convention the TPU splash and
+    tokamax patches use, and the class name keeps matching their
+    ``"ScaledDotProduct"`` lookup, so enabling a splash kernel still replaces
+    this module.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -156,17 +156,9 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
         scale: float | None = None,
         enable_gqa: bool = False,
         is_causal: bool = True,
-        positions: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        if segment_ids is None and positions is not None:
-            positions_local = (
-                positions.to_local()
-                if hasattr(positions, "to_local")
-                else positions
-            )
-            segment_ids = segment_ids_from_positions(positions_local)
         if self.sliding_window_size is None and segment_ids is None:
             return super().forward(
                 q_BLHK,

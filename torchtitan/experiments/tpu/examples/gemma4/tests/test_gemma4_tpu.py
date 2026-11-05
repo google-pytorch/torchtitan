@@ -48,6 +48,7 @@ from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import (
     QKVLinear,
     ScaledDotProductInnerAttention,
+    segment_ids_from_positions,
 )
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear, RouterGateLinear
@@ -457,7 +458,7 @@ class TestGemma4SoftCappedLoss(absltest.TestCase):
       workarounds.use_output_projection_patch(model)
 
 
-class TestGemma4SdpaSlidingWindow(absltest.TestCase):
+class TestGemma4SdpaSlidingWindow(parameterized.TestCase):
   """Sliding layers must apply the HF window on the plain SDPA backend."""
 
   _WINDOW = 4
@@ -536,15 +537,16 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
 
     x = torch.randn(2 * self._SEQ_LEN, self._DIM)
     positions = torch.arange(self._SEQ_LEN).repeat(2)
+    segment_ids = segment_ids_from_positions(positions)
     with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
-      actual = attn(x, attention_masks=None, positions=positions).view(
-          2, self._SEQ_LEN, self._DIM
-      )
+      actual = attn(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
       expected = self._attention_with_mask(attn, hf_mask)(
-          x, attention_masks=None, positions=positions
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
       ).view(2, self._SEQ_LEN, self._DIM)
       full_causal = self._attention_with_mask(attn, causal_mask)(
-          x, attention_masks=None, positions=positions
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
       ).view(2, self._SEQ_LEN, self._DIM)
 
     torch.testing.assert_close(actual, expected)
@@ -576,88 +578,94 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
       else:
         self.assertIsNone(inner.sliding_window_size)
 
-  def test_packed_document_masking_on_sliding_and_global_layers(self):
+  @parameterized.named_parameters(
+      dict(testcase_name="sliding", is_sliding=True, window=_WINDOW),
+      dict(testcase_name="global", is_sliding=False, window=None),
+  )
+  def test_packed_document_masking_on_sliding_and_global_layers(
+      self, is_sliding: bool, window: int | None
+  ):
     """Packed positions (resetting to 0 at doc boundaries) mask cross-doc keys."""
     head_dim = 8
-    for is_sliding, window in ((True, self._WINDOW), (False, None)):
-      cfg = Gemma4Attention.Config(
-          dim=self._DIM,
-          n_heads=4,
-          n_kv_heads=2,
-          head_dim=head_dim,
-          is_sliding=is_sliding,
-          sliding_window_size=window,
-          qk_norm=RMSNorm.Config(
-              normalized_shape=head_dim, eps=1e-6, param_init=_NORM_INIT
-          ),
-          v_norm=RMSNorm.Config(
-              normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
-          ),
-          qkv_linear=QKVLinear.Config(
-              head_dim=head_dim,
-              wq=Linear.Config(
-                  in_features=self._DIM,
-                  out_features=32,
-                  param_init=_LINEAR_INIT,
-              ),
-              wkv=Linear.Config(
-                  in_features=self._DIM,
-                  out_features=16,
-                  param_init=_LINEAR_INIT,
-              ),
-          ),
-          wo=Linear.Config(
-              in_features=32, out_features=self._DIM, param_init=_LINEAR_INIT
-          ),
-          inner_attention=ScaledDotProductInnerAttention.Config(),
-          rope=Gemma4RoPE.Config(
-              dim=head_dim, max_context_length=self._SEQ_LEN, theta=10000.0
-          ),
-      )
-      torch.manual_seed(0)
-      attn = cfg.build()
-      attn.init_states()
+    cfg = Gemma4Attention.Config(
+        dim=self._DIM,
+        n_heads=4,
+        n_kv_heads=2,
+        head_dim=head_dim,
+        is_sliding=is_sliding,
+        sliding_window_size=window,
+        qk_norm=RMSNorm.Config(
+            normalized_shape=head_dim, eps=1e-6, param_init=_NORM_INIT
+        ),
+        v_norm=RMSNorm.Config(
+            normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
+        ),
+        qkv_linear=QKVLinear.Config(
+            head_dim=head_dim,
+            wq=Linear.Config(
+                in_features=self._DIM,
+                out_features=32,
+                param_init=_LINEAR_INIT,
+            ),
+            wkv=Linear.Config(
+                in_features=self._DIM,
+                out_features=16,
+                param_init=_LINEAR_INIT,
+            ),
+        ),
+        wo=Linear.Config(
+            in_features=32, out_features=self._DIM, param_init=_LINEAR_INIT
+        ),
+        inner_attention=ScaledDotProductInnerAttention.Config(),
+        rope=Gemma4RoPE.Config(
+            dim=head_dim, max_context_length=self._SEQ_LEN, theta=10000.0
+        ),
+    )
+    torch.manual_seed(0)
+    attn = cfg.build()
+    attn.init_states()
 
-      # Two packed documents of length 6 in a 12-token sequence (doc boundary
-      # at index 6 is inside the 4-token sliding window for tokens 6..8).
-      doc_split = 6
-      positions_1d = torch.cat(
-          [torch.arange(doc_split), torch.arange(self._SEQ_LEN - doc_split)]
-      )
-      positions = positions_1d.repeat(2)
-      seg_1d = torch.tensor(
-          [1] * doc_split + [2] * (self._SEQ_LEN - doc_split)
-      )
-      same_doc = seg_1d[:, None] == seg_1d[None, :]
-      dist = (
-          torch.arange(self._SEQ_LEN)[:, None]
-          - torch.arange(self._SEQ_LEN)[None, :]
-      )
-      unpacked_mask = dist >= 0
-      if is_sliding and window is not None:
-        unpacked_mask = unpacked_mask & (dist < window)
-      packed_mask = unpacked_mask & same_doc
+    # Two packed documents of length 6 in a 12-token sequence (doc boundary
+    # at index 6 is inside the 4-token sliding window for tokens 6..8).
+    doc_split = 6
+    positions_1d = torch.cat(
+        [torch.arange(doc_split), torch.arange(self._SEQ_LEN - doc_split)]
+    )
+    positions = positions_1d.repeat(2)
+    segment_ids = segment_ids_from_positions(positions)
+    seg_1d = torch.tensor(
+        [1] * doc_split + [2] * (self._SEQ_LEN - doc_split)
+    )
+    same_doc = seg_1d[:, None] == seg_1d[None, :]
+    dist = (
+        torch.arange(self._SEQ_LEN)[:, None]
+        - torch.arange(self._SEQ_LEN)[None, :]
+    )
+    unpacked_mask = dist >= 0
+    if is_sliding and window is not None:
+      unpacked_mask = unpacked_mask & (dist < window)
+    packed_mask = unpacked_mask & same_doc
 
-      x = torch.randn(2 * self._SEQ_LEN, self._DIM)
-      with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
-        actual = attn(x, attention_masks=None, positions=positions).view(
-            2, self._SEQ_LEN, self._DIM
-        )
-        expected = self._attention_with_mask(attn, packed_mask)(
-            x, attention_masks=None, positions=positions
-        ).view(2, self._SEQ_LEN, self._DIM)
-        unpacked = self._attention_with_mask(attn, unpacked_mask)(
-            x, attention_masks=None, positions=positions
-        ).view(2, self._SEQ_LEN, self._DIM)
+    x = torch.randn(2 * self._SEQ_LEN, self._DIM)
+    with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
+      actual = attn(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
+      expected = self._attention_with_mask(attn, packed_mask)(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
+      unpacked = self._attention_with_mask(attn, unpacked_mask)(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
 
-      torch.testing.assert_close(actual, expected)
-      # Document 1 (rows :doc_split) is identical; document 2 must differ when
-      # cross-document keys are masked out.
-      torch.testing.assert_close(
-          actual[:, :doc_split], unpacked[:, :doc_split]
-      )
-      doc2_diff = (actual[:, doc_split:] - unpacked[:, doc_split:]).abs().amax()
-      self.assertGreater(doc2_diff.item(), 1e-4)
+    torch.testing.assert_close(actual, expected)
+    # Document 1 (rows :doc_split) is identical; document 2 must differ when
+    # cross-document keys are masked out.
+    torch.testing.assert_close(
+        actual[:, :doc_split], unpacked[:, :doc_split]
+    )
+    doc2_diff = (actual[:, doc_split:] - unpacked[:, doc_split:]).abs().amax()
+    self.assertGreater(doc2_diff.item(), 1e-4)
 
 
 class TestGemma4HFReferenceParity(BaseDeviceTest):
@@ -1115,15 +1123,25 @@ class TestGemma4SplashAttentionParity(BaseDeviceTest):
     positions_row1 = torch.arange(seq_len)
     positions_cpu = torch.cat([positions_row0, positions_row1]).to(torch.long)
     positions_device = positions_cpu.to(self.accelerator_device)
+    segment_ids_cpu = segment_ids_from_positions(positions_cpu)
+    segment_ids_device = segment_ids_cpu.to(self.accelerator_device)
 
     x_cpu, x_device = self._create_input_tensor_cpu_device(
         size=(batch * seq_len, dim), requires_grad=True
     )
 
     with set_unflatten_seq_len(seq_len):
-      y_cpu = attention_cpu(x_cpu, attention_masks=None, positions=positions_cpu)
+      y_cpu = attention_cpu(
+          x_cpu,
+          attention_masks=None,
+          positions=positions_cpu,
+          segment_ids=segment_ids_cpu,
+      )
       y_device = attention_device(
-          x_device, attention_masks=None, positions=positions_device
+          x_device,
+          attention_masks=None,
+          positions=positions_device,
+          segment_ids=segment_ids_device,
       )
 
     # Splash/tokamax run QK^T and PV in bf16 on the TPU MXU, vs. fp32 SDPA on
@@ -1177,7 +1195,10 @@ class TestGemma4SplashAttentionParity(BaseDeviceTest):
     unmasked_cpu.inner_attention = ScaledDotProductInnerAttention.Config().build()
     with torch.no_grad(), set_unflatten_seq_len(seq_len):
       y_unmasked = unmasked_cpu(
-          x_cpu, attention_masks=None, positions=positions_cpu
+          x_cpu,
+          attention_masks=None,
+          positions=positions_cpu,
+          segment_ids=segment_ids_cpu,
       )
     unmasked_diff = (
         torch.linalg.vector_norm(y_device.detach().float().cpu() - y_unmasked)

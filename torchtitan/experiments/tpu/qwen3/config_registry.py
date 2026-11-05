@@ -999,11 +999,12 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
     # budget, and the module OOMs before the first step (measured on 64 v7x).
     # So the two kernels are tiled independently.
     experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
-    # A K tile that does not divide F leaves a masked remainder tile.
-    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
+    # W2's dWeight fits untiled: [F, D] is 25 MB in FP32. Every extra K slab
+    # re-reads the dOutput rows; untiling saves ~1 ms per layer.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 0, 0)
     # With W2 sharded on its trailing axis (FSDP wider than the expert count),
-    # the transposed-RHS dWeight is stored [E, D, F]: tile D and keep F whole.
-    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 2048)
+    # the transposed-RHS dWeight is stored [E, D, F], also untiled.
+    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 0)
     experts.use_kernel_native_weight_layout = True
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.

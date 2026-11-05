@@ -139,6 +139,18 @@ class BLDLayoutTest(parameterized.TestCase):
     for g_actual, g_expected in zip(grads_actual, grads_expected):
       torch.testing.assert_close(g_actual, g_expected, rtol=1e-4, atol=1e-4)
 
+  def test_fused_qk_norm_rope_marks_only_qk_norm_cossin_blocks(self):
+    for name, eligible in (
+        ("qwen3_packed", True),
+        ("qwen3_bf16_rope", False),
+        ("llama3_real", False),
+    ):
+      _, bld = _build_pair(name)
+      self.assertEqual(apply_bld_layout(bld, fused_qk_norm_rope=True), 1)
+      self.assertEqual(
+          getattr(bld.attention, "fused_qk_norm_rope", False), eligible, name
+      )
+
   def test_idempotent(self):
     _, bld = _build_pair("qwen3_qkv")
     self.assertEqual(apply_bld_layout(bld), 1)

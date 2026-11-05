@@ -756,6 +756,7 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
     apply_bld_layout(
         model,
         skip_reason=bld_skip_reason(job_config.parallelism),
+        fused_qk_norm_rope=tpu_config.fused_qk_norm_rope,
     )
 
 

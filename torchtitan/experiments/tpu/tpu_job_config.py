@@ -19,6 +19,10 @@ class TPUConfig:
   # of upstream's folded [T, ...] tensors, which make XLA pick slow TPU layouts
   # (see experiments/tpu/bld_layout.py). Numerics match to rounding order.
   bld_block_layout: bool = True
+  # With bld_block_layout: run the elementwise passes of QK-norm + CosSinRoPE
+  # and their backward as Pallas kernels with BF16 I/O, instead of XLA fusions
+  # that materialize FP32 copies of Q and K. Bitwise equal to the unfused path.
+  fused_qk_norm_rope: bool = False
   use_jax_profiler: bool = False
   # Emit one aggregate MFU measurement after the configured start log step
   # through the end of training. Both boundaries must be metric log steps.

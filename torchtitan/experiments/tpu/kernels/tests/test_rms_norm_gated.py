@@ -1,5 +1,7 @@
 """Accelerator tests for the Pallas gated RMSNorm kernels."""
 
+import contextlib
+from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
@@ -190,12 +192,18 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
     with self.assertRaisesRegex(ValueError, "Unsupported inputs"):
       rms_norm_gated.rms_norm_gated(x_cpu, x_cpu, w_cpu, 1e-6)
 
-    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
-      return
+    with mock.patch.object(
+        rms_norm_gated.pltpu,
+        "get_tpu_info",
+        side_effect=ValueError("Unsupported TPU device kind: cpu"),
+    ):
+      self.assertIsNone(
+          rms_norm_gated._vmem_limit_bytes()  # pylint: disable=protected-access
+      )
+
     dev = self.accelerator_device
     x_ok = torch.zeros(2048, 128, device=dev, dtype=torch.bfloat16)
     w_ok = torch.ones(128, device=dev, dtype=torch.bfloat16)
-    self.assertTrue(rms_norm_gated.supports(x_ok, x_ok, w_ok))
 
     bad_cases = [
         (torch.zeros(100, 128, device=dev, dtype=torch.bfloat16), None, w_ok),
@@ -222,14 +230,23 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
             torch.ones(128, device=dev, dtype=torch.float16),
         ),
     ]
-    for x_bad, g_bad, w_bad in bad_cases:
-      g_in = x_bad if g_bad is None else g_bad
-      self.assertFalse(rms_norm_gated.supports(x_bad, g_in, w_bad))
-      with self.assertRaisesRegex(ValueError, "Unsupported inputs"):
-        rms_norm_gated.rms_norm_gated(x_bad, g_in, w_bad, 1e-6)
+    fake_tpu_dev = SimpleNamespace(type="tpu", index=0)
+    with (
+        contextlib.nullcontext()
+        if dev.type == "tpu"
+        else mock.patch.object(
+            torch.Tensor, "device", new=property(lambda _self: fake_tpu_dev)
+        )
+    ):
+      self.assertTrue(rms_norm_gated.supports(x_ok, x_ok, w_ok))
+      for x_bad, g_bad, w_bad in bad_cases:
+        g_in = x_bad if g_bad is None else g_bad
+        self.assertFalse(rms_norm_gated.supports(x_bad, g_in, w_bad))
+        with self.assertRaisesRegex(ValueError, "Unsupported inputs"):
+          rms_norm_gated.rms_norm_gated(x_bad, g_in, w_bad, 1e-6)
 
-    with self.assertRaisesRegex(ValueError, "eps must be non-negative"):
-      rms_norm_gated.rms_norm_gated(x_ok, x_ok, w_ok, -1e-6)
+      with self.assertRaisesRegex(ValueError, "eps must be non-negative"):
+        rms_norm_gated.rms_norm_gated(x_ok, x_ok, w_ok, -1e-6)
 
     fake_dtensor = mock.MagicMock(spec=DTensor)
     self.assertFalse(rms_norm_gated.supports(fake_dtensor, x_ok, w_ok))

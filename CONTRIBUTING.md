@@ -74,6 +74,31 @@ launch instructions; the
 [TorchTPU optimization guide](torchtitan/experiments/tpu/torch-tpu-optimization-guide.md) has the
 tuning levers.
 
+## Tests
+
+Put tests in a `tests/` directory next to the code they cover, and let the file name say what
+hardware the test needs. Both GitHub CI and Google's internal build read the hardware lane from the
+name, so a test that follows the convention runs in both without any CI or build configuration:
+
+| File name                                        | Runs on                                              |
+| ------------------------------------------------ | ---------------------------------------------------- |
+| `test_foo.py`                                    | CPU                                                  |
+| `test_foo_tpu.py`                                | one TPU chip (`--device=tpu`)                        |
+| `test_foo_distributed.py`                        | eight TPU chips, multi-process (`--num_devices=8`)   |
+| `torchtitan/experiments/tpu/kernels/tests/*.py`  | one TPU chip, whatever the suffix (Pallas kernels)   |
+
+Single-chip tests subclass `BaseAcceleratorDeviceTest`
+([`base_device_test.py`](torchtitan/experiments/tpu/base_device_test.py)) and multi-chip tests
+subclass `BaseDistributedDeviceTest`
+([`base_distributed_device_test.py`](torchtitan/experiments/tpu/base_distributed_device_test.py));
+CI checks that a `BaseDistributedDeviceTest` lives in a `*_distributed.py` file. A test may import a
+sibling test module for shared fixtures. Anything else (an unusual topology, a custom shard count, a
+dependency outside the standard set) is configured by hand on the internal side, so please call it
+out in the pull request.
+
+A test that is temporarily broken is listed, with the reason, in
+[`.ci/discover_tpu_tests.py`](.ci/discover_tpu_tests.py) rather than deleted or skipped inline.
+
 ## AI-generated code
 
 Use of AI assistants is neither encouraged nor discouraged, but **the author is fully responsible

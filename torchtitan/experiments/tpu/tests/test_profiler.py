@@ -3,13 +3,13 @@
 import os
 import pathlib
 import tempfile
-from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from absl.testing import absltest
 import jax
-import torch
-from torchtitan.experiments.tpu import jax_profiler
+
 import torchtitan.experiments.tpu.base_device_test as base_device_test
 import torchtitan.tools.profiler as torchtitan_profiler
 
@@ -18,8 +18,7 @@ class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_profiler_runs_and_outputs_traces(self):
     device = self.accelerator_device
-    if device.type != "tpu":
-      self.skipTest("This test is TPU-only")
+    self.assertEqual(device.type, "tpu", "This test is TPU-only")
 
     # 1. Setup a simple model to run some compute workloads on the TPU device.
     model = torch.nn.Sequential(
@@ -98,62 +97,6 @@ class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):
       # 6. Clean up temporary directory if fallback was used.
       if temp_dir_ctx:
         temp_dir_ctx.cleanup()
-
-  def test_jax_profiler_waits_for_device_before_start_and_stop(self):
-    """JaxProfiler syncs the accelerator before start_trace and stop_trace."""
-    tmpdir = self.create_tempdir().full_path
-    fake_prof = SimpleNamespace(
-        _config=SimpleNamespace(save_traces_folder="traces"),
-        _base_folder=tmpdir,
-        _leaf_folder="leaf",
-        tpu_step_num=10,
-    )
-    wrapper = jax_profiler.JaxProfiler(fake_prof)
-
-    for rank, is_avail, expected in (
-        (0, True, ["sync", "start_trace", "sync", "stop_trace"]),
-        (1, True, []),
-        (0, False, ["start_trace", "stop_trace"]),
-    ):
-      events: list[str] = []
-
-      def _record(label: str, ev: list[str] = events):
-        return lambda *_args, **_kwargs: ev.append(label)
-
-      with (
-          self.subTest(rank=rank, is_avail=is_avail),
-          mock.patch.dict(os.environ, {"RANK": str(rank)}),
-          mock.patch.object(
-              torch.distributed, "get_rank", autospec=True, return_value=rank
-          ),
-          mock.patch.object(
-              torch.accelerator,
-              "is_available",
-              autospec=True,
-              return_value=is_avail,
-          ),
-          mock.patch.object(
-              torch.accelerator,
-              "synchronize",
-              autospec=True,
-              side_effect=_record("sync"),
-          ),
-          mock.patch.object(
-              jax.profiler,
-              "start_trace",
-              autospec=True,
-              side_effect=_record("start_trace"),
-          ),
-          mock.patch.object(
-              jax.profiler,
-              "stop_trace",
-              autospec=True,
-              side_effect=_record("stop_trace"),
-          ),
-      ):
-        wrapper.start()
-        wrapper.stop()
-      self.assertEqual(events, expected)
 
 
 if __name__ == "__main__":

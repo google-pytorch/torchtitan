@@ -158,5 +158,47 @@ class KernelArgumentsTest(parameterized.TestCase):
     self.assertEqual(attention._kernel_kwargs(SimpleNamespace(), 2048, 2048), {})
 
 
+class PostTrainingWorkshopConfigsTest(absltest.TestCase):
+  """Tests for Gemma 4 post-training workshop configurations."""
+
+  def test_gemma4_cpt_and_sft_configs_build(self):
+    """Verifies CPT and SFT workshop configs construct with expected settings."""
+    from torchtitan.experiments.tpu.transformers_modeling_backend import config_registry  # pylint: disable=g-import-not-at-top
+
+    cpt_cfg = config_registry.gemma4_e2b_cpt_codeparrot()
+    self.assertEqual(cpt_cfg.hf_model, "google/gemma-4-E2B")
+    self.assertTrue(cpt_cfg.checkpoint.enable)
+    self.assertTrue(cpt_cfg.checkpoint.initial_load_in_hf)
+    self.assertTrue(cpt_cfg.checkpoint.last_save_in_hf)
+    self.assertTrue(cpt_cfg.checkpoint.last_save_model_only)
+
+    cpt_plain = config_registry.gemma4_e2b_cpt_codeparrot_plain_ce()
+    self.assertFalse(cpt_plain.model_spec.model.fused_loss)
+
+    sft_cfg = config_registry.gemma4_e2b_sft_alpaca()
+    self.assertEqual(sft_cfg.hf_model, "google/gemma-4-E2B-it")
+    self.assertEqual(sft_cfg.model_spec.flavor, "sft_full")
+    self.assertTrue(sft_cfg.checkpoint.last_save_in_hf)
+
+    sft_plain = config_registry.gemma4_e2b_sft_alpaca_plain_ce()
+    self.assertFalse(sft_plain.model_spec.model.fused_loss)
+
+  def test_format_alpaca_sample(self):
+    """Verifies Alpaca row formatting into user/assistant chat messages."""
+    from torchtitan.experiments.tpu.transformers_modeling_backend import config_registry  # pylint: disable=g-import-not-at-top
+
+    msgs = config_registry._format_alpaca_sample({  # pylint: disable=protected-access
+        "instruction": "Sort a list.",
+        "input": "[3, 1, 2]",
+        "output": "sorted([3, 1, 2])",
+    })
+    self.assertLen(msgs, 2)
+    self.assertEqual(msgs[0]["role"], "user")
+    self.assertIn("### Input:\n[3, 1, 2]", msgs[0]["content"])
+    self.assertEqual(
+        msgs[1], {"role": "assistant", "content": "sorted([3, 1, 2])"}
+    )
+
+
 if __name__ == "__main__":
   absltest.main()

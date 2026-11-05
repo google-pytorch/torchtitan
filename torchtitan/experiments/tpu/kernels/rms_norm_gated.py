@@ -63,9 +63,12 @@ def _bwd_kernel(eps, x_ref, g_ref, w_ref, dy_ref, dx_ref, dg_ref, dw_ref):
   dx_ref[...] = dx.astype(dx_ref.dtype)
 
 
-def _vmem_limit_bytes() -> int:
+def _vmem_limit_bytes() -> int | None:
   """Scoped VMEM limit for both kernels: 90% of the core's VMEM."""
-  return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  try:
+    return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  except (AttributeError, RuntimeError, ValueError):
+    return None
 
 
 def _block_rows(dim: int, *dtypes) -> int:

@@ -38,6 +38,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy,
     ReplicateComputation,
 )
+from torchtitan.experiments.tpu.graph_trainer import collectives as collectives_lib
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
 
 # Importing `scan_fsdp` installs `_movedim_reduce_scatter_tensor` on `funcol`,
@@ -333,7 +334,7 @@ class GraphSplitTest(absltest.TestCase):
       gm: torch.fx.GraphModule,
       partition_map: dict[torch.fx.Node, int],
   ) -> None:
-    chains = graph_split_lib._collect_collective_chains(gm)
+    chains = collectives_lib.collect_collective_chains(gm)
     self.assertNotEmpty(chains)
     for launch, nodes in chains.items():
       self.assertEqual(
@@ -918,7 +919,7 @@ class GraphSplitTest(absltest.TestCase):
         # An FP32 reduction carries the BF16 gradient across the boundary and
         # casts it in the RS executable.
         for node in graph.graph.nodes:
-          if graph_split_lib._is_reduce_scatter(node):
+          if collectives_lib.is_reduce_scatter(node):
             cast = node.args[0]
             self.assertEqual(cast.meta["val"].dtype, torch.float32)
             self.assertEqual(
@@ -939,6 +940,25 @@ class GraphSplitTest(absltest.TestCase):
         rs_only.collective_layer_to_partition["rs"],
         {layer: part + 1 for layer, part in rs_only.layer_to_partition.items()},
     )
+
+    # A reduce-scatter that is not a gradient reduction (like a TP activation
+    # reduce-scatter): truncating a reduction's chain to its launch makes its
+    # consumer ordinary compute. It stays with its inputs unless RS are
+    # pipelined, which cannot move it.
+    chains = collectives_lib.collect_collective_chains(backward)
+    launch = next(n for n in chains if collectives_lib.is_reduce_scatter(n))
+    chains[launch] = {launch}
+    for pipelined_kinds in ((), ("ag",)):
+      owners = graph_split_lib._collect_backward_collective_owners(
+          chains, 4, pipelined_kinds
+      )
+      self.assertNotIn(launch, owners)
+    with self.assertRaisesRegex(ValueError, "neither a parameter gather"):
+      graph_split_lib._collect_backward_collective_owners(chains, 4, ("rs",))
+    with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
+      split_backward_graph_by_layer(
+          backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=()
+      )
 
     # A real Zero2-like trace has RS but no backward AG ownership.
     zero2_backward = self._trace_simple_fsdp(

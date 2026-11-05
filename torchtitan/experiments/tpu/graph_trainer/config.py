@@ -114,8 +114,9 @@ class GraphSplitterConfig:
   expert_all_gathers_under_splash: bool = False
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
-  # ("rs"). The rest stay with their layer, as in ``by_layer``.
-  pipeline_kinds: tuple[PipelinedCollective, ...] = ("ag", "rs")
+  # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``
+  # moves both. Rejected with any other mode, and when empty.
+  pipeline_kinds: tuple[PipelinedCollective, ...] | None = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -203,6 +204,25 @@ def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:
     )
 
 
+def _validate_graph_split(graph_split: GraphSplitterConfig) -> None:
+  # Knobs that would leave the split unchanged are rejected, so a sweep cannot
+  # record a no-op arm as a real result.
+  kinds = graph_split.pipeline_kinds
+  if kinds is None:
+    return
+  if graph_split.backward_partition_mode != "fsdp_pipeline":
+    raise ValueError(
+        "compile.graph_split.pipeline_kinds applies only to "
+        "backward_partition_mode='fsdp_pipeline', got "
+        f"{graph_split.backward_partition_mode!r}"
+    )
+  if not kinds:
+    raise ValueError(
+        "compile.graph_split.pipeline_kinds is empty, which gives the "
+        "by_layer layout; use backward_partition_mode='by_layer'"
+    )
+
+
 def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
   compile_config = config.compile
   save_regions = compile_config.save_regions
@@ -263,6 +283,7 @@ def apply_tpu_graph_trainer_model_transforms(
   model, so ``compile.use_scan_layers`` can select the scanned model class.
   """
   _validate_fsdp_allreduce_slice(config)
+  _validate_graph_split(config.compile.graph_split)
 
   compile_config = config.compile
   if compile_config.pass_pipeline != "tpu":

@@ -1135,11 +1135,15 @@ class GraphSplitTest(absltest.TestCase):
     cast.replace_input_with(wait, mul)
     gm.recompile()
 
-    chains = graph_split_lib._collect_collective_chains(gm)
+    chains = collectives_lib.collect_collective_chains(gm)
     chain = next(chain for chain in chains.values() if wait in chain)
     self.assertNotIn(mul, chain)
     self.assertNotIn(cast, chain)
-    with self.assertRaisesRegex(ValueError, "reverse dependency"):
+    with self.assertRaisesRegex(
+        ValueError,
+        "reverse dependency|neither a parameter gather nor a gradient"
+        " reduction",
+    ):
       split_backward_graph_by_layer(gm, n_layers=2, pipeline_collectives=True)
 
 

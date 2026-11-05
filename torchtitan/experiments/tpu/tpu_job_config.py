@@ -279,7 +279,10 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
           or self.parallelism.pipeline_parallel_degree > 1
       ):
         raise ValueError(
-            "compile.compile_grad_norm currently requires EP1 and PP1"
+            "compile.compile_grad_norm currently requires EP1 and PP1; pass"
+            " --compile.no-compile_grad_norm with"
+            " --parallelism.expert_parallel_degree > 1 or"
+            " --parallelism.pipeline_parallel_degree > 1"
         )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.

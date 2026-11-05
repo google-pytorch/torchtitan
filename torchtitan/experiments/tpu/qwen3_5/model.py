@@ -138,15 +138,13 @@ class TpuQwen35Model(Qwen35Model):
       Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
       ep_deg = config.parallelism.expert_parallel_degree
       if ep_deg > 1:
-        # Under EP > 1, dense `(fsdp,)` and routed-expert `(efsdp, ep)` DTensors
-        # live on distinct meshes: foreach `CompiledGradNorm` rejects mixed
-        # meshes, and `DEFER_AND_FUSE` avoids eager barrier stalls.
-        if hasattr(config, "compile") and hasattr(
-            config.compile, "compile_grad_norm"
-        ):
-          config.compile.compile_grad_norm = False
-        if hasattr(config, "tpu_config") and not config.tpu_config.eager_mode:
-          config.tpu_config.eager_mode = "DEFER_AND_FUSE"
+        # Only model-config changes belong here. `compile_grad_norm` (rejected
+        # under EP > 1 by `TPUTrainerConfig.__post_init__` at parse time) and
+        # `tpu_config.eager_mode` (applied by `gmain` before the trainer is
+        # built) must be set in the recipe or on the command line.
+        # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
+        # for the paired (w1 + w3) Pallas kernel unless the experts opt in to
+        # the EP-aware paired kernel; otherwise fall back to unpaired Pallas.
         for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
           if not experts.allow_ep_paired_grouped_mm:
             experts.use_pallas_paired_grouped_mm = False

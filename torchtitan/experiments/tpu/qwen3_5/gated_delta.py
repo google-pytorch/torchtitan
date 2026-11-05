@@ -18,9 +18,9 @@ axis as one stream. This module provides the TPU replacements:
    the causal ``conv1d`` and the recurrence also restart at every document
    packed into a row (``positions == 0``), as upstream's ``cu_seqlens`` kernels
    do. The document boundaries are static-shape ``[B, S]`` segment-id masks;
-   setting ``reset_at_documents=False`` (``document_resets.enabled=False``)
-   turns off the document restarts so pretraining runs over each ``[B, S]`` row
-   as one stream.
+   setting ``Config.document_resets.enabled=False`` (or the attribute
+   ``config.reset_at_documents = False``) turns off the document restarts so
+   pretraining runs over each ``[B, S]`` row as one stream.
 """
 
 from dataclasses import dataclass, field, replace
@@ -586,8 +586,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   document offsets, which ``Qwen35Model`` only builds for the flex and varlen
   attention backends and whose shape changes with the number of documents.
 
-  ``Config.reset_at_documents=False`` (``document_resets.enabled=False``) drops
-  ``positions`` instead, so the convolution and the recurrence run over each
+  ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the convolution and the recurrence run over each
   ``[B, S]`` row as one stream, as upstream does without ``cu_seqlens`` (e.g.
   with SDPA). Pretraining recipes use it: the Tokamax kernels lay every
   document out from a 64-token chunk boundary to restart at it, which costs
@@ -603,6 +602,8 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         default_factory=GatedDeltaDocumentResets.Config
     )
 
+    # Attribute alias for `document_resets.enabled` (not a dataclass field: it
+    # is not a constructor/`replace()` argument and is not serialized).
     @property
     def reset_at_documents(self) -> bool:
       return self.document_resets.enabled
@@ -613,7 +614,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
 
   def __init__(self, config: Config):
     super().__init__(config)
-    self.reset_at_documents = config.document_resets.build().enabled
+    self.reset_at_documents = config.document_resets.enabled
 
   def forward(
       self,
@@ -654,7 +655,8 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         cu_seqlens,
         key_head_dim=self.key_head_dim,
         value_head_dim=self.value_head_dim,
-        # TPU: pass `positions`; packed documents restart conv + recurrence.
+        # TPU: pass `positions` so packed documents restart conv + recurrence,
+        # unless document resets are disabled (pretraining).
         positions=positions if self.reset_at_documents else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)

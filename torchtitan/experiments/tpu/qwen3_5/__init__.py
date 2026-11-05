@@ -10,7 +10,8 @@ Wraps upstream ``torchtitan.models.qwen3_5`` for the TPU lane
   for ``TpuGatedDeltaNet``, which pass ``positions`` down to
   ``TpuInnerGatedDeltaNet``, so packed documents restart the causal
   convolution and the delta-rule state (upstream: ``cu_seqlens``, built only
-  for the flex and varlen backends).
+  for the flex and varlen backends), unless ``document_resets.enabled=False``
+  (the pretraining benchmark recipes).
 * Swaps every full-attention layer for ``TpuQwen35Attention`` with a
   ``SlidingWindowScaledDotProductInnerAttention`` without a window, so packed
   documents are masked on SDPA and the Splash patch sees ``positions``.

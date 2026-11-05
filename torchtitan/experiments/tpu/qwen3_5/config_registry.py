@@ -552,7 +552,8 @@ def qwen35_moe_35b_split_tokamax_benchmark(
   # backward; v=640 divides the 248320 vocabulary (388 blocks). Requires bf16
   # activations and xla_tpu_scoped_vmem_limit_kib=65472 (~51.9 MiB VMEM
   # single-buffered; fp32 hidden states would need ~69.9 MiB). On one TPU7x
-  # core at 64K tokens: 564 vs 633 ms forward + backward with (1024, 512, 2048).
+  # core at 64K tokens (measured with 8 x 8192 tokens/rank): 564 vs 633 ms
+  # forward + backward with (1024, 512, 2048).
   _enable_pallas_cross_entropy(
       base_cfg, b_block_size=1024, h_block_size=2048, v_block_size=640
   )
@@ -565,9 +566,11 @@ def qwen35_moe_35b_split_tokamax_benchmark(
       memory_policy="tpu_selective",
       save_regions=("moe.routing", "attention.inner_attention"),
   )
-  # 512-row expert tiles for EP=1 at 64K tokens per rank (~2K routed rows per
-  # expert on average): the routed-expert MLP's forward + backward takes 22.9
-  # vs 26.8 ms per layer on one TPU7x core with the Qwen3-30B tiles (256).
+  # 512-row expert tiles, measured at EP=1 with 64K tokens per rank (8 x 8192,
+  # ~2K routed rows per expert on average): the routed-expert MLP's forward +
+  # backward takes 22.9 vs 26.8 ms per layer on one TPU7x core with the
+  # Qwen3-30B tiles (256). The 32K-token default and the EP recipes inherit
+  # this tile.
   _use_tpu_moe_kernels(cfg, tile_m=512)
   # Throughput DVFS operating point (p_state=7) and SparseCore collective
   # offload (async AG, dual-SC RS, latency-hiding scheduler), merged onto

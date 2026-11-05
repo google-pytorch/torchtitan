@@ -93,6 +93,11 @@ def rms_norm_gated_fwd_jax(
 ) -> jax.Array:
   rows, dim = x.shape
   block_rows = _block_rows(dim, x.dtype, gate.dtype)
+  if rows <= 0 or rows % block_rows != 0:
+    raise ValueError(
+        f"rows ({rows}) must be a positive multiple of block_rows"
+        f" ({block_rows})"
+    )
   row_spec = _row_spec(block_rows, dim)
   return pl.pallas_call(
       lambda *refs: _fwd_kernel(eps, *refs),
@@ -118,6 +123,11 @@ def rms_norm_gated_bwd_jax(
   """Returns ``(dx, dg, dw_1D)`` accumulated in FP32 across row blocks."""
   rows, dim = x.shape
   block_rows = _block_rows(dim, x.dtype, gate.dtype, dy.dtype)
+  if rows <= 0 or rows % block_rows != 0:
+    raise ValueError(
+        f"rows ({rows}) must be a positive multiple of block_rows"
+        f" ({block_rows})"
+    )
   row_spec = _row_spec(block_rows, dim)
   return pl.pallas_call(
       lambda *refs: _bwd_kernel(eps, *refs),

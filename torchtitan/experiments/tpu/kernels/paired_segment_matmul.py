@@ -164,6 +164,206 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
     )(group_metadata, group_offset, lhs, rhs1, rhs3)
 
 
+def row_chunk_bounds(rows_total, tile_m, chunks):
+    """Tile-aligned row boundaries for ``chunks`` pipelined gather pieces.
+
+    The first gather is exposed and gather i+1 hides under piece i's matmul,
+    which takes longer than the gather of an equal piece. So, when the sizes
+    divide, the pieces ramp up 1, 2, 4, then 8 units of ``rows_total /
+    (8 * chunks)``, which shortens the exposed first gather; otherwise they
+    are equal.
+    """
+    if rows_total % (chunks * tile_m):
+        raise ValueError(
+            "The routed row count must split into tile-aligned chunks"
+        )
+    unit = rows_total // (8 * chunks)
+    if chunks >= 4 and unit % tile_m == 0:
+        sizes = [1, 2, 4]
+        while sum(sizes) + 8 <= 8 * chunks:
+            sizes.append(8)
+        sizes[-1] += 8 * chunks - sum(sizes)
+        sizes = [u * unit for u in sizes]
+    else:
+        sizes = [rows_total // chunks] * chunks
+    bounds = [0]
+    for size in sizes:
+        bounds.append(bounds[-1] + size)
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def chunk_grid(group_metadata, num_active_tiles, tile_start, tile_end):
+    """The contiguous range of MegaBlox grid steps that visit m tiles in
+    ``[tile_start, tile_end)``, as (first step, step count) int32 arrays.
+
+    Steps visit m tiles in nondecreasing order, so a tile-aligned row chunk
+    owns a contiguous run of the global steps, with the same expert visits it
+    would get from its own metadata.
+    """
+    m_tile_ids = group_metadata[2]
+    active = jnp.arange(m_tile_ids.shape[0]) < num_active_tiles
+    first = jnp.sum(active & (m_tile_ids < tile_start)).astype(jnp.int32)
+    end = jnp.sum(active & (m_tile_ids < tile_end)).astype(jnp.int32)
+    return first.reshape(1), end - first
+
+
+def _paired_forward_rows(
+    lhs,
+    rhs1,
+    rhs3,
+    group_metadata,
+    grid,
+    outs,
+    *,
+    tile_m,
+    row_offset,
+    rows_total,
+):
+    """``_paired_forward`` over the routed rows starting at ``row_offset``.
+
+    ``group_metadata`` describes all routed rows; ``grid`` (``chunk_grid``)
+    selects this chunk's steps. Results, and a copy of ``lhs``, land in the
+    matching rows of full-size outputs: ``outs`` (h1, h3, routed rows) are
+    aliased and updated in place, or, for the first chunk, fresh buffers whose
+    other rows are filled by later chunks. ``row_offset`` is tile aligned, so
+    every tile sees the same expert visits, and the same arithmetic, as in the
+    unchunked kernel.
+    """
+    m, k = lhs.shape
+    groups, _, n = rhs1.shape
+    if row_offset % tile_m or m % tile_m:
+        raise ValueError("Row chunks must be tile aligned")
+    tile_offset = row_offset // tile_m
+    grid_start, grid_size = grid
+
+    def kernel(group_metadata, grid_start, lhs, rhs1, rhs3, *refs):
+        out1, out3, routed, acc1, acc3 = refs[-5:]
+        _, _, m_tile_ids = group_metadata
+        local_id = pl.program_id(1)
+        grid_id = local_id + grid_start[0]
+        first_visit = jnp.logical_or(
+            local_id == 0,
+            m_tile_ids[grid_id] != m_tile_ids[jnp.maximum(grid_id - 1, 0)],
+        )
+
+        @pl.when(first_visit)
+        def _():
+            routed[...] = lhs[...]
+
+        loaded_lhs = lhs[...]
+        acc1[...] = lax.dot(
+            loaded_lhs, rhs1[...], preferred_element_type=jnp.float32
+        )
+        acc3[...] = lax.dot(
+            loaded_lhs, rhs3[...], preferred_element_type=jnp.float32
+        )
+        mask = _get_store_mask(
+            grid_id=grid_id,
+            group_metadata=group_metadata,
+            tm=tile_m,
+            tn=n,
+        )
+        out1[...] = lax.select(
+            mask[...], acc1[...], out1[...].astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        out3[...] = lax.select(
+            mask[...], acc3[...], out3[...].astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+
+    def lhs_indices(n_i, local_id, k_i, group_metadata, grid_start):
+        del n_i, k_i
+        return group_metadata[2][local_id + grid_start[0]] - tile_offset, 0
+
+    def rhs_indices(n_i, local_id, k_i, group_metadata, grid_start):
+        del n_i, k_i
+        return group_metadata[1][local_id + grid_start[0]], 0, 0
+
+    def out_indices(n_i, local_id, k_i, group_metadata, grid_start):
+        del n_i, k_i
+        return group_metadata[2][local_id + grid_start[0]], 0
+
+    rhs_spec = pl.BlockSpec((None, k, n), rhs_indices)
+    out_spec = pl.BlockSpec((tile_m, n), out_indices)
+    routed_spec = pl.BlockSpec((tile_m, k), out_indices)
+    in_specs = [pl.BlockSpec((tile_m, k), lhs_indices), rhs_spec, rhs_spec]
+    operands = [group_metadata, grid_start, lhs, rhs1, rhs3]
+    aliases = {}
+    if outs is not None:
+        in_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 3
+        operands += list(outs)
+        # Operand 7 counts the three group-metadata arrays and grid_start.
+        aliases = {7: 0, 8: 1, 9: 2}
+    return pl.pallas_call(
+        kernel,
+        out_shape=[
+            jax.ShapeDtypeStruct((rows_total, n), jnp.bfloat16),
+            jax.ShapeDtypeStruct((rows_total, n), jnp.bfloat16),
+            jax.ShapeDtypeStruct((rows_total, k), lhs.dtype),
+        ],
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=in_specs,
+            out_specs=[out_spec, out_spec, routed_spec],
+            grid=(1, grid_size, 1),
+            scratch_shapes=[
+                pltpu.VMEM((tile_m, n), jnp.float32),
+                pltpu.VMEM((tile_m, n), jnp.float32),
+            ],
+        ),
+        input_output_aliases=aliases,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary", "arbitrary")
+        ),
+        cost_estimate=pl.CostEstimate(
+            flops=4 * m * k * n,
+            transcendentals=0,
+            bytes_accessed=(
+                2 * m * k * 2 + 2 * groups * k * n * 2 + 2 * m * n * 2
+            ),
+        ),
+        name="moe_gmm_w13_fwd",
+    )(*operands)
+
+
+def _gather_paired_forward(
+    x, token_indices, rhs1, rhs3, group_sizes, *, tile_m, chunks
+):
+    """``_paired_forward(x[token_indices], ...)`` with the gather pipelined.
+
+    The routed rows are gathered in ``chunks`` tile-aligned pieces
+    (``row_chunk_bounds``). Each piece feeds a row-range kernel that also
+    writes it into one full routed-row buffer, so XLA can run piece i+1's
+    (SparseCore) gather under piece i's matmuls without slicing or
+    concatenating routed-row tensors. Returns
+    (h1, h3, x[token_indices]), bitwise equal to the unchunked computation.
+    """
+    _validate_shapes(x, rhs1, rhs3, group_sizes, tile_m)
+    rows_total = token_indices.shape[0]
+    group_metadata, num_active_tiles = _metadata(
+        group_sizes,
+        m=rows_total,
+        tile_m=tile_m,
+        groups=rhs1.shape[0],
+        visit_empty_groups=False,
+    )
+    outs = None
+    for start, end in row_chunk_bounds(rows_total, tile_m, chunks):
+        outs = _paired_forward_rows(
+            x[token_indices[start:end]],
+            rhs1,
+            rhs3,
+            group_metadata,
+            chunk_grid(
+                group_metadata, num_active_tiles, start // tile_m, end // tile_m
+            ),
+            outs,
+            tile_m=tile_m,
+            row_offset=start,
+            rows_total=rows_total,
+        )
+    return tuple(outs)
+
+
 def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
     """Return ``existing + bf16(dout @ rhs^T)`` per expert group, in place.
 
@@ -492,6 +692,111 @@ def _backward(ctx, grad_output1, grad_output3):
 _paired_grouped_mm_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
+@pallas.jax_op("tt_experts::gather_paired_grouped_mm")
+def _gather_paired_grouped_mm_fwd(
+    x: jax.Array,
+    token_indices: jax.Array,
+    inverse: jax.Array,
+    rhs1: jax.Array,
+    rhs3: jax.Array,
+    group_sizes: jax.Array,
+    tile_m: int,
+    tgmm_tile_m: int,
+    tgmm_tile_k: int,
+    chunks: int,
+    recompute_chunks: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    # recompute_chunks replaces chunks in rematerialized copies (graph pass
+    # apply_recompute_gather_chunks).
+    del inverse, tgmm_tile_m, tgmm_tile_k, recompute_chunks
+    return _gather_paired_forward(
+        x, token_indices, rhs1, rhs3, group_sizes, tile_m=tile_m, chunks=chunks
+    )
+
+
+def _gather_setup_context(ctx, inputs, output):
+    x, _, inverse, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m, tgmm_tile_k = (
+        inputs[:9]
+    )
+    routed = output[2]
+    ctx.mark_non_differentiable(routed)
+    ctx.save_for_backward(routed, inverse, rhs1, rhs3, group_sizes)
+    ctx.x_shape = x.shape
+    ctx.tile_m = tile_m
+    ctx.tgmm_tile_m = tgmm_tile_m
+    ctx.tgmm_tile_k = tgmm_tile_k
+
+
+def _gather_backward(ctx, grad_output1, grad_output3, _grad_routed):
+    routed, inverse, rhs1, rhs3, group_sizes = ctx.saved_tensors
+    grad_routed, grad_rhs1, grad_rhs3 = _paired_grouped_mm_bwd(
+        grad_output1,
+        grad_output3,
+        routed,
+        rhs1,
+        rhs3,
+        group_sizes,
+        ctx.tile_m,
+        ctx.tgmm_tile_m,
+        ctx.tgmm_tile_k,
+    )
+    # The same inverse-permutation gather and FP32 top-k sum as the TPU
+    # dispatcher's _LocalReorder backward.
+    tokens, dim = ctx.x_shape
+    grad_x = (
+        torch.index_select(grad_routed, 0, inverse)
+        .float()
+        .reshape(tokens, -1, dim)
+        .sum(dim=1)
+        .to(grad_routed.dtype)
+    )
+    return (grad_x, None, None, grad_rhs1, grad_rhs3) + (None,) * 6
+
+
+_gather_paired_grouped_mm_fwd.register_autograd(
+    _gather_backward, setup_context=_gather_setup_context
+)
+
+
+def gather_paired_segment_matmul_pallas_2d(
+    x: torch.Tensor,
+    token_indices: torch.Tensor,
+    inverse: torch.Tensor,
+    rhs1: torch.Tensor,
+    rhs3: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    tile_m: int,
+    tgmm_tile_m: int,
+    tgmm_tile_k: int,
+    chunks: int,
+    recompute_chunks: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``paired_segment_matmul_pallas_2d(x[token_indices], ...)``, with the
+    token gather pipelined against the matmul in ``chunks`` row pieces
+    (``recompute_chunks``, if nonzero, in rematerialized copies).
+
+    ``inverse`` inverts the route permutation; backward uses it to return
+    token gradients as the TPU dispatcher's local reorder does.
+    """
+    if group_sizes.dtype != torch.int32:
+        group_sizes = group_sizes.to(torch.int32)
+    h1, h3, _ = _gather_paired_grouped_mm_fwd(
+        x,
+        token_indices.to(torch.int32),
+        inverse.to(torch.int32),
+        rhs1,
+        rhs3,
+        group_sizes,
+        tile_m,
+        tgmm_tile_m,
+        tgmm_tile_k,
+        chunks,
+        recompute_chunks or chunks,
+    )
+    return h1, h3
+
+
 def paired_segment_matmul_pallas_2d(
     lhs: torch.Tensor,
     rhs1: torch.Tensor,
@@ -517,4 +822,7 @@ def paired_segment_matmul_pallas_2d(
     )
 
 
-__all__ = ["paired_segment_matmul_pallas_2d"]
+__all__ = [
+    "gather_paired_segment_matmul_pallas_2d",
+    "paired_segment_matmul_pallas_2d",
+]

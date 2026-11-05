@@ -1067,6 +1067,34 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
     )
 
+  def test_235b_token_gather_chunking(self) -> None:
+    # (chunks, recompute chunks, combine) per recipe; see config_registry.
+    for recipe, expected in (
+        (
+            qwen3_config_registry._qwen3_moe_235b_fsdp_activation_offload,
+            (8, 0, True),
+        ),
+        (qwen3_moe_235b_fsdp_activation_offload_4x4x4, (8, 1, False)),
+        (qwen3_moe_235b_fsdp_activation_offload_maxtext, (0, 0, False)),
+    ):
+      with self.subTest(recipe=recipe.__name__):
+        routed = [
+            config
+            for _, config, _, _ in recipe().model_spec.model.traverse(
+                TpuRoutedExperts.Config
+            )
+        ]
+        self.assertNotEmpty(routed)
+        for config in routed:
+          self.assertEqual(
+              (
+                  config.gather_in_expert_chunks,
+                  config.gather_in_expert_recompute_chunks,
+                  config.combine_in_experts,
+              ),
+              expected,
+          )
+
   @parameterized.named_parameters(
       ("scan", qwen3_moe_235b_scan),
       ("activation_offload", qwen3_moe_235b_fsdp_activation_offload_maxtext),

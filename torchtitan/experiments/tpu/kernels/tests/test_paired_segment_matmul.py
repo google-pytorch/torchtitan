@@ -6,6 +6,7 @@ from absl.testing import absltest
 import torch
 
 from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu import token_dispatcher
 from torchtitan.experiments.tpu.kernels import expert_segment_matmul
 from torchtitan.experiments.tpu.kernels import paired_segment_matmul
 
@@ -298,6 +299,98 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
                 tile_m=128,
                 tgmm_tile_m=128,
             )
+
+    def test_chunked_token_gathers_match_dispatcher(self):
+        """The gather-in-experts ops against the dispatcher path, bitwise.
+
+        W1/W3 with its token gather must match ``local_reorder`` + the paired
+        kernel, and W2 with its combine must match the W2 kernel +
+        ``stable_grouped_reduce``: outputs and every gradient, for ramped and
+        equal row chunks and both W2 layouts.
+        """
+        device = self.accelerator_device
+        tokens, dim, hidden, experts, top_k, tile_m = 2048, 256, 128, 8, 2, 128
+        rows = tokens * top_k
+        # 4 chunks of 4096 rows ramp (units of 128 rows); 2 chunks are equal.
+        self.assertEqual(
+            [end - start for start, end in paired_segment_matmul.row_chunk_bounds(
+                rows, tile_m, 4
+            )],
+            [128, 256, 512, 1024, 1024, 1152],
+        )
+        generator = torch.Generator().manual_seed(0)
+        expert_ids = (
+            torch.rand(tokens, experts, generator=generator)
+            .topk(top_k, dim=1)
+            .indices.to(device)
+        )
+        scores0 = torch.rand(tokens, top_k, generator=generator).to(device)
+        x0 = self._bounded_values((tokens, dim), 17, 0.003, device)
+        w10 = self._bounded_values((experts, dim, hidden), 19, 0.002, device)
+        w30 = self._bounded_values((experts, dim, hidden), 23, 0.0015, device)
+        w20 = self._bounded_values((experts, hidden, dim), 29, 0.002, device)
+        grad_y = self._bounded_values((tokens, dim), 31, 0.001, device)
+        group_sizes = torch.bincount(
+            expert_ids.reshape(-1), minlength=experts
+        ).to(torch.int32)
+
+        def run(chunks, transpose_w2):
+            x, w1, w3, scores = (
+                t.clone().requires_grad_() for t in (x0, w10, w30, scores0)
+            )
+            w2 = (w20.transpose(1, 2).contiguous() if transpose_w2 else w20)
+            w2 = w2.clone().requires_grad_()
+            if chunks:
+                permutation = torch.argsort(expert_ids.reshape(-1), stable=True)
+                token_ids, inverse, routed_scores = (
+                    token_dispatcher._LocalRouteOrder.apply(
+                        scores, permutation, top_k
+                    )
+                )
+                gate, up = (
+                    paired_segment_matmul.gather_paired_segment_matmul_pallas_2d(
+                        x, token_ids, inverse, w1, w3, group_sizes,
+                        tile_m=tile_m, tgmm_tile_m=tile_m, tgmm_tile_k=0,
+                        chunks=chunks,
+                    )
+                )
+            else:
+                routed, token_ids, routed_scores = token_dispatcher.local_reorder(
+                    x, scores, expert_ids, top_k
+                )
+                gate, up = paired_segment_matmul.paired_segment_matmul_pallas_2d(
+                    routed, w1, w3, group_sizes, tile_m=tile_m, tgmm_tile_m=tile_m
+                )
+            hidden_act = (
+                (torch.nn.functional.silu(gate) * up).float()
+                * routed_scores.reshape(-1, 1)
+            ).bfloat16()
+            if chunks:
+                y = expert_segment_matmul.down_proj_combine_pallas_2d(
+                    hidden_act, w2, group_sizes, token_ids, top_k=top_k,
+                    tile_m=tile_m, tgmm_tiling=(tile_m, 0, 0),
+                    transpose_rhs=transpose_w2, chunks=chunks,
+                )
+            else:
+                y = token_dispatcher.stable_grouped_reduce(
+                    expert_segment_matmul.segment_matmul_pallas_2d(
+                        hidden_act, w2, group_sizes, tile_m=tile_m,
+                        tgmm_tiling=(tile_m, 0, 0), transpose_rhs=transpose_w2,
+                    ),
+                    token_ids,
+                    top_k,
+                )
+            grads = torch.autograd.grad(
+                y, (x, w1, w3, w2, scores), grad_y
+            )
+            return (y, *grads)
+
+        for transpose_w2 in (False, True):
+            want = run(0, transpose_w2)
+            for chunks in (2, 4):
+                with self.subTest(chunks=chunks, transpose_w2=transpose_w2):
+                    for got, expected in zip(run(chunks, transpose_w2), want):
+                        torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

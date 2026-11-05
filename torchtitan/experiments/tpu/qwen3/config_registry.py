@@ -943,6 +943,25 @@ def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
     config.scale_before_down_proj = True
 
 
+def _gather_tokens_in_experts(
+    cfg: TPUTrainerConfig,
+    chunks: int,
+    *,
+    combine: bool = False,
+    recompute_chunks: int = 0,
+) -> None:
+  """Pipeline the MoE token gathers against the expert matmuls in row chunks.
+
+  ``chunks=0`` keeps the dispatcher's unchunked gather. Results are bitwise
+  unchanged either way.
+  """
+  assert cfg.model_spec is not None
+  for _, config, _, _ in cfg.model_spec.model.traverse(TpuRoutedExperts.Config):
+    config.gather_in_expert_chunks = chunks
+    config.gather_in_expert_recompute_chunks = recompute_chunks
+    config.combine_in_experts = combine
+
+
 def _use_q235_tokamax_attention(cfg: TPUTrainerConfig) -> None:
   splash = cfg.splash_attention_kernel
   splash.use_tokamax_splash_attention_kernel = True
@@ -1057,6 +1076,10 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   # Finish the expert all-gathers under attention, while the SparseCore that
   # runs them is otherwise idle.
   cfg.compile.graph_split.expert_all_gathers_under_splash = True
+  # Gather the routed tokens (and, in backward, the combine gradients) in row
+  # chunks that overlap the expert matmuls. Measured at world 512 on top of
+  # #114/#127/#128: 24.149 -> 23.424 s/step, bitwise.
+  _gather_tokens_in_experts(cfg, 8, combine=True)
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_COMPILED_OFFLOAD_FLAGS,
@@ -1074,6 +1097,8 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TpuGraphTrainer.Config:
   """MaxText-numerics variant of the Q235 activation-offload recipe."""
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
   _without_splash_saves(cfg)
+  # Not yet measured on this variant.
+  _gather_tokens_in_experts(cfg, 0)
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
@@ -1131,6 +1156,12 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
   # Measured 24.261 -> 23.861 s/step on top of #119.
   cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
   cfg.compile.graph_split.pipeline_kinds = ("rs",)
+  # Chunk only the forward token gathers. Backward chunk gathers would queue
+  # on the SparseCores behind the pipelined reduce-scatters, which complete
+  # in issue order, and stall the recomputed expert matmuls. The combine
+  # gradient gather, a backward-only op, stays unchunked for the same reason.
+  # Measured 23.862 -> 23.516 s/step, bitwise.
+  _gather_tokens_in_experts(cfg, 8, recompute_chunks=1)
   return cfg
 
 

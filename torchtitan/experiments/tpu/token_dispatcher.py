@@ -29,6 +29,7 @@ from torch.autograd.function import once_differentiable
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
+from torchtitan.experiments.tpu.kernels.route_sum import route_sum
 from torchtitan.experiments.tpu.remat_regions import (
     annotate_region,
     MOE_ROUTING,
@@ -134,10 +135,7 @@ class _StableGroupedReduce(torch.autograd.Function):
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(index_N)
     permutation_N = torch.argsort(index_N, stable=True)
-    grouped_TKD = torch.index_select(src_ND, 0, permutation_N).reshape(
-        -1, top_k, src_ND.shape[1]
-    )
-    return grouped_TKD.float().sum(dim=1).to(src_ND.dtype)
+    return route_sum(src_ND, permutation_N, top_k)
 
   @staticmethod
   def backward(ctx, grad_output_TD):
@@ -189,7 +187,6 @@ class _LocalReorder(torch.autograd.Function):
     inverse_N = torch.argsort(permutation_N)
     token_indices_N = permutation_N // top_k
     ctx.save_for_backward(inverse_N)
-    ctx.input_shape = x_TD.shape
     ctx.score_shape = scores_TK.shape
     ctx.top_k = top_k
     ctx.mark_non_differentiable(token_indices_N)
@@ -204,13 +201,7 @@ class _LocalReorder(torch.autograd.Function):
     (inverse_N,) = ctx.saved_tensors
     grad_x_TD = None
     if grad_routed_ND is not None:
-      grad_x_TD = torch.index_select(grad_routed_ND, 0, inverse_N)
-      grad_x_TD = (
-          grad_x_TD.float()
-          .reshape(ctx.input_shape[0], ctx.top_k, ctx.input_shape[1])
-          .sum(dim=1)
-          .to(grad_routed_ND.dtype)
-      )
+      grad_x_TD = route_sum(grad_routed_ND, inverse_N, ctx.top_k)
     grad_scores_TK = None
     if grad_scores_N is not None:
       grad_scores_TK = torch.index_select(

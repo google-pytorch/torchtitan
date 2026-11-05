@@ -1,26 +1,57 @@
+from dataclasses import dataclass
 import logging
+from typing import Any, Iterator
+
 import torch
-from typing import Iterator
+
+from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.models.flux.utils import IMAGE_LATENT_SIZE_RATIO, LATENT_CHANNELS
 
 logger = logging.getLogger(__name__)
 
-class RandomDataloader:
+
+class RandomDataloader(BaseDataLoader):
     """
     A dataloader that generates random encodings.
     Pre-generates a configurable pool of batches and loops them round-robin
     to avoid generation bottlenecks and memory bloat during training.
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseDataLoader.Config):
+        bsz: int = 1
+        max_steps: int = 1
+        img_size: int = 256
+        max_t5_len: int = 256
+        t5_dim: int = 4096
+        clip_dim: int = 768
+        max_cached_batches: int = 100
+
     def __init__(
         self,
-        bsz: int,
-        max_steps: int,
-        img_size: int,
-        max_t5_len: int,
-        t5_dim: int,
-        clip_dim: int,
-        max_cached_batches: int = 100
+        bsz: int | Config = 1,
+        max_steps: int = 1,
+        img_size: int = 256,
+        max_t5_len: int = 256,
+        t5_dim: int = 4096,
+        clip_dim: int = 768,
+        max_cached_batches: int = 100,
+        *,
+        config: Config | None = None,
+        **kwargs: Any,
     ):
+        del kwargs
+        if isinstance(bsz, RandomDataloader.Config):
+            config = bsz
+        if config is not None:
+            bsz = config.bsz
+            max_steps = config.max_steps
+            img_size = config.img_size
+            max_t5_len = config.max_t5_len
+            t5_dim = config.t5_dim
+            clip_dim = config.clip_dim
+            max_cached_batches = config.max_cached_batches
+
         self.bsz = bsz
         self.max_steps = max_steps
         self.img_size = img_size
@@ -70,5 +101,12 @@ class RandomDataloader:
             yield data_copy
             step += 1
 
+    def state_dict(self) -> dict[str, Any]:
+        return {}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        del state_dict
+
     def close(self) -> None:
         """No-op; called by Trainer.close()."""
+

@@ -22,7 +22,6 @@ from torchtitan.config.transform import apply_transforms, ContextParallelTransfo
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
-from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -1054,6 +1053,9 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   # removed 1.31 s of exposed H2D in the measured BF16 arm at a 0.96-GiB HBM
   # cost from carrying the completed activation across one child boundary.
   cfg.compile.graph_split.cpu_offload_prefetch_executables = 1
+  # Finish the expert all-gathers under attention, while the SparseCore that
+  # runs them is otherwise idle.
+  cfg.compile.graph_split.expert_all_gathers_under_splash = True
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_COMPILED_OFFLOAD_FLAGS,
@@ -1122,6 +1124,12 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
       cfg.libtpu_init_flags,
       tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
   )
+  # At 128 ranks the FP32 expert reduce-scatters cannot finish inside their
+  # layer's executable without stalling it; run each one in the next
+  # executable instead. The deadline barrier already hides the all-gathers.
+  # Measured 24.261 -> 23.861 s/step on top of #119.
+  cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
+  cfg.compile.graph_split.pipeline_kinds = ("rs",)
   return cfg
 
 
@@ -1248,6 +1256,9 @@ def qwen3_moe_235b_scan_torchao_float8() -> TpuGraphTrainer.Config:
   """
   cfg = qwen3_moe_235b_scan()
   assert cfg.model_spec is not None
+  # Imported here so that only float8 configs require torchao.
+  from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
+
   # Convert only the attention projections (wqkv/wo); the routed experts are
   # grouped matmuls, not linears. filter_fqns entries match as substrings of a
   # linear's FQN and keep it in BF16:

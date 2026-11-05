@@ -16,7 +16,7 @@ the non-copy variant has a derivative:
 
 The override is exact, so `CosSinRoPE` and its own TPU override
 (`bf16_rope.py`) are left untouched. Remove it once `view_as_complex_copy` has
-an autograd formula upstream; `test_real_rope.py` fails when that lands.
+an autograd formula upstream; `test_real_rope_tpu.py` fails when that lands.
 """
 
 from dataclasses import dataclass

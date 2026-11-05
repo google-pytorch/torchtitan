@@ -1058,6 +1058,7 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   # Finish the expert all-gathers under attention, while the SparseCore that
   # runs them is otherwise idle.
   cfg.compile.graph_split.expert_all_gathers_under_splash = True
+  cfg.compile.graph_split.expert_all_gathers_in_saved_splash_layers = True
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_COMPILED_OFFLOAD_FLAGS,

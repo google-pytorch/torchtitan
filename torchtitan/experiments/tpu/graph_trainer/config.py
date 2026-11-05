@@ -112,6 +112,10 @@ class GraphSplitterConfig:
   # the routed-token gathers. Values are unchanged. Applies to layers that
   # have both an MoE and Splash; raises if no layer does.
   expert_all_gathers_under_splash: bool = False
+  # With ``expert_all_gathers_under_splash``: in backward layers that reuse a
+  # saved Splash output (``save_last_n_layers``), finish the expert
+  # all-gathers before the recomputed MoE input is read instead.
+  expert_all_gathers_in_saved_splash_layers: bool = False
   # ``fsdp_pipeline`` only: which collectives move to the neighbouring
   # executables, parameter all-gathers ("ag") and/or gradient reductions
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``

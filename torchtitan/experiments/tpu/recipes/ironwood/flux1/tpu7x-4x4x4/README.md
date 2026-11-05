@@ -42,7 +42,6 @@ gcluster job submit \
     -m torchtitan.experiments.tpu.train \
     --module=flux \
     --config=flux_dev \
-    --optimizer.implementation=foreach \
     --metrics.log_freq=1 \
     --training.steps=40 \
     --training.dtype=float32 \
@@ -91,7 +90,6 @@ gcluster job submit \
     -m torchtitan.experiments.tpu.train \
     --module=flux \
     --config=flux_dev \
-    --optimizer.implementation=foreach \
     --metrics.log_freq=1 \
     --training.steps=40 \
     --training.dtype=bfloat16 \

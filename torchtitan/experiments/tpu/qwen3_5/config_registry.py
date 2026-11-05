@@ -439,9 +439,11 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
       memory_policy="tpu_selective",
       save_regions=("moe.routing", "attention.inner_attention"),
   )
-  # 512-row expert tiles for EP=1 at 64K tokens per rank (~2K routed rows per
-  # expert on average): the routed-expert MLP's forward + backward takes 22.9
-  # vs 26.8 ms per layer on one TPU7x core with the Qwen3-30B tiles (256).
+  # 512-row expert tiles, measured at EP=1 with 64K tokens per rank (8 x 8192,
+  # ~2K routed rows per expert on average): the routed-expert MLP's forward +
+  # backward takes 22.9 vs 26.8 ms per layer on one TPU7x core with the
+  # Qwen3-30B tiles (256). The 32K-token default and the EP recipes inherit
+  # this tile.
   _use_tpu_moe_kernels(cfg, tile_m=512)
   # Throughput DVFS operating point (p_state=7) and SparseCore collective
   # offload (async AG, dual-SC RS, latency-hiding scheduler), merged onto

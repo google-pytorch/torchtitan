@@ -253,7 +253,9 @@ class RmsNormGatedTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertFalse(rms_norm_gated.supports(x_ok, fake_dtensor, w_ok))
     self.assertFalse(rms_norm_gated.supports(x_ok, x_ok, fake_dtensor))
 
-    bad_jax = rms_norm_gated.jnp.zeros((100, 128), dtype=rms_norm_gated.jnp.bfloat16)
+    bad_jax = rms_norm_gated.jnp.zeros(
+        (100, 128), dtype=rms_norm_gated.jnp.bfloat16
+    )
     w_jax = rms_norm_gated.jnp.ones((1, 128), dtype=rms_norm_gated.jnp.float32)
     with self.assertRaisesRegex(ValueError, "positive multiple of block_rows"):
       rms_norm_gated.rms_norm_gated_fwd_jax(bad_jax, bad_jax, w_jax, 1e-6)

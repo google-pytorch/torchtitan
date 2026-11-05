@@ -279,9 +279,7 @@ def unsupported_reason(
         f" {max_s} for dtype={x_BSC.dtype}, width={width}"
     )
   if channels <= 0 or channels % _BLOCK_C != 0:
-    return (
-        f"channels={channels} must be a positive multiple of {_BLOCK_C}"
-    )
+    return f"channels={channels} must be a positive multiple of {_BLOCK_C}"
   if weight_C1W.shape != (channels, 1, width):
     return (
         f"weight shape {tuple(weight_C1W.shape)} must match"

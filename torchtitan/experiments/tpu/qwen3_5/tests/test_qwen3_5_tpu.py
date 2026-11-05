@@ -59,6 +59,7 @@ from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwe
 from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
@@ -2625,12 +2626,34 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       dx, dscores = torch.autograd.grad(loss, (x_in, scores_in))
       return h_disp, gs_disp, out_disp, dx, dscores
 
-    gm = make_fx(trace_step, tracing_mode="fake")(
-        xs[0].detach().requires_grad_(True),
-        idxs[0],
-        scores[0].detach().requires_grad_(True),
-        counts[0],
-    )
+    with contextlib.ExitStack() as trace_stack:
+      if not self._is_tpu():
+        # Off TPU there is no traceable EP exchange (the dispatcher raises
+        # instead of returning zeros); stub it to check the dispatcher's own
+        # ops and shapes.
+        trace_stack.enter_context(
+            mock.patch.object(
+                trace_disp,
+                "_gather_expert_counts",
+                autospec=True,
+                side_effect=lambda lc, pg, sz: lc.repeat(sz),
+            )
+        )
+        trace_stack.enter_context(
+            mock.patch.object(
+                qwen35_token_dispatcher,
+                "_ragged_all_to_all_impl",
+                side_effect=lambda op, rows, *_: op.detach().new_zeros(
+                    (rows, *op.shape[1:])
+                ),
+            )
+        )
+      gm = make_fx(trace_step, tracing_mode="fake")(
+          xs[0].detach().requires_grad_(True),
+          idxs[0],
+          scores[0].detach().requires_grad_(True),
+          counts[0],
+      )
     op_names = [
         str(n.target) for n in gm.graph.nodes if n.op == "call_function"
     ]
@@ -2689,11 +2712,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         self.dense = torch.nn.Parameter(torch.ones(4))
         self.expert = torch.nn.Parameter(torch.ones(4) * 2.0)
 
-    self.assertIs(
-        qwen3_5_tpu._split_optimizer_groups_by_mesh,  # pylint: disable=protected-access
-        tpu_gt_mod._split_optimizers_by_mesh,  # pylint: disable=protected-access
-    )
-    split_fn = tpu_gt_mod.split_optimizers_by_mesh
+    # `post_optimizer_build_qwen3_5` and `TpuGraphTrainer` share this helper.
+    self.assertIs(tpu_gt_mod.split_optimizers_by_mesh, split_optimizers_by_mesh)
+    split_fn = split_optimizers_by_mesh
     toy = _TwoPartToy()
     toy.dense._spec = type("Spec", (), {"mesh": object()})()
     toy.expert._spec = type("Spec", (), {"mesh": object()})()
@@ -2710,9 +2731,11 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     toy.dense.grad = torch.ones_like(toy.dense)
     toy.expert.grad = torch.ones_like(toy.expert)
     opt_container.step()
+    # FQN-keyed state stays attached to the right parameter after the split.
     sd = opt_container.state_dict()
-    self.assertTrue(any("dense" in k for k in sd))
-    self.assertTrue(any("expert" in k for k in sd))
+    self.assertTrue(any(k.startswith("state.dense.") for k in sd), sorted(sd))
+    self.assertTrue(any(k.startswith("state.expert.") for k in sd), sorted(sd))
+    self.assertTrue(torch.equal(sd["state.dense.step"], sd["state.expert.step"]))
 
   def test_ep_ragged_all_to_all_detaches_operand_and_caches_rank(self):
     """Tests TPU ragged_all_to_all receives detached operand & rank buffer."""

@@ -137,7 +137,14 @@ def _ragged_all_to_all_impl(
           ]
     return output
 
-  return output
+  # Tracing (make_fx / Dynamo) off TPU, or no process group: there is no
+  # traceable exchange here, and returning the zero-initialized buffer would
+  # silently zero the MoE output and gradients.
+  raise NotImplementedError(
+      "Dropless EP ragged_all_to_all needs a TPU process group with"
+      " `group_name` when traced; off TPU it only runs eagerly with an EP mesh"
+      f" (device={src.device.type}, pg={pg!r}, ep_mesh={ep_mesh!r})."
+  )
 
 
 class _RaggedAllToAll(torch.autograd.Function):
@@ -323,7 +330,11 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
       return _wait(
           all_gather_single(local_counts_E, gather_dim=0, group=self.ep_mesh)
       )
-    return local_counts_E.repeat(ep_size)
+    if ep_size == 1:
+      return local_counts_E
+    raise NotImplementedError(
+        f"Gathering expert counts over {ep_size} EP ranks needs a process group."
+    )
 
   def _ragged_all_to_all(
       self,

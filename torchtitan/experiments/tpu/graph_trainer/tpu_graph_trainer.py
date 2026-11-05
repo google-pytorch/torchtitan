@@ -59,6 +59,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     register as register_tpu_pipeline,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
@@ -161,7 +162,7 @@ class TpuGraphTrainer(GraphTrainer):
 
         super().__init__(config)
 
-        if _split_optimizers_by_mesh(self.optimizers):
+        if split_optimizers_by_mesh(self.optimizers):
             self.lr_schedulers = config.lr_scheduler.build(
                 optimizers=self.optimizers,
                 training_steps=config.training.steps,
@@ -666,12 +667,6 @@ def _make_fwd_bwd_adamw_fn(
         ]
 
     return fwd_bwd_adamw
-
-
-from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
-
-
-_split_optimizers_by_mesh = split_optimizers_by_mesh
 
 
 def _dump_weight_stats(model_parts) -> None:

@@ -27,7 +27,6 @@ import dataclasses
 from functools import partial
 import math
 
-import torch
 from torch import nn
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import derive
@@ -43,6 +42,7 @@ from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
 )
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35Model, TpuQwen35TransformerBlock
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
 from torchtitan.protocols.model import ModelConfigConverter
@@ -59,7 +59,7 @@ __all__ = [
 _CONV1D_INIT = {"weight": partial(nn.init.kaiming_uniform_, a=math.sqrt(5))}
 
 
-def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
+def use_tpu_modules(config: Qwen35Model.Config) -> TpuQwen35Model.Config:
   """Returns ``config`` as a text-only TPU config (see the module docstring).
 
   Args:
@@ -96,11 +96,6 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
       layer.moe.load_balance_coeff = None
     config.layers[i] = derive(layer, TpuQwen35TransformerBlock.Config)
   return derive(config, TpuQwen35Model.Config, vision_encoder=None)
-
-
-from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
-
-_split_optimizer_groups_by_mesh = split_optimizers_by_mesh
 
 
 def post_optimizer_build_qwen3_5(

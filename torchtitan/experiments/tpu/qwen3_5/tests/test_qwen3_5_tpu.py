@@ -586,16 +586,24 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     seg = seg.to(dev)
 
     if self._is_tpu() and gated_delta.causal_conv1d is not None:
-      with mock.patch.object(
-          gated_delta.causal_conv1d,
-          "causal_conv_silu",
-          wraps=gated_delta.causal_conv1d.causal_conv_silu,
-      ) as pallas_spy:
+      gated_delta._logged_conv_fallback_reasons.clear()  # pylint: disable=protected-access
+      with (
+          mock.patch.object(
+              gated_delta.causal_conv1d,
+              "causal_conv_silu",
+              wraps=gated_delta.causal_conv1d.causal_conv_silu,
+          ) as pallas_spy,
+          mock.patch.object(gated_delta.logger, "info") as log_info_spy,
+      ):
         out_pallas = gated_delta.causal_conv_silu(x, weight, None)
         self.assertEqual(pallas_spy.call_count, 1)
         _ = gated_delta.causal_conv_silu(x, weight, seg)
+        self.assertEqual(log_info_spy.call_count, 0)
+        _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
         _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
         self.assertEqual(pallas_spy.call_count, 1)
+        self.assertEqual(log_info_spy.call_count, 1)
+        self.assertIn("seq_len=7", log_info_spy.call_args.args[1])
       out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
       self.assertLess(_relative_l2_error(out_pallas, out_slice), 5e-3)
     else:

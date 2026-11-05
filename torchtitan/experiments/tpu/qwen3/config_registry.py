@@ -1044,6 +1044,7 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   cfg.compile.save_last_n_layers = {
       "attention.inner_attention": 36
   }
+  _save_routing(cfg)
   cfg.compile.graph_split.forward_layers_per_executable = 1
   # Current ``by_layer`` is the direct successor of the ``sequential`` mode
   # used by the measured schedule: one complete backward layer per
@@ -1064,9 +1065,20 @@ def _qwen3_moe_235b_fsdp_activation_offload() -> TpuGraphTrainer.Config:
   return cfg
 
 
+def _save_routing(cfg: TpuGraphTrainer.Config) -> None:
+  """Keep each layer's top-k ids and expert sort orders for backward.
+
+  About 8 MB per layer, so backward skips the router top-k and the route
+  sorts.
+  """
+  cfg.compile.memory_policy = "tpu_selective_and_offload"
+  cfg.compile.save_regions = ("moe.routing",)
+
+
 def _without_splash_saves(cfg: TpuGraphTrainer.Config) -> None:
   """Fall back to plain offload; the Splash saves were measured only at w512."""
   cfg.compile.memory_policy = "full_and_offload"
+  cfg.compile.save_regions = ()
   cfg.compile.save_last_n_layers = {}
 
 
@@ -1117,6 +1129,7 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
   """
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
   _without_splash_saves(cfg)
+  _save_routing(cfg)
   _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   # This topology's large FSDP reductions benefit from libtpu's hierarchical
   # n-D lowering. Keep the unvalidated HSDP and MaxText-numerics variants on

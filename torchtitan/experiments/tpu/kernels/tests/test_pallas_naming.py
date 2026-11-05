@@ -15,7 +15,7 @@ def _copy(x):
     return pl.pallas_call(
         _copy_kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        interpret=True,
+        interpret=pltpu.InterpretParams(),
     )(x)
 
 

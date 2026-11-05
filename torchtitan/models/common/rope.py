@@ -327,7 +327,10 @@ class _RotatePairs(torch.autograd.Function):
 
     @staticmethod
     def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        if x.dtype == torch.bfloat16 and x.is_contiguous():
+        # The int32 pair views are a GPU load/store trick. On TPU they made a llama3 8B
+        # scan step 39% slower (2.31 vs 1.66 s), so other devices read the two halves.
+        pairs_as_int32 = x.dtype == torch.bfloat16 and x.is_cuda
+        if pairs_as_int32 and x.is_contiguous():
             # Read each pair as one int32 (x[2i] in the low half), so loads stay contiguous.
             # A bf16 shifted into the high 16 bits is its exact fp32. The int32 view also
             # ends the fusion with whatever produced x, which is written out first. It needs an
@@ -342,7 +345,7 @@ class _RotatePairs(torch.autograd.Function):
             x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
         real = (x_real * cos - x_imag * sin).type_as(x)
         imag = (x_real * sin + x_imag * cos).type_as(x)
-        if x.dtype == torch.bfloat16:
+        if pairs_as_int32:
             # Write each rotated pair as one int32 so stores stay contiguous; a store per half
             # writes every other element.
             low = real.view(torch.int16).to(torch.int32) & 0xFFFF

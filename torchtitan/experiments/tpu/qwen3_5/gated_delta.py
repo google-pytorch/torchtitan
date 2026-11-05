@@ -188,6 +188,9 @@ class _CausalConvSilu(torch.autograd.Function):
     return grad_x, grad_w_C1W, None
 
 
+_logged_conv_fallback_reasons: set[str] = set()
+
+
 def causal_conv_silu(
     x_BSC: torch.Tensor,
     weight_C1W: torch.Tensor,
@@ -208,12 +211,25 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
-  if (
-      segment_ids_BS is None
-      and causal_conv1d is not None
-      and causal_conv1d.supports(x_BSC, weight_C1W)
-  ):
-    return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+  if segment_ids_BS is None and causal_conv1d is not None:
+    reason = causal_conv1d.unsupported_reason(x_BSC, weight_C1W)
+    if reason is None:
+      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+    if (
+        x_BSC.device.type == "tpu"
+        and not torch.compiler.is_compiling()
+        and reason not in _logged_conv_fallback_reasons
+    ):
+      _logged_conv_fallback_reasons.add(reason)
+      logger.info(
+          "Pallas causal_conv1d fallback to slice path (%s): x=%s (%s),"
+          " weight=%s (%s).",
+          reason,
+          tuple(x_BSC.shape),
+          x_BSC.dtype,
+          tuple(weight_C1W.shape),
+          weight_C1W.dtype,
+      )
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 

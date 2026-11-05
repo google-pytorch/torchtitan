@@ -100,7 +100,7 @@
   "torchtitan.experiments.tpu.tests.test_layer_loop": 5,
   "torchtitan.experiments.tpu.tests.test_mfu_flops": 7,
   "torchtitan.experiments.tpu.tests.test_model_distributed": 130,
-  "torchtitan.experiments.tpu.tests.test_real_rope_tpu": 7,
+  "torchtitan.experiments.tpu.tests.test_complex_rope_scan": 7,
   "torchtitan.experiments.tpu.tests.test_scan_backward_patch": 12,
   "torchtitan.experiments.tpu.tests.test_tpu_flags": 4,
   "torchtitan.experiments.tpu.tests.test_train_distributed": 278,

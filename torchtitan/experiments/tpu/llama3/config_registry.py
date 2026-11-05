@@ -46,15 +46,8 @@ from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llam
 from torchtitan.models.llama3.config_registry import model_registry
 
 
-# Llama3's `ComplexRoPE` calls `view_as_complex`, which cannot be traced inside
-# a higher-order op such as `scan`; see `overrides/real_rope.py`. The rewrite is
-# bit-identical and perf-neutral, so every recipe carries it.
 # Upstream d771abb0 identifies an override by the import path of its decorated
 # `@override` factory, so each target is `module.function`, not just `module`.
-_REAL_ROPE_OVERRIDE = (
-    "torchtitan.experiments.tpu.overrides.real_rope"
-    ".tpu_real_arithmetic_complex_rope"
-)
 _FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
 )
@@ -146,7 +139,6 @@ def llama3_debugmodel() -> TPUTrainerConfig:
           steps=10,
       ),
   )
-  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   return config
 
 
@@ -197,7 +189,6 @@ def llama3_1b() -> TPUTrainerConfig:
           steps=10,
       ),
   )
-  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   return config
 
 
@@ -261,7 +252,6 @@ def llama3_8b() -> TPUTrainerConfig:
           sa_block_kv_dq=2048,
       ),
   )
-  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   _enable_pallas_cross_entropy(config)
   return config
 
@@ -326,7 +316,6 @@ def llama3_70b() -> TPUTrainerConfig:
           sa_block_kv_dq=2048,
       ),
   )
-  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   _enable_pallas_cross_entropy(config)
   return config
 
@@ -391,7 +380,6 @@ def llama3_405b() -> TPUTrainerConfig:
           sa_block_kv_dq=2048,
       ),
   )
-  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   _enable_pallas_cross_entropy(config)
   return config
 
@@ -481,7 +469,6 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           sa_block_kv_dq=2048,
       ),
   )
-  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   _enable_pallas_cross_entropy(config)
   return config
 

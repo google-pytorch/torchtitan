@@ -54,15 +54,6 @@ SEQ_LEN = 32
 TOKENS = 2 * SEQ_LEN
 SEED = 1234
 
-# `scan` re-traces its body through functionalization, which has no derivative
-# for `view_as_complex_copy`. The llama3 TPU recipes request this override for
-# the same reason; here there is no recipe to carry it. qwen3 uses `CosSinRoPE`
-# and needs nothing. Drop it once `view_as_complex_copy` has a derivative.
-# https://github.com/google-pytorch/torchtitan/issues/20
-_REAL_ROPE_OVERRIDE = (
-    "torchtitan.experiments.tpu.overrides.real_rope"
-    ".tpu_real_arithmetic_complex_rope"
-)
 _DISCARDED_TOKEN_COUNTER_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.discarded_token_counter"
     ".tpu_discarded_token_counter"
@@ -86,8 +77,6 @@ def _config(registry=model_registry):
         layer.attention.rope = dataclasses.replace(
             layer.attention.rope, max_context_length=TOKENS
         )
-    if registry is model_registry:
-        apply_overrides(OverrideConfig(imports=[_REAL_ROPE_OVERRIDE]), config)
     return config
 
 

@@ -985,6 +985,19 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
+    ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
+    if ep_mesh is None:
+      return super().forward(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+      )
+    if self.scale_before_down_proj:
+      raise ValueError(
+          "scale_before_down_proj requires EP=1 local dispatch; under EP use"
+          " roe_weights_on_activation instead"
+      )
     num_chunks = self.num_token_chunks
     num_tokens = x_TD.shape[0]
     if num_tokens > 0 and num_tokens % num_chunks != 0:
@@ -993,7 +1006,11 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
           for d in range(min(num_chunks, num_tokens), 0, -1)
           if num_tokens % d == 0
       )
-      if (num_tokens, num_chunks) not in self._warned_chunk_snap:
+      if (
+          get_proxy_mode() is None
+          and not isinstance(x_TD, torch._subclasses.FakeTensor)
+          and (num_tokens, num_chunks) not in self._warned_chunk_snap
+      ):
         self._warned_chunk_snap.add((num_tokens, num_chunks))
         logger.warning(
             "%d tokens are not divisible by num_token_chunks=%d; using %d"
@@ -1002,50 +1019,37 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
             self.num_token_chunks,
             num_chunks,
         )
-    ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
+    is_roe = (
+        isinstance(self.token_dispatcher, TpuQwen35TokenDispatcher)
+        and self.token_dispatcher._resolve_comm_mode(ep_mesh.size())  # pylint: disable=protected-access
+        == "ring_of_experts"
+    )
     weights_on_activation = (
-        ep_mesh is not None
-        and isinstance(self.token_dispatcher, TpuQwen35TokenDispatcher)
+        is_roe
         and self.token_dispatcher.roe_weights_on_activation
         and getattr(self.inner_experts, "use_pallas_grouped_mm", False)
     )
-    if (
-        (num_chunks <= 1 and not weights_on_activation)
-        or ep_mesh is None
-        or num_tokens == 0
-    ):
+    if (num_chunks <= 1 and not weights_on_activation) or num_tokens == 0:
       return super().forward(
           x_TD,
           topk_scores_TK,
           topk_expert_ids_TK,
           num_local_tokens_per_expert_E,
       )
-
-    if self.scale_before_down_proj:
-      raise ValueError(
-          "scale_before_down_proj requires EP=1 local dispatch; under EP use"
-          " roe_weights_on_activation instead"
-      )
-    needs_chunk_counts = True
-    if isinstance(self.token_dispatcher, TpuQwen35TokenDispatcher):
-      needs_chunk_counts = (
-          self.token_dispatcher._resolve_comm_mode(ep_mesh.size())  # pylint: disable=protected-access
-          != "ring_of_experts"
-      )
+    needs_chunk_counts = num_chunks > 1 and not is_roe
 
     # Unshard FSDP expert parameters once outside the chunk loop via
     # ``inner_experts.__call__`` so FX preserves ``module_fqn`` metadata for
-    # SimpleFSDP collective bucketing.
+    # SimpleFSDP collective bucketing. ``TpuGroupedExperts.forward`` casts to
+    # BF16 per chunk (a no-op when ``mixed_precision_param="bfloat16"``, and
+    # required when weights are FP32 so per-chunk dWeights widen to FP32 before
+    # autograd accumulates across chunks).
     with maybe_set_sparse_mesh():
       unsharded_weights = self.inner_experts(
           x_TD,
           num_local_tokens_per_expert_E,
           unshard_only=True,
       )
-    if getattr(self.inner_experts, "use_pallas_grouped_mm", False):
-      # The Pallas expert matmuls run in BF16: cast FP32 master weights once
-      # here rather than once per chunk.
-      unsharded_weights = tuple(w.bfloat16() for w in unsharded_weights)
 
     x_chunks = x_TD.chunk(num_chunks, dim=0)
     score_chunks = topk_scores_TK.chunk(num_chunks, dim=0)

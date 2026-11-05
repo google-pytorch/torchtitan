@@ -3780,6 +3780,16 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertLen(fwd_barriers, 2)
     self.assertLen(bwd_barriers, 2)
     self.assertTrue(all(_get_layer_id(n) == 0 for n in barriers))
+    # The second backward barrier (before chunk 0's backward, after chunks 3
+    # and 2 have both completed) must wait on PyTorch autograd's cross-chunk
+    # weight-gradient accumulation aten.add nodes (which lack seq_nr metadata).
+    bwd_barrier_1_add_args = [
+        a
+        for a in bwd_barriers[1].args
+        if isinstance(a, torch.fx.Node)
+        and a.target is torch.ops.aten.add.Tensor
+    ]
+    self.assertLen(bwd_barrier_1_add_args, 3)
 
     got_outputs = run_traced(traced, module=toy)(
         x_cpu, s_cpu, ids_cpu, counts_cpu

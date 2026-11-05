@@ -222,6 +222,7 @@ class TpuQwen35Model(Qwen35Model):
             dispatcher.bind_ep_rank_holder(self)
             if not getattr(inner_experts, "use_pallas_grouped_mm", False):
               dispatcher.roe_zero_pad_tail = True
+              dispatcher.roe_weights_on_activation = False
         else:
           dispatcher = getattr(module, "token_dispatcher", None)
           if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):

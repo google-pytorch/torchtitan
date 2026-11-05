@@ -145,6 +145,8 @@ def _ragged_gather_reduce_tc_layout(
     block_size: int,
     num_out_tokens: int | None = None,
 ) -> tuple[int, int, int]:
+  if block_size <= top_k:
+    raise ValueError(f"block_size ({block_size}) must be > top_k ({top_k}).")
   if num_out_tokens is None:
     num_out_tokens = num_indices // top_k
   align = _RAGGED_GATHER_REDUCE_TC_ALIGN
@@ -417,7 +419,7 @@ def ragged_gather_reduce_tc_metadata(
   max_blocks, _, slots_len = _ragged_gather_reduce_tc_layout(
       num_indices, top_k, block_size, num_out_tokens=num_out_tokens
   )
-  if num_out_tokens == 0:
+  if num_out_tokens == 0 or num_indices == 0:
     empty_slots = jnp.zeros((slots_len,), jnp.int32)
     return RaggedGatherReduceMetadata(
         src_rows=empty_slots,
@@ -1008,16 +1010,10 @@ def _roe_gather_fwd(
     x_all_GD: jax.Array,
     token_ids_sorted_M: jax.Array,
     start_count_2: jax.Array,
-    src_rows: jax.Array,
-    tokens: jax.Array,
-    blocks: jax.Array,
     cap: int,
-    top_k: int,
     gather_block_size: int,
-    reduce_block_size: int,
     zero_pad_tail: bool,
 ) -> jax.Array:
-  del src_rows, tokens, blocks, top_k, reduce_block_size
   g_tokens, d_dim = x_all_GD.shape
   x3d = x_all_GD.reshape(g_tokens, d_dim // 128, 128)
   out3d = ragged_gather_tc(
@@ -1063,48 +1059,6 @@ def _roe_gather_bwd(
       weights=None,
   )
   return out3d.reshape(num_out_tokens, d_dim)
-
-
-def _roe_gather_setup_context(ctx, inputs, output):
-  del output
-  (
-      x_all_GD,
-      token_ids_sorted_M,
-      _start_count_2,
-      src_rows,
-      tokens,
-      blocks,
-      _cap,
-      top_k,
-      _gather_block_size,
-      reduce_block_size,
-      _zero_pad_tail,
-  ) = inputs
-  ctx.save_for_backward(src_rows, tokens, blocks)
-  ctx.num_indices = token_ids_sorted_M.shape[0]
-  ctx.num_out_tokens = x_all_GD.shape[0]
-  ctx.top_k = top_k
-  ctx.reduce_block_size = reduce_block_size
-
-
-def _roe_gather_backward(ctx, grad_routed_RD):
-  src_rows, tokens, blocks = ctx.saved_tensors
-  grad_x_all_GD = _roe_gather_bwd(
-      grad_routed_RD.contiguous(),
-      src_rows,
-      tokens,
-      blocks,
-      ctx.num_indices,
-      ctx.num_out_tokens,
-      ctx.top_k,
-      ctx.reduce_block_size,
-  )
-  return (grad_x_all_GD,) + (None,) * 10
-
-
-_roe_gather_fwd.register_autograd(
-    _roe_gather_backward, setup_context=_roe_gather_setup_context
-)
 
 
 @pallas.jax_op("tt_moe::roe_unsort_fwd")
@@ -1372,6 +1326,54 @@ def roe_compute_routing(
   )
 
 
+class _RoESortGather(torch.autograd.Function):
+  """Gathers ``x_all_GD`` into ``[cap, D]`` with TC gather-reduce backward."""
+
+  @staticmethod
+  def forward(
+      ctx,
+      x_all_GD: torch.Tensor,
+      token_ids_sorted_M: torch.Tensor,
+      start_count_2: torch.Tensor,
+      src_rows: torch.Tensor,
+      tokens: torch.Tensor,
+      blocks: torch.Tensor,
+      cap: int,
+      top_k: int,
+      gather_block_size: int,
+      reduce_block_size: int,
+      zero_pad_tail: bool,
+  ) -> torch.Tensor:
+    ctx.save_for_backward(src_rows, tokens, blocks)
+    ctx.num_indices = token_ids_sorted_M.shape[0]
+    ctx.num_out_tokens = x_all_GD.shape[0]
+    ctx.top_k = top_k
+    ctx.reduce_block_size = reduce_block_size
+    return _roe_gather_fwd(
+        x_all_GD.contiguous(),
+        token_ids_sorted_M,
+        start_count_2,
+        cap,
+        gather_block_size,
+        zero_pad_tail,
+    )
+
+  @staticmethod
+  def backward(ctx, grad_routed_RD: torch.Tensor):
+    src_rows, tokens, blocks = ctx.saved_tensors
+    grad_x_all_GD = _roe_gather_bwd(
+        grad_routed_RD.contiguous(),
+        src_rows,
+        tokens,
+        blocks,
+        ctx.num_indices,
+        ctx.num_out_tokens,
+        ctx.top_k,
+        ctx.reduce_block_size,
+    )
+    return (grad_x_all_GD,) + (None,) * 10
+
+
 def roe_sort_gather(
     x_all_GD: torch.Tensor,
     token_ids_sorted_M: torch.Tensor,
@@ -1387,8 +1389,8 @@ def roe_sort_gather(
     zero_pad_tail: bool = False,
 ) -> torch.Tensor:
   """Gathers ``x_all_GD`` into ``[cap, D]`` for this rank's local experts."""
-  return _roe_gather_fwd(
-      x_all_GD.contiguous(),
+  return _RoESortGather.apply(
+      x_all_GD,
       token_ids_sorted_M,
       start_count_2,
       src_rows,
@@ -1458,13 +1460,9 @@ class _RoEUnsortReduce(torch.autograd.Function):
       gather_block_size: int,
       reduce_block_size: int,
   ) -> torch.Tensor:
-    ctx.save_for_backward(
-        token_ids_sorted_M, start_count_2, src_rows, tokens, blocks
-    )
+    ctx.save_for_backward(token_ids_sorted_M, start_count_2)
     ctx.cap = routed_output_RD.shape[0]
-    ctx.top_k = top_k
     ctx.gather_block_size = gather_block_size
-    ctx.reduce_block_size = reduce_block_size
     return _roe_gather_bwd(
         routed_output_RD.contiguous(),
         src_rows,
@@ -1478,20 +1476,13 @@ class _RoEUnsortReduce(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_partial_GD: torch.Tensor):
-    token_ids_sorted_M, start_count_2, src_rows, tokens, blocks = (
-        ctx.saved_tensors
-    )
+    token_ids_sorted_M, start_count_2 = ctx.saved_tensors
     grad_routed_RD = _roe_gather_fwd(
         grad_partial_GD.contiguous(),
         token_ids_sorted_M,
         start_count_2,
-        src_rows,
-        tokens,
-        blocks,
         ctx.cap,
-        ctx.top_k,
         ctx.gather_block_size,
-        ctx.reduce_block_size,
         False,
     )
     return (grad_routed_RD,) + (None,) * 9

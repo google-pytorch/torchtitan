@@ -122,6 +122,20 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
     np.testing.assert_array_equal(np.asarray(sorted_wp), expected_wp)
     np.testing.assert_array_equal(np.asarray(sorted_wk), keys_wide[expected_wp])
 
+    with self.assertRaisesRegex(ValueError, "block_size .* must be > top_k"):
+      ragged_gather_tc._ragged_gather_reduce_tc_layout(
+          num_indices=64, top_k=8, block_size=8
+      )
+    empty_meta = ragged_gather_tc.ragged_gather_reduce_tc_metadata(
+        jnp.zeros((0,), dtype=jnp.int32),
+        0,
+        0,
+        top_k=4,
+        block_size=128,
+        num_out_tokens=8,
+    )
+    self.assertEqual(empty_meta.num_indices, 0)
+
   def test_multi_block_gather_and_four_buffer_reduce_ring(self):
     """Exercises >= 6 gather steps, >= 8 reduce blocks (4-buffer wrap), and rem > 0."""
     self._require_tpu()

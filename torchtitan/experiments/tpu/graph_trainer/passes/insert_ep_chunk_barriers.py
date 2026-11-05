@@ -68,21 +68,37 @@ def apply_ep_chunk_barrier_pass(
     )
     # Unchunked nodes of each (layer, phase) in graph order: the only
     # candidates for "completed after chunk k - W", so each chunk scans its own
-    # layer's bucket instead of the whole joint graph.
+    # layer's bucket instead of the whole joint graph. PyTorch autograd does
+    # not attach ``seq_nr`` or ``autograd_backward`` to cross-chunk weight-grad
+    # accumulation ``aten.add`` ops (``setup_stacktrace_preservation_hooks``
+    # resets both in the node posthook before ``InputBuffer::add`` runs), so
+    # unchunked nodes with ``layer_id < 0`` inherit their bucket when all of
+    # their input nodes belong to the same ``(layer_id, is_bwd)`` bucket.
     unchunked: dict[tuple[int, bool], list[torch.fx.Node]] = defaultdict(list)
+    node_key: dict[torch.fx.Node, tuple[int, bool]] = {}
     for node in nodes:
         if node.op != "call_function":
             continue
-        layer_id = _get_layer_id(node)
-        if layer_id < 0:
-            continue
-        key = (layer_id, _is_backward_node(node))
         cidx = _chunk_idx(node)
-        if cidx is None:
-            if node.all_input_nodes:
-                unchunked[key].append(node)
+        layer_id = _get_layer_id(node)
+        if cidx is not None:
+            if layer_id < 0:
+                continue
+            key = (layer_id, _is_backward_node(node))
+            by_layer_phase[key][cidx].append(node)
+            node_key[node] = key
             continue
-        by_layer_phase[key][cidx].append(node)
+        if not node.all_input_nodes:
+            continue
+        if layer_id >= 0:
+            key = (layer_id, _is_backward_node(node))
+        else:
+            inp_keys = {node_key.get(inp) for inp in node.all_input_nodes}
+            if len(inp_keys) != 1 or None in inp_keys:
+                continue
+            key = next(iter(inp_keys))  # type: ignore[assignment]
+        unchunked[key].append(node)
+        node_key[node] = key
 
     if not by_layer_phase:
         return gm

@@ -70,15 +70,17 @@ def _select_bwd_buffer_count(
 ) -> tuple[int, int] | int | None:
   """Selects backward ``buffer_count`` that fits VMEM, or ``None`` for ``(2, 2)``.
 
-  Tokamax's ``_calculate_bwd_vmem_bytes`` sums ``compute_s``'s ``(B, V)`` fp32
-  stack temporary (``4 * B * V``) and the subsequent ``dot_general`` fp32
-  temporaries in ``accumulate_{x,w}_grad`` (``4 * H_alloc * (B + V)``) as if
-  both stages were live simultaneously. Because ``compute_s`` finishes before
-  the gradient GEMMs start, at most ``max(4 * B * V, 4 * H_alloc * (B + V))``
-  of those stack temporaries are live at once; subtracting the non-overlapping
-  ``min(...)`` keeps the default ``(1024, 512, 2048)`` bf16 tiles on TPU7x at
-  ``(2, 2)`` (52.4 MiB <= 57.6 MiB) while stepping larger tiles down through
-  ``(2, 1)`` to ``1`` (e.g. ``(1024, 2048, 640)`` bf16 -> ``1`` at 49.4 MiB).
+  Tokamax's ``_calculate_bwd_vmem_bytes`` sums three sequential fp32 stack
+  temporaries in ``bwd_pipeline`` -- ``compute_s`` (``4 * B * V``),
+  ``accumulate_w_grad``'s ``dot_general`` (``4 * H_alloc * V``), and
+  ``accumulate_x_grad``'s ``dot_general`` (``4 * B * H_alloc``) -- as if all
+  three were live simultaneously. Because those three stages execute
+  sequentially within each grid step, at most the largest of the three is live
+  at once; subtracting the two smaller non-overlapping temporaries keeps the
+  default ``(1024, 512, 2048)`` bf16 tiles on TPU7x at ``(2, 2)`` (52.4 MiB <=
+  57.6 MiB) while stepping larger tiles down through ``(2, 1)`` (e.g.
+  ``(1024, 2048, 640)`` bf16 at 57.4 MiB; actual Mosaic allocation 56.1 MiB vs
+  69.1 MiB OOM at ``(2, 2)``) to ``1`` when ``(2, 1)`` also exceeds the limit.
   """
   calc_fn = getattr(kernel, "_calculate_bwd_vmem_bytes", None)
   if calc_fn is None:
@@ -100,10 +102,12 @@ def _select_bwd_buffer_count(
         else int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
     )
     h_alloc = 1 << (h_block_size - 1).bit_length()
-    non_overlapping_stack_bytes = min(
+    stack_temps = (
         4 * b_block_size * v_block_size,
-        4 * h_alloc * (b_block_size + v_block_size),
+        4 * h_alloc * v_block_size,
+        4 * b_block_size * h_alloc,
     )
+    non_overlapping_stack_bytes = sum(stack_temps) - max(stack_temps)
 
     def estimate_vmem(buf_count: tuple[int, int] | int) -> int:
       return (

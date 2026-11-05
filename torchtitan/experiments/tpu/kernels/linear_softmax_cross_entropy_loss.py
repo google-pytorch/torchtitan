@@ -51,6 +51,7 @@ jaxtyping.jaxtyped = _real_jaxtyped
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
 import torch
 from torch_tpu._internal.pallas import pallas
+from torchtitan.tools.logging import logger
 
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:
@@ -86,6 +87,16 @@ def _bwd_vmem_exceeds_capacity(
     )
     return vmem_22 > vmem_limit
   except Exception:  # pylint: disable=broad-exception-caught
+    # Keep (2, 2) buffering, but say why: a Tokamax API change here silently
+    # disables the fallback and surfaces as a compile-time VMEM OOM.
+    logger.warning(
+        "Could not estimate the fused CE backward VMEM for tiles (%d, %d, %d);"
+        " keeping the default (2, 2) gradient buffering.",
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        exc_info=True,
+    )
     return False
 
 

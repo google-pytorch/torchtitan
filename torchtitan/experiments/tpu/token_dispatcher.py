@@ -214,25 +214,21 @@ class _LocalReorder(torch.autograd.Function):
   """
 
   @staticmethod
-  def forward(ctx, x_TD, scores_TK, permutation_N, top_k):
+  def forward(ctx, x_TD, scores_TK, permutation_N, inverse_N, top_k):
     ctx.set_materialize_grads(False)
-    inverse_N = torch.argsort(permutation_N).to(permutation_N.dtype)
     token_indices_N = permutation_N // top_k
     ctx.save_for_backward(inverse_N)
     ctx.score_shape = scores_TK.shape
     ctx.top_k = top_k
-    ctx.mark_non_differentiable(token_indices_N, inverse_N)
+    ctx.mark_non_differentiable(token_indices_N)
     return (
         torch.index_select(x_TD, 0, token_indices_N),
         token_indices_N,
         torch.index_select(scores_TK.reshape(-1), 0, permutation_N),
-        inverse_N,
     )
 
   @staticmethod
-  def backward(
-      ctx, grad_routed_ND, _grad_token_indices_N, grad_scores_N, _grad_inverse_N
-  ):
+  def backward(ctx, grad_routed_ND, _grad_token_indices_N, grad_scores_N):
     (inverse_N,) = ctx.saved_tensors
     grad_x_TD = None
     if grad_routed_ND is not None:
@@ -242,7 +238,7 @@ class _LocalReorder(torch.autograd.Function):
       grad_scores_TK = torch.index_select(
           grad_scores_N, 0, inverse_N
       ).reshape(ctx.score_shape)
-    return grad_x_TD, grad_scores_TK, None, None
+    return grad_x_TD, grad_scores_TK, None, None, None
 
 
 def local_reorder(
@@ -257,7 +253,7 @@ def local_reorder(
   Returns the routed rows, their token indices, their scores and the inverse
   of the expert permutation. Given ``num_experts``, the indices are int32.
   """
-  # Marked so that a selective memory policy can save the sort order.
+  # Marked so that a selective memory policy can save the sort orders.
   with annotate_region(MOE_ROUTING):
     if num_experts is None:
       permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
@@ -265,7 +261,11 @@ def local_reorder(
       permutation_N = stable_expert_order(
           expert_ids_TK.reshape(-1), num_experts
       )
-  return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
+    inverse_N = torch.argsort(permutation_N).to(permutation_N.dtype)
+  routed_ND, token_indices_N, scores_N = _LocalReorder.apply(
+      x_TD, scores_TK, permutation_N, inverse_N, top_k
+  )
+  return routed_ND, token_indices_N, scores_N, inverse_N
 
 
 @dataclass(frozen=True, kw_only=True)

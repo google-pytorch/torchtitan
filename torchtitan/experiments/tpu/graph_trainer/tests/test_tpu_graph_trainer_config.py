@@ -1052,6 +1052,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             (128, 512, 512),
         )
 
+  def test_235b_splitter_recipes_save_routing(self) -> None:
+    config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+    self.assertEqual(config.compile.memory_policy, "tpu_selective_and_offload")
+    self.assertEqual(config.compile.save_regions, ("moe.routing",))
+    self.assertEqual(config.compile.save_last_n_layers, {})
+    maxtext = qwen3_moe_235b_fsdp_activation_offload_maxtext()
+    self.assertEqual(maxtext.compile.memory_policy, "full_and_offload")
+    self.assertEqual(maxtext.compile.save_regions, ())
+
   def test_235b_4x4x4_reduce_scatter_policy(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
 
@@ -1266,11 +1275,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   )
   def test_qwen3_235b_recipes_keep_their_own_memory_policy(self, name) -> None:
     # The 235B recipes start from the 30B benchmark recipe, whose
-    # tpu_selective saves were measured only on 30B.
+    # tpu_selective saves were measured only on 30B. Some save the routing.
     config = getattr(qwen3_config_registry, name)()
 
     self.assertNotEqual(config.compile.memory_policy, "tpu_selective")
-    self.assertEqual(config.compile.save_regions, ())
+    self.assertIn(config.compile.save_regions, ((), ("moe.routing",)))
     # The model transforms validate the memory settings.
     self._qwen3_graph_config(config)
 

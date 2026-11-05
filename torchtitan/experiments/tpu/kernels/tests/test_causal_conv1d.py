@@ -1,5 +1,7 @@
 """Accelerator tests for the Pallas depthwise causal conv1d + SiLU kernels."""
 
+import contextlib
+from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
@@ -213,8 +215,9 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
       causal_conv1d.causal_conv_silu(cpu_x, cpu_w)
 
     dev = self.accelerator_device
+    x_ok = torch.zeros(1, 8, 128, device=dev, dtype=torch.bfloat16)
     w_ok = torch.zeros(128, 1, 4, device=dev, dtype=torch.bfloat16)
-    for bad_x, bad_w in (
+    bad_cases = (
         (torch.zeros(1, 8, 96, device=dev, dtype=torch.bfloat16), w_ok[:96]),
         (torch.zeros(1, 6, 128, device=dev, dtype=torch.bfloat16), w_ok),
         (torch.zeros(0, 8, 128, device=dev, dtype=torch.bfloat16), w_ok),
@@ -229,8 +232,18 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
             torch.zeros(1, 8, 128, device=dev, dtype=torch.bfloat16),
             torch.zeros(128, 1, 9, device=dev, dtype=torch.bfloat16),
         ),
+    )
+    fake_tpu_dev = SimpleNamespace(type="tpu", index=0)
+    with (
+        contextlib.nullcontext()
+        if dev.type == "tpu"
+        else mock.patch.object(
+            torch.Tensor, "device", new=property(lambda _self: fake_tpu_dev)
+        )
     ):
-      self.assertFalse(causal_conv1d.supports(bad_x, bad_w))
+      self.assertTrue(causal_conv1d.supports(x_ok, w_ok))
+      for bad_x, bad_w in bad_cases:
+        self.assertFalse(causal_conv1d.supports(bad_x, bad_w))
 
     fake_dtensor = mock.MagicMock(spec=DTensor)
     self.assertFalse(causal_conv1d.supports(fake_dtensor, w_ok))
@@ -258,6 +271,33 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
           causal_conv1d._max_supported_seq_len(torch.bfloat16, width=8),  # pylint: disable=protected-access
           4096,
       )
+
+    with mock.patch.object(
+        causal_conv1d.pltpu,
+        "get_tpu_info",
+        side_effect=ValueError("Unsupported TPU device kind: cpu"),
+    ):
+      self.assertIsNone(
+          causal_conv1d._vmem_limit_bytes()  # pylint: disable=protected-access
+      )
+
+    saved_cache = list(causal_conv1d._tpu_gen_cache)  # pylint: disable=protected-access
+    self.addCleanup(
+        lambda: (
+            causal_conv1d._tpu_gen_cache.clear(),  # pylint: disable=protected-access
+            causal_conv1d._tpu_gen_cache.extend(saved_cache),  # pylint: disable=protected-access
+        )
+    )
+    for dev_name, expected in (("TPU v5 lite", 5), ("tpu7x", 7), ("other", None)):
+      causal_conv1d._tpu_gen_cache.clear()  # pylint: disable=protected-access
+      fake_tpu = SimpleNamespace(
+          get_device_properties=lambda n=dev_name: SimpleNamespace(name=n)
+      )
+      with mock.patch.object(torch, "tpu", fake_tpu, create=True):
+        self.assertEqual(
+            causal_conv1d._tpu_generation(),  # pylint: disable=protected-access
+            expected,
+        )
 
 
 if __name__ == "__main__":

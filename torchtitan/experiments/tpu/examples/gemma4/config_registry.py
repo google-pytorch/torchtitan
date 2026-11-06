@@ -169,7 +169,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -286,7 +286,7 @@ def gemma4_31b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=200,
           decay_ratio=0.8,

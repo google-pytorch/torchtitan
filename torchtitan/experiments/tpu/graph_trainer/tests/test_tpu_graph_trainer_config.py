@@ -1080,6 +1080,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
     )
 
+  def test_235b_4x4x4_saves_last_splash_layers(self) -> None:
+    config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+
+    self.assertEqual(config.compile.memory_policy, "tpu_selective_and_offload")
+    self.assertEqual(
+        config.compile.save_last_n_layers, {"attention.inner_attention": 8}
+    )
+
   @parameterized.named_parameters(
       ("scan", qwen3_moe_235b_scan),
       ("activation_offload", qwen3_moe_235b_fsdp_activation_offload_maxtext),

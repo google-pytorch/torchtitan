@@ -556,9 +556,13 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       return F.silu(gated_delta._causal_conv(x_in, w_in, seg))  # pylint: disable=protected-access
 
     # fp64 on the bf16 values: only the backward's own rounding counts.
+    # Call `_CausalConvSilu.apply` directly so whole-row slice backward is not
+    # bypassed on TPU when `causal_conv1d` is installed.
     expected_grads = conv_grads(autograd_conv_silu, "cpu", torch.float64)
     dev = self.accelerator_device
-    grads = conv_grads(gated_delta.causal_conv_silu, dev, torch.bfloat16)
+    grads = conv_grads(
+        gated_delta._CausalConvSilu.apply, dev, torch.bfloat16  # pylint: disable=protected-access
+    )
     autograd_grads = conv_grads(autograd_conv_silu, dev, torch.bfloat16)
     for name, grad_bf16, autograd_bf16, expected_grad in zip(
         ("x", "weight"), grads, autograd_grads, expected_grads, strict=True
@@ -572,6 +576,40 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           msg=f"d{name}: {err:.2e} vs autograd {autograd_err:.2e}",
       )
       self.assertLess(err, 1e-2, msg=f"d{name}: {err:.2e}")
+
+  def test_causal_conv_silu_dispatches_to_pallas_when_supported(self):
+    """Tests whole-row TPU dispatch to Pallas causal_conv1d and fallbacks."""
+    dev = self.accelerator_device
+    x = torch.randn(2, 64, 128, device=dev, dtype=torch.bfloat16)
+    weight = torch.randn(128, 1, 4, device=dev, dtype=torch.bfloat16) * 0.5
+    seg = segment_ids_from_positions(_packed_positions((24, 40))).expand(2, -1)
+    seg = seg.to(dev)
+
+    if self._is_tpu() and gated_delta.causal_conv1d is not None:
+      gated_delta._logged_conv_fallback_reasons.clear()  # pylint: disable=protected-access
+      with (
+          mock.patch.object(
+              gated_delta.causal_conv1d,
+              "causal_conv_silu",
+              wraps=gated_delta.causal_conv1d.causal_conv_silu,
+          ) as pallas_spy,
+          mock.patch.object(gated_delta.logger, "info") as log_info_spy,
+      ):
+        out_pallas = gated_delta.causal_conv_silu(x, weight, None)
+        self.assertEqual(pallas_spy.call_count, 1)
+        _ = gated_delta.causal_conv_silu(x, weight, seg)
+        self.assertEqual(log_info_spy.call_count, 0)
+        _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
+        _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
+        self.assertEqual(pallas_spy.call_count, 1)
+        self.assertEqual(log_info_spy.call_count, 1)
+        self.assertIn("seq_len=7", log_info_spy.call_args.args[1])
+      out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
+      self.assertLess(_relative_l2_error(out_pallas, out_slice), 5e-3)
+    else:
+      out_fallback = gated_delta.causal_conv_silu(x, weight, None)
+      out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
+      torch.testing.assert_close(out_fallback, out_slice)
 
   def test_causal_conv_silu_backward_avoids_scatter_adds(self):
     """Tests that the conv backward does not add slices into zero buffers.

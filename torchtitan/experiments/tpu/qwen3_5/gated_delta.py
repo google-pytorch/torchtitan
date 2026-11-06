@@ -36,6 +36,15 @@ from torchtitan.experiments.tpu import unflatten_shim
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
 from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
+from torchtitan.tools.logging import logger
+
+try:
+  from torchtitan.experiments.tpu.kernels import causal_conv1d
+except ImportError as e:
+  # Expected without torch_tpu / Pallas (CPU, GPU); on TPU this means the
+  # ~2x slower slice-based convolution is used instead.
+  logger.info("Pallas causal_conv1d unavailable (%s); using the XLA path.", e)
+  causal_conv1d = None
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -179,6 +188,9 @@ class _CausalConvSilu(torch.autograd.Function):
     return grad_x, grad_w_C1W, None
 
 
+_logged_conv_fallback_reasons: set[str] = set()
+
+
 def causal_conv_silu(
     x_BSC: torch.Tensor,
     weight_C1W: torch.Tensor,
@@ -186,8 +198,9 @@ def causal_conv_silu(
 ) -> torch.Tensor:
   """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
 
-  The backward is ``_CausalConvSilu``'s: shifted slices of the output gradient
-  instead of autograd's scattered adds.
+  Whole-row TPU inputs within ``causal_conv1d.supports`` run the fused Pallas
+  kernels; packed documents or unsupported shapes/devices use
+  ``_CausalConvSilu``'s shifted slices.
 
   Args:
     x_BSC: ``[B, S, C]`` input.
@@ -198,6 +211,25 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
+  if segment_ids_BS is None and causal_conv1d is not None:
+    reason = causal_conv1d.unsupported_reason(x_BSC, weight_C1W)
+    if reason is None:
+      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+    if (
+        x_BSC.device.type == "tpu"
+        and not torch.compiler.is_compiling()
+        and reason not in _logged_conv_fallback_reasons
+    ):
+      _logged_conv_fallback_reasons.add(reason)
+      logger.info(
+          "Pallas causal_conv1d fallback to slice path (%s): x=%s (%s),"
+          " weight=%s (%s).",
+          reason,
+          tuple(x_BSC.shape),
+          x_BSC.dtype,
+          tuple(weight_C1W.shape),
+          weight_C1W.dtype,
+      )
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 

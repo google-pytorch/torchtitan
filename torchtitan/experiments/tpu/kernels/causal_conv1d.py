@@ -82,7 +82,7 @@ def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:
     base = 8192 if dtype == torch.bfloat16 else 4096
   else:
     # TPU v5/v6 default to 16 MiB scoped VMEM.
-    # TODO(jialeic): Benchmark and raise the v5/v6 sequence-length caps now
+    # TODO: Benchmark and raise the v5/v6 sequence-length caps now
     # that _vmem_limit_bytes() requests 90% of physical VMEM.
     base = 2048 if dtype == torch.bfloat16 else 1024
   return base // 2 if width > 4 else base

@@ -305,19 +305,6 @@ def tag_sac_policy(
                 node.meta["recompute"] = parent.meta["recompute"]
             continue
 
-        # A `scan` node stands for its whole loop, so recomputing one reruns
-        # every iteration in backward: exact loss, smaller saved set, twice the
-        # work -- a regression that looks like a win in the memory number.
-        #
-        # This saves *every* scan, deliberately. A node's meta cannot say which
-        # loop it is (a HOP's body is traced separately, so tags placed there do
-        # not survive into the joint graph), and a loop is expensive to redo
-        # whatever it contains. The body's own checkpointing is set where the
-        # scan is built; see `graph_trainer/layer_stack.py`.
-        if node.target is torch.ops.higher_order.scan:
-            node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
-            continue
-
         # Always save sym-int nodes (shape reads like sym_size/sym_stride, and
         # tensor->int scalar conversions) rather than recompute them: recomputing
         # a shape read pins the parent tensor alive in backward just to reread its

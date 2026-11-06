@@ -42,7 +42,9 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
 # Imported for the side effect: they register TPU-only memory policies before
 # ``tag_with_memory_policy_pass`` looks them up by name.
 import torchtitan.experiments.tpu.graph_trainer.tpu_host_offload  # noqa: F401
-import torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy  # noqa: F401
+from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    save_loop_nodes_pass,
+)
 from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
@@ -547,6 +549,9 @@ def construct_tpu_transform_passes(
         passes.append(
             functools.partial(tag_with_memory_policy_pass, config=config)
         )
+        # After the policy, whichever it is, so that no policy can make the
+        # backward rerun a whole loop.
+        passes.append(save_loop_nodes_pass)
         # Same order as the CUDA pipeline in ``graph_trainer/passes.py``: tag,
         # then inject, then remat. A no-op unless the policy tagged something
         # MUST_CPU_OFFLOAD, but without it the offloading policies set their

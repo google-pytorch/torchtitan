@@ -48,6 +48,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
     TpuGraphTrainerMemoryPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
@@ -909,10 +910,11 @@ _ROW = (512, 256)
 def _loop_graph() -> tuple[torch.fx.GraphModule, list[torch.fx.Node]]:
     """A joint graph with one forward node of each loop HOP; returns it and them.
 
-    The scan pair is what scanned layers trace to: the forward loop saves one
-    row per layer and the backward loop reads that stack by index, which
-    ``full_and_scan_offload`` needs. The other loops sit inside a layer, next
-    to the ``feed_forward.w2`` matmuls that ``tpu_selective`` saves.
+    The scan pair is what scanned layers trace to: the forward loop saves a
+    copy of its carry (the layer input) per layer and the backward loop reads
+    that stack by index, which ``full_and_scan_offload`` needs. The other
+    loops sit inside a layer, next to the ``feed_forward.w2`` matmuls that
+    ``tpu_selective`` saves.
     """
     root = nn.Module()
     graph = torch.fx.Graph()
@@ -937,7 +939,13 @@ def _loop_graph() -> tuple[torch.fx.GraphModule, list[torch.fx.Node]]:
             )
             g.output((mm(g, tensor(row, _ROW), (4, 4)),))
         else:
-            g.output((mm(g, nodes[0], (4, 4)), mm(g, nodes[0], _ROW)))
+            saved = tensor(
+                g.call_function(torch.ops.aten.clone.default, args=(nodes[0],)), _ROW
+            )
+            # The tag scan_remat_policy puts on the saved carry; scan offload
+            # picks its value by this tag.
+            saved.meta["custom"] = {REMAT_REGION: "layer_input"}
+            g.output((mm(g, nodes[0], (4, 4)), saved))
         root.add_module(name, torch.fx.GraphModule(nn.Module(), g))
         return graph.get_attr(name)
 
@@ -1002,19 +1010,13 @@ class TestLoopNodesAreSaved(unittest.TestCase):
         for policy in policies:
             with self.subTest(policy=policy):
                 selective = policy.startswith("tpu_selective")
+                # The real config class, so a field a pass starts reading
+                # comes with its default instead of an AttributeError.
                 config = SimpleNamespace(
-                    compile=SimpleNamespace(
+                    compile=TpuGraphTrainerCompileConfig(
                         memory_policy=policy,
-                        full_recompute_save_ops="",
                         cpu_offload_budget_gb=100.0,
                         save_regions=(FEED_FORWARD_W2,) if selective else (),
-                        save_last_n_layers={},
-                        fsdp_barrier_policy="none",
-                        enable_remat_barriers=False,
-                        graph_split=SimpleNamespace(enabled=False),
-                        cpu_offload_prefetch_n_layers=0,
-                        cpu_offload_defer_n_layers=0,
-                        fsdp_allreduce_slice_parameter_patterns=(),
                     ),
                     parallelism=_parallelism("always"),
                 )

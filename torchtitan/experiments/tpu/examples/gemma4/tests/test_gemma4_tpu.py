@@ -1014,6 +1014,14 @@ class TestGemma4SplashAttentionParity(BaseDeviceTest):
         f" {max_rel_error:.1e}",
     )
 
+  @parameterized.parameters(gemma4_31b, gemma4_26b_a4b)
+  def test_production_recipes_enable_splash_attention(self, recipe):
+    cfg = recipe()
+    self.assertTrue(cfg.splash_attention_kernel.use_splash_attention_kernel)
+    self.assertFalse(
+        cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel
+    )
+
   @parameterized.named_parameters(
       dict(testcase_name="splash", kernel="splash"),
       dict(testcase_name="tokamax", kernel="tokamax"),

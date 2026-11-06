@@ -261,6 +261,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       use_vmap_bwd=_sa("use_vmap_bwd"),
       num_stacked_q_heads=_sa("num_stacked_q_heads"),
       use_batch_loop_fwd=_sa("use_batch_loop_fwd"),
+      use_transposed_bwd=_sa("use_transposed_bwd"),
       q_layout=_sa("q_layout"),
       k_layout=_sa("k_layout"),
       v_layout=_sa("v_layout"),
@@ -730,6 +731,13 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   # Splash Attention Patch
   if hasattr(job_config, "splash_attention_kernel"):
     sa_config = job_config.splash_attention_kernel
+    if getattr(sa_config, "use_transposed_bwd", False) and not (
+        sa_config.use_tokamax_splash_attention_kernel
+    ):
+      raise ValueError(
+          "splash_attention_kernel.use_transposed_bwd replaces the Tokamax"
+          " splash backward; it needs use_tokamax_splash_attention_kernel=True."
+      )
     if sa_config.use_tokamax_splash_attention_kernel:
       use_tokamax_splash_attention_patch(model, sa_config)
     elif sa_config.use_splash_attention_kernel:

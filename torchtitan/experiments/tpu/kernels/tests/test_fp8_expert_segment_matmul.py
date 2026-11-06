@@ -91,6 +91,14 @@ class Fp8GmmTest(base_device_test.BaseAcceleratorDeviceTest):
                 self.assertEqual(float(jnp.abs(drhs[g]).max()), 0.0)
 
 
+def _bf16_ulp_distance(a, b):
+    """Elementwise distance in BF16 ulps (ordered sign-magnitude bits)."""
+    def ordered(x):
+        bits = np.asarray(x).view(np.uint16).astype(np.int32)
+        return np.where(bits & 0x8000, -(bits & 0x7FFF), bits)
+    return np.abs(ordered(a) - ordered(b))
+
+
 class Fp8SwigluKernelTest(base_device_test.BaseAcceleratorDeviceTest):
     """The SwiGLU Pallas kernels, run by JAX directly."""
 
@@ -130,10 +138,10 @@ class Fp8SwigluKernelTest(base_device_test.BaseAcceleratorDeviceTest):
         unfused = fp8_esm.swiglu_grad(gate_up, d_hidden, fused=False)
         self.assertEqual(got.dtype, jnp.bfloat16)
         self.assertEqual(got.shape, gate_up.shape)
-        np.testing.assert_array_equal(
-            np.asarray(got.astype(jnp.float32)),
-            np.asarray(unfused.astype(jnp.float32)),
-        )
+        # Mosaic and XLA lower sigmoid differently (equal on JAX 0.11.1, up to
+        # 3 FP32 ulp apart on 0.12), so a result on a BF16 rounding tie can
+        # land on the neighboring value.
+        self.assertLessEqual(_bf16_ulp_distance(got, unfused).max(), 1)
 
         gu_r = _to_torch(gate_up).requires_grad_()
         g_r, u_r = gu_r.chunk(2, dim=-1)

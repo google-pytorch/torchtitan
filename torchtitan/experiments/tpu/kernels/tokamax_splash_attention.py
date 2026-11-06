@@ -89,6 +89,8 @@ class TokamaxConfig:
   q_layout: str = "HEAD_DIM_MINOR"
   k_layout: str = "HEAD_DIM_MINOR"
   v_layout: str = "HEAD_DIM_MINOR"
+  num_stacked_q_heads: int = 1
+  use_batch_loop_fwd: bool = False
 
   @classmethod
   def update(cls, **kwargs):
@@ -117,6 +119,8 @@ def _make_splash_attention_fn(
     v_layout: str = "HEAD_DIM_MINOR",
     use_vmap_bwd: bool = False,
     kv_seq_len: int | None = None,
+    num_stacked_q_heads: int = 1,
+    use_batch_loop_fwd: bool = False,
 ):
   """Create JAX splash attention forward and backward functions using Tokamax.
 
@@ -161,6 +165,7 @@ def _make_splash_attention_fn(
       q_layout=_get_layout(q_layout),
       k_layout=_get_layout(k_layout),
       v_layout=_get_layout(v_layout),
+      num_stacked_q_heads=num_stacked_q_heads,
   )
   if cp_size > 1 and (
       getattr(config, "qk_diag_skip", False)
@@ -241,6 +246,17 @@ def _make_splash_attention_fn(
       # pylint: enable=protected-access
       return out_b, stats_b["logsumexp"]
 
+    if use_batch_loop_fwd:
+      per_example = [
+          _single_fwd_with_lse(
+              q_scaled[b],
+              k[b],
+              v[b],
+              None if segment_ids is None else segment_ids[b],
+          )
+          for b in range(q.shape[0])
+      ]
+      return tuple(jnp.stack(xs) for xs in zip(*per_example))
     # in_axes=None broadcasts a None segment_ids to every batch element.
     seg_axis = None if segment_ids is None else 0
     out, logsumexp = jax.vmap(
@@ -334,6 +350,8 @@ def jax_attention_fwd(
     q_layout: str,
     k_layout: str,
     v_layout: str,
+    num_stacked_q_heads: int,
+    use_batch_loop_fwd: bool,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward attention in JAX using Pallas.
 
@@ -379,6 +397,8 @@ def jax_attention_fwd(
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
+      num_stacked_q_heads=num_stacked_q_heads,
+      use_batch_loop_fwd=use_batch_loop_fwd,
   )
 
   # Apply scaling inside the compiled JAX pipeline
@@ -418,6 +438,8 @@ def jax_attention_bwd(
     q_layout: str,
     k_layout: str,
     v_layout: str,
+    num_stacked_q_heads: int,
+    use_batch_loop_fwd: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Backward attention in JAX calling direct Pallas kernel backward."""
   seq_len = q.shape[1]
@@ -459,6 +481,8 @@ def jax_attention_bwd(
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
+      num_stacked_q_heads=num_stacked_q_heads,
+      use_batch_loop_fwd=use_batch_loop_fwd,
   )
 
   default_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -512,6 +536,8 @@ _KERNEL_CONFIG_FIELDS = (
     "q_layout",
     "k_layout",
     "v_layout",
+    "num_stacked_q_heads",
+    "use_batch_loop_fwd",
 )
 
 

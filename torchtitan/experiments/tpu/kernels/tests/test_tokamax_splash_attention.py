@@ -428,29 +428,30 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     )
     logging.info("MQA/GQA backward test passed.")
 
+  def _set_tokamax_config(self, **values):
+    cfg = tokamax_splash_attention.TokamaxConfig
+    for name, value in values.items():
+      self.addCleanup(setattr, cfg, name, getattr(cfg, name))
+      setattr(cfg, name, value)
+
   @parameterized.named_parameters(
-      ("mha_scan_bwd", 8, False),
-      ("mha_vmap_bwd", 8, True),
-      ("gqa_scan_bwd", 2, False),
-      ("gqa_vmap_bwd", 2, True),
-      ("mqa_scan_bwd", 1, False),
-      ("mqa_vmap_bwd", 1, True),
+      ("mha_scan_bwd", 8, dict(use_vmap_bwd=False)),
+      ("mha_vmap_bwd", 8, dict(use_vmap_bwd=True)),
+      ("gqa_scan_bwd", 2, dict(use_vmap_bwd=False)),
+      ("gqa_vmap_bwd", 2, dict(use_vmap_bwd=True)),
+      ("mqa_scan_bwd", 1, dict(use_vmap_bwd=False)),
+      ("mqa_vmap_bwd", 1, dict(use_vmap_bwd=True)),
+      ("gqa_vmap_bwd_stacked", 2, dict(use_vmap_bwd=True, num_stacked_q_heads=4)),
+      ("gqa_loop_fwd_stacked", 2, dict(use_vmap_bwd=True, use_batch_loop_fwd=True, num_stacked_q_heads=4)),
+      ("mqa_loop_fwd", 1, dict(use_vmap_bwd=True, use_batch_loop_fwd=True)),
   )
-  def test_segment_ids_parity(self, n_kv_heads, use_vmap_bwd):
+  def test_segment_ids_parity(self, n_kv_heads, config):
     """Packed-document forward and gradients match a block-causal SDPA reference."""
     device = self.accelerator_device
     torch.manual_seed(7)
     b, n_heads, seq_len, head_dim = 2, 8, 256, 64
     n_rep = n_heads // n_kv_heads
-
-    prev_use_vmap_bwd = tokamax_splash_attention.TokamaxConfig.use_vmap_bwd
-    tokamax_splash_attention.TokamaxConfig.use_vmap_bwd = use_vmap_bwd
-    self.addCleanup(
-        setattr,
-        tokamax_splash_attention.TokamaxConfig,
-        "use_vmap_bwd",
-        prev_use_vmap_bwd,
-    )
+    self._set_tokamax_config(**config)
 
     # (B, S, H, D). Row 0 packs two documents, row 1 packs four with a
     # boundary inside a 128-token block, so a kernel that only honored the
@@ -507,6 +508,21 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       torch.testing.assert_close(
           got.cpu(), want.transpose(1, 2), rtol=5e-2, atol=5e-2, msg=name
       )
+
+    if config.get("num_stacked_q_heads", 1) != 1 or config.get("use_batch_loop_fwd"):
+      # Stacking only regroups query rows of the same matmuls, and per-example
+      # calls only drop tiles with no same-document pair, so the output must
+      # equal the unstacked, vmapped kernel's bit for bit.
+      self._set_tokamax_config(num_stacked_q_heads=1, use_batch_loop_fwd=False)
+      out_unstacked = tokamax_splash_attention.splash_sdpa(
+          q_t.detach(),
+          k_t.detach(),
+          v_t.detach(),
+          segment_ids=segment_ids.to(device),
+          is_causal=True,
+          enable_gqa=n_kv_heads != n_heads,
+      )
+      self.assertTrue(torch.equal(out.detach().cpu(), out_unstacked.cpu()))
 
     # Guard against a vacuous pass: without segment_ids the kernel must differ
     # from the packed reference.

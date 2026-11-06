@@ -12,23 +12,39 @@ axis as one stream. This module provides the TPU replacements:
    ``conv1d`` and the recurrence run on each ``[B, S]`` row independently
    without dynamic-shape ``cu_seqlens`` offsets (upstream ``GatedDeltaNet``
    only passes ``cu_seqlens``, not ``positions`` / ``segment_ids``).
+   ``tokamax_gated_delta.TokamaxGatedDeltaKernel`` swaps the recurrence for
+   Tokamax's Mosaic TPU kernels.
 3. ``TpuGatedDeltaNet``: ``GatedDeltaNet`` that passes ``positions`` down, so
    the causal ``conv1d`` and the recurrence also restart at every document
    packed into a row (``positions == 0``), as upstream's ``cu_seqlens`` kernels
-   do. The document boundaries are static-shape ``[B, S]`` segment-id masks.
+   do. The document boundaries are static-shape ``[B, S]`` segment-id masks;
+   setting ``Config.document_resets.enabled=False`` (or the attribute
+   ``config.reset_at_documents = False``) turns off the document restarts so
+   pretraining runs over each ``[B, S]`` row as one stream.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
 
+from torchtitan.config.configurable import Configurable
+from torchtitan.config.override import override
 from torchtitan.experiments.tpu import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
 from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
+from torchtitan.tools.logging import logger
+
+try:
+  from torchtitan.experiments.tpu.kernels import causal_conv1d
+except ImportError as e:
+  # Expected without torch_tpu / Pallas (CPU, GPU); on TPU this means the
+  # ~2x slower slice-based convolution is used instead.
+  logger.info("Pallas causal_conv1d unavailable (%s); using the XLA path.", e)
+  causal_conv1d = None
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -172,6 +188,9 @@ class _CausalConvSilu(torch.autograd.Function):
     return grad_x, grad_w_C1W, None
 
 
+_logged_conv_fallback_reasons: set[str] = set()
+
+
 def causal_conv_silu(
     x_BSC: torch.Tensor,
     weight_C1W: torch.Tensor,
@@ -179,8 +198,9 @@ def causal_conv_silu(
 ) -> torch.Tensor:
   """``silu`` of a depthwise causal ``conv1d`` over ``[B, S, C]``.
 
-  The backward is ``_CausalConvSilu``'s: shifted slices of the output gradient
-  instead of autograd's scattered adds.
+  Whole-row TPU inputs within ``causal_conv1d.supports`` run the fused Pallas
+  kernels; packed documents or unsupported shapes/devices use
+  ``_CausalConvSilu``'s shifted slices.
 
   Args:
     x_BSC: ``[B, S, C]`` input.
@@ -191,6 +211,25 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
+  if segment_ids_BS is None and causal_conv1d is not None:
+    reason = causal_conv1d.unsupported_reason(x_BSC, weight_C1W)
+    if reason is None:
+      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+    if (
+        x_BSC.device.type == "tpu"
+        and not torch.compiler.is_compiling()
+        and reason not in _logged_conv_fallback_reasons
+    ):
+      _logged_conv_fallback_reasons.add(reason)
+      logger.info(
+          "Pallas causal_conv1d fallback to slice path (%s): x=%s (%s),"
+          " weight=%s (%s).",
+          reason,
+          tuple(x_BSC.shape),
+          x_BSC.dtype,
+          tuple(weight_C1W.shape),
+          weight_C1W.dtype,
+      )
   return _CausalConvSilu.apply(x_BSC, weight_C1W, segment_ids_BS)
 
 
@@ -261,8 +300,15 @@ def chunked_gated_delta(
       x.reshape(bs, n_heads, num_chunks, chunk, x.shape[-1]) for x in (q, k, v)
   ]
   beta = beta.reshape(bs, n_heads, num_chunks, chunk, 1)
-  g = g.reshape(bs, n_heads, num_chunks, chunk).cumsum(dim=-1)
-  g_last = g[..., -1:]
+  g = g.reshape(bs, n_heads, num_chunks, chunk)
+  # Each chunk's total log decay, from the per-token decays rather than as
+  # `g.cumsum(-1)[..., -1:]`: under torch.compile(backend="tpu") (as in
+  # TpuGraphTrainer), the gradient through a slice of a cumsum output that is
+  # also used elementwise comes out wrong on TPU (v5e and TPU7x; dg off by
+  # 3x, NaN losses at initialization decays). See
+  # test_chunked_gated_delta_compiled_grads_match_eager.
+  g_last = g.sum(dim=-1, keepdim=True)
+  g = g.cumsum(dim=-1)
 
   # decay[i, j] = exp(g_i - g_j) for i >= j and 0 otherwise. Masking before
   # exp keeps the positive upper-triangle exponents from overflowing.
@@ -313,6 +359,30 @@ def chunked_gated_delta(
   return out.transpose(1, 2).contiguous().to(out_dtype)
 
 
+def per_row_segment_ids(
+    segment_ids_BS: torch.Tensor, max_num_segments: int
+) -> torch.Tensor:
+  """Per-row 1-based document ids, keeping at most ``max_num_segments`` apart.
+
+  Args:
+    segment_ids_BS: ``[B, S]`` document index of each token, non-decreasing
+      along each row (e.g. ``segment_ids_from_positions`` or arbitrary sorted
+      document ids).
+    max_num_segments: Documents per row kept apart.
+
+  Returns:
+    ``[B, S]`` int32 ids that start at 1 in every row and increment by 1 at
+    each document boundary up to ``max_num_segments``. Documents beyond
+    ``max_num_segments`` share the last id, so they run as one sequence, as
+    without document ids.
+  """
+  if segment_ids_BS.shape[1] <= 1:
+    return torch.ones_like(segment_ids_BS, dtype=torch.int32)
+  changes = (segment_ids_BS[:, 1:] != segment_ids_BS[:, :-1]).to(torch.int32)
+  ids = F.pad(changes.cumsum(dim=1, dtype=torch.int32), (1, 0)) + 1
+  return ids.clamp(max=max_num_segments).to(torch.int32)
+
+
 class TpuGatedDeltaKernel(GatedDeltaKernel):
   """``GatedDeltaKernel`` running ``chunked_gated_delta`` on ``[B, S]`` rows."""
 
@@ -323,6 +393,54 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
   def __init__(self, config: Config):
     super().__init__(config)
     self.chunk_size = config.chunk_size
+
+  def document_ids(self, segment_ids_BS: torch.Tensor) -> torch.Tensor:
+    """The document ids that the causal convolution and the recurrence use.
+
+    ``TpuInnerGatedDeltaNet`` passes the same ids to both, so a kernel that
+    keeps only some documents apart (``TokamaxGatedDeltaKernel``) merges the
+    others in the convolution too. This one keeps every document apart.
+
+    Args:
+      segment_ids_BS: ``[B, S]`` document index of each token.
+
+    Returns:
+      ``[B, S]`` document ids.
+    """
+    return segment_ids_BS
+
+  def recurrence(
+      self,
+      q_BSHK: torch.Tensor,
+      k_BSHK: torch.Tensor,
+      v_BSHV: torch.Tensor,
+      g_BSH: torch.Tensor,
+      beta_BSH: torch.Tensor,
+      segment_ids_BS: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    """The gated delta rule on ``[B, S]`` rows; subclasses swap the kernel.
+
+    Args:
+      q_BSHK: Queries, one key head per value head.
+      k_BSHK: Keys, one key head per value head.
+      v_BSHV: Values.
+      g_BSH: Log-space decay.
+      beta_BSH: Update gate.
+      segment_ids_BS: Optional ``[B, S]`` document index of each token; the
+        recurrence restarts at every document.
+
+    Returns:
+      ``[B, S, H, V]`` output.
+    """
+    return chunked_gated_delta(
+        q_BSHK,
+        k_BSHK,
+        v_BSHV,
+        g_BSH,
+        beta_BSH,
+        chunk_size=self.chunk_size,
+        segment_ids=segment_ids_BS,
+    )
 
   def forward(
       self,
@@ -346,14 +464,13 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
     if repeats > 1:
       xq_BSHK = xq_BSHK.repeat_interleave(repeats, dim=2)
       xk_BSHK = xk_BSHK.repeat_interleave(repeats, dim=2)
-    return chunked_gated_delta(
+    return self.recurrence(
         xq_BSHK,
         xk_BSHK,
         xv_BSHV,
         g_BSH,
         beta_BSH,
-        chunk_size=self.chunk_size,
-        segment_ids=segment_ids_BS,
+        segment_ids_BS=segment_ids_BS,
     )
 
 
@@ -411,9 +528,11 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
             f" {num_tokens} tokens."
         )
       # Document index of each token: documents start at positions == 0.
-      segment_ids_BS = segment_ids_from_positions(
-          positions.reshape(-1)
-      ).reshape(query_BSC.shape[:2])
+      segment_ids_BS = self.kernel.document_ids(
+          segment_ids_from_positions(positions.reshape(-1)).reshape(
+              query_BSC.shape[:2]
+          )
+      )
 
     def causal_conv(
         x_BSC: torch.Tensor,
@@ -440,6 +559,40 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
 
 
+class GatedDeltaDocumentResets(Configurable):
+  """Leaf config controlling packed-document resets in ``TpuGatedDeltaNet``.
+
+  Kept as its own leaf ``Configurable`` so ``gated_delta_document_resets``
+  targets ``layers.{i}.delta_net.document_resets`` without conflicting with
+  ``tokamax_gated_delta_kernel`` at
+  ``layers.{i}.delta_net.inner_gated_delta_net.kernel`` under ``override``.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Configurable.Config):
+    enabled: bool = True
+
+  def __init__(self, config: Config):
+    self.enabled = config.enabled
+
+
+class GatedDeltaDocumentResets(Configurable):
+  """Leaf config controlling packed-document resets in ``TpuGatedDeltaNet``.
+
+  Kept as its own leaf ``Configurable`` so ``gated_delta_document_resets``
+  targets ``layers.{i}.delta_net.document_resets`` without conflicting with
+  ``tokamax_gated_delta_kernel`` at
+  ``layers.{i}.delta_net.inner_gated_delta_net.kernel`` under ``override``.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Configurable.Config):
+    enabled: bool = True
+
+  def __init__(self, config: Config):
+    self.enabled = config.enabled
+
+
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 
@@ -449,11 +602,36 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   recurrence at every packed document. Upstream instead passes ``cu_seqlens``
   document offsets, which ``Qwen35Model`` only builds for the flex and varlen
   attention backends and whose shape changes with the number of documents.
+
+  ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the
+  convolution and the recurrence run over each ``[B, S]`` row as one stream, as
+  upstream does without ``cu_seqlens`` (e.g. with SDPA). Pretraining recipes use
+  it: the Tokamax kernels lay every document out from a 64-token chunk boundary
+  to restart at it, which costs time and memory.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(GatedDeltaNet.Config):
-    pass
+    # Restart the causal convolution and the recurrence at every packed
+    # document (`positions == 0`). RL needs this when packing multiple rollouts
+    # into one `[B, S]` row; pretraining on packed text may turn it off.
+    document_resets: GatedDeltaDocumentResets.Config = field(
+        default_factory=GatedDeltaDocumentResets.Config
+    )
+
+    # Attribute alias for `document_resets.enabled` (not a dataclass field: it
+    # is not a constructor/`replace()` argument and is not serialized).
+    @property
+    def reset_at_documents(self) -> bool:
+      return self.document_resets.enabled
+
+    @reset_at_documents.setter
+    def reset_at_documents(self, value: bool) -> None:
+      self.document_resets = replace(self.document_resets, enabled=value)
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+    self.reset_at_documents = config.document_resets.enabled
 
   def forward(
       self,
@@ -494,10 +672,22 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         cu_seqlens,
         key_head_dim=self.key_head_dim,
         value_head_dim=self.value_head_dim,
-        # TPU: pass `positions`; packed documents restart conv + recurrence.
-        positions=positions,
+        # TPU: pass `positions` so packed documents restart conv + recurrence,
+        # unless document resets are disabled (pretraining).
+        positions=positions if self.reset_at_documents else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)
+
+
+@override(
+    target=GatedDeltaDocumentResets.Config,
+    description="Set whether GatedDeltaNet resets at packed documents.",
+)
+def gated_delta_document_resets(
+    cfg: GatedDeltaDocumentResets.Config, *, enabled: bool = True
+) -> GatedDeltaDocumentResets.Config:
+  """Sets ``enabled`` on ``GatedDeltaDocumentResets.Config``."""
+  return replace(cfg, enabled=enabled)

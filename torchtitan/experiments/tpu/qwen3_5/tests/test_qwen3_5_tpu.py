@@ -17,6 +17,7 @@ Covers:
 """
 
 import copy
+import dataclasses
 import functools
 from types import SimpleNamespace
 from unittest import mock
@@ -967,6 +968,52 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         0.1,
         msg="Negative control failed: no GDN leak without positions",
     )
+    # Config.reset_at_documents=False (pretraining) ignores positions in both
+    # forward and backward: whole rows match gdn(x, positions=None).
+    gdn_no_reset_cfg = dataclasses.replace(
+        config.layers[0].delta_net,
+        document_resets=gated_delta.GatedDeltaDocumentResets.Config(
+            enabled=False
+        ),
+    )
+    self.assertFalse(gdn_no_reset_cfg.reset_at_documents)
+    gdn_no_reset = gdn_no_reset_cfg.build()
+    gdn_no_reset.init_states(buffer_device=torch.device("cpu"))
+    gdn_no_reset.load_state_dict(gdn.state_dict())
+    gdn_no_reset = gdn_no_reset.to(self.accelerator_device)
+    self.assertFalse(gdn_no_reset.reset_at_documents)
+
+    grad_out = torch.randn_like(out_leaky)
+    x_ref = x.detach().clone().requires_grad_(True)
+    x_no_reset = x.detach().clone().requires_grad_(True)
+    gdn.zero_grad()
+    gdn_no_reset.zero_grad()
+    with set_unflatten_seq_len(seq_len):
+      out_ref_bwd = gdn(x_ref)
+      out_no_reset = gdn_no_reset(x_no_reset, positions=positions)
+    out_ref_bwd.backward(grad_out)
+    out_no_reset.backward(grad_out)
+
+    test_utils.check_equivalence(
+        out_no_reset.detach().cpu(),
+        out_ref_bwd.detach().cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Without Document Resets",
+    )
+    grad_tol = 2e-2 if self._is_tpu() else 5e-4
+    self.assertLessEqual(
+        _relative_l2_error(x_no_reset.grad, x_ref.grad),
+        grad_tol,
+        msg="GDN reset_at_documents=False input grad mismatch",
+    )
+    ref_grads = dict(gdn.named_parameters())
+    for name, param in gdn_no_reset.named_parameters():
+      self.assertLessEqual(
+          _relative_l2_error(param.grad, ref_grads[name].grad),
+          grad_tol,
+          msg=f"GDN reset_at_documents=False param grad mismatch for {name}",
+      )
 
   def test_per_row_segment_ids(self):
     """Tests per-row 1-based document ids capped at max_num_segments."""
@@ -1470,8 +1517,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertIsNone(gt_cfg.model_spec.pipelining_fn)
     self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
-    # The conversion re-wraps the model config: the kernels must survive it.
+    # The conversion re-wraps the model config: the kernels and GDN reset
+    # setting must survive it.
     self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
+    self.assertEqual(
+        [
+            d.reset_at_documents
+            for _, d, _, _ in gt_cfg.model_spec.model.traverse(
+                gated_delta.TpuGatedDeltaNet.Config
+            )
+        ],
+        [False] * 30,
+    )
     splitter = GraphSplitter.from_trainer_config(
         gt_cfg,
         optimizer_in_graph=(gt_cfg.compile.optimizer_compile == "in_graph"),
@@ -1549,6 +1606,43 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
     self.assertIsInstance(bench_cfg, TpuGraphTrainer.Config)
     self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+
+    # Pretraining: no GatedDeltaNet packed-document resets (RL keeps them).
+    def resets(cfg):
+      return [
+          d.reset_at_documents
+          for _, d, _, _ in cfg.model_spec.model.traverse(
+              gated_delta.TpuGatedDeltaNet.Config
+          )
+      ]
+
+    self.assertEqual(resets(bench_cfg), [False] * 30)
+    self.assertEqual(resets(config_registry.qwen35_moe_35b()), [True] * 30)
+    re_enabled_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    doc_resets_override = (
+        "torchtitan.experiments.tpu.qwen3_5.gated_delta."
+        "gated_delta_document_resets"
+    )
+    # Combining with the recipe's own overrides (including Tokamax KDA) keeps
+    # both FusedLossLinearWrapper and TokamaxGatedDeltaKernel active without
+    # nested-override conflicts.
+    apply_overrides(
+        OverrideConfig(
+            imports=[*re_enabled_cfg.override.imports, doc_resets_override]
+        ),
+        re_enabled_cfg,
+    )
+    self.assertEqual(resets(re_enabled_cfg), [True] * 30)
+    for layer in re_enabled_cfg.model_spec.model.layers:
+      if layer.delta_net is not None:
+        self.assertEqual(
+            type(layer.delta_net.inner_gated_delta_net.kernel).__qualname__,
+            "TokamaxGatedDeltaKernel.Config",
+        )
+    self.assertEqual(
+        type(re_enabled_cfg.model_spec.model.lm_head).__qualname__,
+        "FusedLossLinearWrapper.Config",
+    )
     self.assertEqual(
         bench_cfg.override.imports,
         [
@@ -1653,6 +1747,56 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
     self.assertEqual(parsed.model_spec.max_context_length, 262144)
+    self.assertEqual(resets(parsed), [False] * 30)
+
+    # CLI `--override.imports` can re-enable document resets alongside the
+    # recipe's fused-loss and Tokamax KDA overrides (with custom segments).
+    parsed_rl = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--override.imports",
+        config_registry.FUSED_LOSS_OVERRIDE,
+        (
+            f'{config_registry.TOKAMAX_GATED_DELTA_OVERRIDE}={{"max_num_segments":'
+            " 32}"
+        ),
+        doc_resets_override,
+    ])
+    apply_overrides(parsed_rl.override, parsed_rl)
+    self.assertEqual(resets(parsed_rl), [True] * 30)
+    first_gdn_kernel = parsed_rl.model_spec.model.layers[
+        0
+    ].delta_net.inner_gated_delta_net.kernel
+    self.assertEqual(
+        type(first_gdn_kernel).__qualname__, "TokamaxGatedDeltaKernel.Config"
+    )
+    self.assertEqual(first_gdn_kernel.max_num_segments, 32)
+
+    # 1-layer split + selective save_last_n_layers CLI flags (used at 96K
+    # tokens/rank) also parse.
+    parsed_96k = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--compile.graph_split.forward_layers_per_executable=1",
+        "--compile.graph_split.backward_layers_per_executable=1",
+        "--compile.save_regions",
+        "moe.routing",
+        "--compile.save_last_n_layers",
+        "attention.inner_attention",
+        "2",
+    ])
+    apply_tpu_graph_trainer_model_transforms(parsed_96k)
+    self.assertEqual(
+        parsed_96k.compile.graph_split.forward_layers_per_executable, 1
+    )
+    self.assertEqual(
+        parsed_96k.compile.graph_split.backward_layers_per_executable, 1
+    )
+    self.assertEqual(parsed_96k.compile.save_regions, ("moe.routing",))
+    self.assertEqual(
+        parsed_96k.compile.save_last_n_layers,
+        {"attention.inner_attention": 2},
+    )
 
 
 if __name__ == "__main__":

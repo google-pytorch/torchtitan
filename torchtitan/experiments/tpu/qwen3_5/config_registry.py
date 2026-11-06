@@ -32,6 +32,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
@@ -105,6 +106,25 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
     experts_config.use_kernel_native_weight_layout = True
   for _, dispatcher, _, _ in dispatchers:
     dispatcher.fuse_route_score_backward = True
+
+
+def _no_gated_delta_document_resets(cfg: TPUTrainerConfig) -> None:
+  """Runs every GatedDeltaNet over whole rows, without packed-document resets.
+
+  Pretraining on packed text does not need the causal convolution and the
+  recurrence to restart at each document (upstream does not without
+  `cu_seqlens`), and the Tokamax kernels' restarts lay every document out
+  from a 64-token chunk boundary. Full attention still masks documents.
+
+  Args:
+    cfg: The recipe to update in place.
+  """
+  assert cfg.model_spec is not None
+  delta_nets = list(cfg.model_spec.model.traverse(TpuGatedDeltaNet.Config))
+  if not delta_nets:
+    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model_spec.model")
+  for _, delta_net, _, _ in delta_nets:
+    delta_net.reset_at_documents = False
 
 
 def _use_tokamax_gated_delta(
@@ -371,10 +391,10 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   `--training.dtype=bfloat16` to fit one tpu7x-2x2x1 host): FP32 master
   weights, gradients and AdamW state with bf16 compute, ZeRO-3 with selective
   rematerialization, GraphTrainer with 2 layers per forward and backward
-  executable, Tokamax's Mosaic KDA kernels for the 30 GatedDeltaNet layers,
-  Pallas paired grouped matmuls for the experts, Splash attention, and the
-  Pallas fused linear cross-entropy. 32K tokens per rank (16 sequences of
-  2048).
+  executable, Tokamax's Mosaic KDA kernels for the 30 GatedDeltaNet layers
+  (without packed-document resets), Pallas paired grouped matmuls for the
+  experts, Splash attention, and the Pallas fused linear cross-entropy. 32K
+  tokens per rank (16 sequences of 2048).
   """
   base_cfg = qwen35_moe_35b()
   base_cfg.dataloader = c4_test_dataloader()
@@ -398,6 +418,8 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
       enable_amp=False,
       enable_mfu_benchmark=False,
   )
+  _use_tokamax_gated_delta(base_cfg)
+  _no_gated_delta_document_resets(base_cfg)
   # Save each layer's MoE router top-k / sort permutation and the 10 full
   # attention layers' Splash output + LSE (~5.98 GiB logical at 64K tokens/rank)
   # so backward skips re-running router top-k/argsort and Splash forward.
@@ -407,7 +429,6 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
       memory_policy="tpu_selective",
       save_regions=("moe.routing", "attention.inner_attention"),
   )
-  _use_tokamax_gated_delta(cfg)
   # Throughput DVFS operating point (p_state=7) and SparseCore collective
   # offload (async AG, dual-SC RS, latency-hiding scheduler), merged onto
   # qwen35_moe_35b's 65472 KiB scoped VMEM limit.

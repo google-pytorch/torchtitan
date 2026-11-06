@@ -24,6 +24,7 @@ from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
 from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+from torchtitan.experiments.tpu.attention_balance import balance_rows
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.tools.logging import logger
@@ -187,6 +188,10 @@ class TPUGrainDataLoader(GrainDataLoader):
     """Chat datasets only: overrides the field holding the prompt."""
     response_field: str | None = None
     """Chat datasets only: overrides the field holding the response."""
+    attention_balance: bool = False
+    """Re-deal each step's packed rows across DP ranks so per-rank attention
+    cost (sum of squared document lengths) is even. The global batch is
+    unchanged; see `attention_balance.py` for which losses stay invariant."""
 
   def __init__(self, config: Config, **kwargs: Any) -> None:
     if isinstance(config.dataset, str):
@@ -229,7 +234,18 @@ class TPUGrainDataLoader(GrainDataLoader):
           proc = dataclasses.replace(proc, img_size=256)
         ds_cfg = dataclasses.replace(base_ds, source=src, processor=proc)
       config = dataclasses.replace(config, dataset=ds_cfg)  # pytype: disable=wrong-arg-types
+    if config.attention_balance and config.max_num_documents is not None:
+      # The packer caps documents per local batch; moving rows across ranks
+      # can exceed that cap on the receiving rank.
+      raise ValueError("attention_balance does not support max_num_documents")
     super().__init__(config, **kwargs)
+    if config.attention_balance:
+      self._iterator = balance_rows(
+          self._iterator,
+          seq_len=kwargs["max_context_length"],
+          num_tokens_per_rank=kwargs["num_tokens_per_batch"],
+          dp_world_size=kwargs["dp_world_size"],
+      )
 
 
 def c4_test_dataloader(**kwargs: Any) -> TPUGrainDataLoader.Config:

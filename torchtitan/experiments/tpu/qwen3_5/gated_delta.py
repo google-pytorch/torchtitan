@@ -576,6 +576,23 @@ class GatedDeltaDocumentResets(Configurable):
     self.enabled = config.enabled
 
 
+class GatedDeltaDocumentResets(Configurable):
+  """Leaf config controlling packed-document resets in ``TpuGatedDeltaNet``.
+
+  Kept as its own leaf ``Configurable`` so ``gated_delta_document_resets``
+  targets ``layers.{i}.delta_net.document_resets`` without conflicting with
+  ``tokamax_gated_delta_kernel`` at
+  ``layers.{i}.delta_net.inner_gated_delta_net.kernel`` under ``override``.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Configurable.Config):
+    enabled: bool = True
+
+  def __init__(self, config: Config):
+    self.enabled = config.enabled
+
+
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 

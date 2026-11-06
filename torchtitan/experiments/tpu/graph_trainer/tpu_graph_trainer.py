@@ -59,6 +59,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     register as register_tpu_pipeline,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
@@ -153,20 +154,24 @@ class TpuGraphTrainer(GraphTrainer):
             kwargs.pop("tpu_compile_mode", None)
             return parallelize_fn(model, *args, **kwargs)
 
+        post_optimizer_build_fn = config.model_spec.post_optimizer_build_fn
+
+        def tpu_graph_post_optimizer_build(
+            optimizers, model_parts, parallel_dims
+        ):
+            if post_optimizer_build_fn is not None:
+                post_optimizer_build_fn(optimizers, model_parts, parallel_dims)
+            split_optimizers_by_mesh(optimizers)
+
         config.model_spec = dataclasses.replace(
-            config.model_spec, parallelize_fn=tpu_graph_parallelize
+            config.model_spec,
+            parallelize_fn=tpu_graph_parallelize,
+            post_optimizer_build_fn=tpu_graph_post_optimizer_build,
         )
         # Ensure the 'tpu' pass pipeline is registered before GraphTrainer traces/compiles
         register_tpu_pipeline()
 
         super().__init__(config)
-
-        if _split_optimizers_by_mesh(self.optimizers):
-            self.lr_schedulers = config.lr_scheduler.build(
-                optimizers=self.optimizers,
-                training_steps=config.training.steps,
-            )
-            self.metrics_processor.lr_schedulers = self.lr_schedulers
 
         self._optimizer_in_graph = (
             config.compile.optimizer_compile == "in_graph"
@@ -666,43 +671,6 @@ def _make_fwd_bwd_adamw_fn(
         ]
 
     return fwd_bwd_adamw
-
-
-def _split_optimizers_by_mesh(optimizers_container) -> bool:
-    try:
-        from torch.distributed.tensor import DTensor
-    except Exception:
-        DTensor = None
-
-    def _mesh_key(p):
-        if DTensor is None or not isinstance(p, DTensor):
-            return None
-        try:
-            return id(p._spec.mesh)
-        except Exception:
-            return None
-
-    did_split = False
-    for opt in optimizers_container.optimizers:
-        new_groups: list[dict] = []
-        for grp in opt.param_groups:
-            params = list(grp["params"])
-            base_kwargs = {k: v for k, v in grp.items() if k != "params"}
-            buckets: dict = {}
-            for p in params:
-                key = _mesh_key(p)
-                buckets.setdefault(key, []).append(p)
-            if len(buckets) > 1:
-                did_split = True
-            for bucket_params in buckets.values():
-                new_groups.append({"params": bucket_params, **base_kwargs})
-        if len(new_groups) == len(opt.param_groups):
-            continue
-        opt.param_groups = []
-        opt.state.clear()
-        for grp in new_groups:
-            opt.add_param_group(grp)
-    return did_split
 
 
 def _dump_weight_stats(model_parts) -> None:

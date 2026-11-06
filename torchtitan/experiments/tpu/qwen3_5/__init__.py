@@ -29,6 +29,7 @@ from functools import partial
 import math
 
 from torch import nn
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import derive
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 
@@ -41,7 +42,8 @@ from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
     TpuRMSNormGated,
 )
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
-from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35TransformerBlock
+from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35Model, TpuQwen35TransformerBlock
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
 from torchtitan.protocols.model import ModelConfigConverter
@@ -49,6 +51,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
     "model_registry",
+    "post_optimizer_build_qwen3_5",
     "qwen3_5_configs",
     "use_tpu_modules",
 ]
@@ -57,7 +60,7 @@ __all__ = [
 _CONV1D_INIT = {"weight": partial(nn.init.kaiming_uniform_, a=math.sqrt(5))}
 
 
-def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
+def use_tpu_modules(config: Qwen35Model.Config) -> TpuQwen35Model.Config:
   """Returns ``config`` as a text-only TPU config (see the module docstring).
 
   Args:
@@ -65,7 +68,7 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
       place.
 
   Returns:
-    A ``Qwen35Model.Config`` without a vision encoder.
+    A ``TpuQwen35Model.Config`` without a vision encoder.
   """
   for i, layer in enumerate(config.layers):
     if layer.attention is not None:
@@ -93,7 +96,17 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
     if layer.moe is not None:
       layer.moe.load_balance_coeff = None
     config.layers[i] = derive(layer, TpuQwen35TransformerBlock.Config)
-  return dataclasses.replace(config, vision_encoder=None)
+  return derive(config, TpuQwen35Model.Config, vision_encoder=None)
+
+
+def post_optimizer_build_qwen3_5(
+    optimizers,
+    model_parts: list[nn.Module],
+    parallel_dims,
+) -> None:
+  """Splits multi-mesh optimizer param groups, then registers the MoE hook."""
+  split_optimizers_by_mesh(optimizers)
+  register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
 
 def model_registry(
@@ -132,6 +145,7 @@ def model_registry(
       model=use_tpu_modules(model_spec.model),
       parallelize_fn=parallelize_qwen3_5,
       pipelining_fn=None,
+      post_optimizer_build_fn=post_optimizer_build_qwen3_5,
   )
 
 

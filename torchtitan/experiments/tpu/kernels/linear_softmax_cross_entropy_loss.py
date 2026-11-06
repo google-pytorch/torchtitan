@@ -68,19 +68,45 @@ def _select_bwd_buffer_count(
     v_block_size: int,
     dtype,
 ) -> tuple[int, int] | int | None:
-  """Selects backward ``buffer_count`` that fits VMEM, or ``None`` for ``(2, 2)``.
+  """Picks the backward kernel's gradient buffering so its tiles fit in VMEM.
 
-  Tokamax's ``_calculate_bwd_vmem_bytes`` sums three sequential fp32 stack
-  temporaries in ``bwd_pipeline`` -- ``compute_s`` (``4 * B * V``),
-  ``accumulate_w_grad``'s ``dot_general`` (``4 * H_alloc * V``), and
-  ``accumulate_x_grad``'s ``dot_general`` (``4 * B * H_alloc``) -- as if all
-  three were live simultaneously. Because those three stages execute
-  sequentially within each grid step, at most the largest of the three is live
-  at once; subtracting the two smaller non-overlapping temporaries keeps the
-  default ``(1024, 512, 2048)`` bf16 tiles on TPU7x at ``(2, 2)`` (52.4 MiB <=
-  57.6 MiB) while stepping larger tiles down through ``(2, 1)`` (e.g.
-  ``(1024, 2048, 640)`` bf16 at 57.4 MiB; actual Mosaic allocation 56.1 MiB vs
-  69.1 MiB OOM at ``(2, 2)``) to ``1`` when ``(2, 1)`` also exceeds the limit.
+  ``buffer_count`` controls how the backward kernel moves its two fp32
+  gradient blocks (``x_grad`` of shape (B, H) and ``w_grad`` of shape (H, V))
+  between HBM and VMEM. Each block is read, accumulated into and written
+  back, so it has two sides:
+    (in, out): ``in`` VMEM copies for reading the next block ahead of time,
+      ``out`` copies for writing finished blocks back while compute
+      continues. An int ``n`` means ``(n, 1)``.
+    (2, 2): reads and write-backs both overlap compute (Tokamax's default).
+    (2, 1): reads overlap; each write-back must finish before the kernel moves
+      on. One fewer gradient copy in VMEM.
+    1: no overlap at all. Smallest, slowest.
+  Each extra copy costs one fp32 gradient tile per block, so ``(2, 2)`` needs
+  two more of each than ``1``. Tokamax may lower the count further when a
+  block is revisited too soon to buffer safely.
+
+  Tries ``(2, 2)``, ``(2, 1)``, then ``1``, and returns the first that fits
+  under the kernel's VMEM limit (90% of capacity). Returns ``None`` when
+  ``(2, 2)`` fits, so Tokamax's default is passed through unchanged. If even
+  ``1`` exceeds the estimate, returns ``1`` and logs a warning, since the
+  kernel will likely fail to compile.
+
+  The VMEM use comes from Tokamax's ``_calculate_bwd_vmem_bytes``, which
+  over-counts: besides the (B, V) logits temporary (which can overlap the
+  previous V-step's gradient matmuls via the 2-slot scratch buffer), it
+  reserves space for both the (H, V) weight-gradient product and the (B, H)
+  input-gradient product as if both were live at once. The kernel computes
+  those two gradient products one after another, so only the larger of the
+  two needs space, and the estimate here drops the smaller one.
+
+  For example, on TPU7x (57.6 MiB limit) with bf16 inputs:
+    (1024, 512, 2048): 56.4 MiB at (2, 2) -> keeps the default.
+    (1024, 1024, 1280): 61.4 MiB at (2, 2), 52.4 MiB at (2, 1) -> (2, 1).
+    (1024, 2048, 640): 72.9 MiB at (2, 2), 59.9 MiB at (2, 1), 46.9 MiB at 1
+      -> 1.
+
+  Logs once per tile and dtype when it changes the buffering, and keeps the
+  default (with a warning) if the estimate is unavailable.
   """
   calc_fn = getattr(kernel, "_calculate_bwd_vmem_bytes", None)
   if calc_fn is None:
@@ -102,12 +128,10 @@ def _select_bwd_buffer_count(
         else int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
     )
     h_alloc = 1 << (h_block_size - 1).bit_length()
-    stack_temps = (
-        4 * b_block_size * v_block_size,
+    non_overlapping_grad_dot_bytes = min(
         4 * h_alloc * v_block_size,
         4 * b_block_size * h_alloc,
     )
-    non_overlapping_stack_bytes = sum(stack_temps) - max(stack_temps)
 
     def estimate_vmem(buf_count: tuple[int, int] | int) -> int:
       return (
@@ -118,7 +142,7 @@ def _select_bwd_buffer_count(
               dtype=dtype,
               buffer_count=buf_count,
           )
-          - non_overlapping_stack_bytes
+          - non_overlapping_grad_dot_bytes
       )
 
     vmem_22 = estimate_vmem((2, 2))
@@ -138,19 +162,32 @@ def _select_bwd_buffer_count(
     )
     if event_key not in _logged_bwd_buffer_events:
       _logged_bwd_buffer_events.add(event_key)
-      logger.info(
-          "Fused CE backward tiles (%d, %d, %d) (%s) exceed VMEM limit"
-          " %.1f MiB at buffer_count=(2, 2) (est. %.1f MiB); using"
-          " buffer_count=%s (est. %.1f MiB).",
-          b_block_size,
-          h_block_size,
-          v_block_size,
-          jax.numpy.dtype(dtype),
-          vmem_limit / (1024 * 1024),
-          vmem_22 / (1024 * 1024),
-          chosen,
-          vmem_chosen / (1024 * 1024),
-      )
+      if vmem_chosen > vmem_limit:
+        logger.warning(
+            "Fused CE backward tiles (%d, %d, %d) (%s) exceed VMEM limit"
+            " %.1f MiB even at buffer_count=1 (est. %.1f MiB); kernel will"
+            " likely fail to compile (use bfloat16 inputs or smaller tiles).",
+            b_block_size,
+            h_block_size,
+            v_block_size,
+            jax.numpy.dtype(dtype),
+            vmem_limit / (1024 * 1024),
+            vmem_chosen / (1024 * 1024),
+        )
+      else:
+        logger.info(
+            "Fused CE backward tiles (%d, %d, %d) (%s) exceed VMEM limit"
+            " %.1f MiB at buffer_count=(2, 2) (est. %.1f MiB); using"
+            " buffer_count=%s (est. %.1f MiB).",
+            b_block_size,
+            h_block_size,
+            v_block_size,
+            jax.numpy.dtype(dtype),
+            vmem_limit / (1024 * 1024),
+            vmem_22 / (1024 * 1024),
+            chosen,
+            vmem_chosen / (1024 * 1024),
+        )
     return chosen
   except Exception:  # pylint: disable=broad-exception-caught
     # Keep (2, 2) buffering, but say why: a Tokamax API change here silently

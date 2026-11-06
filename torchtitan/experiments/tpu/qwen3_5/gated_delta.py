@@ -35,7 +35,7 @@ from torchtitan.experiments.tpu import unflatten_shim
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
 from torchtitan.tools.logging import logger
 
 try:
@@ -45,6 +45,12 @@ except ImportError as e:
   # ~2x slower slice-based convolution is used instead.
   logger.info("Pallas causal_conv1d unavailable (%s); using the XLA path.", e)
   causal_conv1d = None
+
+try:
+  from torchtitan.experiments.tpu.kernels import rms_norm_gated
+except ImportError as e:
+  logger.info("Pallas rms_norm_gated unavailable (%s); using the XLA path.", e)
+  rms_norm_gated = None
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -557,6 +563,27 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     )
     # TT-UNFLATTEN-SHIM: fold [B, S, ...] back to [T, ...].
     return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
+
+
+class TpuRMSNormGated(RMSNormGated):
+  """``RMSNormGated`` that dispatches to Pallas on supported TPU shapes."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(RMSNormGated.Config):
+    pass
+
+  def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    weight = self.weight
+    if rms_norm_gated is not None and rms_norm_gated.supports(
+        x, gate, weight
+    ):
+      return rms_norm_gated.rms_norm_gated(x, gate, weight, self.eps)
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + self.eps)
+    x = weight * x.to(input_dtype)
+    return (x.float() * F.silu(gate.float())).to(input_dtype)
 
 
 class GatedDeltaDocumentResets(Configurable):

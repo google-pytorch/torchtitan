@@ -132,6 +132,7 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
+        allow_ep_paired_grouped_mm: bool = False
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -171,6 +172,7 @@ class TpuGroupedExperts(GroupedExperts):
             config.pallas_grouped_mm_w2_transposed_tgmm_tiling
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
+        self.allow_ep_paired_grouped_mm = config.allow_ep_paired_grouped_mm
         self._use_transposed_w2_rhs = False
         self._native_sharding_applied = False
 
@@ -220,6 +222,7 @@ class TpuGroupedExperts(GroupedExperts):
         # padding before combine, and validating the nested EP/FSDP sharding.
         if (
             self.use_pallas_paired_grouped_mm
+            and not self.allow_ep_paired_grouped_mm
             and parallel_dims.get_optional_mesh("ep") is not None
         ):
             raise ValueError("Paired grouped matmul requires EP=1 exact-row dispatch")
@@ -250,6 +253,7 @@ class TpuGroupedExperts(GroupedExperts):
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``GroupedExperts.forward`` with a configurable activation.
 
@@ -257,7 +261,9 @@ class TpuGroupedExperts(GroupedExperts):
         ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
         silu.
         """
-        if isinstance(self.w1_EFD, DTensor):
+        if weights is not None:
+            w1_EFD, w2_EDF, w3_EFD = weights
+        elif isinstance(self.w1_EFD, DTensor):
             w1_EFD = self.w1_EFD.to_local()
             w2_EDF = self.w2_EDF.to_local()
             w3_EFD = self.w3_EFD.to_local()
@@ -286,26 +292,9 @@ class TpuGroupedExperts(GroupedExperts):
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
 
-    def forward(
+    def _unshard_local_weights(
         self,
-        x_RD: torch.Tensor,
-        num_tokens_per_expert_E: torch.Tensor,
-        row_scale_R: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the experts on expert-sorted rows.
-
-        ``row_scale_R``, if given, multiplies each row's hidden activation
-        before the down projection (W2).
-        """
-        # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
-        # dWeight is incorrect at M=4096. See
-        # https://github.com/google-pytorch/torch_tpu/issues/2668.
-        if not self.use_pallas_grouped_mm:
-            if row_scale_R is not None:
-                raise ValueError("row_scale_R requires Pallas grouped matmul")
-            if self.activation == "silu":
-                return super().forward(x_RD, num_tokens_per_expert_E)
-            return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
@@ -313,13 +302,54 @@ class TpuGroupedExperts(GroupedExperts):
             w1_EKN = local_tensor(self.w1_EDF)
             w2_EKN = local_tensor(self.w2_EFD)
             w3_EKN = local_tensor(self.w3_EDF)
-        else:
+        elif self.use_pallas_grouped_mm:
             w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
             w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
             w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
-
+        else:
+            return (
+                local_tensor(self.w1_EFD),
+                local_tensor(self.w2_EDF),
+                local_tensor(self.w3_EFD),
+            )
         if self._use_transposed_w2_rhs:
             w2_EKN = w2_EKN.transpose(-2, -1)
+        return w1_EKN, w2_EKN, w3_EKN
+
+    def forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+        row_scale_R: torch.Tensor | None = None,
+        *,
+        pre_unsharded_weights: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+        unshard_only: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the experts on expert-sorted rows.
+
+        ``row_scale_R``, if given, multiplies each row's hidden activation
+        before the down projection (W2).
+        """
+        if unshard_only:
+            return self._unshard_local_weights()
+        # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
+        # dWeight is incorrect at M=4096. See
+        # https://github.com/google-pytorch/torch_tpu/issues/2668.
+        if not self.use_pallas_grouped_mm:
+            if row_scale_R is not None:
+                raise ValueError("row_scale_R requires Pallas grouped matmul")
+            if self.activation == "silu" and pre_unsharded_weights is None:
+                return super().forward(x_RD, num_tokens_per_expert_E)
+            return self._native_experts_forward(
+                x_RD, num_tokens_per_expert_E, weights=pre_unsharded_weights
+            )
+        w1_EKN, w2_EKN, w3_EKN = (
+            pre_unsharded_weights
+            if pre_unsharded_weights is not None
+            else self._unshard_local_weights()
+        )
 
         # Match GroupedExperts: expert compute is BF16 even when the surrounding
         # model is FP32, and the final result is restored to the caller's dtype.
@@ -334,11 +364,10 @@ class TpuGroupedExperts(GroupedExperts):
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
         # Forward and backward Pallas kernels require lhs.shape[0] to be a
-        # multiple of tile_m and both dWeight TGMM M tiles. Under ragged EP > 1
-        # (unpaired segment_matmul_pallas_2d), pad only the buffer rows so
-        # unrouted tail rows [count : num_rows] are not swept into the last
-        # expert; under EP == 1 exact-row paired GEMM, include the zero-padded
-        # rows in the last expert's count.
+        # multiple of tile_m and both dWeight TGMM M tiles, while skipping rows
+        # past sum(num_tokens_per_expert_E). Pad only the buffer rows here;
+        # mutating num_tokens_per_expert_E[-1] would sweep uninitialized tail
+        # rows [count : num_rows] into the last expert under ragged EP > 1.
         row_align = math.lcm(
             tile_m,
             max(1, tgmm_tiling[0]),
@@ -348,13 +377,6 @@ class TpuGroupedExperts(GroupedExperts):
         pad_rows = -num_rows % row_align
         if pad_rows:
             x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
-            if self.use_pallas_paired_grouped_mm:
-                num_tokens_per_expert_E = torch.cat(
-                    [
-                        num_tokens_per_expert_E[:-1],
-                        num_tokens_per_expert_E[-1:] + pad_rows,
-                    ]
-                )
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16

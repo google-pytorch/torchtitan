@@ -213,6 +213,19 @@ SPARSECORE_COLLECTIVE_OFFLOAD: FlagMap = {
     "xla_tpu_enable_sparse_core_collective_offload_reduce_scatter": "true",
 }
 
+# Additional SparseCore / scheduler flags from MaxText MLPerf v6.1 MoE recipes
+# on TPU7x for overlapping dependent EP + FSDP all-gather / reduce-scatter
+# collectives while keeping small routing-weight gathers and ragged-buffer
+# layout copies on the TensorCore (+3.6% on Qwen3.5-397B EP=8; do not set
+# xla_tpu_enable_async_all_to_all, which halts
+# SparseCoreTileExecuteCoreSequencer on small ragged_all_to_all tensors).
+MAXTEXT_MOE_SPARSECORE_OFFLOAD: FlagMap = {
+    "xla_tpu_enable_sparse_core_reduce_scatter_v2": "true",
+    "xla_tpu_enable_layer_scheduler_for_dependent_collectives": "true",
+    "xla_tpu_enable_offloading_gather_to_sparsecore": "false",
+    "xla_tpu_enable_offloading_copy_to_sparsecore": "false",
+}
+
 # Request TPU7x performance state 7, the throughput-oriented operating point.
 # This trades higher device power for faster compute; it does not change the
 # graph.

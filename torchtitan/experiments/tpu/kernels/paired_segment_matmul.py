@@ -97,7 +97,17 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
         acc3,
     ):
         del group_offset
+        _, _, m_tile_ids = group_metadata
         grid_id = pl.program_id(1)
+        prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+        first_visit = jnp.logical_or(
+            grid_id == 0, m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
+        )
+
+        @pl.when(first_visit)
+        def _zero_out():
+            out1[...] = jnp.zeros_like(out1)
+            out3[...] = jnp.zeros_like(out3)
 
         acc1[...] = jnp.zeros_like(acc1)
         acc3[...] = jnp.zeros_like(acc3)
@@ -504,8 +514,10 @@ def paired_segment_matmul_pallas_2d(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply two equal-shaped expert projections while sharing lhs loads.
 
-    ``group_sizes`` must sum exactly to ``lhs.shape[0]``; this kernel does not
-    initialize a capacity-padding tail. ``tgmm_tile_k`` (0 = full K) tiles the
+    ``group_sizes`` may sum to ``<= lhs.shape[0]`` (such as under dropless EP):
+    active output tiles covering ``[0, sum(group_sizes))`` are zero-initialized
+    on first visit before masked stores, while inactive tail tiles past
+    ``sum(group_sizes)`` are skipped. ``tgmm_tile_k`` (0 = full K) tiles the
     dWeight kernel's K dimension to bound its VMEM footprint.
     """
     if rhs1.shape != rhs3.shape:

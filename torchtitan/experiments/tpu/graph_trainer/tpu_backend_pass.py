@@ -311,6 +311,10 @@ def tpu_backend_compile_pass(
     eliminating per-node host dispatch overhead during training steps.
     """
     StaticCompiler = _import_static_compiler()
+    if hasattr(torch.ops, "tpu") and hasattr(
+        torch.ops.tpu, "_optimization_barrier"
+    ):
+        _ensure_optimization_barrier_fake()
 
     example_inputs = _restore_pinned_host_compile_inputs(gm, example_inputs)
 
@@ -597,7 +601,11 @@ def construct_tpu_transform_passes(
     from torchtitan.experiments.tpu.graph_trainer.passes.insert_combine_barriers import (
         apply_combine_barrier_pass,
     )
+    from torchtitan.experiments.tpu.graph_trainer.passes.insert_ep_chunk_barriers import (
+        apply_ep_chunk_barrier_pass,
+    )
     passes.append(apply_combine_barrier_pass)
+    passes.append(apply_ep_chunk_barrier_pass)
 
     if fsdp_barrier_policy != "none":
         model_config = config.model_spec.model

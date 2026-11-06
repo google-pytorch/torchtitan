@@ -3,15 +3,13 @@
 from dataclasses import dataclass
 
 import torch
-import torchtitan.config
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
-from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
 
@@ -117,10 +115,12 @@ class TpuQwen35Model(Qwen35Model):
   """``Qwen35Model`` whose config and parallelization wire TPU EP execution.
 
   Under expert parallelism, ``Config.update_from_config`` switches the MoE
-  layers to ``TpuQwen35TokenDispatcher`` and disables the ``EP == 1`` paired
-  Pallas kernel, and ``parallelize`` enables the unpaired Pallas grouped
-  matmuls on TPU so dynamic or empty expert segments under EP never hit
-  ``torch._grouped_mm``.
+  layers to ``TpuQwen35RoutedExperts`` and ``TpuQwen35TokenDispatcher``, keeps
+  paired Pallas grouped matmuls enabled only when ``allow_ep_paired_grouped_mm``
+  is set, and scales ``num_token_chunks`` with ``expert_parallel_degree`` when
+  ``auto_scale_token_chunks`` is enabled. ``parallelize`` upgrades unconfigured
+  TPU expert layers to unpaired Pallas grouped matmuls so dynamic or empty
+  expert segments under EP never hit ``torch._grouped_mm``.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -130,31 +130,39 @@ class TpuQwen35Model(Qwen35Model):
       # Zero-argument super() does not work in slots dataclasses on Python
       # 3.12 (the class is re-created); call the parent explicitly.
       Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
-      if config.parallelism.expert_parallel_degree > 1:
+      ep_deg = config.parallelism.expert_parallel_degree
+      if ep_deg > 1:
         # Only model-config changes belong here. `compile_grad_norm` (rejected
         # under EP > 1 by `TPUTrainerConfig.__post_init__` at parse time) and
         # `tpu_config.eager_mode` (applied by `gmain` before the trainer is
         # built) must be set in the recipe or on the command line.
-        # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
-        # for the paired (w1 + w3) Pallas kernel; fall back to unpaired Pallas
-        # grouped matmuls under EP > 1.
-        for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
-          experts.use_pallas_paired_grouped_mm = False
-        for _, dispatcher, parent, field_name in list(
-            self.traverse(AllToAllTokenDispatcher.Config)
+        graph_split = getattr(
+            getattr(config, "compile", None), "graph_split", None
+        )
+        if (
+            graph_split is not None
+            and graph_split.enabled
+            and graph_split.backward_partition_mode != "by_layer"
         ):
-          if type(dispatcher) in (  # pylint: disable=unidiomatic-typecheck
-              AllToAllTokenDispatcher.Config,
-              TpuAllToAllTokenDispatcher.Config,
-          ):
-            ep_dispatcher = torchtitan.config.derive(
-                dispatcher,
-                token_dispatcher.TpuQwen35TokenDispatcher.Config,
+          raise ValueError(
+              "Expert parallelism needs"
+              " --compile.graph_split.backward_partition_mode=by_layer: the EP"
+              " activation collectives cannot be moved by"
+              f" {graph_split.backward_partition_mode!r}. Use a *_ep_* recipe"
+              " or pass the flag."
+          )
+        # `TpuGroupedExperts.parallelize` requires `EP == 1` exact-row dispatch
+        # for the paired (w1 + w3) Pallas kernel unless the experts opt in to
+        # the EP-aware paired kernel; otherwise fall back to unpaired Pallas.
+        for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
+          if not experts.allow_ep_paired_grouped_mm:
+            experts.use_pallas_paired_grouped_mm = False
+        routed_cfgs, _ = token_dispatcher.use_ep_modules(self)
+        for routed in routed_cfgs:
+          if routed.auto_scale_token_chunks:
+            routed.num_token_chunks = token_dispatcher.default_num_token_chunks(
+                ep_deg
             )
-            if isinstance(parent, list):
-              parent[field_name] = ep_dispatcher
-            else:
-              setattr(parent, field_name, ep_dispatcher)
 
   def _init_self_buffers(
       self, *, buffer_device: torch.device | None = None
@@ -207,6 +215,15 @@ class TpuQwen35Model(Qwen35Model):
       )
       self.register_buffer("_ep_local_rank", rank_buf, persistent=False)
       for module in self.modules():
-        dispatcher = getattr(module, "token_dispatcher", None)
-        if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
-          dispatcher.bind_ep_rank_holder(self)
+        if isinstance(module, MoE):
+          inner_experts = module.routed_experts.inner_experts
+          dispatcher = module.routed_experts.token_dispatcher
+          if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
+            dispatcher.bind_ep_rank_holder(self)
+            if not getattr(inner_experts, "use_pallas_grouped_mm", False):
+              dispatcher.roe_zero_pad_tail = True
+              dispatcher.roe_weights_on_activation = False
+        else:
+          dispatcher = getattr(module, "token_dispatcher", None)
+          if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
+            dispatcher.bind_ep_rank_holder(self)

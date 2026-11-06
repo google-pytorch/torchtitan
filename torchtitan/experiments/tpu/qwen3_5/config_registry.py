@@ -32,6 +32,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
+from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher as qwen35_token_dispatcher
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -222,39 +223,99 @@ def _use_graph_split(
   return cfg
 
 
-def _use_expert_parallel(cfg: TPUTrainerConfig, *, ep_degree: int) -> None:
+def _use_expert_parallel(
+    cfg: TPUTrainerConfig,
+    *,
+    ep_degree: int,
+    comm_mode: qwen35_token_dispatcher.CommMode = "auto",
+    num_token_chunks: int | None = None,
+    roe_use_pallas_tc: bool = True,
+    roe_weights_on_activation: bool = True,
+    allow_ep_paired_grouped_mm: bool = True,
+    enable_sparsecore_offload: bool = True,
+) -> None:
   """Shards the routed experts over `ep_degree` ranks (Expert Parallelism).
 
-  `TpuQwen35Model.Config.update_from_config` switches the token dispatcher to
-  `TpuQwen35TokenDispatcher` (dropless static-shape `ragged_all_to_all`
-  dispatch and combine) and the expert matmuls to the unpaired Pallas kernels.
+  Configures Ring-of-Experts (`comm_mode="auto"`, resolving to
+  `"ring_of_experts"` when `ep_degree <= top_k` and `"ragged_all_to_all"`
+  otherwise), sequence-chunked pipelining (`num_token_chunks`), paired W1+W3
+  Pallas grouped matmuls, and SparseCore collective offload flags adapted from
+  MaxText's MLPerf v6.1 TPU7x recipes.
 
   Args:
     cfg: The recipe to update in place.
     ep_degree: Expert-parallel degree; it must divide the number of experts.
+    comm_mode: EP transport (`"auto"`, `"ring_of_experts"`, or
+      `"ragged_all_to_all"`).
+    num_token_chunks: Number of token sequence chunks per MoE layer (`>= 1`), or
+      `None` to scale automatically as `max(4, min(ep_degree, 16))`
+      (re-evaluated in `TpuQwen35Model.Config.update_from_config` if
+      `--parallelism.expert_parallel_degree` is overridden on the CLI).
+    roe_use_pallas_tc: Use Pallas TensorCore async-DMA gather / weighted
+      gather-reduce kernels for Ring-of-Experts.
+    roe_weights_on_activation: Apply routing weights on the routed experts'
+      hidden activation (before `w2`) and combine with an unweighted
+      gather-reduce, instead of a weighted gather-reduce with a fused scale +
+      dScore backward over the model dim.
+    allow_ep_paired_grouped_mm: Keep the paired W1+W3 Pallas grouped matmul
+      enabled under EP > 1.
+    enable_sparsecore_offload: Add `SPARSECORE_COLLECTIVE_OFFLOAD` and
+      `MAXTEXT_MOE_SPARSECORE_OFFLOAD` to `cfg.libtpu_init_flags`.
   """
   cfg.parallelism.expert_parallel_degree = ep_degree
   # `CompiledGradNorm` needs a single mesh; the eager norm reduces over the
-  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes. `DEFER_AND_FUSE` avoids
-  # per-op eager dispatch stalls in that multi-mesh reduction.
+  # dense (`fsdp`) and expert (`efsdp`, `ep`) meshes. Enable `DEFER_AND_FUSE`
+  # so eager `clip_grad_norm_` fuses across the parameter list.
   cfg.compile.compile_grad_norm = False
   if not cfg.tpu_config.eager_mode:
     cfg.tpu_config.eager_mode = "DEFER_AND_FUSE"
+
+  resolved_chunks = (
+      qwen35_token_dispatcher.default_num_token_chunks(ep_degree)
+      if num_token_chunks is None
+      else num_token_chunks
+  )
+  auto_scale_chunks = num_token_chunks is None
+
+  if cfg.model_spec is not None:
+    model_cfg = cfg.model_spec.model
+    for _, experts, _, _ in model_cfg.traverse(TpuGroupedExperts.Config):
+      experts.allow_ep_paired_grouped_mm = allow_ep_paired_grouped_mm
+      if not allow_ep_paired_grouped_mm:
+        experts.use_pallas_paired_grouped_mm = False
+    routed_cfgs, dispatcher_cfgs = qwen35_token_dispatcher.use_ep_modules(
+        model_cfg
+    )
+    for routed in routed_cfgs:
+      routed.num_token_chunks = resolved_chunks
+      routed.auto_scale_token_chunks = auto_scale_chunks
+    for dispatcher in dispatcher_cfgs:
+      dispatcher.comm_mode = comm_mode
+      dispatcher.roe_use_pallas_tc = roe_use_pallas_tc
+      dispatcher.roe_weights_on_activation = roe_weights_on_activation
+
+  if enable_sparsecore_offload:
+    cfg.libtpu_init_flags = tpu_flags.merge_flags(
+        cfg.libtpu_init_flags,
+        tpu_flags.SPARSECORE_COLLECTIVE_OFFLOAD,
+        tpu_flags.MAXTEXT_MOE_SPARSECORE_OFFLOAD,
+    )
+
   if (
       isinstance(cfg.compile, TpuGraphTrainerCompileConfig)
       and cfg.compile.graph_split.enabled
   ):
-    # Full rematerialization avoids keeping `ep_size * N` static EP receive
-    # buffers or `moe.routing` metadata live across child executables.
-    cfg.compile.memory_policy = "full"
-    cfg.compile.save_regions = ()
+    # Chunked dropless EP bounds the live EP buffers, so `tpu_selective` can
+    # keep the router top-k ids and Splash outputs instead of the full remat
+    # that unchunked EP needed.
+    cfg.compile.memory_policy = "tpu_selective"
+    cfg.compile.save_regions = ("moe.routing", "attention.inner_attention")
     cfg.compile.save_last_n_layers = {}
-    # Under `fsdp_pipeline`, backward child `L` holds the all-gather of layer
-    # `L - 1` and the reduce-scatter of layer `L + 1`, so the 3:1
-    # GatedDeltaNet:Attention cycle yields 6 distinct backward children, each
-    # with the EP all-to-alls (~9 min to compile each on 8 CPUs). `by_layer`
-    # children with one layer each are self-contained: 3 distinct backward
-    # children.
+    # `by_layer` is required: the EP collectives (Ring-of-Experts all-gather /
+    # reduce-scatter, ragged all-to-all) are activation collectives that
+    # `fsdp_pipeline` cannot move between children. One layer per child also
+    # keeps the 3:1 GatedDeltaNet:Attention cycle at 3 distinct backward
+    # children instead of 6.
     graph_split = cfg.compile.graph_split
     graph_split.forward_layers_per_executable = 1
     graph_split.backward_layers_per_executable = 1
@@ -343,7 +404,7 @@ def graph_trainer_qwen35_moe_debugmodel() -> TpuGraphTrainer.Config:
   )
 
 
-def qwen35_moe_35b() -> TPUTrainerConfig:
+def qwen35_moe_35b(flavor: str = "35B-A3B") -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 
   As in the Qwen3 TPU recipes, FP32 parameters, gradients and AdamW state
@@ -358,11 +419,11 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
   """
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
-      hf_assets_path="./assets/hf/Qwen3.5-35B-A3B",
+      hf_assets_path=f"./assets/hf/Qwen3.5-{flavor}",
       # Logging syncs the host on the loss; every 5 steps lets the host
       # dispatch the next step while the current one runs.
       metrics=MetricsProcessor.Config(log_freq=5),
-      model_spec=model_registry("35B-A3B", converters=_TPU_MOE_CONVERTERS),
+      model_spec=model_registry(flavor, converters=_TPU_MOE_CONVERTERS),
       optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       # A 2-step warmup to the peak LR diverged the randomly initialized
       # 40-layer model (loss 12.77 -> 6.45 -> 8.48 -> NaN at step 4 on
@@ -423,7 +484,9 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
+def qwen35_moe_35b_split_tokamax_benchmark(
+    flavor: str = "35B-A3B",
+) -> TpuGraphTrainer.Config:
   """Qwen3.5-35B-A3B benchmark: ZeRO-3, graph split, Tokamax GatedDeltaNet.
 
   Runs on any TPU7x slice from tpu7x-2x2x2 (2 hosts, 8 chips, 16 ranks) up to
@@ -435,8 +498,13 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   (without packed-document resets), Pallas paired grouped matmuls for the
   experts, Splash attention, and the Pallas fused linear cross-entropy. 32K
   tokens per rank (16 sequences of 2048).
+
+  Args:
+    flavor: Model flavor. The 397B-A17B EP recipe reuses this base with
+      `"397B-A17B"` (60 layers, 512 experts) and then overrides the batch,
+      dtypes and parallelism.
   """
-  base_cfg = qwen35_moe_35b()
+  base_cfg = qwen35_moe_35b(flavor)
   base_cfg.dataloader = c4_test_dataloader()
   base_cfg.hf_assets_path = "./tests/assets/tokenizer"
   base_cfg.parallelism = ParallelismConfig(
@@ -502,4 +570,46 @@ def qwen35_moe_35b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   """`qwen35_moe_35b_split_tokamax_benchmark` with Expert Parallelism (EP=4)."""
   cfg = qwen35_moe_35b_split_tokamax_benchmark()
   _use_expert_parallel(cfg, ep_degree=4)
+  return cfg
+
+
+def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
+  """Qwen3.5-397B-A17B 8K pretraining benchmark with Expert Parallelism (EP=8).
+
+  `qwen35_moe_35b_split_tokamax_benchmark` configured for the 60-layer,
+  512-expert, top-10 397B-A17B model on `tpu7x-2x4x4` (32 chips, 64 ranks) and
+  larger slices with the highest-throughput settings enabled by default
+  (`1,013 tok/s/rank`, `112.31 TFLOPS/rank`, `9.74% MFU`, `33.77 GiB` HBM):
+  - BF16 parameters, optimizer state (8 bytes per parameter, ~46 GiB per rank
+    vs ~92.5 GiB in FP32 on 64 ranks), and BF16 gradient reduce-scatter
+    (`+8.8%` step time on 397B, matching MLPerf v6.1 397B GRPO).
+  - 24,576 tokens per rank (3 sequences of 8192) across 12 sequence chunks
+    (`W=2` barriers bound live dropless chunk buffers to ~33.8 GiB trainer HBM).
+  - Ring-of-Experts with weights-on-activation (`roe_weights_on_activation`),
+    paired W1+W3 grouped matmuls with K=1024 dWeight tiling (fitting 64 MiB
+    VMEM at D=4096, F=1024), and SparseCore collective offload with gather/copy
+    offload disabled so small routing gathers stay on TensorCore (`+3.6%`).
+  """
+  cfg = qwen35_moe_35b_split_tokamax_benchmark("397B-A17B")
+  cfg.training.dtype = "bfloat16"
+  cfg.training.mixed_precision_param = "bfloat16"
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.training.max_context_length = 8192
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 3 * 8192
+  # The 35B (1024, 2048, 640) LCE tiles assume a single H=2048 hidden block;
+  # use the default tiles for H=4096.
+  _enable_pallas_cross_entropy(cfg)
+  # At D=4096, F=1024, untiled paired W1+W3 dWeight needs 86 MiB of VMEM for
+  # two FP32 (K, N) accumulators plus double-buffered BF16 slabs; tile K at
+  # 1024 (~20 MiB), keep W2's shorter K=1024 untiled, and tile D at 2048 when
+  # W2 is transposed. Inherited tile_m=512 matched tile_m=256 within 0.3% on
+  # 397B TPU7x (while tile_m=128 regressed -3%), so keep tile_m=512.
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    tm = experts.pallas_grouped_mm_tile_m
+    experts.pallas_grouped_mm_tgmm_tiling = (tm, 1024, 0)
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (tm, 0, 0)
+    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (tm, 0, 2048)
+  _use_expert_parallel(cfg, ep_degree=8, num_token_chunks=12)
   return cfg

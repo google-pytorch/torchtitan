@@ -83,9 +83,6 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
     FusedLossLinearWrapper,
     fused_loss_lm_head,
 )
-from torchtitan.experiments.tpu.overrides.real_rope import (
-    TpuRealArithmeticComplexRoPE,
-)
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
@@ -120,7 +117,7 @@ from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
 )
-from torchtitan.models.common import ComplexRoPE, Linear
+from torchtitan.models.common import Linear
 from torchtitan.models.common.moe import MoE, MoELoadBalanceAuxLoss
 from torchtitan.models.llama3.config_registry import (
     model_registry as llama3_model_registry,
@@ -1376,42 +1373,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_layerwise_recipe_stays_off_the_graph_trainer(self, recipe) -> None:
     """The production lane is layerwise; adding a `_scan` twin must not move it."""
     self.assertNotIsInstance(recipe(), TpuGraphTrainer.Config)
-
-  @parameterized.parameters(
-      llama3_debugmodel,
-      llama3_1b,
-      llama3_8b,
-      llama3_8b_scan,
-      llama3_70b,
-      llama3_70b_scan,
-      llama3_405b,
-      llama3_405b_scan,
-      sft_llama3_8b_metamath,
-  )
-  def test_llama3_recipe_overrides_complex_rope(self, recipe) -> None:
-    """A recipe without it cannot run its decoder loop as a `scan`."""
-    config = recipe()
-    graph_config = (
-        config
-        if isinstance(config, TpuGraphTrainer.Config)
-        else TpuGraphTrainer.Config.from_tpu_trainer_config(
-            config, llama3_gt.model_registry
-        )
-    )
-
-    self.assertIn(
-        "torchtitan.experiments.tpu.overrides.real_rope"
-        ".tpu_real_arithmetic_complex_rope",
-        graph_config.override.imports,
-    )
-    apply_overrides(graph_config.override, graph_config)
-    assert graph_config.model_spec is not None
-    with torch.device("meta"):
-      model = graph_config.model_spec.model.build()
-    ropes = [m for m in model.modules() if isinstance(m, ComplexRoPE)]
-    self.assertNotEmpty(ropes)
-    for rope in ropes:
-      self.assertIsInstance(rope, TpuRealArithmeticComplexRoPE)
 
   @parameterized.parameters(
       (qwen3_8b, qwen3_gt),

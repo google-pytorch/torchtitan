@@ -18,7 +18,7 @@ unflatten sequence length:
   ``TpuPackedQKVLinear``: accept [B, L, D]; q/k/v are [B, L, H, K],
   the RoPE cache is fetched by the configured RoPE module and viewed as
   [B, L, 1, W], and the rotation is that module's own ``apply_rotary_emb`` --
-  so ``real_rope`` and ``bf16_rope`` keep working. Exact ``CosSinRoPE`` uses a
+  so overrides such as ``bf16_rope`` keep working. Exact ``CosSinRoPE`` uses a
   rotate-half that does not concatenate the FP32 q/k halves (same FP32
   products and sums; bit-exact on CPU).
 * MoE (any ``feed_forward``-less block's ``moe``): flatten [B, L, D] to [T, D]

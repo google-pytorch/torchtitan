@@ -12,7 +12,6 @@ from torchtitan.experiments.tpu.bld_layout import apply_bld_layout
 from torchtitan.experiments.tpu.bld_layout import bld_skip_reason
 from torchtitan.experiments.tpu.bld_layout import cossin_rotate
 from torchtitan.experiments.tpu.overrides.bf16_rope import tpu_activation_dtype_cossin_rope
-from torchtitan.experiments.tpu.overrides.real_rope import tpu_real_arithmetic_complex_rope
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import ComplexRoPE
@@ -47,12 +46,10 @@ def _qwen3_block(fuse_qkv: bool, rope=None):
   )[0]
 
 
-def _llama3_block(fuse_qkv: bool, real: bool):
+def _llama3_block(fuse_qkv: bool):
   rope = ComplexRoPE.Config(
       dim=_HEAD_DIM, max_context_length=_MAX_LEN, theta=500000.0
   )
-  if real:
-    rope = tpu_real_arithmetic_complex_rope(rope)
   return _build_llama3_layers(
       n_layers=1,
       dim=_DIM,
@@ -76,9 +73,8 @@ _BLOCKS = {
     "qwen3_bf16_rope": lambda: _qwen3_block(
         False, tpu_activation_dtype_cossin_rope(_cossin_rope())
     ),
-    "llama3_complex": lambda: _llama3_block(True, real=False),
-    "llama3_real": lambda: _llama3_block(True, real=True),
-    "llama3_qkv_real": lambda: _llama3_block(False, real=True),
+    "llama3_fused": lambda: _llama3_block(True),
+    "llama3_qkv": lambda: _llama3_block(False),
 }
 
 
@@ -161,7 +157,7 @@ class BLDLayoutTest(parameterized.TestCase):
     self.assertIs(type(block), cls)
 
   @parameterized.named_parameters(
-      ("qkv", "qwen3_qkv"), ("fused", "llama3_real"), ("packed", "qwen3_packed")
+      ("qkv", "qwen3_qkv"), ("fused", "llama3_fused"), ("packed", "qwen3_packed")
   )
   def test_qkv_subclass_swapped_later(self, name):
     # SimpleFSDP swaps parametrized modules to generated subclasses after the
@@ -190,7 +186,7 @@ class BLDLayoutTest(parameterized.TestCase):
     self.assertIs(type(block), cls)
 
   def test_generated_classes_pickle(self):
-    _, bld = _build_pair("llama3_real")
+    _, bld = _build_pair("llama3_fused")
     apply_bld_layout(bld)
     # Classes pickle by qualified name; the graph trainer's GraphPickler needs
     # generated ones to resolve.

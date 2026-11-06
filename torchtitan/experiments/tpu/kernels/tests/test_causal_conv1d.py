@@ -290,11 +290,7 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
             causal_conv1d._tpu_gen_cache.extend(saved_cache),  # pylint: disable=protected-access
         )
     )
-    for dev_name, expected in (
-        ("TPU v5 lite", 5),
-        ("tpu7x", 7),
-        ("other", None),
-    ):
+    for dev_name, expected in (("TPU v5 lite", 5), ("tpu7x", 7), ("other", None)):
       causal_conv1d._tpu_gen_cache.clear()  # pylint: disable=protected-access
       fake_tpu = SimpleNamespace(
           get_device_properties=lambda n=dev_name: SimpleNamespace(name=n)

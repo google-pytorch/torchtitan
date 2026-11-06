@@ -23,9 +23,11 @@ applies the transform to each logits tile in-kernel (see that module's doc).
 """
 
 import hashlib
+import inspect
 
 # Workaround for https://github.com/openxla/tokamax/issues/240
 import jaxtyping
+
 # 1. Save the real decorator
 _real_jaxtyped = jaxtyping.jaxtyped
 
@@ -39,18 +41,166 @@ def _dummy_jaxtyped(*args, **kwargs):
     return args[0]
   return decorator
 
+
 # 3. Swap the dummy in, import tokamax, and swap the real one back
 jaxtyping.jaxtyped = _dummy_jaxtyped
 import tokamax  # pylint: disable=g-import-not-at-top
+
 jaxtyping.jaxtyped = _real_jaxtyped
 
 import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
 import torch
 from torch_tpu._internal.pallas import pallas
+from torchtitan.tools.logging import logger
 
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:
   return soft_cap is not None or output_multiplier != 1.0
+
+
+_logged_bwd_buffer_events: set[tuple[object, ...]] = set()
+
+
+def _select_bwd_buffer_count(
+    kernel,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    dtype,
+) -> tuple[int, int] | int | None:
+  """Picks the backward kernel's gradient buffering so its tiles fit in VMEM.
+
+  ``buffer_count`` controls how the backward kernel moves its two fp32
+  gradient blocks (``x_grad`` of shape (B, H) and ``w_grad`` of shape (H, V))
+  between HBM and VMEM. Each block is read, accumulated into and written
+  back, so it has two sides:
+    (in, out): ``in`` VMEM copies for reading the next block ahead of time,
+      ``out`` copies for writing finished blocks back while compute
+      continues. An int ``n`` means ``(n, 1)``.
+    (2, 2): reads and write-backs both overlap compute (Tokamax's default).
+    (2, 1): reads overlap; each write-back must finish before the kernel moves
+      on. One fewer gradient copy in VMEM.
+    1: no overlap at all. Smallest, slowest.
+  Each extra copy costs one fp32 gradient tile per block, so ``(2, 2)`` needs
+  two more of each than ``1``. Tokamax may lower the count further when a
+  block is revisited too soon to buffer safely.
+
+  Tries ``(2, 2)``, ``(2, 1)``, then ``1``, and returns the first that fits
+  under the kernel's VMEM limit (90% of capacity). Returns ``None`` when
+  ``(2, 2)`` fits, so Tokamax's default is passed through unchanged. If even
+  ``1`` exceeds the estimate, returns ``1`` and logs a warning, since the
+  kernel will likely fail to compile.
+
+  The VMEM use comes from Tokamax's ``_calculate_bwd_vmem_bytes``, which
+  over-counts: besides the (B, V) logits temporary (which can overlap the
+  previous V-step's gradient matmuls via the 2-slot scratch buffer), it
+  reserves space for both the (H, V) weight-gradient product and the (B, H)
+  input-gradient product as if both were live at once. The kernel computes
+  those two gradient products one after another, so only the larger of the
+  two needs space, and the estimate here drops the smaller one.
+
+  For example, on TPU7x (57.6 MiB limit) with bf16 inputs:
+    (1024, 512, 2048): 56.4 MiB at (2, 2) -> keeps the default.
+    (1024, 1024, 1280): 61.4 MiB at (2, 2), 52.4 MiB at (2, 1) -> (2, 1).
+    (1024, 2048, 640): 72.9 MiB at (2, 2), 59.9 MiB at (2, 1), 46.9 MiB at 1
+      -> 1.
+
+  Logs once per tile and dtype when it changes the buffering, and keeps the
+  default (with a warning) if the estimate is unavailable.
+  """
+  calc_fn = getattr(kernel, "_calculate_bwd_vmem_bytes", None)
+  if calc_fn is None:
+    event_key = ("missing_calc_fn",)
+    if event_key not in _logged_bwd_buffer_events:
+      _logged_bwd_buffer_events.add(event_key)
+      logger.warning(
+          "Tokamax kernel is missing _calculate_bwd_vmem_bytes; keeping"
+          " default (2, 2) gradient buffering."
+      )
+    return None
+  try:
+    from jax.experimental.pallas import tpu as pltpu  # pylint: disable=g-import-not-at-top
+
+    limit_fn = getattr(kernel, "_get_vmem_limit_bytes", None)
+    vmem_limit = (
+        limit_fn()
+        if limit_fn is not None
+        else int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
+    )
+    h_alloc = 1 << (h_block_size - 1).bit_length()
+    non_overlapping_grad_dot_bytes = min(
+        4 * h_alloc * v_block_size,
+        4 * b_block_size * h_alloc,
+    )
+
+    def estimate_vmem(buf_count: tuple[int, int] | int) -> int:
+      return (
+          calc_fn(
+              b_block_size,
+              h_block_size,
+              v_block_size,
+              dtype=dtype,
+              buffer_count=buf_count,
+          )
+          - non_overlapping_grad_dot_bytes
+      )
+
+    vmem_22 = estimate_vmem((2, 2))
+    if vmem_22 <= vmem_limit:
+      return None
+    chosen: tuple[int, int] | int = (
+        (2, 1) if estimate_vmem((2, 1)) <= vmem_limit else 1
+    )
+    vmem_chosen = estimate_vmem(chosen)
+    event_key = (
+        "buffer_count",
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        str(jax.numpy.dtype(dtype)),
+        chosen,
+    )
+    if event_key not in _logged_bwd_buffer_events:
+      _logged_bwd_buffer_events.add(event_key)
+      if vmem_chosen > vmem_limit:
+        logger.warning(
+            "Fused CE backward tiles (%d, %d, %d) (%s) exceed VMEM limit"
+            " %.1f MiB even at buffer_count=1 (est. %.1f MiB); kernel will"
+            " likely fail to compile (use bfloat16 inputs or smaller tiles).",
+            b_block_size,
+            h_block_size,
+            v_block_size,
+            jax.numpy.dtype(dtype),
+            vmem_limit / (1024 * 1024),
+            vmem_chosen / (1024 * 1024),
+        )
+      else:
+        logger.info(
+            "Fused CE backward tiles (%d, %d, %d) (%s) exceed VMEM limit"
+            " %.1f MiB at buffer_count=(2, 2) (est. %.1f MiB); using"
+            " buffer_count=%s (est. %.1f MiB).",
+            b_block_size,
+            h_block_size,
+            v_block_size,
+            jax.numpy.dtype(dtype),
+            vmem_limit / (1024 * 1024),
+            vmem_22 / (1024 * 1024),
+            chosen,
+            vmem_chosen / (1024 * 1024),
+        )
+    return chosen
+  except Exception:  # pylint: disable=broad-exception-caught
+    # Keep (2, 2) buffering, but say why: a Tokamax API change here silently
+    # disables the fallback and surfaces as a compile-time VMEM OOM.
+    logger.warning(
+        "Could not estimate the fused CE backward VMEM for tiles (%d, %d, %d);"
+        " keeping the default (2, 2) gradient buffering.",
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        exc_info=True,
+    )
+    return None
 
 
 def _my_fwd(
@@ -158,18 +308,26 @@ def _my_bwd(
 
   from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel  # pylint: disable=g-import-not-at-top
 
-  grad_x, grad_w = (
-      kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
-          dout,
-          lse,
-          x,
-          labels,
-          weights,
-          b_block_size=b_block_size,
-          h_block_size=h_block_size,
-          v_block_size=v_block_size,
-          reduction=reduction,
-      )
+  bwd_fn = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
+  bwd_kwargs = {}
+  bwd_dtype = jax.numpy.result_type(x.dtype, weights.dtype)
+  if "buffer_count" in inspect.signature(inspect.unwrap(bwd_fn)).parameters:
+    buf_count = _select_bwd_buffer_count(
+        kernel, b_block_size, h_block_size, v_block_size, bwd_dtype
+    )
+    if buf_count is not None:
+      bwd_kwargs["buffer_count"] = buf_count
+  grad_x, grad_w = bwd_fn(
+      dout,
+      lse,
+      x,
+      labels,
+      weights,
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
+      reduction=reduction,
+      **bwd_kwargs,
   )
   # Keep the Pallas and reference implementations on the same autograd dtype
   # contract. The pinned Tokamax revision separately fixes where dout is

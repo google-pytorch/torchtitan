@@ -420,6 +420,16 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   )
   _use_tokamax_gated_delta(base_cfg)
   _no_gated_delta_document_resets(base_cfg)
+  # One hidden block (H=2048) keeps every x tile resident in the fused LCE
+  # backward; v=640 divides the 248320 vocabulary (388 blocks). Needs bf16
+  # activations: on TPU7x the backward fits the kernel's VMEM limit (90% of 64
+  # MiB) only single-buffered (~51.9 MiB; fp32 hidden states would need ~69.9
+  # MiB), which `linear_softmax_cross_entropy_loss` selects. On one TPU7x
+  # core at 64K tokens (measured with 8 x 8192 tokens/rank): 564 vs 633 ms
+  # forward + backward with (1024, 512, 2048).
+  _enable_pallas_cross_entropy(
+      base_cfg, b_block_size=1024, h_block_size=2048, v_block_size=640
+  )
   # Save each layer's MoE router top-k / sort permutation and the 10 full
   # attention layers' Splash output + LSE (~5.98 GiB logical at 64K tokens/rank)
   # so backward skips re-running router top-k/argsort and Splash forward.

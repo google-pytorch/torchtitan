@@ -27,6 +27,7 @@ import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from torchtitan.experiments.tpu.remat_regions import annotate_region, FSDP_GATHER
 from torchtitan.tools.logging import logger
 
 
@@ -291,6 +292,12 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
     """Turns one layer's local shard into that layer's whole weight."""
     if spec is None:
         return shard
+    # The region makes the scan body recompute the gather in backward.
+    with annotate_region(FSDP_GATHER):
+        return _gather_slice(shard, spec)
+
+
+def _gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec) -> torch.Tensor:
     if not spec.sharded:
         if not spec.group_name:
             # No mesh at all, so no other rank holds a gradient to add.

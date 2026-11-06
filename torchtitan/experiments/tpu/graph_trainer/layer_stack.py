@@ -69,6 +69,7 @@ from torchtitan.experiments.tpu.layer_loop import (
     runs_layer_loop,
     TpuLayerLoop,
 )
+from torchtitan.experiments.tpu.remat_regions import annotate_moe_expert_counts
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.protocols.module import Module
@@ -381,13 +382,23 @@ class StackedLayers(TpuLayerLoop):
     parametrizations are untouched.
     """
 
-    def __init__(self, layers: nn.ModuleDict, stack: "LayerStack", *, use_scan: bool):
+    def __init__(
+        self,
+        layers: nn.ModuleDict,
+        stack: "LayerStack",
+        *,
+        use_scan: bool,
+        save_regions: tuple[str, ...] = (),
+    ):
         super().__init__(layers)
         self.stack = stack
         self.use_scan = use_scan
+        self.save_regions = save_regions
 
     def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
-        return self.stack.run(h, *args, use_scan=self.use_scan)
+        return self.stack.run(
+            h, *args, use_scan=self.use_scan, save_regions=self.save_regions
+        )
 
 
 class LayerStack:
@@ -549,7 +560,13 @@ class LayerStack:
 
     # -- installation ------------------------------------------------------
 
-    def install(self, model: nn.Module, *, use_scan: bool) -> None:
+    def install(
+        self,
+        model: nn.Module,
+        *,
+        use_scan: bool,
+        save_regions: tuple[str, ...] = (),
+    ) -> None:
         """Attach the stack to the model, at the end of its ``__init__``.
 
         Three attachments, and the model isn't stacked until all three are on:
@@ -607,22 +624,31 @@ class LayerStack:
                 "model config has to go through `tpu_model_class` first."
             )
         if use_scan:
-            # Logged because a recipe would otherwise believe its own setting:
-            # `compile.memory_policy` tags joint-graph nodes, and the
-            # body's are not in it. Only `LayerStack.run`'s budget reaches them,
-            # and it must be 0.0 or the in-body gather is saved instead of
-            # recomputed.
+            # The scan body saves the counts by this region; see
+            # `scan_remat_policy`.
+            annotate_moe_expert_counts()
+            # Logged because `compile.memory_policy` does not reach the
+            # body's nodes; only `save_regions` does. See `scan_remat_policy`.
             logger.info(
-                "Decoder layers run as a scan: the body is fully "
-                "activation-checkpointed, whatever the memory policy asks for"
+                "Decoder layers run as a scan: the body recomputes everything "
+                "but its MoE expert counts and save regions %s",
+                list(save_regions),
             )
         # The container holds the same layer modules, so `self.layers` keeps
         # working and is deliberately not repointed at it.
-        model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
+        model.layers = StackedLayers(
+            model.layers, self, use_scan=use_scan, save_regions=save_regions
+        )
 
     # -- running the layers ------------------------------------------------
 
-    def run(self, h: torch.Tensor, *args, use_scan: bool):
+    def run(
+        self,
+        h: torch.Tensor,
+        *args,
+        use_scan: bool,
+        save_regions: tuple[str, ...] = (),
+    ):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
         Both paths run the same ``body``. Layer 0 acts as the template:
@@ -734,25 +760,11 @@ class LayerStack:
                 # a scalar and drop it.
                 return out, out.new_zeros(())
 
-            # Budget 0.0 forces the gathered weight to be recomputed in the
-            # backward. Left alone, the partitioner saves it -- a collective
-            # looks expensive to redo -- and the saved copy is carried out of
-            # the loop, which is the whole memory win gone.
-            #
-            # It costs a full recompute of the body. Tagging just the gather
-            # would be cheaper, but that tag lives in `node.meta["custom"]`,
-            # which the body's re-trace drops before it reaches any node inside
-            # the scan. Switch once the meta survives.
-            #
-            # The one exception is the MoE aux loss's expert counts: redoing
-            # their all-reduce in backward is an exposed DCN round trip per
-            # layer on multi-slice. The window tags the re-traced joint graph
-            # to save just those, and is exactly budget 0.0 for a body without
-            # them. See `scan_remat_policy`.
-            #
-            # The patch is process-global, so it has to be a window; it closes
-            # when this call returns. `test_layer_stack.py` checks both halves.
-            with scan_body_remat_window():
+            # The window picks what the body saves for backward, by region.
+            # Left alone, the partitioner would save the gathered weight, and
+            # the saved copy is carried out of the loop: the whole memory win
+            # gone. See `scan_remat_policy`.
+            with scan_body_remat_window(frozenset(save_regions)):
                 carry, _ = scan(scan_body, h, xs)
             return carry
 
@@ -762,7 +774,9 @@ class LayerStack:
         return h
 
 
-def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
+def _apply_stacked_layers(
+    model: nn.Module, *, use_scan: bool, save_regions: tuple[str, ...] = ()
+) -> None:
     """Stack the decoder layers' weights, and with ``use_scan`` run them as one.
 
     Called from the model's own ``__init__`` (see
@@ -827,7 +841,7 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
     setattr(model, STACK_ATTR, holder)
     stack = LayerStack(model.layers, holder)
     stack.unregister_and_allocate()
-    stack.install(model, use_scan=use_scan)
+    stack.install(model, use_scan=use_scan, save_regions=save_regions)
     logger.info(
         "Stacked %d weights across %d layers, run as a %s",
         len(stack.names),
@@ -837,20 +851,22 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
 
 
 @functools.cache
-def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
+def _stacked_model_class(
+    config_cls: type, use_scan: bool, save_regions: tuple[str, ...] = ()
+) -> type:
     """Build the ``Stacked<Model>`` subclass that stacks itself on construction.
 
     It subclasses whatever layer-loop class ``tpu_model_class`` builds, because
     the model has to run its layers through its layers container for stacking to
     do anything. Its ``__init__`` builds the model as usual and then stacks it.
 
-    One class per (config class, ``use_scan``), cached.
+    One class per (config class, ``use_scan``, ``save_regions``), cached.
     """
     base = tpu_model_class(config_cls)
 
     def __init__(self, *args, **kwargs):
         base.__init__(self, *args, **kwargs)
-        _apply_stacked_layers(self, use_scan=use_scan)
+        _apply_stacked_layers(self, use_scan=use_scan, save_regions=save_regions)
 
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
@@ -882,7 +898,10 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
 
 
 def with_tpu_stacked_layers(
-    model_config: Decoder.Config, *, use_scan: bool
+    model_config: Decoder.Config,
+    *,
+    use_scan: bool,
+    save_regions: tuple[str, ...] = (),
 ) -> Decoder.Config:
     """Put ``model_config`` on a model that arrives already stacked.
 
@@ -893,11 +912,13 @@ def with_tpu_stacked_layers(
 
     ``use_scan`` additionally runs the layers as one ``scan`` rather than one
     at a time; it is fixed at construction because it decides which container
-    ``model.layers`` becomes.
+    ``model.layers`` becomes. ``save_regions`` names the regions the scan body
+    keeps for backward; see ``scan_remat_policy``.
 
     Builds on :func:`tpu_model_class`, and has to be applied in the same place
     and for the same reasons; see its docstring.
     """
     return derive(
-        model_config, _stacked_model_class(type(model_config), use_scan).Config
+        model_config,
+        _stacked_model_class(type(model_config), use_scan, save_regions).Config,
     )

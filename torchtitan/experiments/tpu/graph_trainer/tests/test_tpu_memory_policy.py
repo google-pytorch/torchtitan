@@ -523,6 +523,7 @@ def _selective_config(
         compile=SimpleNamespace(
             save_regions=save_regions,
             save_last_n_layers=last_n_layers or {},
+            use_scan_layers=False,
         ),
         parallelism=_parallelism("always"),
     )

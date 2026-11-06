@@ -41,7 +41,12 @@ def _get_model_config(model_name: str = "testmodel") -> Llama3Model.Config:
   Defaults to 'testmodel' (which specifies dim=64, n_heads=8, n_layers=1,
   vocab_size=128, max_seq_len=512).
   """
-  return llama3_tpu.llama3_configs[model_name]
+  import copy
+  from torchtitan.models.llama3.sharding import set_llama3_sharding_config
+
+  config = copy.deepcopy(llama3_tpu.llama3_configs[model_name])
+  set_llama3_sharding_config(config, enable_sp=False)
+  return config
 
 
 def _verify_dtensor_llama3_tp_forward_worker(

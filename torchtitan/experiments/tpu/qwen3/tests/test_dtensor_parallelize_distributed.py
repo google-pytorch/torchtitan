@@ -37,7 +37,12 @@ def _get_qwen3_model_config(model_name: str = "testmodel") -> Qwen3Model.Config:
   Defaults to 'testmodel' (which specifies dim=128, head_dim=16, n_layers=3,
   vocab_size=2048, max_seq_len=128).
   """
-  return qwen3_tpu.qwen3_configs[model_name]
+  import copy
+  from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
+
+  config = copy.deepcopy(qwen3_tpu.qwen3_configs[model_name])
+  set_qwen3_sharding_config(config, enable_sp=False, enable_ep=False)
+  return config
 
 
 def _verify_dtensor_qwen3_non_moe_tp_forward_worker(

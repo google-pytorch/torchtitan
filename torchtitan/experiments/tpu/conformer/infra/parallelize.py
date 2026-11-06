@@ -76,12 +76,22 @@ def parallelize_conformer(
 
   # Resolve DeviceMesh and mode based on strategy
   if strategy in (ParallelStrategy.FSDP2, ParallelStrategy.SIMPLEFSDP):
+    if parallel_dims.spmd_backend == "spmd_types":
+      if parallel_dims.cp_enabled:
+        parallel_dims.world_mesh[["dp_shard", "cp"]]._flatten(
+            mesh_dim_name="fsdp"
+        )
+        fsdp_axis = "fsdp"
+      else:
+        fsdp_axis = "dp_shard"
+    else:
+      fsdp_axis = "fsdp"
     if parallel_dims.dp_replicate_enabled:
-      dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
+      dp_mesh = parallel_dims.get_mesh(["dp_replicate", fsdp_axis])
       reshard = not parallel_dims.pp_enabled
       dp_mode = "hybrid_shard"
     else:
-      dp_mesh = parallel_dims.get_mesh(["fsdp"])
+      dp_mesh = parallel_dims.get_mesh([fsdp_axis])
       reshard = not parallel_dims.pp_enabled
       dp_mode = "fully_shard"
   elif strategy in (

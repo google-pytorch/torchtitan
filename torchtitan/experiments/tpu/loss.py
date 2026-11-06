@@ -199,4 +199,11 @@ def build_cross_entropy_loss(
     return _legacy_pallas_loss_config(job_config).build(
         compile_config=job_config.compile
     )
-  return components_loss.CrossEntropyLoss(components_loss.CrossEntropyLoss.Config())
+  global_vocab_size = getattr(job_config.loss, "global_vocab_size", None)
+  if global_vocab_size is None and job_config.model_spec is not None:
+    global_vocab_size = getattr(job_config.model_spec.model, "vocab_size", None)
+  return components_loss.CrossEntropyLoss(
+      components_loss.CrossEntropyLoss.Config(
+          global_vocab_size=global_vocab_size
+      )
+  )

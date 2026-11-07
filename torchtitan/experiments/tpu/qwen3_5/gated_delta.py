@@ -466,6 +466,7 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
       key_head_dim: int,
       value_head_dim: int,
       positions: torch.Tensor | None = None,
+      segment_ids: torch.Tensor | None = None,
   ) -> torch.Tensor:
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
     num_tokens = query_TC.shape[0]
@@ -483,7 +484,17 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
           for x in (query_BSC, key_BSC, value_BSC, g_BSH, beta_BSH)
       )
     segment_ids_BS = None
-    if positions is not None:
+    if segment_ids is not None:
+      # Computed once per step by `Qwen35Model.forward`: the same ids as
+      # `segment_ids_from_positions(positions)` below.
+      if segment_ids.numel() != num_tokens:
+        raise ValueError(
+            "TpuInnerGatedDeltaNet needs one segment id per token, got"
+            f" segment_ids of shape {tuple(segment_ids.shape)} for"
+            f" {num_tokens} tokens."
+        )
+      segment_ids_BS = segment_ids.reshape(query_BSC.shape[:2])
+    elif positions is not None:
       if positions.numel() != num_tokens:
         raise ValueError(
             "TpuInnerGatedDeltaNet needs one position per token, got"
@@ -542,6 +553,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
       x_TD: torch.Tensor,
       attention_masks: VarlenMetadata | None = None,
       positions: torch.Tensor | None = None,
+      segment_ids: torch.Tensor | None = None,
   ) -> torch.Tensor:
     num_tokens = x_TD.shape[0]
     if attention_masks is not None:
@@ -578,6 +590,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         value_head_dim=self.value_head_dim,
         # TPU: pass `positions`; packed documents restart conv + recurrence.
         positions=positions,
+        segment_ids=segment_ids,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)

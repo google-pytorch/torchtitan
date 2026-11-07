@@ -28,6 +28,7 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     create_varlen_metadata_for_document,
     FlexInnerAttention,
+    segment_ids_from_positions,
     VarlenInnerAttention,
     VarlenMetadata,
 )
@@ -631,8 +632,24 @@ class Qwen35Model(Decoder):
         # ``positions`` is 3D MRoPE (batch, seq, 3) for multimodal batches and
         # 2D (batch, seq) for text; ``preprocess_inputs`` resolved which one to
         # forward. The per-layer MRoPE dispatches on rank.
-        for layer in self.layers.values():
-            x = layer(x, attention_masks, positions)
+        # The document index of each token, computed once here (as
+        # ``Decoder.forward`` does) for the layers that take it
+        # (``accepts_segment_ids``), rather than inside every layer: each layer
+        # is its own compiled, activation-checkpointed region, so per-layer
+        # copies are neither shared nor saved. Only for a plain 1-D token
+        # stream, from which every consumer derives exactly these ids.
+        takes_ids = [
+            getattr(layer, "accepts_segment_ids", False)
+            for layer in self.layers.values()
+        ]
+        segment_ids = None
+        if type(positions) is torch.Tensor and positions.dim() == 1 and any(takes_ids):
+            segment_ids = segment_ids_from_positions(positions)
+        for layer, takes in zip(self.layers.values(), takes_ids):
+            if segment_ids is not None and takes:
+                x = layer(x, attention_masks, positions, segment_ids)
+            else:
+                x = layer(x, attention_masks, positions)
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:

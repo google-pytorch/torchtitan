@@ -486,14 +486,17 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     segment_ids_BS = None
     if segment_ids is not None:
       # Computed once per step by `Qwen35Model.forward`: the same ids as
-      # `segment_ids_from_positions(positions)` below.
+      # `segment_ids_from_positions(positions)` below, so they go through the
+      # kernel's `document_ids` too.
       if segment_ids.numel() != num_tokens:
         raise ValueError(
             "TpuInnerGatedDeltaNet needs one segment id per token, got"
             f" segment_ids of shape {tuple(segment_ids.shape)} for"
             f" {num_tokens} tokens."
         )
-      segment_ids_BS = segment_ids.reshape(query_BSC.shape[:2])
+      segment_ids_BS = self.kernel.document_ids(
+          segment_ids.reshape(query_BSC.shape[:2])
+      )
     elif positions is not None:
       if positions.numel() != num_tokens:
         raise ValueError(

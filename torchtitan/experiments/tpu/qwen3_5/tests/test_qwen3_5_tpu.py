@@ -1323,6 +1323,34 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             segment_ids=segment_ids_from_positions(positions)[:-1],
         )
 
+  def test_gated_delta_net_given_segment_ids_go_through_document_ids(self):
+    """Tests given ``segment_ids`` with a kernel that merges documents.
+
+    ``TokamaxGatedDeltaKernel.document_ids`` keeps only the first
+    ``max_num_segments`` documents of a row apart (here on its XLA path on
+    CPU). Ids from the model must be merged in the convolution and the
+    recurrence like the ids the layer derives from ``positions``.
+    """
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn_cfg = copy.deepcopy(config.layers[0].delta_net)
+    gdn_cfg.inner_gated_delta_net.kernel = (
+        tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(max_num_segments=2)
+    )
+    gdn = gdn_cfg.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    seq_len = 32
+    torch.manual_seed(0)
+    x = torch.randn(seq_len, config.dim)
+    positions = _packed_positions((6, 5, 7, 6, 8))  # 5 documents, 2 kept apart.
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      from_positions = gdn(x, positions=positions)
+      given = gdn(
+          x,
+          positions=positions,
+          segment_ids=segment_ids_from_positions(positions),
+      )
+    self.assertTrue(torch.equal(given, from_positions))
+
   def test_attention_isolates_packed_documents(self):
     """Tests that TpuQwen35Attention isolates packed documents via positions."""
     config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model

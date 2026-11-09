@@ -1,15 +1,74 @@
 """Tests for the minimal distributed training setup for Llama3 models."""
 
+import dataclasses
+import json
 import os
 import shutil
 import tempfile
+from unittest import mock
 
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
+from torchtitan.components import metrics
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
 import torchtitan.experiments.tpu.train
+
+
+class _RecordLossesAndExpertBias:
+  """Runs the trainer; rank 0 saves each step's loss and MoE expert biases.
+
+  The loss is what ``MetricsProcessor.log`` reports; the biases are every MoE
+  layer's ``expert_bias_E`` read at the same call, i.e. after that step's
+  optimizer pre-hook (the auxiliary-loss-free balancer) has run. Module-level
+  with ``__name__`` for the spawned ``torchrun`` workers.
+  """
+
+  def __init__(self, output_path: str):
+    self.output_path = output_path
+    self.__name__ = "_RecordLossesAndExpertBias"
+    self.__qualname__ = "_RecordLossesAndExpertBias"
+
+  def __call__(self, config):
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.models.common.moe import MoE
+
+    model_parts = []
+    post_optimizer_build_fn = config.model_spec.post_optimizer_build_fn
+
+    def capture(optimizers, parts, parallel_dims):
+      model_parts.extend(parts)
+      return post_optimizer_build_fn(optimizers, parts, parallel_dims)
+
+    config.model_spec = dataclasses.replace(
+        config.model_spec, post_optimizer_build_fn=capture
+    )
+    history = []
+    original = metrics.MetricsProcessor.log
+
+    def log(processor, step, global_avg_loss, global_max_loss, *args, **kwargs):
+      biases = [
+          module.expert_bias_E.detach().float().cpu().tolist()
+          for part in model_parts
+          for module in part.modules()
+          if isinstance(module, MoE)
+      ]
+      history.append([step, global_avg_loss, biases])
+      return original(
+          processor, step, global_avg_loss, global_max_loss, *args, **kwargs
+      )
+
+    with mock.patch.object(metrics.MetricsProcessor, "log", log):
+      torchtitan.experiments.tpu.train.start_trainer(config)
+    if int(os.environ.get("RANK", "0")) == 0:
+      with open(self.output_path, "w") as f:
+        json.dump(history, f)
+
+
+# EP 4 vs EP 1, DeepSeek-V3 debugmodel, fp32 params / reductions, 3 steps.
+_DSV3_EP_LOSS_RTOL = 1e-4
 
 
 class TrainDistributedTest(
@@ -162,6 +221,25 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           enable_compile=True,
           args=[
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      # EP 4 over the 4 chips (debugmodel: 8 experts, 2 per rank) through the
+      # static-shape ragged all-to-all dispatcher.
+      dict(
+          testcase_name="deepseek_v3_simplefsdp_tpu_moe_ep4",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel_tpu_moe",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--parallelism.expert_parallel_degree=4",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -812,6 +890,91 @@ class TrainDistributedTest(
         start_trainer=torchtitan.experiments.tpu.train.start_trainer,  # pyrefly: ignore[bad-argument-type]
         enable_compile=enable_compile,
     )
+
+  def test_deepseek_v3_expert_parallel_matches_ep1(self):
+    """EP 4 (ragged all-to-all dispatcher) trains to the EP 1 losses.
+
+    DeepSeek-V3 debugmodel (8 experts, 2 per EP rank), TPU MoE recipe,
+    per-block compile, same data and seed, fp32 params and reductions; only
+    ``expert_parallel_degree`` differs. EP changes where expert gradients are
+    reduced and the expert row order inside each grouped matmul, so the match
+    is to rounding order; bound and measurement in the assertions. The
+    expert-bias balancer must move ``expert_bias_E`` under EP as under EP 1.
+    The control arm warms the learning rate up over 3 steps instead of 2 and
+    must land outside the loss bound at steps 2 and 3.
+    """
+    shape = [
+        "--module=torchtitan.experiments.tpu.deepseek_v3",
+        "--config=deepseek_v3_debugmodel_tpu_moe",
+        "--dataloader.dataset_path=tests/assets/c4_test",
+        "--dataloader.dataset=c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
+        "--training.steps=3",
+        "--training.mixed_precision_param=float32",
+        "--training.mixed_precision_reduce=float32",
+        "--training.max_context_length=256",
+        "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+        "--debug.seed=42",
+        "--debug.deterministic",
+    ]
+    ep4 = ["--parallelism.expert_parallel_degree=4"]
+    arms = {
+        "ep1": shape,
+        "ep4": shape + ep4,
+        "control": shape + ep4 + ["--lr_scheduler.warmup_steps=3"],
+    }
+    tempdir = self.create_tempdir().full_path
+    runs = {}
+    for arm, config_args in arms.items():
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=list(config_args),
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+          start_trainer=_RecordLossesAndExpertBias(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        runs[arm] = {step: (loss, biases) for step, loss, biases in json.load(f)}
+
+    reference, ep = runs["ep1"], runs["ep4"]
+    self.assertEqual(sorted(reference), [1, 2, 3])
+    self.assertEqual(sorted(ep), [1, 2, 3])
+    for step in (1, 2, 3):
+      (ep_loss, ep_bias), (ref_loss, ref_bias) = ep[step], reference[step]
+      logging.info(
+          "deepseek_v3 EP4 step %d: loss %.7f, EP1 %.7f, |diff| %.2e (%.2e"
+          " relative); max |expert bias diff| %.2e",
+          step,
+          ep_loss,
+          ref_loss,
+          abs(ep_loss - ref_loss),
+          abs(ep_loss - ref_loss) / abs(ref_loss),
+          max(
+              abs(a - b)
+              for layer_a, layer_b in zip(ep_bias, ref_bias, strict=True)
+              for a, b in zip(layer_a, layer_b, strict=True)
+          ),
+      )
+      self.assertAlmostEqual(
+          ep_loss, ref_loss, delta=abs(ref_loss) * _DSV3_EP_LOSS_RTOL,
+          msg=f"step {step}",
+      )
+      self.assertNotEmpty(ep_bias)
+      self.assertLen(ep_bias, len(ref_bias))
+      # The balancer moved every MoE layer's bias, under EP as under EP 1.
+      for layer_bias in (*ep_bias, *ref_bias):
+        self.assertGreater(sum(abs(b) for b in layer_bias), 0.0)
+    for step in (2, 3):
+      self.assertGreater(
+          abs(runs["control"][step][0] - reference[step][0]),
+          abs(reference[step][0]) * _DSV3_EP_LOSS_RTOL,
+          msg=f"control step {step}",
+      )
 
 
 if __name__ == "__main__":

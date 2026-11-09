@@ -22,6 +22,7 @@ __all__ = [
     "deepseek_v3_671b_2l_16e_fused_ce",
     "deepseek_v3_671b_2l_16e_tpu_moe",
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas",
+    "deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
     "deepseek_v3_debugmodel_tpu_moe",
@@ -58,7 +59,9 @@ def _enable_pallas_cross_entropy(config):
   return config
 
 
-def _enable_tpu_moe(config, *, pallas_grouped_mm: bool):
+def _enable_tpu_moe(
+    config, *, pallas_grouped_mm: bool, expert_parallel_degree: int = 1
+):
   """Rebuild the recipe's model with the lane's MoE converters (rung 5).
 
   Same flavor and context length, built through ``model_registry(...,
@@ -80,8 +83,13 @@ def _enable_tpu_moe(config, *, pallas_grouped_mm: bool):
       pipelining_fn=spec.pipelining_fn,
   )
   use_tpu_moe_kernels(
-      config.model_spec.model, pallas_grouped_mm=pallas_grouped_mm
+      config.model_spec.model,
+      pallas_grouped_mm=pallas_grouped_mm,
+      # Under EP the routing scores stay on the token's rank, so they are
+      # applied after the return all-to-all, not before W2.
+      scale_before_down_proj=pallas_grouped_mm and expert_parallel_degree == 1,
   )
+  config.parallelism.expert_parallel_degree = expert_parallel_degree
   return config
 
 
@@ -274,3 +282,17 @@ def graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe_pallas() -> (
   return _enable_tpu_moe(
       graph_trainer_deepseek_v3_671b_2l_16e_fused_ce(), pallas_grouped_mm=True
   )
+
+
+def deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_2l_16e_tpu_moe_pallas`` at EP 4 (4 experts per chip).
+
+  The static-shape ragged all-to-all dispatcher; scores applied after the
+  return exchange (no score-before-W2 under EP).
+  """
+  return _enable_tpu_moe(
+      deepseek_v3_671b_2l_16e_fused_ce(),
+      pallas_grouped_mm=True,
+      expert_parallel_degree=4,
+  )
+

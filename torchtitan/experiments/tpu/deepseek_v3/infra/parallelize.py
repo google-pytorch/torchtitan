@@ -15,7 +15,9 @@ compile -> FSDP -- with three TPU differences:
   other TPU models; dense layers get ``spmd_safe`` under compile (MoE layers do
   not, as in TPU Qwen3).
 
-CP, PP and EP are rejected until they are validated on TPU.
+CP and PP are rejected until they are validated on TPU. EP (no TP) follows
+upstream / the TPU Qwen3 wrapper: ``Module.parallelize`` installs the EP
+sharding, then SimpleFSDP wraps the expert banks on the EDP mesh.
 
 ``parallelize_deepseek_v3_graph_trainer`` is the GraphTrainer counterpart
 (whole-step joint graph): the same checks and shard-dim planner, then upstream
@@ -29,7 +31,11 @@ import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed.compile import _maybe_regional_inductor_backend
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.tpu.activation_checkpoint import tpu_selective_ac_config
+from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+from torchtitan.experiments.graph_trainer.simple_fsdp import MixedPrecisionPolicy
 from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import parallelize_deepseekv3 as graph_trainer_parallelize_deepseekv3
+from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import install_tpu_replicate_computation
 from torchtitan.experiments.tpu.qwen3_sharding import configure_qwen_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import MoE
@@ -49,10 +55,10 @@ def _validate_supported(
     raise NotImplementedError(
         "Pipeline parallelism is not supported for DeepSeek-V3 on TPU yet."
     )
-  if parallel_dims.ep_enabled:
+  if parallel_dims.ep_enabled and parallel_dims.tp_enabled:
     raise NotImplementedError(
-        "Expert parallelism is not supported for DeepSeek-V3 on TPU yet; use"
-        " expert_parallel_degree=1 (FSDP shards the experts)."
+        "EP with TP is not supported for DeepSeek-V3 on TPU (the TPU combine"
+        " has no SP-local layout)."
     )
   if parallelism.spmd_backend != "partial_dtensor":
     raise NotImplementedError(
@@ -85,6 +91,57 @@ def _apply_compile_static(
       "Compiling each DeepSeekV3TransformerBlock with torch.compile"
       " (dynamic=False)"
   )
+
+
+def _shard_expert_banks_on_edp_mesh(
+    model: nn.Module,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    training: torchtitan.config.TrainingConfig,
+) -> None:
+  """SimpleFSDP for the EP-sharded expert banks, on the EDP mesh.
+
+  ``apply_simple_fsdp`` does this itself, but finds the banks by walking
+  ``model.layers`` for ``TransformerBlock`` instances; activation checkpointing
+  has already replaced each block with a ``CheckpointWrapper``, so under AC it
+  finds none and then tries to shard the EP DTensors over the dense FSDP mesh
+  ("Cannot concatenate overlapping meshes", measured). Same placement as
+  ``apply_simple_fsdp``'s EP branch (dim 1 only when EDP x EP exceeds the
+  expert count); ``data_parallel`` then skips these modules in the model-wide
+  pass.
+  """
+  if parallel_dims.dp_replicate_enabled:
+    edp_mesh = parallel_dims.get_mesh(["dp_replicate", "efsdp"])
+    dp_mode = (
+        "hybrid_shard"
+        if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled
+        else "replicate"
+    )
+  else:
+    edp_mesh = parallel_dims.get_mesh(["efsdp"])
+    dp_mode = "fully_shard"
+  mp_policy = MixedPrecisionPolicy(
+      param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+          training.mixed_precision_param
+      ],
+      reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+          training.mixed_precision_reduce
+      ],
+  )
+  for moe in [m for m in model.modules() if isinstance(m, MoE)]:
+    inner_experts = moe.routed_experts.inner_experts
+    shard_dim = (
+        1
+        if edp_mesh["efsdp"].size() * parallel_dims.ep
+        > inner_experts.num_experts
+        else 0
+    )
+    moe.routed_experts.inner_experts = data_parallel(
+        inner_experts,
+        edp_mesh,
+        dp_mode,
+        mp_policy=mp_policy,
+        shard_dim=shard_dim,
+    )
 
 
 def parallelize_deepseek_v3(
@@ -131,11 +188,19 @@ def parallelize_deepseek_v3(
       "aot_fx_trace",
   )
 
-  # Under partial_dtensor, Module.parallelize is only needed for TP; it applies
-  # the sharding configs set by DeepSeekV3Model.Config.update_from_config.
-  if parallel_dims.tp_enabled:
+  # Under partial_dtensor, Module.parallelize is needed for TP and EP (as
+  # upstream's parallelize_deepseekv3): it applies the sharding configs set by
+  # DeepSeekV3Model.Config.update_from_config, which for EP shard the expert
+  # banks on the "ep" mesh and wire the token dispatcher's EP mesh.
+  if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
     model.parallelize(parallel_dims)
 
+  if parallel_dims.ep_enabled:
+    # Core SelectiveAC saves all_to_all_single outputs (the EP dispatcher's
+    # count / offset exchanges); torch-tpu's split compiler rejects the
+    # backward wait on a saved collective ("Expected call_function for
+    # wait_tensor producer, got placeholder", measured), so recompute them.
+    ac_config = tpu_selective_ac_config(ac_config)
   if ac_config is not None:
     ac_config.build(dump_folder=dump_folder).apply(model)
 
@@ -149,10 +214,26 @@ def parallelize_deepseek_v3(
       # Shared planner: dim 1 for uneven vocab weights (and, once the TPU
       # grouped-expert converter is on, uneven expert banks).
       configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
+      if parallel_dims.ep_enabled:
+        _shard_expert_banks_on_edp_mesh(model, parallel_dims, training)
       model = apply_simple_fsdp(
           model, parallel_dims=parallel_dims, training=training
       )
+      # As the TPU Qwen3 wrapper: split meshes (creates process groups, so
+      # every rank runs it right after sharding), then native TPU collectives
+      # for non-leading FSDP shards.
+      for holder in model.modules():
+        if hasattr(holder, "build_split_meshes"):
+          holder.build_split_meshes()
+      install_tpu_replicate_computation(model)
     else:
+      edp_mesh = None
+      if parallel_dims.ep_enabled:
+        edp_mesh = parallel_dims.get_optional_mesh(
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
       dp_mesh_names = (
           ["dp_replicate", "fsdp"]
           if parallel_dims.dp_replicate_enabled
@@ -172,7 +253,7 @@ def parallelize_deepseek_v3(
           cpu_offload=training.enable_cpu_offload,
           reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
           ep_degree=parallel_dims.ep,
-          edp_mesh=None,
+          edp_mesh=edp_mesh,
           dp_mesh_dims=None,
           edp_mesh_dims=None,
           enable_symm_mem=parallelism.enable_fsdp_symm_mem,
@@ -213,9 +294,15 @@ def parallelize_deepseek_v3_graph_trainer(
         " GraphTrainer; use SimpleFSDP / HSDP."
     )
   configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
-  return graph_trainer_parallelize_deepseekv3(
+  model = graph_trainer_parallelize_deepseekv3(
       model,
       parallel_dims=parallel_dims,
       parallelism=parallelism,
       **kwargs,
   )
+  # As the TPU Qwen3 GraphTrainer wrapper (graph_trainer/qwen3.py).
+  for holder in model.modules():
+    if hasattr(holder, "build_split_meshes"):
+      holder.build_split_meshes()
+  install_tpu_replicate_computation(model)
+  return model

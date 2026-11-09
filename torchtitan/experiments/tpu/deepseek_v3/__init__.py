@@ -35,6 +35,7 @@ import torchtitan.models.deepseek_v3 as deepseek_v3_models
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.ragged_ep_dispatcher import TpuRaggedEPTokenDispatcherConverter
 from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExperts
 from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExpertsConverter
 from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
@@ -110,6 +111,9 @@ def tpu_moe_converters() -> list[ModelConfigConverter.Config]:
   """
   return [
       TpuTokenDispatcherConverter.Config(),
+      # EP 1: unchanged (TpuAllToAllTokenDispatcher). EP > 1: static-shape
+      # dropless ragged all-to-all (tpu/ragged_ep_dispatcher.py).
+      TpuRaggedEPTokenDispatcherConverter.Config(),
       TpuGroupedExpertsConverter.Config(),
       TpuRoutedExpertsConverter.Config(),
   ]
@@ -119,6 +123,7 @@ def use_tpu_moe_kernels(
     config: deepseek_v3_models.DeepSeekV3Model.Config,
     *,
     pallas_grouped_mm: bool = False,
+    scale_before_down_proj: bool | None = None,
 ) -> deepseek_v3_models.DeepSeekV3Model.Config:
   """Sets the Pallas switches on a config already built with ``tpu_moe_converters``.
 
@@ -139,6 +144,9 @@ def use_tpu_moe_kernels(
     config: A DeepSeek-V3 model config built with ``tpu_moe_converters()``.
     pallas_grouped_mm: Use the Pallas grouped matmul instead of
       ``torch._grouped_mm``.
+    scale_before_down_proj: Apply routing scores before W2 (needs Pallas and
+      EP 1: the scores stay on the source rank under EP). Defaults to
+      ``pallas_grouped_mm``.
 
   Returns:
     The same config, modified in place.
@@ -171,8 +179,10 @@ def use_tpu_moe_kernels(
     # for W2, whose full-N (D = 7168) FP32 accumulator needs the smaller K.
     expert_config.pallas_grouped_mm_tgmm_tiling = (512, tile(dim, 1024), 0)
     expert_config.pallas_grouped_mm_w2_tgmm_tiling = (512, tile(hidden, 256), 0)
+  if scale_before_down_proj is None:
+    scale_before_down_proj = pallas_grouped_mm
   for _, routed_config, _, _ in routed:
-    routed_config.scale_before_down_proj = True
+    routed_config.scale_before_down_proj = scale_before_down_proj
   return config
 
 

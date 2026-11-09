@@ -29,7 +29,10 @@ instead of 256 routed experts), for per-rung measurements.
 """
 
 import dataclasses
+import functools
+import math
 
+from torch import nn
 import torchtitan.models.common as common_models
 import torchtitan.models.deepseek_v3 as deepseek_v3_models
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
@@ -94,6 +97,33 @@ def use_tpu_attention(
     layer.attention.inner_attention = (
         SlidingWindowScaledDotProductInnerAttention.Config()
     )
+  return config
+
+
+def _set_mtp_param_inits(
+    config: deepseek_v3_models.DeepSeekV3Model.Config,
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  """Gives the MTP-only modules an explicit ``param_init`` (in place).
+
+  Upstream's ``_build_mtp_layers`` leaves ``enorm`` / ``hnorm`` / ``mtp_norm``
+  / ``eh_proj`` without one, so ``init_states`` falls back to
+  ``reset_parameters()``. Under SimpleFSDP the weight is a parametrization
+  (the all-gathered view), and ``reset_parameters`` writes into that view,
+  not the shard: the shards keep ``to_empty``'s garbage and the first MTP
+  step is NaN (measured, debugmodel MTP 1 on 4 v6e chips: ``enorm`` output
+  non-finite). The inits are ``reset_parameters``' own: ones for RMSNorm,
+  ``kaiming_uniform_(a=sqrt(5))`` for the bias-free ``Linear``.
+  """
+  norm_init = {"weight": nn.init.ones_}
+  linear_init = {
+      "weight": functools.partial(nn.init.kaiming_uniform_, a=math.sqrt(5))
+  }
+  for layer in config.mtp_layers:
+    for norm in (layer.enorm, layer.hnorm, layer.mtp_norm):
+      if norm.param_init is None:
+        norm.param_init = dict(norm_init)
+    if layer.eh_proj.param_init is None:
+      layer.eh_proj.param_init = dict(linear_init)
   return config
 
 
@@ -303,6 +333,7 @@ def _reduced_671b(
     n_moe_layers: int,
     num_experts: int,
     seq_len: int,
+    num_mtp_layers: int = 0,
 ) -> deepseek_v3_models.DeepSeekV3Model.Config:
   """671B with fewer layers and routed experts, everything else unchanged.
 
@@ -311,7 +342,8 @@ def _reduced_671b(
   ``transformers.DeepseekV3Config``); embeddings, final norm and head come from
   upstream's 671B config. Group-limited routing keeps 8 groups / top-4 groups /
   top-8 experts, so with 16 experts every group holds 2 and the top-8 are the
-  experts of the 4 chosen groups.
+  experts of the 4 chosen groups. MTP layers, if any, are built from the last
+  (MoE) layer, as upstream builds them.
   """
   config = _upstream_flavor("671B")
   rope = config.layers[0].attention.rope
@@ -343,7 +375,10 @@ def _reduced_671b(
       non_blocking_capacity_factor=None,
       rope=dataclasses.replace(rope, max_context_length=seq_len),
   )
-  config.mtp_layers = []
+  # pylint: disable-next=protected-access
+  config.mtp_layers = deepseek_v3_models._build_mtp_layers(
+      config.layers[-1], dim=config.dim, num_mtp_layers=num_mtp_layers
+  )
   return use_tpu_attention(config)
 
 
@@ -368,7 +403,7 @@ def model_registry(
   """Returns a TPU ``ModelSpec`` for a DeepSeek-V3 flavor.
 
   Args:
-    flavor: One of upstream's flavors or ``671B-31L``.
+    flavor: One of upstream's flavors, ``671B-31L`` or ``671B-2L-16E``.
     seq_len: Context length; defaults to the flavor's maximum.
     converters: Optional model-config converters, applied before the TPU
       attention swap.
@@ -378,17 +413,18 @@ def model_registry(
     The model spec, using ``parallelize_deepseek_v3``.
   """
   if flavor == REDUCED_671B_FLAVOR:
-    if num_mtp_layers:
-      raise ValueError(f"{flavor} has no MTP layers")
     model_spec = model_registry("671B", seq_len=seq_len)
     config = _reduced_671b(
-        **_REDUCED_671B_SHAPE, seq_len=model_spec.max_context_length
+        **_REDUCED_671B_SHAPE,
+        seq_len=model_spec.max_context_length,
+        num_mtp_layers=num_mtp_layers,
     )
     # As upstream's model_registry: converters see the final layer list.
     if converters is not None:
       validate_converter_order(converters)
       for converter in converters:
         config = converter.build().convert(config)
+    _set_mtp_param_inits(config)
     return dataclasses.replace(model_spec, flavor=flavor, model=config)
   base_flavor, n_layers = _PROXY_FLAVORS.get(flavor, (flavor, None))
   if base_flavor not in _UPSTREAM_FLAVORS:
@@ -407,6 +443,7 @@ def model_registry(
   if n_layers is not None:
     _truncate_layers(model_spec.model, n_layers)
   use_tpu_attention(model_spec.model)
+  _set_mtp_param_inits(model_spec.model)
   return dataclasses.replace(
       model_spec,
       flavor=flavor,

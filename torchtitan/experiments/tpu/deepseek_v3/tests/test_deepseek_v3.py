@@ -936,6 +936,307 @@ class TestDeepSeekV3TpuMoE(BaseAcceleratorDeviceTest):
       self.assertGreater((moe.expert_bias_E - previous).abs().sum().item(), 0)
 
 
+# MTP parity: two rows of 64 tokens, each packing three documents, so the
+# depth-1 roll has document tails to fill (one per document) inside the row.
+_MTP_DOC_LENGTHS = (24, 13, 27)
+_MTP_SEQ_LEN = sum(_MTP_DOC_LENGTHS)
+
+
+def _mtp_positions() -> torch.Tensor:
+  return torch.cat([torch.arange(n) for n in _MTP_DOC_LENGTHS]).repeat(_BATCH)
+
+
+class _NoCp:
+  cp_enabled = False
+
+
+class _PartialDtensor:
+  spmd_backend = "partial_dtensor"
+
+
+def _mtp_forward_backward(model, loss_fn, tokens, labels, positions, *,
+                          roll_positions=True):
+  """The trainer's MTP step: ``preprocess_inputs`` -> forward -> loss -> backward.
+
+  ``roll_positions=False`` is the control: the depth inputs and labels are
+  rolled without the document boundaries.
+
+  Returns:
+    ``(per-depth logits, loss, gradients)``; logits are recomputed from the
+    ``(hidden, weight.T)`` pairs when the LM head is the fused-loss wrapper.
+  """
+  batch = {"input": tokens, "labels": labels}
+  batch["positions"] = positions
+  inputs, depth_labels, extra = model.preprocess_inputs(
+      batch, parallel_dims=_NoCp(), parallelism=_PartialDtensor()
+  )
+  if not roll_positions:
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.models.deepseek_v3.mtp import roll_mtp_sequence
+
+    rolled, valid = roll_mtp_sequence(
+        tokens, shift=1, fill_value=0, return_valid_mask=True
+    )
+    inputs = (inputs[0], rolled)
+    depth_labels = (
+        depth_labels[0],
+        roll_mtp_sequence(labels, shift=1, fill_value=-100),
+    )
+    extra["mtp_input_valid_masks"] = (valid,)
+  num_valid = (depth_labels[0] != -100).sum()
+  with set_unflatten_seq_len(_MTP_SEQ_LEN):
+    pred = model(inputs, **extra)
+    loss, _ = loss_fn(pred, depth_labels, num_valid)
+    loss.backward()
+  logits = [
+      (p[0].float() @ p[1].float()) if isinstance(p, tuple) else p.float()
+      for p in pred
+  ]
+  grads = {}
+  for name, param in model.named_parameters():
+    if param.grad is None:
+      continue
+    prefix, _, leaf = name.rpartition(".")
+    if leaf in _NATIVE_TO_CANONICAL_EXPERT_WEIGHT:
+      grads[f"{prefix}.{_NATIVE_TO_CANONICAL_EXPERT_WEIGHT[leaf]}"] = (
+          param.grad.transpose(-2, -1)
+      )
+    else:
+      grads[name] = param.grad
+  return (
+      [l.detach().cpu() for l in logits],
+      loss.detach().float().cpu(),
+      grads,
+  )
+
+
+class TestDeepSeekV3MultiTokenPrediction(BaseAcceleratorDeviceTest):
+  """MTP 1 on the TPU lane vs upstream's own forward + ``MTPLoss`` on CPU.
+
+  HF has no MTP, so the reference is upstream TorchTitan: the same tiny
+  config with one MTP layer (a copy of the last, MoE, layer), upstream's MoE
+  path, plain ``Linear`` head and ``MTPLoss`` (weight 0.1, the recipes'),
+  fp32 at "highest" on CPU. Both sides run upstream's
+  ``MTPDecoder.preprocess_inputs`` (document-aware depth roll), forward and
+  loss on packed rows; per-depth logits, the loss and every gradient are
+  compared. The TPU side takes its loss from the TPU trainer's builder
+  (``build_cross_entropy_loss``) on the MTP recipes, which before this rung
+  returned plain cross entropy for any non-Pallas config.
+
+  ``plain``: upstream MoE path + ``MTPLoss`` (``deepseek_v3_debugmodel_mtp``).
+  ``tpu_moe``: the lane's MoE converters, native experts. ``fused_pallas``:
+  converters + Pallas experts + the fused-loss LM head and
+  ``PallasMTPCrossEntropyLoss`` (``deepseek_v3_debugmodel_fused_ce_mtp``,
+  tiles shrunk to the test's 128 tokens); TPU only.
+
+  Controls: the reference without the MTP term (weight 0, i.e. what a
+  main-only loss trains) and the reference with the depth roll ignoring
+  document boundaries both land outside the bounds.
+  """
+
+  def setUp(self):
+    super().setUp()
+    use_cpu_safe_histc_patch()
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous)
+    if self.accelerator_device.type == "tpu":
+      self.enter_context(_Bf16GroupedMmDefaultPrecision())
+
+  @parameterized.named_parameters(
+      dict(testcase_name="plain", path="plain"),
+      dict(testcase_name="tpu_moe", path="tpu_moe"),
+      dict(testcase_name="fused_pallas", path="fused_pallas"),
+  )
+  def test_matches_upstream_mtp(self, path):
+    # pylint: disable=g-import-not-at-top
+    from torchtitan.config import derive
+    from torchtitan.experiments.tpu.loss import PallasMTPCrossEntropyLoss
+    from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
+    from torchtitan.experiments.tpu.overrides.fused_loss import FusedLossLinearWrapper
+    from torchtitan.models.deepseek_v3.mtp import MTPLoss
+    # pylint: enable=g-import-not-at-top
+
+    pallas = path == "fused_pallas"
+    if pallas and self.accelerator_device.type != "tpu":
+      self.skipTest("The fused loss and Pallas experts run on TPU only")
+    device = self.accelerator_device
+    # Lane-aligned expert width for the Pallas kernels (F % 128 == 0).
+    overrides = dict(moe_hidden_dim=128)
+
+    torch.manual_seed(0)
+    reference = _tiny_titan_config(num_mtp_layers=1, **overrides).build()
+    reference.init_states(buffer_device=torch.device("cpu"))
+    with torch.no_grad():
+      for name, param in reference.named_parameters():
+        if "norm" in name:
+          # Unit-initialized (enorm / hnorm / mtp_norm too).
+          param.copy_(1.0 + 0.1 * torch.randn_like(param))
+        elif name.endswith("router.gate.weight"):
+          param.copy_(0.1 * torch.randn_like(param))
+      moes = [l.moe for l in reference.layers.values() if l.moe_enabled]
+      moes += [l.moe for l in reference.mtp_layers]
+      for moe in moes:
+        moe.expert_bias_E.copy_(0.05 * torch.randn_like(moe.expert_bias_E))
+    self.assertLen(reference.mtp_layers, 1)
+    self.assertTrue(reference.mtp_layers[0].moe_enabled)
+
+    config = _tiny_titan_config(num_mtp_layers=1, **overrides)
+    if path != "plain":
+      for converter in deepseek_v3_tpu.tpu_moe_converters():
+        config = converter.build().convert(config)
+      deepseek_v3_tpu.use_tpu_moe_kernels(config, pallas_grouped_mm=pallas)
+    if pallas:
+      config.lm_head = derive(config.lm_head, FusedLossLinearWrapper.Config)
+      recipe = deepseek_v3_tpu.deepseek_v3_debugmodel_fused_ce_mtp()
+      recipe.loss.b_block_size = 128
+      recipe.loss.h_block_size = 128
+      recipe.loss.v_block_size = 128
+    else:
+      recipe = deepseek_v3_tpu.deepseek_v3_debugmodel_mtp()
+    loss_fn = build_cross_entropy_loss(recipe)
+    self.assertIsInstance(
+        loss_fn, PallasMTPCrossEntropyLoss if pallas else MTPLoss
+    )
+    self.assertEqual(loss_fn.mtp_scale, 0.1)
+    model = config.build()
+    if path != "plain":
+      self.assertIsInstance(
+          model.mtp_layers[0].moe.routed_experts, TpuRoutedExperts
+      )
+    missing, unexpected = model.load_state_dict(reference.state_dict())
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+    model = model.to(device).train()
+
+    torch.manual_seed(1)
+    num_tokens = _BATCH * _MTP_SEQ_LEN
+    tokens = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    labels = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    positions = _mtp_positions()
+
+    def reference_run(mtp_scale, roll_positions=True):
+      ref = _tiny_titan_config(num_mtp_layers=1, **overrides).build()
+      ref.load_state_dict(reference.state_dict())
+      ref.train()
+      return _mtp_forward_backward(
+          ref, MTPLoss.Config(mtp_scale=mtp_scale).build(), tokens, labels,
+          positions, roll_positions=roll_positions,
+      )
+
+    ref_logits, ref_loss, ref_grads = reference_run(0.1)
+    logits, loss, grads = _mtp_forward_backward(
+        model, loss_fn, tokens.to(device), labels.to(device),
+        positions.to(device),
+    )
+    self.assertLen(logits, 2)  # Main + one MTP depth.
+    # Every MTP parameter is trained.
+    mtp_grads = {n: g for n, g in ref_grads.items() if n.startswith("mtp_")}
+    self.assertNotEmpty(mtp_grads)
+    self.assertTrue(all(g.norm() > 0 for g in mtp_grads.values()))
+
+    logit_errors = []
+    for depth, (got, expected) in enumerate(zip(logits, ref_logits)):
+      test_utils.check_equivalence(
+          got, expected, atol=2e-2, rtol=1e-2, check_name=f"Logits {depth}",
+          test_label=f"TPU lane ({path})", ref_label="upstream CPU",
+      )
+      logit_errors.append((got - expected).abs().max().item())
+    test_utils.check_equivalence(
+        loss, ref_loss, atol=2e-3, rtol=1e-3, check_name="Loss",
+        test_label=f"TPU lane ({path})", ref_label="upstream CPU",
+    )
+    worst = assert_gradients(self, grads, ref_grads, bound=2e-2)
+    print(
+        f"MTP ({path}, {device.type}) vs upstream CPU: max |logit diff| main"
+        f" {logit_errors[0]:.3e} / MTP {logit_errors[1]:.3e}, |loss diff|"
+        f" {(loss - ref_loss).abs():.3e} (loss {ref_loss:.6f}), worst gradient"
+        f" relative L2 {worst[0]:.3e} ({worst[1]})"
+    )
+    for multiplier in (0.0, -1.0):
+      with self.assertRaises(AssertionError):
+        assert_gradients(
+            self,
+            {n: g * multiplier for n, g in ref_grads.items()},
+            ref_grads,
+            bound=2e-2,
+        )
+
+    # Controls: a main-only objective and a boundary-blind roll both fail.
+    _, no_mtp_loss, no_mtp_grads = reference_run(0.0)
+    _, blind_loss, blind_grads = reference_run(0.1, roll_positions=False)
+    for name, control_loss, control_grads in (
+        ("no MTP term", no_mtp_loss, no_mtp_grads),
+        ("roll across documents", blind_loss, blind_grads),
+    ):
+      moved = (control_loss - loss).abs().item()
+      print(f"MTP control ({name}): loss moves {moved:.3e}")
+      self.assertGreater(moved, 2e-3 + 1e-3 * abs(ref_loss.item()), name)
+      with self.assertRaises(AssertionError):
+        assert_gradients(self, control_grads, grads, bound=2e-2)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="debugmodel", flavor="debugmodel"),
+      dict(testcase_name="proxy", flavor="671B-2L-16E"),
+      dict(testcase_name="target", flavor="671B-31L"),
+  )
+  def test_mtp_modules_have_param_init(self, flavor):
+    """Every MTP-block module with parameters carries an explicit param_init.
+
+    Without one, ``init_states`` calls ``reset_parameters``, which under
+    SimpleFSDP writes into the all-gathered view instead of the shard (first
+    MTP step NaN on 4 chips before this rung).
+    """
+    spec = deepseek_v3_tpu.model_registry(
+        flavor, seq_len=4096, num_mtp_layers=1
+    )
+    with torch.device("meta"):
+      model = spec.model.build()
+    self.assertLen(model.mtp_layers, 1)
+    for name, module in model.mtp_layers.named_modules():
+      if any(True for _ in module.parameters(recurse=False)):
+        self.assertIsNotNone(module._param_init, name)  # pylint: disable=protected-access
+
+  def test_per_block_parallelize_covers_mtp_layers(self):
+    """AC and per-block compile reach the MTP block; it stays in ``mtp_layers``."""
+    # pylint: disable=g-import-not-at-top
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+    from torchtitan.components.optimizer.optimizer import _iter_moe_layers
+    from torchtitan.distributed.activation_checkpoint import FullAC
+    from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
+    # pylint: enable=g-import-not-at-top
+
+    class _ParallelDims:
+      cp_enabled = pp_enabled = ep_enabled = tp_enabled = False
+      dp_shard_enabled = dp_replicate_enabled = False
+
+    with torch.device("meta"):
+      model = _tiny_titan_config(num_mtp_layers=1).build()
+    num_layers = len(model.layers)
+    model = deepseek_v3_tpu.parallelize_deepseek_v3(
+        model,
+        parallel_dims=_ParallelDims(),
+        training=None,
+        parallelism=_PartialDtensor(),
+        compile_config=TpuTrainerCompileConfig(enable=True, backend="tpu"),
+        ac_config=FullAC.Config(),
+        dump_folder="",
+        skip_dp=True,
+    )
+    self.assertLen(model.layers, num_layers)
+    self.assertLen(model.mtp_layers, 1)
+    blocks = [*model.layers.values(), model.mtp_layers[0]]
+    for block in blocks:
+      self.assertIsInstance(block, CheckpointWrapper)
+      # nn.Module.compile sets the compiled call implementation.
+      self.assertIsNotNone(block._compiled_call_impl)  # pylint: disable=protected-access
+    # The balancer hook still finds the MTP block's MoE.
+    self.assertLen(
+        list(_iter_moe_layers([model])),
+        sum(l.moe_enabled for l in model.layers.values()) + 1,
+    )
+
+
 class TestDeepSeekV3CompiledBiasBalancer(BaseAcceleratorDeviceTest):
   """The auxiliary-loss-free balancer survives per-block compile.
 
@@ -1103,12 +1404,31 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
           moe_layers=1,
           ep=4,
       ),
+      dict(
+          testcase_name="target_mtp",
+          config="deepseek_v3_671b_31l_4x4x4_mtp",
+          flavor="671B-31L",
+          moe_layers=28,
+          ep=16,
+          mtp_layers=1,
+      ),
+      dict(
+          testcase_name="proxy_mtp",
+          config="deepseek_v3_671b_2l_16e_target_proxy_mtp",
+          flavor="671B-2L-16E",
+          moe_layers=1,
+          ep=4,
+          mtp_layers=1,
+      ),
   )
-  def test_parses_with_the_target_setup(self, config, flavor, moe_layers, ep):
+  def test_parses_with_the_target_setup(
+      self, config, flavor, moe_layers, ep, mtp_layers=0
+  ):
     # pylint: disable=g-import-not-at-top
     import torchtitan.config
     from torchtitan.distributed.activation_checkpoint import FullAC
     from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+    from torchtitan.experiments.tpu.loss import PallasMTPCrossEntropyLoss
     from torchtitan.experiments.tpu.ragged_ep_dispatcher import TpuRaggedEPTokenDispatcher
     # pylint: enable=g-import-not-at-top
 
@@ -1119,11 +1439,14 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
     model = job.model_spec.model
     self.assertEqual(job.model_spec.flavor, flavor)
     self.assertEqual(sum(l.moe is not None for l in model.layers), moe_layers)
+    # MTP blocks are MoE blocks too (built from the last layer).
+    self.assertLen(model.mtp_layers, mtp_layers)
     self.assertLen(
-        list(model.traverse(TpuRaggedEPTokenDispatcher.Config)), moe_layers
+        list(model.traverse(TpuRaggedEPTokenDispatcher.Config)),
+        moe_layers + mtp_layers,
     )
     experts = [e for _, e, _, _ in model.traverse(TpuGroupedExperts.Config)]
-    self.assertLen(experts, moe_layers)
+    self.assertLen(experts, moe_layers + mtp_layers)
     self.assertTrue(all(e.use_pallas_grouped_mm for e in experts))
     self.assertFalse(
         any(
@@ -1137,6 +1460,11 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
     self.assertEqual(job.training.max_context_length, 4096)
     self.assertEqual(job.training.num_tokens_per_microbatch_per_dp_rank, 4096)
     self.assertIsInstance(job.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        isinstance(job.loss, PallasMTPCrossEntropyLoss.Config), mtp_layers > 0
+    )
+    if mtp_layers:
+      self.assertEqual(job.loss.mtp_scale, 0.1)
     self.assertIn(
         "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head",
         job.override.imports,

@@ -25,6 +25,8 @@ GraphTrainer's DeepSeek-V3 setup (FQN annotation -> SimpleFSDP -> GraphTrainer
 compile).
 """
 
+import contextlib
+
 import torch
 from torch import nn
 import torchtitan.config
@@ -34,7 +36,10 @@ from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.activation_checkpoint import tpu_selective_ac_config
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.graph_trainer.simple_fsdp import MixedPrecisionPolicy
+from torchtitan.experiments.graph_trainer.compile import apply_compile
+from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import annotate_deepseekv3
 from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import parallelize_deepseekv3 as graph_trainer_parallelize_deepseekv3
+from torchtitan.experiments.graph_trainer.ep_eager_chunk import maybe_apply_ep_overlap_eager_chunking
 from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import install_tpu_replicate_computation
 from torchtitan.experiments.tpu.qwen3_sharding import configure_qwen_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
@@ -69,6 +74,33 @@ def _validate_supported(
 
 def _is_moe_layer(layer: nn.Module) -> bool:
   return any(isinstance(m, MoE) for m in layer.modules())
+
+
+@contextlib.contextmanager
+def _with_mtp_layers_in_layers(model: nn.Module):
+  """Temporarily appends ``model.mtp_layers`` to ``model.layers``.
+
+  Layer-wise passes (dense-layer ``spmd_safe``, activation checkpointing,
+  per-block compile) walk ``model.layers`` only, so without this the MTP
+  blocks would run eager and keep every activation. Upstream's
+  ``apply_fsdp_to_mtp_decoder`` uses the same trick for FSDP2. On exit the
+  (possibly wrapped) modules move back to ``mtp_layers``, which is what
+  ``MTPDecoder.forward`` and the balancer hook iterate. A no-op without MTP.
+  """
+  mtp_layers = getattr(model, "mtp_layers", None)
+  keys = []
+  if mtp_layers is not None:
+    first = len(model.layers)
+    for i, layer in enumerate(mtp_layers):
+      key = str(first + i)
+      model.layers[key] = layer
+      keys.append(key)
+  try:
+    yield
+  finally:
+    for i, key in enumerate(keys):
+      mtp_layers[i] = model.layers[key]
+      del model.layers[key]
 
 
 def _apply_compile_static(
@@ -180,9 +212,10 @@ def parallelize_deepseek_v3(
 
   compile_enabled = compile_config.enable and "model" in compile_config.components
   if compile_enabled and hasattr(model, "layers"):
-    for layer in model.layers.values():
-      if not _is_moe_layer(layer):
-        apply_spmd_safe(layer)
+    with _with_mtp_layers_in_layers(model):
+      for layer in model.layers.values():
+        if not _is_moe_layer(layer):
+          apply_spmd_safe(layer)
   per_block_compile = compile_enabled and tpu_compile_mode not in (
       "fullgraph",
       "aot_fx_trace",
@@ -201,11 +234,13 @@ def parallelize_deepseek_v3(
     # backward wait on a saved collective ("Expected call_function for
     # wait_tensor producer, got placeholder", measured), so recompute them.
     ac_config = tpu_selective_ac_config(ac_config)
-  if ac_config is not None:
-    ac_config.build(dump_folder=dump_folder).apply(model)
+  # MTP blocks get the same AC and per-block compile as the decoder layers.
+  with _with_mtp_layers_in_layers(model):
+    if ac_config is not None:
+      ac_config.build(dump_folder=dump_folder).apply(model)
 
-  if per_block_compile:
-    _apply_compile_static(model, compile_config)
+    if per_block_compile:
+      _apply_compile_static(model, compile_config)
 
   if not skip_dp and (
       parallel_dims.dp_shard_enabled or parallel_dims.dp_replicate_enabled
@@ -265,6 +300,56 @@ def parallelize_deepseek_v3(
   return model
 
 
+def _graph_trainer_parallelize_with_mtp(
+    model: nn.Module,
+    *,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    training: torchtitan.config.TrainingConfig,
+    parallelism: torchtitan.config.ParallelismConfig,
+    compile_config,
+    ac_config,
+    dump_folder: str,
+) -> nn.Module:
+  """Upstream GraphTrainer's ``parallelize_deepseekv3`` steps, MTP-aware.
+
+  Same calls in the same order (FQN annotation -> ``Module.parallelize`` for
+  EP -> SimpleFSDP -> EP eager chunking -> compile setup); two of them see the
+  MTP blocks as extra ``layers`` entries:
+
+  * the FQN annotation, so MTP nodes are tagged ``layers.<n_layers + i>`` and
+    remat regions / the graph splitter treat each MTP block as one more layer;
+  * ``apply_simple_fsdp``, whose EP branch shards the expert banks it finds in
+    ``model.layers`` on the EDP mesh. An MTP bank left on the EP mesh fails the
+    model-wide pass ("Cannot concatenate overlapping meshes", measured at EP
+    4).
+
+  ``Module.parallelize`` must not see them twice (it raises on a second call
+  per instance), so it runs with ``mtp_layers`` in their own container.
+  """
+  del ac_config  # GraphTrainer applies its own memory policy.
+  assert (
+      training.num_tokens_per_microbatch_per_dp_rank
+      % parallel_dims.seq_len_divisor
+      == 0
+  )
+  with _with_mtp_layers_in_layers(model):
+    annotate_deepseekv3(model)
+  if parallel_dims.ep_enabled:
+    model.parallelize(parallel_dims)
+  with _with_mtp_layers_in_layers(model):
+    model = apply_simple_fsdp(
+        model, parallel_dims=parallel_dims, training=training
+    )
+  maybe_apply_ep_overlap_eager_chunking(model, compile_config)
+  return apply_compile(
+      model,
+      compile_config=compile_config,
+      parallelism=parallelism,
+      parallel_dims=parallel_dims,
+      dump_folder=dump_folder,
+  )
+
+
 def parallelize_deepseek_v3_graph_trainer(
     model: nn.Module,
     *,
@@ -294,12 +379,20 @@ def parallelize_deepseek_v3_graph_trainer(
         " GraphTrainer; use SimpleFSDP / HSDP."
     )
   configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
-  model = graph_trainer_parallelize_deepseekv3(
-      model,
-      parallel_dims=parallel_dims,
-      parallelism=parallelism,
-      **kwargs,
-  )
+  if getattr(model, "mtp_layers", None) is None:
+    model = graph_trainer_parallelize_deepseekv3(
+        model,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        **kwargs,
+    )
+  else:
+    model = _graph_trainer_parallelize_with_mtp(
+        model,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        **kwargs,
+    )
   # As the TPU Qwen3 GraphTrainer wrapper (graph_trainer/qwen3.py).
   for holder in model.modules():
     if hasattr(holder, "build_split_meshes"):

@@ -161,6 +161,71 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     self._maybe_compile(compile_config)
 
 
+class PallasMTPCrossEntropyLoss(PallasCrossEntropyLoss):
+  """Fused linear + cross entropy for a model with multi-token prediction.
+
+  The fused-loss counterpart of upstream's ``MTPLoss``
+  (``models/deepseek_v3/mtp.py``), with the same arithmetic: ``(main_sum +
+  mtp_scale / num_mtp_layers * sum(depth_sums)) / global_valid_tokens``. Under
+  the fused-loss override an ``MTPDecoder`` returns one ``(hidden, weight.T)``
+  pair per prediction (main, then one per MTP depth), all with the same LM
+  head; each pair goes through the fused kernel, so no ``[tokens, vocab]``
+  logits exist for the MTP depths either. The depth labels carry
+  ``IGNORE_INDEX`` at document tails, which the kernel path already masks.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(PallasCrossEntropyLoss.Config):
+    mtp_scale: float = 0.3
+    """Total weight of the MTP terms (split evenly over the depths).
+
+    Upstream ``MTPLoss``' default; the TPU DeepSeek-V3 MTP recipes set
+    MaxText's ``mtp_loss_scaling_factor`` (0.1).
+    """
+
+  def __init__(
+      self,
+      config: Config,
+      *,
+      compile_config: torchtitan.config.CompileConfig | None = None
+  ):
+    super().__init__(config, compile_config=compile_config)
+    self.mtp_scale = config.mtp_scale
+
+  def __call__(
+      self,
+      pred,
+      labels,
+      global_valid_tokens: torch.Tensor | None = None,
+      **kwargs,
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    del kwargs
+    if (
+        not isinstance(pred, tuple)
+        or not isinstance(labels, tuple)
+        or not all(isinstance(p, tuple) for p in pred)
+    ):
+      raise ValueError(
+          "PallasMTPCrossEntropyLoss expects one (hidden, weight) pair and one"
+          " labels tensor per prediction (main first, then each MTP depth)"
+      )
+    if len(pred) != len(labels) or len(pred) < 2:
+      raise ValueError(
+          "PallasMTPCrossEntropyLoss needs a main and at least one MTP"
+          f" prediction with one labels tensor each, got {len(pred)}"
+          f" predictions and {len(labels)} labels"
+      )
+    mtp_weight = self.mtp_scale / (len(pred) - 1)
+    main_loss = self.fn(pred[0], labels[0])
+    mtp_loss = main_loss.new_zeros((), dtype=torch.float32)
+    for mtp_pred, mtp_labels in zip(pred[1:], labels[1:], strict=True):
+      mtp_loss = mtp_loss + self.fn(mtp_pred, mtp_labels) * mtp_weight
+    loss = main_loss + mtp_loss
+    if global_valid_tokens is not None:
+      loss = loss / global_valid_tokens
+    return loss, {}
+
+
 def _legacy_pallas_loss_config(
     job_config: tpu_job_config_module.TPUTrainerConfig,
 ) -> PallasCrossEntropyLoss.Config:
@@ -190,6 +255,15 @@ def build_cross_entropy_loss(
   """
   if isinstance(job_config.loss, PallasCrossEntropyLoss.Config):
     return job_config.loss.build(compile_config=job_config.compile)
+
+  # Multi-token prediction (DeepSeek-V3 / V4 ``MTPDecoder``): the model returns
+  # one prediction per depth, which plain cross entropy cannot take. Built
+  # uncompiled, like the plain cross entropy below.
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.models.deepseek_v3.mtp import MTPLoss
+
+  if isinstance(job_config.loss, MTPLoss.Config):
+    return job_config.loss.build()
 
   # TODO: Remove this backward-compatibility fallback once all TPU recipes
   # select PallasCrossEntropyLoss.Config directly.

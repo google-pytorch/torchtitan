@@ -689,7 +689,10 @@ class Module(nn.Module, Configurable):
 
             new_kwargs[name] = value
 
-        new_args = tuple(new_kwargs.pop(name) for name in pos_arg_names)
+        # Only the positional parameters the caller passed: a trailing defaulted
+        # one it omitted (e.g. ``segment_ids`` in ``self.attention(x, masks,
+        # positions)``) is neither in ``args`` nor in ``new_kwargs``.
+        new_args = tuple(new_kwargs.pop(name) for name in pos_arg_names[: len(args)])
         return new_args, new_kwargs
 
     def _redistribute_outputs(self, parallel_dims: ParallelDims, outputs: Any) -> Any:

@@ -471,6 +471,41 @@ class TestModuleRedistributionDTensor(DTensorTestBase):
         )
 
 
+class TestModuleRedistributionOmittedPositionalArgs(unittest.TestCase):
+    """A caller may omit a trailing defaulted positional parameter."""
+
+    class TwoArgs(Module):
+        def forward(self, x, segment_ids=None):
+            return x if segment_ids is None else x + segment_ids
+
+    class _NoMeshDims:
+        spmd_backend = "partial_dtensor"
+
+        def resolve_shared_mesh(self, layouts):
+            del layouts
+            return None
+
+    def test_omitted_trailing_positional_arg(self):
+        # DeepSeek-V3's MTP block calls ``attention(x, masks, positions)``
+        # without ``segment_ids``; under EP / TP this raised KeyError.
+        module = self.TwoArgs()
+        module._sharding_config = ShardingConfig(
+            in_src_shardings={"x": SpmdType({MeshAxisName.TP: spmd.R})}
+        )
+        module._cache_pos_arg_names()
+        x = torch.randn(2, 3)
+        args, kwargs = module._redistribute_inputs(self._NoMeshDims(), (x,), {})
+        self.assertEqual(len(args), 1)
+        self.assertIs(args[0], x)
+        self.assertEqual(kwargs, {})
+        seg = torch.ones(2, 3)
+        args, kwargs = module._redistribute_inputs(
+            self._NoMeshDims(), (x, seg), {}
+        )
+        self.assertEqual(len(args), 2)
+        self.assertIs(args[1], seg)
+
+
 class TestVerifyModuleProtocol(unittest.TestCase):
     """Tests for BaseModel.verify_module_protocol."""
 

@@ -15,10 +15,12 @@ from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.loss import PallasMTPCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.models.deepseek_v3.mtp import MTPLoss
 
 __all__ = [
     "deepseek_v3_671b_2l_16e",
@@ -27,9 +29,14 @@ __all__ = [
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas",
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4",
     "deepseek_v3_671b_2l_16e_target_proxy",
+    "deepseek_v3_671b_2l_16e_target_proxy_mtp",
     "deepseek_v3_671b_31l_4x4x4",
+    "deepseek_v3_671b_31l_4x4x4_mtp",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
+    "deepseek_v3_debugmodel_fused_ce_mtp",
+    "deepseek_v3_debugmodel_mtp",
+    "deepseek_v3_debugmodel_target_mtp",
     "deepseek_v3_debugmodel_tpu_moe",
     "deepseek_v3_debugmodel_tpu_moe_pallas",
     "graph_trainer_deepseek_v3_671b_2l_16e",
@@ -37,6 +44,8 @@ __all__ = [
     "graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe",
     "graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe_pallas",
     "graph_trainer_deepseek_v3_debugmodel",
+    "graph_trainer_deepseek_v3_debugmodel_mtp",
+    "graph_trainer_deepseek_v3_debugmodel_target_mtp",
     "graph_trainer_deepseek_v3_debugmodel_tpu_moe",
 ]
 
@@ -47,6 +56,11 @@ _PROXY_CONTEXT_LENGTH = 4096
 _FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
 )
+# Total MTP loss weight: MaxText's ``mtp_loss_scaling_factor`` (base.yml 0.1;
+# the Lineage MLPerf config ``deepseek3-671b-lineage.yml`` sets
+# ``mtp_num_layers: 1`` and does not override it). Upstream ``MTPLoss``
+# defaults to 0.3 (DeepSeek-V3's weight for its first 10T tokens).
+_MTP_LOSS_SCALE = 0.1
 
 
 def _enable_pallas_cross_entropy(config):
@@ -61,6 +75,29 @@ def _enable_pallas_cross_entropy(config):
   config.loss = PallasCrossEntropyLoss.Config()
   if _FUSED_LOSS_OVERRIDE not in config.override.imports:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+  return config
+
+
+def _use_mtp_loss(config):
+  """Switch the recipe's loss to its multi-token-prediction form.
+
+  Plain cross entropy becomes upstream's ``MTPLoss``; the fused Pallas loss
+  becomes ``PallasMTPCrossEntropyLoss`` with the same kernel settings. Both
+  weigh the MTP depths by ``_MTP_LOSS_SCALE``. The model must already have
+  its MTP layers (``model_registry(..., num_mtp_layers=...)``).
+  """
+  if not config.model_spec.model.mtp_layers:
+    raise ValueError("The recipe's model has no MTP layers")
+  if isinstance(config.loss, PallasCrossEntropyLoss.Config):
+    config.loss = PallasMTPCrossEntropyLoss.Config(
+        **{
+            field.name: getattr(config.loss, field.name)
+            for field in dataclasses.fields(config.loss)
+        },
+        mtp_scale=_MTP_LOSS_SCALE,
+    )
+  else:
+    config.loss = MTPLoss.Config(mtp_scale=_MTP_LOSS_SCALE)
   return config
 
 
@@ -144,6 +181,23 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       # Off by default; --compile.enable turns on per-block compile on TorchTPU.
       compile=TpuTrainerCompileConfig(enable=False, backend="tpu"),
   )
+
+
+def deepseek_v3_debugmodel_mtp() -> TPUTrainerConfig:
+  """``deepseek_v3_debugmodel`` with one MTP layer and upstream's ``MTPLoss``.
+
+  The MTP block (a copy of the last, MoE, layer plus ``enorm`` / ``hnorm`` /
+  ``eh_proj`` / ``mtp_norm``) gets the decoder layers' AC and per-block
+  compile; MTP loss weight 0.1 (MaxText's).
+  """
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.deepseek_v3 import model_registry
+
+  config = deepseek_v3_debugmodel()
+  config.model_spec = model_registry(
+      "debugmodel", seq_len=_DEBUGMODEL_CONTEXT_LENGTH, num_mtp_layers=1
+  )
+  return _use_mtp_loss(config)
 
 
 def deepseek_v3_671b_2l_16e() -> TPUTrainerConfig:
@@ -230,6 +284,18 @@ def deepseek_v3_debugmodel_fused_ce() -> TPUTrainerConfig:
   return _enable_pallas_cross_entropy(deepseek_v3_debugmodel())
 
 
+def deepseek_v3_debugmodel_fused_ce_mtp() -> TPUTrainerConfig:
+  """``deepseek_v3_debugmodel_mtp`` with the fused loss for every depth."""
+  return _use_mtp_loss(
+      _enable_pallas_cross_entropy(deepseek_v3_debugmodel_mtp())
+  )
+
+
+def graph_trainer_deepseek_v3_debugmodel_mtp() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_debugmodel_mtp`` on the TPU GraphTrainer."""
+  return _graph_trainer(deepseek_v3_debugmodel_mtp())
+
+
 def deepseek_v3_671b_2l_16e_fused_ce() -> TPUTrainerConfig:
   """``deepseek_v3_671b_2l_16e`` with the fused Pallas linear + cross entropy."""
   return _enable_pallas_cross_entropy(deepseek_v3_671b_2l_16e())
@@ -306,7 +372,9 @@ def deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4() -> TPUTrainerConfig:
 _TARGET_EP_DEGREE = 16
 
 
-def _target_recipe(flavor: str, expert_parallel_degree: int) -> TPUTrainerConfig:
+def _target_recipe(
+    flavor: str, expert_parallel_degree: int, num_mtp_layers: int = 0
+) -> TPUTrainerConfig:
   """The 64-chip target recipe's settings on any flavor (see below)."""
   config = _enable_pallas_cross_entropy(deepseek_v3_debugmodel())
   # pylint: disable-next=g-import-not-at-top
@@ -316,6 +384,7 @@ def _target_recipe(flavor: str, expert_parallel_degree: int) -> TPUTrainerConfig
       flavor,
       seq_len=_PROXY_CONTEXT_LENGTH,
       converters=tpu_moe_converters(),
+      num_mtp_layers=num_mtp_layers,
   )
   use_tpu_moe_kernels(
       config.model_spec.model,
@@ -349,6 +418,8 @@ def _target_recipe(flavor: str, expert_parallel_degree: int) -> TPUTrainerConfig
       enable_mfu_benchmark=True, mfu_benchmark_start_step=10
   )
   config.metrics = MetricsProcessor.Config(log_freq=1)
+  if num_mtp_layers:
+    _use_mtp_loss(config)
   return config
 
 
@@ -381,3 +452,35 @@ def deepseek_v3_671b_2l_16e_target_proxy() -> TPUTrainerConfig:
   attention, compile and token budget per rank, on 4 v6e chips.
   """
   return _target_recipe("671B-2L-16E", 4)
+
+
+def deepseek_v3_671b_31l_4x4x4_mtp() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_31l_4x4x4`` plus one MTP layer (MaxText Lineage's MTP 1).
+
+  The MTP block is a 29th MoE block (ragged EP dispatcher, Pallas experts) with
+  the decoder layers' full AC and per-block compile; its head shares the LM
+  head and runs through the fused loss (``PallasMTPCrossEntropyLoss``, MTP
+  weight 0.1 = MaxText's ``mtp_loss_scaling_factor``). 337.4B parameters
+  (MaxText reports 337.418B for its 31-layer MTP-1 proxy).
+  """
+  return _target_recipe("671B-31L", _TARGET_EP_DEGREE, num_mtp_layers=1)
+
+
+def deepseek_v3_671b_2l_16e_target_proxy_mtp() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_2l_16e_target_proxy`` plus one MTP layer (MoE, 16 experts)."""
+  return _target_recipe("671B-2L-16E", 4, num_mtp_layers=1)
+
+
+def deepseek_v3_debugmodel_target_mtp() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_31l_4x4x4_mtp``'s settings on ``debugmodel``, EP 4.
+
+  The MTP recipe's switches together (ragged EP dispatcher, Pallas experts,
+  Splash, fused loss for both depths, full AC) at end-to-end-test size.
+  """
+  return _target_recipe("debugmodel", 4, num_mtp_layers=1)
+
+
+def graph_trainer_deepseek_v3_debugmodel_target_mtp() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_debugmodel_target_mtp`` on the TPU GraphTrainer."""
+  return _graph_trainer(deepseek_v3_debugmodel_target_mtp())
+

@@ -1413,6 +1413,14 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
           mtp_layers=1,
       ),
       dict(
+          testcase_name="target_native_gmm",
+          config="deepseek_v3_671b_31l_4x4x4_native_gmm",
+          flavor="671B-31L",
+          moe_layers=28,
+          ep=16,
+          pallas=False,
+      ),
+      dict(
           testcase_name="proxy_mtp",
           config="deepseek_v3_671b_2l_16e_target_proxy_mtp",
           flavor="671B-2L-16E",
@@ -1422,7 +1430,7 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
       ),
   )
   def test_parses_with_the_target_setup(
-      self, config, flavor, moe_layers, ep, mtp_layers=0
+      self, config, flavor, moe_layers, ep, mtp_layers=0, pallas=True
   ):
     # pylint: disable=g-import-not-at-top
     import torchtitan.config
@@ -1447,7 +1455,7 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
     )
     experts = [e for _, e, _, _ in model.traverse(TpuGroupedExperts.Config)]
     self.assertLen(experts, moe_layers + mtp_layers)
-    self.assertTrue(all(e.use_pallas_grouped_mm for e in experts))
+    self.assertEqual({e.use_pallas_grouped_mm for e in experts}, {pallas})
     self.assertFalse(
         any(
             r.scale_before_down_proj

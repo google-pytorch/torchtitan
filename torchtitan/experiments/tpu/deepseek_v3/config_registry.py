@@ -33,6 +33,7 @@ __all__ = [
     "deepseek_v3_671b_2l_16e_target_proxy_mtp",
     "deepseek_v3_671b_31l_4x4x4",
     "deepseek_v3_671b_31l_4x4x4_mtp",
+    "deepseek_v3_671b_31l_4x4x4_native_gmm",
     "deepseek_v3_671b_4l_16e_target_proxy",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
@@ -380,7 +381,10 @@ _TARGET_EP_DEGREE = 16
 
 
 def _target_recipe(
-    flavor: str, expert_parallel_degree: int, num_mtp_layers: int = 0
+    flavor: str,
+    expert_parallel_degree: int,
+    num_mtp_layers: int = 0,
+    pallas_grouped_mm: bool = True,
 ) -> TPUTrainerConfig:
   """The 64-chip target recipe's settings on any flavor (see below)."""
   config = _enable_pallas_cross_entropy(deepseek_v3_debugmodel())
@@ -395,7 +399,7 @@ def _target_recipe(
   )
   use_tpu_moe_kernels(
       config.model_spec.model,
-      pallas_grouped_mm=True,
+      pallas_grouped_mm=pallas_grouped_mm,
       scale_before_down_proj=False,
   )
   config.optimizer = default_adamw(lr=2.2e-4, implementation="foreach")
@@ -570,3 +574,15 @@ def graph_trainer_deepseek_v3_debugmodel_target_mtp_graph_split() -> (
   the MTP block as its own forward and backward program.
   """
   return _use_graph_split(graph_trainer_deepseek_v3_debugmodel_target_mtp())
+
+
+def deepseek_v3_671b_31l_4x4x4_native_gmm() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_31l_4x4x4`` with native ``torch._grouped_mm`` experts.
+
+  The A/B for the target's expert kernel. At the EP-16 per-rank shape (16
+  local experts x 2,048 received rows, D 7168, F 2048) one v6e chip measured
+  native 39.2 ms vs Pallas (tile_m 512) 43.7 ms per fwd+bwd on a tight buffer
+  and 48.8 vs 54.2 ms on a 4x padded one; on the 2-layer proxy under EP 4
+  native also won (0.600 vs 0.630 s/step). Same checkpoint keys.
+  """
+  return _target_recipe("671B-31L", _TARGET_EP_DEGREE, pallas_grouped_mm=False)

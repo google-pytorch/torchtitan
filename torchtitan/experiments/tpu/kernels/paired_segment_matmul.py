@@ -6,8 +6,8 @@ weights and outputs separate while sharing that work in forward and dWeight.
 dInput keeps two grouped matmuls, but the second adds into the first's output
 in place instead of materializing a second routed-row tensor, bit-exactly.
 
-The implementation intentionally targets the exact-row, BF16 Qwen TPU path.
-It uses full N tiles and requires the total routed-row count to be a multiple
+The implementation intentionally targets the BF16 Qwen TPU path. It uses full
+N tiles and requires the row count (routed rows plus padding) to be a multiple
 of ``tile_m``. The dWeight kernel keeps two ``(K, N)`` FP32 accumulators and
 two BF16 output slabs in VMEM, so at large ``K x N`` (Qwen3-235B: 4096 x 1536
 is 105 MB) it tiles K with ``tgmm_tile_k``; the K slabs are independent, each
@@ -97,7 +97,20 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
         acc3,
     ):
         del group_offset
+        _, _, m_tile_ids = group_metadata
         grid_id = pl.program_id(1)
+        # Zero each output tile on its first visit: the masked stores below
+        # never write rows past sum(group_sizes), which would otherwise keep
+        # stale VMEM contents.
+        prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+        first_visit = jnp.logical_or(
+            grid_id == 0, m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
+        )
+
+        @pl.when(first_visit)
+        def _zero_out():
+            out1[...] = jnp.zeros_like(out1)
+            out3[...] = jnp.zeros_like(out3)
 
         acc1[...] = jnp.zeros_like(acc1)
         acc3[...] = jnp.zeros_like(acc3)
@@ -504,9 +517,13 @@ def paired_segment_matmul_pallas_2d(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply two equal-shaped expert projections while sharing lhs loads.
 
-    ``group_sizes`` must sum exactly to ``lhs.shape[0]``; this kernel does not
-    initialize a capacity-padding tail. ``tgmm_tile_k`` (0 = full K) tiles the
-    dWeight kernel's K dimension to bound its VMEM footprint.
+    ``group_sizes`` may sum to ``<= lhs.shape[0]`` (such as under dropless EP):
+    active output tiles covering ``[0, sum(group_sizes))`` are zero-initialized
+    on first visit before masked stores, while inactive tail tiles past
+    ``sum(group_sizes)`` are skipped and left unwritten. Rows past
+    ``sum(group_sizes)`` add nothing to dWeight, and their dInput rows are
+    unspecified. ``tgmm_tile_k`` (0 = full K) tiles the dWeight kernel's K
+    dimension to bound its VMEM footprint.
     """
     if rhs1.shape != rhs3.shape:
         raise ValueError("Paired grouped matmul weights must have equal shapes")

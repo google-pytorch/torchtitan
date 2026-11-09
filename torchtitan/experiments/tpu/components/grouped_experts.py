@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -324,16 +325,6 @@ class TpuGroupedExperts(GroupedExperts):
         # model is FP32, and the final result is restored to the caller's dtype.
         x_bf16 = x_RD.bfloat16()
         tile_m = self.pallas_grouped_mm_tile_m
-        # The kernels need a row count divisible by tile_m. Append zero rows to
-        # the last expert's group: they add nothing to dWeight and are sliced
-        # off the output. A no-op for tile-aligned batches.
-        num_rows = x_bf16.shape[0]
-        pad_rows = -num_rows % tile_m
-        if pad_rows:
-            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
-            num_tokens_per_expert_E = torch.cat(
-                [num_tokens_per_expert_E[:-1], num_tokens_per_expert_E[-1:] + pad_rows]
-            )
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
@@ -342,6 +333,22 @@ class TpuGroupedExperts(GroupedExperts):
             w2_tgmm_tiling = (
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
+        # The kernels need a row count divisible by tile_m and by both dWeight
+        # M tiles. Append zero rows but leave num_tokens_per_expert_E alone:
+        # every kernel skips rows past its sum, so the pad rows add nothing to
+        # dWeight and are sliced off the output. Growing the last expert's
+        # group over them instead would also pull in any rows between that sum
+        # and num_rows, such as the stale tail of a static-size EP receive
+        # buffer. A no-op for aligned batches.
+        row_align = math.lcm(
+            tile_m,
+            max(1, tgmm_tiling[0]),
+            max(1, w2_tgmm_tiling[0]),
+        )
+        num_rows = x_bf16.shape[0]
+        pad_rows = -num_rows % row_align
+        if pad_rows:
+            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16

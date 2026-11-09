@@ -30,7 +30,7 @@ import math
 
 from torch import nn
 from torchtitan.config import derive
-from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import

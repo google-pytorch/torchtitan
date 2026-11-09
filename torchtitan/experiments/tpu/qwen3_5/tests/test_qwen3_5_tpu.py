@@ -43,7 +43,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
-from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta

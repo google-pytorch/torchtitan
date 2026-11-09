@@ -1,0 +1,679 @@
+"""DeepSeek-V3 on TPU: HF reference parity, weight mapping, flavors, masking.
+
+The reference is HF transformers' ``DeepseekV3ForCausalLM`` built in-process
+from a tiny config that covers what the 671B model uses: one dense and one MoE
+layer, MLA with the q LoRA path and unequal q/k (48) and v (24) head dims, YaRN
+RoPE (interleaved pairs), sigmoid routing with group-limited top-k, the expert
+score-correction bias, normalized and scaled routing weights and a shared
+expert. MTP is not covered: HF transformers does not implement it.
+
+Weights reach the TorchTitan model the way ``--checkpoint.initial_load_in_hf``
+does: ``save_pretrained`` writes the on-disk (per-expert) safetensors layout,
+and upstream's ``DeepSeekV3StateDictAdapter.from_hf`` maps it.
+"""
+
+import os
+import shutil
+import tempfile
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import torch
+import torch.nn.functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
+from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
+import torchtitan.experiments.tpu.deepseek_v3 as deepseek_v3_tpu
+from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
+import torchtitan.models.common as common_models
+from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+import torchtitan.models.deepseek_v3 as deepseek_v3_models
+from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+
+try:
+  import transformers  # pylint: disable=g-import-not-at-top
+except ImportError:  # pragma: no cover
+  transformers = None
+
+# Tiny geometry shared by the HF reference and the TorchTitan config.
+_TINY = dict(
+    vocab_size=2048,
+    dim=128,
+    n_layers=2,
+    n_dense_layers=1,
+    n_heads=8,
+    q_lora_rank=48,
+    kv_lora_rank=32,
+    qk_nope_head_dim=32,
+    qk_rope_head_dim=16,
+    v_head_dim=24,
+    dense_hidden_dim=256,
+    moe_hidden_dim=64,
+    num_experts=8,
+    num_shared_experts=1,
+    top_k=3,
+    num_expert_groups=4,
+    num_limited_groups=2,
+    route_scale=2.5,
+    rope_theta=10000.0,
+    rope_factor=40.0,
+    original_seq_len=4096,
+    max_context_length=128,
+)
+
+# Two rows of 16 tokens, each packing three documents (6, 3, 7 tokens).
+_DOC_LENGTHS = (6, 3, 7)
+_SEQ_LEN = sum(_DOC_LENGTHS)
+_BATCH = 2
+
+
+def _tiny_hf_config():
+  t = _TINY
+  return transformers.DeepseekV3Config(
+      vocab_size=t["vocab_size"],
+      hidden_size=t["dim"],
+      intermediate_size=t["dense_hidden_dim"],
+      moe_intermediate_size=t["moe_hidden_dim"],
+      num_hidden_layers=t["n_layers"],
+      first_k_dense_replace=t["n_dense_layers"],
+      num_attention_heads=t["n_heads"],
+      num_key_value_heads=t["n_heads"],
+      q_lora_rank=t["q_lora_rank"],
+      kv_lora_rank=t["kv_lora_rank"],
+      qk_nope_head_dim=t["qk_nope_head_dim"],
+      qk_rope_head_dim=t["qk_rope_head_dim"],
+      v_head_dim=t["v_head_dim"],
+      n_routed_experts=t["num_experts"],
+      n_shared_experts=t["num_shared_experts"],
+      num_experts_per_tok=t["top_k"],
+      n_group=t["num_expert_groups"],
+      topk_group=t["num_limited_groups"],
+      routed_scaling_factor=t["route_scale"],
+      norm_topk_prob=True,
+      max_position_embeddings=t["max_context_length"],
+      rope_interleave=True,
+      rope_parameters=dict(
+          rope_type="yarn",
+          rope_theta=t["rope_theta"],
+          factor=t["rope_factor"],
+          beta_fast=32.0,
+          beta_slow=1.0,
+          original_max_position_embeddings=t["original_seq_len"],
+          mscale=1.0,
+          mscale_all_dim=1.0,
+      ),
+      tie_word_embeddings=False,
+      attn_implementation="sdpa",
+  )
+
+
+def _tiny_titan_config(
+    num_mtp_layers: int = 0,
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  """The TorchTitan side of ``_tiny_hf_config``, built like the 671B flavor.
+
+  The aux loss is off: HF has none, and it only adds a router gradient.
+  The expert-bias balancer stays on, so ``expert_bias_E`` exists and carries
+  HF's ``e_score_correction_bias``.
+  """
+  t = _TINY
+  # pylint: disable=protected-access
+  layers = deepseek_v3_models._build_dsv3_layers(
+      n_layers=t["n_layers"],
+      n_dense_layers=t["n_dense_layers"],
+      dim=t["dim"],
+      n_heads=t["n_heads"],
+      q_lora_rank=t["q_lora_rank"],
+      kv_lora_rank=t["kv_lora_rank"],
+      qk_nope_head_dim=t["qk_nope_head_dim"],
+      qk_rope_head_dim=t["qk_rope_head_dim"],
+      v_head_dim=t["v_head_dim"],
+      mscale=1.0,
+      dense_hidden_dim=t["dense_hidden_dim"],
+      moe_hidden_dim=t["moe_hidden_dim"],
+      num_experts=t["num_experts"],
+      num_shared_experts=t["num_shared_experts"],
+      router_top_k=t["top_k"],
+      router_score_func="sigmoid",
+      router_num_expert_groups=t["num_expert_groups"],
+      router_num_limited_groups=t["num_limited_groups"],
+      router_route_scale=t["route_scale"],
+      router_route_norm=True,
+      aux_loss_coeff=None,
+      attn_backend="sdpa",
+      moe_comm_backend="standard",
+      non_blocking_capacity_factor=None,
+      rope=common_models.ComplexRoPE.Config(
+          dim=t["qk_rope_head_dim"],
+          max_context_length=t["max_context_length"],
+          theta=t["rope_theta"],
+          scaling="yarn",
+          rope_factor=t["rope_factor"],
+          beta_fast=32.0,
+          beta_slow=1.0,
+          original_seq_len=t["original_seq_len"],
+      ),
+  )
+  dim, vocab_size = t["dim"], t["vocab_size"]
+  config = deepseek_v3_models.DeepSeekV3Model.Config(
+      vocab_size=vocab_size,
+      dim=dim,
+      tok_embeddings=common_models.Embedding.Config(
+          num_embeddings=vocab_size,
+          embedding_dim=dim,
+          param_init=deepseek_v3_models._EMBEDDING_INIT,
+      ),
+      norm=common_models.RMSNorm.Config(
+          normalized_shape=dim,
+          eps=1e-6,
+          param_init=deepseek_v3_models._NORM_INIT,
+      ),
+      lm_head=common_models.Linear.Config(
+          in_features=dim,
+          out_features=vocab_size,
+          param_init=deepseek_v3_models._output_linear_init(dim),
+      ),
+      layers=layers,
+      mtp_layers=deepseek_v3_models._build_mtp_layers(
+          layers[-1], dim=dim, num_mtp_layers=num_mtp_layers
+      ),
+  )
+  # pylint: enable=protected-access
+  return deepseek_v3_tpu.use_tpu_attention(config)
+
+
+def _hf_to_checkpoint_layout(state_dict):
+  """HF transformers v5 in-memory keys -> the on-disk checkpoint keys.
+
+  v5 fuses each MoE layer's experts into ``experts.gate_up_proj`` ``[E, 2F,
+  D]`` (gate rows first) and ``experts.down_proj`` ``[E, D, F]``; checkpoints
+  keep one ``experts.<e>.{gate,up,down}_proj.weight`` per expert, which is
+  what the adapter reads. Used for gradients; checked against
+  ``save_pretrained`` on the weights.
+  """
+  out = {}
+  for key, value in state_dict.items():
+    if key.endswith("mlp.experts.gate_up_proj"):
+      prefix = key[: -len("gate_up_proj")]
+      gate, up = value.chunk(2, dim=1)
+      for e in range(value.shape[0]):
+        out[f"{prefix}{e}.gate_proj.weight"] = gate[e]
+        out[f"{prefix}{e}.up_proj.weight"] = up[e]
+    elif key.endswith("mlp.experts.down_proj"):
+      prefix = key[: -len("down_proj")]
+      for e in range(value.shape[0]):
+        out[f"{prefix}{e}.down_proj.weight"] = value[e]
+    else:
+      out[key] = value
+  return out
+
+
+def _packed_positions() -> torch.Tensor:
+  return torch.cat([torch.arange(n) for n in _DOC_LENGTHS]).repeat(_BATCH)
+
+
+def assert_gradients(test, actual, reference, bound):
+  """Per-tensor relative L2 ``||g - g_ref|| / ||g_ref||`` <= ``bound``.
+
+  An absolute floor (1e-6) applies only where ``||g_ref|| < 1e-4``.
+
+  Returns:
+    ``(worst relative L2, name)``.
+  """
+  test.assertEqual(set(actual), set(reference))
+  worst = (0.0, "")
+  for name, expected in reference.items():
+    expected = expected.float().cpu()
+    got = actual[name].float().cpu()
+    norm = expected.norm().item()
+    error = (got - expected).norm().item()
+    if norm < 1e-4:
+      test.assertLessEqual(error, 1e-6, name)
+    else:
+      relative = error / norm
+      test.assertLessEqual(relative, bound, name)
+      worst = max(worst, (relative, name))
+  return worst
+
+
+class _Bf16GroupedMmDefaultPrecision(TorchDispatchMode):
+  """Runs bf16 ``torch._grouped_mm`` at DEFAULT precision on TPU.
+
+  libtpu 0.0.48 rejects HIGHEST for the bf16 ragged dot behind
+  ``torch._grouped_mm`` (the upstream experts always run bf16). Only those
+  ops (forward and backward) are scoped; every fp32 matmul stays HIGHEST.
+  """
+
+  def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    if (
+        func == torch.ops.aten._grouped_mm.default
+        and args[0].device.type == "tpu"
+        and args[0].dtype == torch.bfloat16
+    ):
+      with torch.tpu.precision(torch.tpu.Precision.DEFAULT):
+        return func(*args, **(kwargs or {}))
+    return func(*args, **(kwargs or {}))
+
+
+class TestDeepSeekV3HFReferenceParity(BaseAcceleratorDeviceTest):
+  """One forward + backward vs HF ``DeepseekV3ForCausalLM`` on packed rows."""
+
+  def setUp(self):
+    super().setUp()
+    if transformers is None or not hasattr(
+        transformers, "DeepseekV3ForCausalLM"
+    ):
+      self.skipTest("transformers with DeepseekV3ForCausalLM is required")
+    use_cpu_safe_histc_patch()
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous)
+    if self.accelerator_device.type == "tpu":
+      self.enter_context(_Bf16GroupedMmDefaultPrecision())
+
+  def _build_reference(self):
+    torch.manual_seed(0)
+    hf_model = transformers.DeepseekV3ForCausalLM(_tiny_hf_config())
+    hf_model = hf_model.float().eval()
+    with torch.no_grad():
+      for name, param in hf_model.named_parameters():
+        if "norm" in name:
+          # Unit-initialized: a dropped multiply would be invisible.
+          param.copy_(1.0 + 0.1 * torch.randn_like(param))
+        elif name.endswith("mlp.gate.weight"):
+          param.copy_(0.1 * torch.randn_like(param))
+      for name, buffer in hf_model.named_buffers():
+        if name.endswith("e_score_correction_bias"):
+          # Moves some top-k choices away from the unbiased ranking.
+          buffer.copy_(0.05 * torch.randn_like(buffer))
+    return hf_model
+
+  def test_forward_backward_matches_hf(self):
+    hf_model = self._build_reference()
+    tmp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+    hf_model.save_pretrained(tmp_dir, safe_serialization=True)
+    from safetensors.torch import load_file  # pylint: disable=g-import-not-at-top
+
+    on_disk = {}
+    for fname in os.listdir(tmp_dir):
+      if fname.endswith(".safetensors"):
+        on_disk.update(load_file(os.path.join(tmp_dir, fname)))
+    # The gradient re-layout helper reproduces save_pretrained's layout.
+    in_memory = _hf_to_checkpoint_layout(hf_model.state_dict())
+    self.assertEqual(set(in_memory), set(on_disk))
+    for key, value in on_disk.items():
+      torch.testing.assert_close(in_memory[key], value, atol=0, rtol=0)
+
+    config = _tiny_titan_config()
+    model = config.build().to(self.accelerator_device)
+    model.init_states(buffer_device=self.accelerator_device)
+    model.eval()
+    adapter = DeepSeekV3StateDictAdapter(config, None)
+    # Keys both ways: what the model asks for is exactly what is on disk ...
+    self.assertEqual(set(adapter.to_hf(model.state_dict())), set(on_disk))
+    # ... and everything on disk lands in the model.
+    missing, unexpected = model.load_state_dict(
+        adapter.from_hf(on_disk), strict=False
+    )
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    routes = ({}, {})
+
+    def record_hf(name):
+      def hook(module, inputs, output):
+        routes[0][name] = output[2].detach().sort(dim=-1).values
+
+      return hook
+
+    def record_titan(name):
+      def hook(module, inputs, output):
+        routes[1][name] = output[1].detach().cpu().sort(dim=-1).values
+
+      return hook
+
+    for i, layer in enumerate(hf_model.model.layers):
+      if hasattr(layer.mlp, "gate"):
+        layer.mlp.gate.register_forward_hook(record_hf(str(i)))
+    for name, layer in model.layers.items():
+      if layer.moe_enabled:
+        layer.moe.router.register_forward_hook(record_titan(name))
+
+    torch.manual_seed(1)
+    num_tokens = _BATCH * _SEQ_LEN
+    tokens = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    labels = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    positions = _packed_positions()
+
+    # Reference: each packed document is its own sequence.
+    hf_logits, start = [], 0
+    hf_routes = {}
+    for _ in range(_BATCH):
+      for length in _DOC_LENGTHS:
+        hf_logits.append(
+            hf_model(input_ids=tokens[start : start + length][None]).logits[0]
+        )
+        for name, value in routes[0].items():
+          hf_routes.setdefault(name, []).append(value)
+        start += length
+    hf_logits = torch.cat(hf_logits)
+    hf_loss = F.cross_entropy(hf_logits, labels)
+    hf_loss.backward()
+
+    with set_unflatten_seq_len(_SEQ_LEN):
+      logits = model(
+          tokens.to(self.accelerator_device),
+          positions.to(self.accelerator_device),
+      )
+    loss = F.cross_entropy(logits.float(), labels.to(self.accelerator_device))
+    loss.backward()
+
+    for name, value in routes[1].items():
+      torch.testing.assert_close(
+          value, torch.cat(hf_routes[name]), atol=0, rtol=0
+      )
+    self.assertNotEmpty(routes[1])
+
+    labels_kw = dict(
+        test_label=f"TorchTitan DeepSeekV3 ({self.accelerator_device.type})",
+        ref_label="HF DeepseekV3ForCausalLM (CPU)",
+    )
+    logit_error = (logits.detach().cpu() - hf_logits.detach()).abs().max()
+    loss_error = (loss.detach().cpu() - hf_loss.detach()).abs()
+    test_utils.check_equivalence(
+        logits.detach().float().cpu(),
+        hf_logits.detach(),
+        atol=2e-2,
+        rtol=1e-2,
+        check_name="Logits",
+        **labels_kw,
+    )
+    test_utils.check_equivalence(
+        loss.detach().float().cpu(),
+        hf_loss.detach(),
+        atol=2e-3,
+        rtol=1e-3,
+        check_name="Loss",
+        **labels_kw,
+    )
+
+    hf_grads = adapter.from_hf(
+        _hf_to_checkpoint_layout({
+            name: param.grad
+            for name, param in hf_model.named_parameters()
+            if param.grad is not None
+        })
+    )
+    grads = {
+        name: param.grad
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    }
+    self.assertLen(grads, len(list(model.parameters())))
+    worst = assert_gradients(self, grads, hf_grads, bound=2e-2)
+    print(
+        f"DeepSeek-V3 vs HF ({self.accelerator_device.type}): max |logit"
+        f" diff| {logit_error:.3e}, |loss diff| {loss_error:.3e}, worst"
+        f" gradient relative L2 {worst[0]:.3e} ({worst[1]})"
+    )
+    # Negative control: the bound rejects zeroed and sign-flipped gradients.
+    for multiplier in (0.0, -1.0):
+      with self.assertRaises(AssertionError):
+        assert_gradients(
+            self,
+            {n: g * multiplier for n, g in hf_grads.items()},
+            hf_grads,
+            bound=2e-2,
+        )
+
+
+class TestDeepSeekV3PackedDocumentMask(BaseAcceleratorDeviceTest):
+  """The document-masked SDPA at MLA's real head dims (q/k 192, v 128)."""
+
+  def test_matches_per_document_attention_and_fails_without_mask(self):
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous)
+    device = self.accelerator_device
+    torch.manual_seed(0)
+    heads, qk_dim, v_dim = 4, 192, 128
+    num_tokens = _BATCH * _SEQ_LEN
+    scale = qk_dim**-0.5
+    q, k = (torch.randn(num_tokens, heads, qk_dim) for _ in range(2))
+    v = torch.randn(num_tokens, heads, v_dim)
+    positions = _packed_positions()
+
+    # Independent reference on CPU: causal SDPA per document.
+    ref_inputs = [t.clone().requires_grad_() for t in (q, k, v)]
+    pieces, start = [], 0
+    for _ in range(_BATCH):
+      for length in _DOC_LENGTHS:
+        qq, kk, vv = (
+            t[start : start + length].transpose(0, 1) for t in ref_inputs
+        )
+        pieces.append(
+            F.scaled_dot_product_attention(
+                qq, kk, vv, is_causal=True, scale=scale
+            ).transpose(0, 1)
+        )
+        start += length
+    expected = torch.cat(pieces)
+    expected_grads = torch.autograd.grad(expected.square().sum(), ref_inputs)
+
+    inputs = [t.to(device).requires_grad_() for t in (q, k, v)]
+    attention = SlidingWindowScaledDotProductInnerAttention.Config().build()
+    with set_unflatten_seq_len(_SEQ_LEN):
+      actual = attention(*inputs, scale=scale, positions=positions.to(device))
+      # Control: the stock SDPA ignores positions (one causal problem/row).
+      unmasked = ScaledDotProductInnerAttention.Config().build()(
+          *inputs, scale=scale, positions=positions.to(device)
+      )
+    self.assertEqual(actual.shape, (num_tokens, heads, v_dim))
+    torch.testing.assert_close(
+        actual.detach().cpu(), expected.detach(), atol=1e-5, rtol=1e-5
+    )
+    actual_grads = torch.autograd.grad(actual.square().sum(), inputs)
+    assert_gradients(
+        self,
+        dict(enumerate(actual_grads)),
+        dict(enumerate(expected_grads)),
+        bound=1e-4,
+    )
+    relative = (
+        (unmasked.detach().cpu() - expected.detach()).norm()
+        / expected.detach().norm()
+    ).item()
+    self.assertGreater(relative, 0.1)
+
+
+class TestDeepSeekV3CompiledBiasBalancer(BaseAcceleratorDeviceTest):
+  """The auxiliary-loss-free balancer survives per-block compile.
+
+  ``MoE.forward`` accumulates ``tokens_per_expert_E`` in place; the optimizer
+  pre-hook turns the counts into an ``expert_bias_E`` update. If the compiled
+  block dropped the in-place add, the counts would stay zero and the bias
+  would never move.
+  """
+
+  def test_counter_and_bias_update_under_compile(self):
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Validates TorchTPU per-block compile (backend='tpu')")
+    from torchtitan.components.optimizer import register_moe_load_balancing_hook  # pylint: disable=g-import-not-at-top
+
+    torch.manual_seed(0)
+    config = _tiny_titan_config()
+    model = config.build().to(self.accelerator_device)
+    model.init_states(buffer_device=self.accelerator_device)
+    model.train()
+    torch._dynamo.config.capture_scalar_outputs = True
+    for layer in model.layers.values():
+      layer.compile(backend="tpu", fullgraph=True, dynamic=False)
+    num_tokens = _BATCH * _SEQ_LEN
+    tokens = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    with set_unflatten_seq_len(_SEQ_LEN):
+      logits = model(
+          tokens.to(self.accelerator_device),
+          _packed_positions().to(self.accelerator_device),
+      )
+    logits.float().square().mean().backward()
+
+    moes = [layer.moe for layer in model.layers.values() if layer.moe_enabled]
+    self.assertNotEmpty(moes)
+    for moe in moes:
+      self.assertEqual(
+          moe.tokens_per_expert_E.sum().item(), num_tokens * _TINY["top_k"]
+      )
+      self.assertEqual(moe.expert_bias_E.abs().sum().item(), 0.0)
+
+    hooks = []
+
+    class _Optimizers:
+
+      def register_step_pre_hook(self, hook):
+        hooks.append(hook)
+
+    class _ParallelDims:
+      ep_enabled = False
+      tp = 1
+
+      def get_optional_mesh(self, name):
+        del name
+        return None
+
+    register_moe_load_balancing_hook(_Optimizers(), [model], _ParallelDims())
+    self.assertLen(hooks, 1)
+    hooks[0]()
+    for moe in moes:
+      self.assertGreater(moe.expert_bias_E.abs().sum().item(), 0.0)
+      self.assertEqual(moe.tokens_per_expert_E.abs().sum().item(), 0.0)
+
+
+class TestDeepSeekV3StateDictAdapter(absltest.TestCase):
+
+  def test_round_trip_with_mtp(self):
+    config = _tiny_titan_config(num_mtp_layers=1)
+    model = config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
+    state = model.state_dict()
+    adapter = DeepSeekV3StateDictAdapter(config, None)
+    hf_state = adapter.to_hf(state)
+    # The MTP layer is HF layer index n_layers (DeepSeek's layer 61 at 671B).
+    mtp_index = _TINY["n_layers"]
+    self.assertIn(f"model.layers.{mtp_index}.eh_proj.weight", hf_state)
+    self.assertIn(
+        f"model.layers.{mtp_index}.mlp.experts.0.gate_proj.weight", hf_state
+    )
+    restored = adapter.from_hf(hf_state)
+    self.assertEqual(set(restored), set(state))
+    for key in state:
+      torch.testing.assert_close(restored[key], state[key], atol=0, rtol=0)
+
+
+class TestDeepSeekV3Flavors(parameterized.TestCase):
+
+  def test_every_flavor_uses_document_masked_sdpa(self):
+    for flavor, config in deepseek_v3_tpu.deepseekv3_configs.items():
+      for layer in [*config.layers, *config.mtp_layers]:
+        inner = layer.attention.inner_attention
+        self.assertIsInstance(
+            inner, SlidingWindowScaledDotProductInnerAttention.Config, flavor
+        )
+        self.assertIsNone(inner.window_size, flavor)
+    spec = deepseek_v3_tpu.model_registry("debugmodel", num_mtp_layers=1)
+    self.assertLen(spec.model.mtp_layers, 1)
+    self.assertIsInstance(
+        spec.model.mtp_layers[0].attention.inner_attention,
+        SlidingWindowScaledDotProductInnerAttention.Config,
+    )
+    self.assertIs(
+        spec.parallelize_fn, deepseek_v3_tpu.parallelize_deepseek_v3
+    )
+    self.assertIsNone(spec.pipelining_fn)
+
+  def test_671b_matches_reference_config(self):
+    """Upstream 671B vs the DeepSeek-V3 checkpoint config.
+
+    ``transformers.DeepseekV3Config()`` defaults are DeepSeek-V3's
+    ``config.json`` values; RoPE is YaRN factor 40 over 4096 original
+    positions, beta 32 / 1, mscale = mscale_all_dim = 1 (checkpoint
+    ``rope_scaling``).
+    """
+    if transformers is None:
+      self.skipTest("transformers is required")
+    hf = transformers.DeepseekV3Config()
+    config = deepseek_v3_tpu.deepseekv3_configs["671B"]
+    self._check_widths(config, hf)
+    self.assertLen(config.layers, hf.num_hidden_layers)
+    for i, layer in enumerate(config.layers):
+      self.assertEqual(layer.moe is None, i < hf.first_k_dense_replace, i)
+
+  def test_671b_31l_proxy(self):
+    if transformers is None:
+      self.skipTest("transformers is required")
+    hf = transformers.DeepseekV3Config()
+    spec = deepseek_v3_tpu.model_registry("671B-31L", num_mtp_layers=1)
+    config = spec.model
+    self.assertEqual(spec.flavor, "671B-31L")
+    self._check_widths(config, hf)
+    self.assertLen(config.layers, deepseek_v3_tpu.PROXY_31L_N_LAYERS)
+    self.assertEqual(
+        [layer.moe is None for layer in config.layers],
+        [True] * 3 + [False] * 28,
+    )
+    self.assertLen(config.mtp_layers, 1)
+    self.assertIsNotNone(config.mtp_layers[0].moe)
+
+  def _check_widths(self, config, hf):
+    self.assertEqual(config.vocab_size, hf.vocab_size)
+    self.assertEqual(config.dim, hf.hidden_size)
+    self.assertFalse(config.enable_weight_tying)
+    for layer in config.layers:
+      attn = layer.attention
+      self.assertEqual(attn.n_heads, hf.num_attention_heads)
+      self.assertEqual(attn.q_lora_rank, hf.q_lora_rank)
+      self.assertEqual(attn.kv_lora_rank, hf.kv_lora_rank)
+      self.assertEqual(attn.qk_nope_head_dim, hf.qk_nope_head_dim)
+      self.assertEqual(attn.qk_rope_head_dim, hf.qk_rope_head_dim)
+      self.assertEqual(attn.v_head_dim, hf.v_head_dim)
+      self.assertEqual(attn.mscale, 1.0)
+      self.assertEqual(attn.rope.scaling, "yarn")
+      self.assertEqual(attn.rope.theta, 10000.0)
+      self.assertEqual(attn.rope.rope_factor, 40.0)
+      self.assertEqual(attn.rope.original_seq_len, 4096)
+      self.assertEqual((attn.rope.beta_fast, attn.rope.beta_slow), (32.0, 1.0))
+      if layer.moe is None:
+        self.assertEqual(layer.feed_forward.w1.out_features, hf.intermediate_size)
+        continue
+      moe = layer.moe
+      router = moe.router
+      self.assertEqual(moe.num_experts, hf.n_routed_experts)
+      self.assertEqual(router.top_k, hf.num_experts_per_tok)
+      self.assertEqual(router.score_func, "sigmoid")
+      self.assertEqual(router.num_expert_groups, hf.n_group)
+      self.assertEqual(router.num_limited_groups, hf.topk_group)
+      self.assertEqual(router.route_scale, hf.routed_scaling_factor)
+      self.assertEqual(router.route_norm, hf.norm_topk_prob)
+      self.assertEqual(
+          moe.routed_experts.inner_experts.hidden_dim, hf.moe_intermediate_size
+      )
+      self.assertEqual(
+          moe.shared_experts.w1.out_features,
+          hf.moe_intermediate_size * hf.n_shared_experts,
+      )
+      # Upstream's balancing: auxiliary-loss-free expert bias + aux loss.
+      self.assertEqual(moe.load_balance_coeff, 1e-3)
+
+  def test_671b_parameter_counts(self):
+    """671B total / 37B active (DeepSeek-V3 report), MTP excluded."""
+    config = deepseek_v3_tpu.deepseekv3_configs["671B"]
+    with torch.device("meta"):
+      model = config.build()
+    nparams, _ = config.get_nparams_and_flops(model, seq_len=4096)
+    self.assertAlmostEqual(nparams / 1e9, 671.0, delta=1.0)
+
+
+if __name__ == "__main__":
+  absltest.main()

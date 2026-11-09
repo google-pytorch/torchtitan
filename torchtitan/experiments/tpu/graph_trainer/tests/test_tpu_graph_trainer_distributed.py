@@ -273,6 +273,22 @@ class TpuGraphTrainerDistributedTest(
               "--tpu_config.mfu_benchmark_start_step=1",
           ],
       ),
+      # Rung 7 (graph split) with the 31-layer MTP recipe's switches: prefix +
+      # 6 layers + the MTP block as separate forward / backward programs.
+      dict(
+          testcase_name="deepseek_v3_target_mtp_ep4_graph_split",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="graph_trainer_deepseek_v3_debugmodel_target_mtp_graph_split",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          use_splash_attention_kernel=True,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--tpu_config.mfu_benchmark_start_step=1",
+          ],
+      ),
       dict(
           testcase_name="gemma4_graph_split_offload",
           module="torchtitan.experiments.tpu.examples.gemma4",
@@ -539,7 +555,21 @@ class TpuGraphTrainerDistributedTest(
           msg=f"control, step {step}",
       )
 
-  def test_deepseek_v3_graph_trainer_matches_per_block_compile(self):
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="joint",
+          graph_trainer_config="graph_trainer_deepseek_v3_debugmodel",
+      ),
+      # Rung 7: the step as per-layer forward / backward programs (prefix + 6
+      # + 6 on debugmodel), full recompute, ZeRO-3.
+      dict(
+          testcase_name="graph_split",
+          graph_trainer_config="graph_trainer_deepseek_v3_debugmodel_graph_split",
+      ),
+  )
+  def test_deepseek_v3_graph_trainer_matches_per_block_compile(
+      self, graph_trainer_config
+  ):
     """GraphTrainer trains DeepSeek-V3 to the per-block-compile losses.
 
     Same recipe, data and seed, fp32 params and reductions; only the trainer
@@ -562,7 +592,7 @@ class TpuGraphTrainerDistributedTest(
     ]
     graph_trainer_args = _train_args(
         module,
-        "graph_trainer_deepseek_v3_debugmodel",
+        graph_trainer_config,
         use_splash_attention_kernel=False,
     ) + shape
     arms = {

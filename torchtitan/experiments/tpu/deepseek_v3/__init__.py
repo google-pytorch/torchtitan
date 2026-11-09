@@ -25,7 +25,8 @@ Flavors: the small test flavors, upstream's ``debugmodel`` / ``16B`` /
 MoE layers, same widths) that matches MaxText's half-depth DeepSeek-V3 run on
 one 4x4x4 v7x slice, and ``671B-2L-16E``, the smallest real-width proxy that
 trains on 4 v6e chips (671B's widths and routing, 1 dense + 1 MoE layer, 16
-instead of 256 routed experts), for per-rung measurements.
+instead of 256 routed experts), for per-rung measurements; ``671B-4L-16E``
+(2 dense + 2 MoE) is its deeper sibling for the graph-split rung.
 """
 
 import dataclasses
@@ -52,6 +53,7 @@ from .infra.parallelize import parallelize_deepseek_v3_graph_trainer
 
 __all__ = [
     "PROXY_31L_N_LAYERS",
+    "DEEP_671B_FLAVOR",
     "REDUCED_671B_FLAVOR",
     "deepseekv3_configs",
     "graph_trainer_model_registry",
@@ -77,7 +79,15 @@ _PROXY_FLAVORS = {"671B-31L": ("671B", PROXY_31L_N_LAYERS)}
 # third (MoE) layer (4.31B) still trains per-block compiled but leaves the
 # GraphTrainer joint program 2.2 GB short on the SDPA path (measured).
 REDUCED_671B_FLAVOR = "671B-2L-16E"
-_REDUCED_671B_SHAPE = dict(n_dense_layers=1, n_moe_layers=1, num_experts=16)
+# The graph-split (rung 7) proxy: 2 dense + 2 MoE layers, so the split sees
+# both layer types twice (heterogeneous neighbours, a dense -> MoE boundary,
+# two balancer buffers). 4.89B parameters, ~19.6 GB of FP32 parameters +
+# gradients + AdamW state per chip on 4 chips.
+DEEP_671B_FLAVOR = "671B-4L-16E"
+_REDUCED_671B_SHAPES = {
+    REDUCED_671B_FLAVOR: dict(n_dense_layers=1, n_moe_layers=1, num_experts=16),
+    DEEP_671B_FLAVOR: dict(n_dense_layers=2, n_moe_layers=2, num_experts=16),
+}
 
 
 def use_tpu_attention(
@@ -389,7 +399,10 @@ deepseekv3_configs = {
         flavor: _upstream_flavor(flavor)
         for flavor in (*_UPSTREAM_FLAVORS, *_PROXY_FLAVORS)
     },
-    REDUCED_671B_FLAVOR: _reduced_671b(**_REDUCED_671B_SHAPE, seq_len=4096),
+    **{
+        flavor: _reduced_671b(**shape, seq_len=4096)
+        for flavor, shape in _REDUCED_671B_SHAPES.items()
+    },
 }
 
 
@@ -403,7 +416,8 @@ def model_registry(
   """Returns a TPU ``ModelSpec`` for a DeepSeek-V3 flavor.
 
   Args:
-    flavor: One of upstream's flavors, ``671B-31L`` or ``671B-2L-16E``.
+    flavor: One of upstream's flavors, ``671B-31L``, ``671B-2L-16E`` or
+      ``671B-4L-16E``.
     seq_len: Context length; defaults to the flavor's maximum.
     converters: Optional model-config converters, applied before the TPU
       attention swap.
@@ -412,10 +426,10 @@ def model_registry(
   Returns:
     The model spec, using ``parallelize_deepseek_v3``.
   """
-  if flavor == REDUCED_671B_FLAVOR:
+  if flavor in _REDUCED_671B_SHAPES:
     model_spec = model_registry("671B", seq_len=seq_len)
     config = _reduced_671b(
-        **_REDUCED_671B_SHAPE,
+        **_REDUCED_671B_SHAPES[flavor],
         seq_len=model_spec.max_context_length,
         num_mtp_layers=num_mtp_layers,
     )
@@ -430,7 +444,7 @@ def model_registry(
   if base_flavor not in _UPSTREAM_FLAVORS:
     raise ValueError(
         f"Unsupported DeepSeek-V3 flavor on TPU: {flavor!r}. Supported:"
-        f" {_UPSTREAM_FLAVORS + tuple(_PROXY_FLAVORS) + (REDUCED_671B_FLAVOR,)}"
+        f" {_UPSTREAM_FLAVORS + tuple(_PROXY_FLAVORS) + tuple(_REDUCED_671B_SHAPES)}"
     )
   model_spec = deepseek_v3_models.model_registry(
       base_flavor,

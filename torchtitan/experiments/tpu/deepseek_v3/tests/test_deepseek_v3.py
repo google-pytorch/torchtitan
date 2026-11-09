@@ -1475,6 +1475,78 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
     self.assertEqual(job.compile.backend, "tpu")
 
 
+class TestDeepSeekV3GraphSplitRecipe(parameterized.TestCase):
+  """Rung 7: the GraphTrainer graph-split recipes match their per-block twins.
+
+  Same model config (layers, converters, kernels), EP, data parallelism, loss,
+  attention, batch and steps; only the trainer and its step structure differ.
+  """
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="target",
+          graph_split="graph_trainer_deepseek_v3_671b_31l_4x4x4",
+          per_block="deepseek_v3_671b_31l_4x4x4",
+          n_layers=31,
+          ep=16,
+      ),
+      dict(
+          testcase_name="target_mtp",
+          graph_split="graph_trainer_deepseek_v3_671b_31l_4x4x4_mtp",
+          per_block="deepseek_v3_671b_31l_4x4x4_mtp",
+          n_layers=31,
+          ep=16,
+      ),
+      dict(
+          testcase_name="proxy",
+          graph_split="graph_trainer_deepseek_v3_671b_4l_16e_target_proxy",
+          per_block="deepseek_v3_671b_4l_16e_target_proxy",
+          n_layers=4,
+          ep=4,
+      ),
+  )
+  def test_graph_split_recipe(self, graph_split, per_block, n_layers, ep):
+    # pylint: disable=g-import-not-at-top
+    import re
+    import torchtitan.config
+    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
+    # pylint: enable=g-import-not-at-top
+
+    def parse(name):
+      return torchtitan.config.ConfigManager().parse_args([
+          "--module=torchtitan.experiments.tpu.deepseek_v3",
+          f"--config={name}",
+      ])
+
+    def canonical(value):
+      return re.sub(r"0x[0-9a-f]+", "0x", repr(value))
+
+    job, reference = parse(graph_split), parse(per_block)
+    self.assertIsInstance(job, TpuGraphTrainer.Config)
+    self.assertLen(job.model_spec.model.layers, n_layers)
+    self.assertEqual(
+        canonical(job.model_spec.model), canonical(reference.model_spec.model)
+    )
+    for field in ("loss", "training", "splash_attention_kernel", "optimizer",
+                  "lr_scheduler", "override", "tpu_config"):
+      self.assertEqual(
+          canonical(getattr(job, field)), canonical(getattr(reference, field)),
+          field,
+      )
+    self.assertEqual(job.parallelism.expert_parallel_degree, ep)
+    self.assertEqual(job.parallelism.data_parallel_shard_degree, -1)
+    self.assertEqual(job.parallelism.fsdp_reshard_after_forward, "always")
+    split = job.compile.graph_split
+    self.assertTrue(split.enabled)
+    self.assertEqual(split.forward_layers_per_executable, 1)
+    self.assertTrue(split.forward_isolate_prefix)
+    self.assertEqual(split.backward_partition_mode, "by_layer")
+    self.assertEqual(split.backward_layers_per_executable, 1)
+    self.assertEqual(job.compile.memory_policy, "full")
+    self.assertEqual(job.compile.fsdp_barrier_policy, "none")
+    self.assertEqual(job.compile.optimizer_compile, "eager")
+
+
 class TestDeepSeekV3StateDictAdapter(absltest.TestCase):
 
   def test_round_trip_with_mtp(self):
@@ -1569,6 +1641,26 @@ class TestDeepSeekV3Flavors(parameterized.TestCase):
       model = config.build()
     params, _ = config.get_nparams_and_flops(model, 4096)
     self.assertAlmostEqual(params / 1e9, 3.373, places=3)
+
+  def test_671b_4l_16e_graph_split_proxy(self):
+    """671B's widths with 2 dense + 2 MoE layers and 16 routed experts."""
+    if transformers is None:
+      self.skipTest("transformers is required")
+    spec = deepseek_v3_tpu.model_registry(
+        deepseek_v3_tpu.DEEP_671B_FLAVOR, seq_len=4096
+    )
+    config = spec.model
+    self.assertEqual(spec.flavor, "671B-4L-16E")
+    self._check_widths(config, transformers.DeepseekV3Config(n_routed_experts=16))
+    self.assertEqual(
+        [layer.moe is None for layer in config.layers],
+        [True, True, False, False],
+    )
+    self.assertEmpty(config.mtp_layers)
+    with torch.device("meta"):
+      model = config.build()
+    params, _ = config.get_nparams_and_flops(model, 4096)
+    self.assertAlmostEqual(params / 1e9, 4.892, places=3)
 
   def _check_widths(self, config, hf):
     self.assertEqual(config.vocab_size, hf.vocab_size)

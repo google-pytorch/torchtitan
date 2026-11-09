@@ -323,10 +323,16 @@ class GraphSplitter:
           "TPU GraphTrainer graph split does not support serialized "
           "precompiled FX artifacts"
       )
+    model_config = config.model_spec.model
+    # MTP blocks (DeepSeek-V3's MTPDecoder) count as trailing layers: the TPU
+    # DeepSeek-V3 GraphTrainer setup tags their nodes ``layers.<n + i>``.
+    n_layers = len(model_config.layers) + len(
+        getattr(model_config, "mtp_layers", None) or ()
+    )
     return cls(
         enabled=enabled,
         config=split_config,
-        n_layers=len(config.model_spec.model.layers) if enabled else 0,
+        n_layers=n_layers if enabled else 0,
     )
 
   def split_and_compile(self, traced: "TracedResult") -> torch.fx.GraphModule:

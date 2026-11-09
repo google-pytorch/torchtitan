@@ -12,6 +12,7 @@ from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.graph_trainer.config import GraphSplitterConfig
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -32,6 +33,7 @@ __all__ = [
     "deepseek_v3_671b_2l_16e_target_proxy_mtp",
     "deepseek_v3_671b_31l_4x4x4",
     "deepseek_v3_671b_31l_4x4x4_mtp",
+    "deepseek_v3_671b_4l_16e_target_proxy",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
     "deepseek_v3_debugmodel_fused_ce_mtp",
@@ -43,9 +45,14 @@ __all__ = [
     "graph_trainer_deepseek_v3_671b_2l_16e_fused_ce",
     "graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe",
     "graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe_pallas",
+    "graph_trainer_deepseek_v3_671b_31l_4x4x4",
+    "graph_trainer_deepseek_v3_671b_31l_4x4x4_mtp",
+    "graph_trainer_deepseek_v3_671b_4l_16e_target_proxy",
     "graph_trainer_deepseek_v3_debugmodel",
+    "graph_trainer_deepseek_v3_debugmodel_graph_split",
     "graph_trainer_deepseek_v3_debugmodel_mtp",
     "graph_trainer_deepseek_v3_debugmodel_target_mtp",
+    "graph_trainer_deepseek_v3_debugmodel_target_mtp_graph_split",
     "graph_trainer_deepseek_v3_debugmodel_tpu_moe",
 ]
 
@@ -484,3 +491,82 @@ def graph_trainer_deepseek_v3_debugmodel_target_mtp() -> TpuGraphTrainer.Config:
   """``deepseek_v3_debugmodel_target_mtp`` on the TPU GraphTrainer."""
   return _graph_trainer(deepseek_v3_debugmodel_target_mtp())
 
+
+def _use_graph_split(config: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
+  """Rung 7: the GraphTrainer step as per-layer programs (graph splitter).
+
+  One unrolled joint program does not fit 31 layers (on ``671B-2L-16E`` its
+  XLA temp is ~2x per-block compile's), and scan is closed (3 dense + 28 MoE
+  layers with different shapes, a balancer buffer per MoE layer). The
+  splitter keeps the layers unrolled and per-layer named and cuts the traced
+  step into a prefix program (embedding), one forward program per layer, and
+  one backward program per layer with its own FSDP collectives (``by_layer``);
+  each layer is recomputed just before its backward (``full``, the per-block
+  recipe's full AC). ZeRO-3 (``reshard_after_forward="always"``) needs the
+  split; the splitter requires ``fsdp_barrier_policy="none"`` and an
+  optimizer outside the step graph (eager foreach AdamW, as per-block).
+  """
+  config.parallelism.fsdp_reshard_after_forward = "always"
+  config.compile.memory_policy = "full"
+  config.compile.enable_remat_barriers = False
+  config.compile.fsdp_barrier_policy = "none"
+  config.compile.optimizer_compile = "eager"
+  config.compile.graph_split = GraphSplitterConfig(
+      enabled=True,
+      forward_layers_per_executable=1,
+      forward_isolate_prefix=True,
+      backward_partition_mode="by_layer",
+      backward_layers_per_executable=1,
+  )
+  return config
+
+
+def graph_trainer_deepseek_v3_debugmodel_graph_split() -> TpuGraphTrainer.Config:
+  """``graph_trainer_deepseek_v3_debugmodel`` as per-layer programs (rung 7)."""
+  return _use_graph_split(_graph_trainer(deepseek_v3_debugmodel()))
+
+
+def deepseek_v3_671b_4l_16e_target_proxy() -> TPUTrainerConfig:
+  """The 64-chip target's settings on ``671B-4L-16E`` (2 dense + 2 MoE), EP 4."""
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.deepseek_v3 import DEEP_671B_FLAVOR
+
+  return _target_recipe(DEEP_671B_FLAVOR, 4)
+
+
+def graph_trainer_deepseek_v3_671b_4l_16e_target_proxy() -> (
+    TpuGraphTrainer.Config
+):
+  """``deepseek_v3_671b_4l_16e_target_proxy`` on GraphTrainer, graph split."""
+  return _use_graph_split(_graph_trainer(deepseek_v3_671b_4l_16e_target_proxy()))
+
+
+def graph_trainer_deepseek_v3_671b_31l_4x4x4() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_671b_31l_4x4x4`` on GraphTrainer as per-layer programs.
+
+  Same model, kernels, EP 16, loss, batch and steps as the per-block target;
+  the step is traced once and split by ``_use_graph_split`` (prefix, 31
+  forward and 31 backward layer programs, full recompute, ZeRO-3).
+  """
+  return _use_graph_split(_graph_trainer(deepseek_v3_671b_31l_4x4x4()))
+
+
+def graph_trainer_deepseek_v3_671b_31l_4x4x4_mtp() -> TpuGraphTrainer.Config:
+  """``graph_trainer_deepseek_v3_671b_31l_4x4x4`` plus MTP 1.
+
+  The MTP block is the 32nd layer program in each direction (its nodes are
+  tagged ``layers.31``); loss ``PallasMTPCrossEntropyLoss``.
+  """
+  return _use_graph_split(_graph_trainer(deepseek_v3_671b_31l_4x4x4_mtp()))
+
+
+def graph_trainer_deepseek_v3_debugmodel_target_mtp_graph_split() -> (
+    TpuGraphTrainer.Config
+):
+  """``graph_trainer_deepseek_v3_debugmodel_target_mtp`` as per-layer programs.
+
+  End-to-end-test size of ``graph_trainer_deepseek_v3_671b_31l_4x4x4_mtp``:
+  EP 4, Pallas experts, Splash, fused loss for both depths, graph split with
+  the MTP block as its own forward and backward program.
+  """
+  return _use_graph_split(graph_trainer_deepseek_v3_debugmodel_target_mtp())

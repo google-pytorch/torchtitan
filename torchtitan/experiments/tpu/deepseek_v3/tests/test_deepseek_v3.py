@@ -489,6 +489,134 @@ class TestDeepSeekV3PackedDocumentMask(BaseAcceleratorDeviceTest):
     self.assertGreater(relative, 0.1)
 
 
+class TestDeepSeekV3SplashAttention(BaseAcceleratorDeviceTest):
+  """Splash / tokamax replace MLA's document-masked SDPA with the same result.
+
+  The kernels' numerics, segment ids included, are ``kernels/tests``'. What is
+  DeepSeek-V3-specific: MLA is its own attention module, its q/k head dim
+  (``qk_nope + qk_rope`` = 192) differs from its v head dim (128), its softmax
+  scale carries the YaRN mscale factor, and it threads ``positions`` /
+  ``segment_ids`` to the inner attention itself. So one MLA attention at the
+  real head dims runs on a packed batch (documents 200 / 180 / 132 and 300 /
+  212 in two 512-token rows), patched on the chip vs the document-masked SDPA
+  on CPU at "highest", comparing the output and every gradient.
+
+  Bounds: relative L2 <= 1e-2 forward, <= 2.5e-2 per gradient (measured on
+  v6e: 2.0e-3 forward, worst gradient 3.1e-3, both kernels).
+
+  Controls on the reference, each outside the forward bound, so a kernel that
+  dropped the segment ids or the YaRN-scaled softmax scale fails here: without
+  the document mask it moves 7.2e-1; with the plain ``qk_head_dim**-0.5``
+  scale (1.87x smaller logits) 3.3e-2.
+  """
+
+  _DOCS = ((200, 180, 132), (300, 212))
+  _SEQ = 512
+
+  def _attention(self):
+    torch.manual_seed(0)
+    config = _tiny_titan_config(
+        dim=256,
+        n_heads=4,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        max_context_length=self._SEQ,
+    )
+    model = config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
+    attention = model.layers["0"].attention
+    with torch.no_grad():
+      for norm in (attention.q_norm, attention.kv_norm):
+        norm.weight.mul_(1.0 + 0.1 * torch.randn_like(norm.weight))
+    return attention
+
+  def _run(self, attention, x, positions, device):
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.models.common.attention import segment_ids_from_positions
+
+    attention = attention.to(device)
+    x = x.to(device).requires_grad_()
+    positions = positions.to(device)
+    with set_unflatten_seq_len(self._SEQ):
+      out = attention(
+          x,
+          None,
+          positions=positions,
+          segment_ids=segment_ids_from_positions(positions),
+      )
+    loss = (out.float() * self._probe.to(device)).sum()
+    params = dict(attention.named_parameters())
+    grads = torch.autograd.grad(loss, [x, *params.values()])
+    grads = dict(zip(["x", *params], grads))
+    return out.detach().float().cpu(), grads
+
+  @parameterized.named_parameters(
+      dict(testcase_name="splash", kernel="splash"),
+      dict(testcase_name="tokamax", kernel="tokamax"),
+  )
+  def test_matches_masked_sdpa_at_real_head_dims(self, kernel):
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Splash / tokamax are TPU Pallas kernels")
+    # pylint: disable=g-import-not-at-top
+    import copy
+    from torchtitan.experiments.tpu import workarounds
+    from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
+    # pylint: enable=g-import-not-at-top
+
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous)
+    attention = self._attention()
+    num_tokens = len(self._DOCS) * self._SEQ
+    torch.manual_seed(1)
+    x = torch.randn(num_tokens, 256)
+    self._probe = torch.randn(num_tokens, 256)
+    positions = torch.cat([torch.arange(n) for row in self._DOCS for n in row])
+
+    expected, expected_grads = self._run(
+        copy.deepcopy(attention), x, positions, torch.device("cpu")
+    )
+
+    patched = copy.deepcopy(attention)
+    if kernel == "tokamax":
+      workarounds.use_tokamax_splash_attention_patch(
+          patched, SplashAttentionKernelConfig()
+      )
+      self.assertIn("forward", vars(patched.inner_attention))
+    else:
+      workarounds.use_splash_attention_patch(
+          patched, SplashAttentionKernelConfig()
+      )
+      self.assertNotIn("ScaledDotProduct", type(patched.inner_attention).__name__)
+    actual, actual_grads = self._run(
+        patched, x, positions, self.accelerator_device
+    )
+    forward_error = ((actual - expected).norm() / expected.norm()).item()
+    self.assertLessEqual(forward_error, 1e-2)
+    worst = assert_gradients(self, actual_grads, expected_grads, bound=2.5e-2)
+    print(
+        f"[{kernel}] forward rel L2 {forward_error:.3e}; worst gradient rel L2"
+        f" {worst[0]:.3e} ({worst[1]})"
+    )
+
+    # Controls on the reference: no document mask, then the plain scale.
+    unmasked = copy.deepcopy(attention)
+    unmasked.inner_attention = ScaledDotProductInnerAttention.Config().build()
+    plain_scale = copy.deepcopy(attention)
+    plain_scale.softmax_scale = plain_scale.qk_head_dim**-0.5
+    for name, control, floor in (
+        ("unmasked", unmasked, 0.1),
+        ("plain scale", plain_scale, 2e-2),
+    ):
+      moved, _ = self._run(control, x, positions, torch.device("cpu"))
+      relative = ((moved - expected).norm() / expected.norm()).item()
+      print(f"[{kernel}] control {name}: reference moves {relative:.3e}")
+      self.assertGreater(relative, floor, name)
+
+
 class TestDeepSeekV3CompiledBiasBalancer(BaseAcceleratorDeviceTest):
   """The auxiliary-loss-free balancer survives per-block compile.
 

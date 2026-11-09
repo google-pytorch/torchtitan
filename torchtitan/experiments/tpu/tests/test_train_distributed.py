@@ -103,6 +103,43 @@ class TrainDistributedTest(
           ],
           skip_devices=[device_type.AcceleratorDeviceType.CUDA],
       ),
+      # Splash / tokamax replace MLA's document-masked SDPA (q/k head 192 vs v
+      # 128 at the debugmodel's qk_nope 128 + rope 64). Context 512 so one
+      # splash block spans the row and a row packs several documents.
+      dict(
+          testcase_name="deepseek_v3_simplefsdp_use_splash_attention_kernel",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--splash_attention_kernel.use_splash_attention_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="deepseek_v3_simplefsdp_use_tokamax_splash_attention_kernel",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       # flux
       dict(
           testcase_name="flux_tp",

@@ -457,9 +457,10 @@ def _get_splash_op_names(**splash_kwargs):
       ),
   )
   torch_fwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
+      # out: q's shape with v's head dim (MLA: q/k 192, v 128).
       # lse: (batch, num_q_heads, q_seq_len, ??)
       lambda q, k, v, segment_ids=None, cp_rank=None: (
-          torch.empty_like(q),
+          q.new_empty((*q.shape[:-1], v.shape[-1])),
           torch.empty(
               q.shape[0],
               q.shape[1],

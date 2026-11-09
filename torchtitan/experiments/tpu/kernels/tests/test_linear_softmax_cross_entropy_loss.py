@@ -12,7 +12,7 @@ from absl.testing import parameterized
 import jax.numpy as jnp
 import torch
 from torchtitan.components import loss
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss
 
 

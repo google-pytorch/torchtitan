@@ -10,14 +10,14 @@ from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
-from torchtitan.experiments.tpu.activation_checkpoint import tpu_selective_ac_config
+from torchtitan.experiments.tpu.components.activation_checkpoint import tpu_selective_ac_config
 from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
 from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
-from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 
 
 def parallelize_qwen3(

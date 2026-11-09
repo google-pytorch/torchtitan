@@ -11,8 +11,8 @@ MFU is largely about staying in the compiled path and feeding it well — the pl
 
 **Worked example.** For a demonstration of high-performance dense LLM training on TorchTPU, see the
 **llama3 sample** — `llama3` (configs in
-[`llama3/config_registry.py`](llama3/config_registry.py), e.g. `llama3_8b()`) — which runs the
-llama3 model ([`../../models/llama3/model.py`](../../models/llama3/model.py)) with the compile +
+[`llama3/config_registry.py`](../llama3/config_registry.py), e.g. `llama3_8b()`) — which runs the
+llama3 model ([`../../models/llama3/model.py`](../../../models/llama3/model.py)) with the compile +
 fused-kernel + FSDP recipe described here. Use it as the reference for how the pieces fit together.
 
 It references two companion libraries you will lean on for kernels and parallelism:
@@ -224,7 +224,7 @@ Caveats:
 Pull in the TPU Pallas kernels rather than hand-rolling — they are bridged into TorchTPU as
 `custom_call`s and both fuse compute and cut dispatches, and both compose with compilation and with
 FSDP. TorchTitan's **llama3** TPU config enables both — see
-[`llama3/config_registry.py`](llama3/config_registry.py), where the `llama3_8b()` / `llama3_70b()`
+[`llama3/config_registry.py`](../llama3/config_registry.py), where the `llama3_8b()` / `llama3_70b()`
 configs set `use_splash_attention_kernel` and `use_loss_kernel`.
 
 Both are Pallas kernels whose performance depends on their block/tile sizes: **the defaults are a
@@ -234,15 +234,15 @@ budget (below). Sweep and measure.**
 #### Fused linear + cross-entropy
 
 tokamax mosaic kernel
-([`kernels/linear_softmax_cross_entropy_loss.py`](kernels/linear_softmax_cross_entropy_loss.py)),
-wired into training by [`loss.py`](loss.py) (`pallas_cross_entropy_loss` /
+([`kernels/linear_softmax_cross_entropy_loss.py`](../kernels/linear_softmax_cross_entropy_loss.py)),
+wired into training by [`loss.py`](../components/loss.py) (`pallas_cross_entropy_loss` /
 `build_cross_entropy_loss`). Fuses the `lm_head` matmul with softmax-cross-entropy so the full
 `[batch, seq, vocab]` logits tensor is **never materialized**. Its biggest value is **memory** — at
 large vocab/batch it removes a huge activation and unblocks a larger batch (feeding §3); the
 throughput effect grows with batch and is neutral when the logits are already small.
 
 **Tile sizes** — three block sizes in
-[`LossKernelConfig` (`tpu_job_config.py`)](tpu_job_config.py): `loss_b_block_size` (default
+[`LossKernelConfig` (`tpu_job_config.py`)](../tpu_job_config.py): `loss_b_block_size` (default
 **1024**), `loss_h_block_size` (default **512**), `loss_v_block_size` (default **2048**).
 **Constraint:** the flattened token count (`batch × seq`) must be a multiple of `loss_b_block_size`,
 or the kernel silently falls back to XLA — keep it divisible by 1024. Tune `loss_v_block_size`
@@ -251,13 +251,13 @@ against your vocab size.
 #### Splash attention
 
 A flash-style TPU attention kernel
-([`kernels/splash_attention.py`](kernels/splash_attention.py)), patched into a model's attention by
-[`workarounds.py`](workarounds.py) (`use_splash_attention_patch`). It matters most at long sequence
+([`kernels/splash_attention.py`](../kernels/splash_attention.py)), patched into a model's attention by
+[`workarounds.py`](../workarounds.py) (`use_splash_attention_patch`). It matters most at long sequence
 length and under memory pressure; at short sequence it is often a wash against TorchTPU's built-in
 flash SDPA, so measure before adopting.
 
 **Tile sizes** — nine block-size knobs in
-[`SplashAttentionKernelConfig` (`tpu_job_config.py`)](tpu_job_config.py), each defaulting to
+[`SplashAttentionKernelConfig` (`tpu_job_config.py`)](../tpu_job_config.py), each defaulting to
 **512**: `sa_block_q`, `sa_block_kv`, `sa_block_dkv`, `sa_block_kv_compute`, `sa_block_q_dkv`,
 `sa_block_kv_dkv`, `sa_block_kv_dkv_compute`, `sa_block_q_dq`, `sa_block_kv_dq`. **Meaningful
 default: 512 across the board.** Larger blocks (1024/2048) can help at long sequence *if they fit
@@ -391,8 +391,8 @@ GraphTrainer (§8).
 Per-block `torch.compile` (§4) leaves everything between blocks eager, and the loss and the
 optimizer step as separate programs, eager unless compiled on their own (§7). **GraphTrainer**
 removes that surface.
-`TpuGraphTrainer` ([`graph_trainer/tpu_graph_trainer.py`](graph_trainer/tpu_graph_trainer.py)),
-the TPU subclass of TorchTitan's [GraphTrainer](../graph_trainer/README.md), traces the whole
+`TpuGraphTrainer` ([`graph_trainer/tpu_graph_trainer.py`](../graph_trainer/tpu_graph_trainer.py)),
+the TPU subclass of TorchTitan's [GraphTrainer](../../graph_trainer/README.md), traces the whole
 training step (forward, loss, backward and optionally the optimizer step) with `make_fx` into a
 single FX graph. It then runs graph passes over it and compiles the result for TPU, so the
 forward, loss and backward run as one XLA program (the optimizer step too, with
@@ -427,8 +427,8 @@ config.compile = TpuGraphTrainerCompileConfig(
 
 `compile.mode` defaults to `"aot_fx_trace"`, the joint-graph mode. In it GraphTrainer does not wrap
 blocks in `torch.compile`, so you do not compile twice. Reference recipes are `qwen3_8b()` in
-[`qwen3/config_registry.py`](qwen3/config_registry.py), which includes the in-graph optimizer, and
-the `llama3_*_scan()` recipes in [`llama3/config_registry.py`](llama3/config_registry.py).
+[`qwen3/config_registry.py`](../qwen3/config_registry.py), which includes the in-graph optimizer, and
+the `llama3_*_scan()` recipes in [`llama3/config_registry.py`](../llama3/config_registry.py).
 
 **Memory policy.** GraphTrainer ignores the eager `activation_checkpoint` config. Activation memory
 is set by `compile.memory_policy`:
@@ -524,7 +524,7 @@ For mid-size models there is a lighter third option that keeps one unrolled grap
 ### Scan over layers
 
 `compile.use_scan_layers=True` runs the decoder layers as a single `scan`
-([`graph_trainer/layer_stack.py`](graph_trainer/layer_stack.py)):
+([`graph_trainer/layer_stack.py`](../graph_trainer/layer_stack.py)):
 
 ```python
 config.compile.use_scan_layers = True
@@ -553,7 +553,7 @@ Constraints:
   shows the workarounds (an override for the counter, `metrics.enable_moe_routing = False`).
 - Some ops do not trace inside a `scan` body. Llama3's complex RoPE is one; the recipes swap in a
   bit-identical real-arithmetic override
-  ([`overrides/real_rope.py`](overrides/real_rope.py)).
+  ([`overrides/real_rope.py`](../overrides/real_rope.py)).
 - `named_parameters()` reports the stacks, not per-layer names, so anything keyed off per-layer
   parameter names stops matching. Model checkpoints keep their per-layer keys and move freely
   between scan and non-scan runs. Optimizer checkpoints do not, so a run cannot resume across a
@@ -566,7 +566,7 @@ Constraints:
 ### Graph splitter
 
 `compile.graph_split.enabled=True` keeps the layers unrolled but cuts the traced step into
-separately compiled programs ([`graph_trainer/graph_split.py`](graph_trainer/graph_split.py)). It
+separately compiled programs ([`graph_trainer/graph_split.py`](../graph_trainer/graph_split.py)). It
 first splits the step into a forward and a backward graph, then optionally subdivides each by
 layer:
 
@@ -578,7 +578,7 @@ config.compile.graph_split.backward_partition_mode = "by_layer"
 config.compile.graph_split.backward_layers_per_executable = 1
 ```
 
-The knobs, in [`GraphSplitterConfig` (`graph_trainer/config.py`)](graph_trainer/config.py):
+The knobs, in [`GraphSplitterConfig` (`graph_trainer/config.py`)](../graph_trainer/config.py):
 
 - `forward_layers_per_executable`: complete layers per forward program. The default `-1` keeps the
   forward as one program.
@@ -641,7 +641,7 @@ always offloads its one tensor. Make sure the host has that much free RAM per ra
 as one stacked `[n_layers, batch, seq, dim]` tensor. One tensor cannot be freed a row at a time, so
 all of it stays live until the backward loop ends. On Llama3-405B at long sequence that stack
 alone is why the shape does not fit. `full_and_scan_offload`
-([`graph_trainer/tpu_host_offload.py`](graph_trainer/tpu_host_offload.py)) puts one offload in the
+([`graph_trainer/tpu_host_offload.py`](../graph_trainer/tpu_host_offload.py)) puts one offload in the
 forward body and one reload in the backward body, so the device holds one layer's slice at a time.
 The value carried to the next layer stays on device, so no iteration waits on a host round trip.
 The Llama3 scan recipes above 8B need this policy to run at all.
@@ -677,7 +677,7 @@ rows per expert) wrapped in a dispatch that sorts tokens by expert and a combine
 back. Left on stock PyTorch ops, both run poorly on TPU. TorchTitan ships TPU kernels for each
 part.
 
-Reference recipes, all in [`qwen3/config_registry.py`](qwen3/config_registry.py):
+Reference recipes, all in [`qwen3/config_registry.py`](../qwen3/config_registry.py):
 `qwen3_moe_30b_fsdp_only_full_ac_benchmark()` (30B), `qwen3_moe_235b_fsdp_activation_offload_*()`
 (235B, graph splitter) and `qwen3_moe_235b_scan()` (235B, scan).
 
@@ -685,11 +685,11 @@ Reference recipes, all in [`qwen3/config_registry.py`](qwen3/config_registry.py)
 
 | Kernel | What it replaces | Switch |
 |---|---|---|
-| Grouped expert matmul ([`kernels/expert_segment_matmul.py`](kernels/expert_segment_matmul.py)) | `torch._grouped_mm` for each expert projection, forward and backward | `use_pallas_grouped_mm` |
-| Paired gate/up matmul ([`kernels/paired_segment_matmul.py`](kernels/paired_segment_matmul.py)) | two separate grouped matmuls for the gate (W1) and up (W3) projections, which read the same routed rows twice | `use_pallas_paired_grouped_mm` |
+| Grouped expert matmul ([`kernels/expert_segment_matmul.py`](../kernels/expert_segment_matmul.py)) | `torch._grouped_mm` for each expert projection, forward and backward | `use_pallas_grouped_mm` |
+| Paired gate/up matmul ([`kernels/paired_segment_matmul.py`](../kernels/paired_segment_matmul.py)) | two separate grouped matmuls for the gate (W1) and up (W3) projections, which read the same routed rows twice | `use_pallas_paired_grouped_mm` |
 | Kernel-native weight layout | a transpose of every expert weight on each call | `use_kernel_native_weight_layout` |
-| Dispatch and combine ([`token_dispatcher.py`](token_dispatcher.py)) | scatter-based autograd for the sort-by-expert reorder and the top-k combine | `TpuTokenDispatcherConverter` |
-| Route-score gradient ([`kernels/route_score.py`](kernels/route_score.py)) | a saved fp32 copy of the expert output and a separate reduction in backward | `fuse_route_score_backward` |
+| Dispatch and combine ([`token_dispatcher.py`](../components/token_dispatcher.py)) | scatter-based autograd for the sort-by-expert reorder and the top-k combine | `TpuTokenDispatcherConverter` |
+| Route-score gradient ([`kernels/route_score.py`](../kernels/route_score.py)) | a saved fp32 copy of the expert output and a separate reduction in backward | `fuse_route_score_backward` |
 
 Enable all five. The grouped matmul is the largest lever. The others remove copies and repeated
 work around it.
@@ -700,11 +700,11 @@ Two converters swap in the TPU classes when the model is built. The kernels are 
 per module:
 
 ```python
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )

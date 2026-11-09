@@ -30,19 +30,19 @@ import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.config.override import OverrideConfig
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
 from torchtitan.experiments.tpu.graph_trainer.config import apply_tpu_graph_trainer_model_transforms
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
@@ -50,9 +50,9 @@ from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
-from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter

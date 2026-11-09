@@ -19,7 +19,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils.checkpoint import CheckpointPolicy
 
-from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 import torchtitan.experiments.tpu.train
 

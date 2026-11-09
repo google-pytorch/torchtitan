@@ -9,7 +9,7 @@ from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
 )
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.models.common.attention import (
     FusedQKVLinear,
     QKVLinear,

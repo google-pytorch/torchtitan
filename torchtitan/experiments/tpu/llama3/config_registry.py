@@ -16,7 +16,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
@@ -31,7 +31,7 @@ from torchtitan.components.data.dataset import SingleDatasetConfig
 from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.experiments.graph_trainer.llama3 import (
     model_registry as graph_trainer_model_registry,
@@ -511,7 +511,7 @@ def _with_float8(
   """
 
   # Imported here so that only float8 configs require torchao.
-  from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
 
   model_spec = model_registry(
       flavor,

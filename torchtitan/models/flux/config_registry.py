@@ -29,7 +29,7 @@ from torchtitan.models.flux.utils import (
     PATCH_WIDTH,
 )
 from torchtitan.models.flux.validate import FluxValidator
-from torchtitan.experiments.tpu.datasets import TPUGrainDataLoader
+from torchtitan.experiments.tpu.components.datasets import TPUGrainDataLoader
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 
 from . import model_registry

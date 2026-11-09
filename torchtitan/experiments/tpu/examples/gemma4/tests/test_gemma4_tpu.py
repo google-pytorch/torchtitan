@@ -14,10 +14,10 @@ from torchtitan.components.loss import (
     IGNORE_INDEX,
     cross_entropy_loss,
 )
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
+from torchtitan.experiments.tpu.testing.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
 from torchtitan.experiments.tpu.examples.gemma4 import (
     _build_flavor_config,
     _build_gemma4_layers,
@@ -46,20 +46,20 @@ from torchtitan.experiments.tpu.examples.gemma4.model import (
 from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
     Gemma4StateDictAdapter,
 )
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.overrides.fused_loss import (
     FusedLossLinearWrapper,
 )
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import (
     QKVLinear,
     ScaledDotProductInnerAttention,

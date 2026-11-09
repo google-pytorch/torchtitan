@@ -71,7 +71,7 @@ the review standards for TorchTitan code, and we do not restate them here. For a
 
 [`torchtitan/experiments/tpu/README.md`](torchtitan/experiments/tpu/README.md) has the setup and
 launch instructions; the
-[TorchTPU optimization guide](torchtitan/experiments/tpu/torch-tpu-optimization-guide.md) has the
+[TorchTPU optimization guide](torchtitan/experiments/tpu/docs/torch-tpu-optimization-guide.md) has the
 tuning levers.
 
 ## Tests
@@ -88,9 +88,9 @@ name, so a test that follows the convention runs in both without any CI or build
 | `torchtitan/experiments/tpu/kernels/tests/*.py`  | one TPU chip, whatever the suffix (Pallas kernels)   |
 
 Single-chip tests subclass `BaseAcceleratorDeviceTest`
-([`base_device_test.py`](torchtitan/experiments/tpu/base_device_test.py)) and multi-chip tests
+([`base_device_test.py`](torchtitan/experiments/tpu/testing/base_device_test.py)) and multi-chip tests
 subclass `BaseDistributedDeviceTest`
-([`base_distributed_device_test.py`](torchtitan/experiments/tpu/base_distributed_device_test.py));
+([`base_distributed_device_test.py`](torchtitan/experiments/tpu/testing/base_distributed_device_test.py));
 CI checks that a `BaseDistributedDeviceTest` lives in a `*_distributed.py` file. A test may import a
 sibling test module for shared fixtures. Anything else (an unusual topology, a custom shard count, a
 dependency outside the standard set) is configured by hand on the internal side, so please call it

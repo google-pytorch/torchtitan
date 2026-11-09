@@ -222,6 +222,20 @@ def use_tpu_moe_kernels(
     # for W2, whose full-N (D = 7168) FP32 accumulator needs the smaller K.
     expert_config.pallas_grouped_mm_tgmm_tiling = (512, tile(dim, 1024), 0)
     expert_config.pallas_grouped_mm_w2_tgmm_tiling = (512, tile(hidden, 256), 0)
+    # W2 FSDP-sharded on its trailing D axis (EP 1 with an FSDP degree that
+    # does not divide the expert count, e.g. 16 experts on 128 ranks) runs
+    # W2's dWeight with a transposed RHS: an (E, D, F) output contracted over
+    # rows, the same TGMM problem as W1 / W3's, so it takes their kernel tiles
+    # (512, 1024 over D, full F). The W2 tiling above, applied to that
+    # transposed kernel (512, full D, 256 over F), needs 32.6 MiB of scoped
+    # VMEM against the 32 MiB default on v6e and TPU7x alike
+    # (CompileTimeScopedVmemOom); these tiles need 22 MiB (AOT compile,
+    # libtpu 0.0.48).
+    expert_config.pallas_grouped_mm_w2_transposed_tgmm_tiling = (
+        512,
+        0,
+        tile(dim, 1024),
+    )
   if scale_before_down_proj is None:
     scale_before_down_proj = pallas_grouped_mm
   for _, routed_config, _, _ in routed:

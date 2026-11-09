@@ -1533,6 +1533,51 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
     self.assertEqual(job.compile.backend, "tpu")
 
 
+class TestDeepSeekV3PallasExpertTiles(parameterized.TestCase):
+  """The transposed-W2 dWeight runs with W1 / W3's dWeight kernel tiles.
+
+  W2 FSDP-sharded on its trailing axis (EP 1 when the FSDP degree does not
+  divide the expert count: 16 experts on 128 ranks) makes W2's dWeight the
+  same (E, D, F) TGMM as W1 / W3's. The plain W2 tiling applied to it
+  (512, full D, 256 over F) needs 32.6 MiB of scoped VMEM, over the 32 MiB
+  default on v6e and TPU7x (AOT compile); W1 / W3's tiles need 22 MiB.
+  """
+
+  @parameterized.named_parameters(
+      dict(testcase_name="target", config="deepseek_v3_671b_31l_4x4x4"),
+      dict(
+          testcase_name="proxy", config="deepseek_v3_671b_2l_16e_target_proxy"
+      ),
+  )
+  def test_transposed_w2_dweight_uses_w13_kernel_tiles(self, config):
+    # pylint: disable=g-import-not-at-top
+    import torchtitan.config
+    from torchtitan.experiments.tpu.kernels.expert_segment_matmul import _tiling
+    # pylint: enable=g-import-not-at-top
+
+    job = torchtitan.config.ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.deepseek_v3",
+        f"--config={config}",
+    ])
+    experts = [
+        e for _, e, _, _ in job.model_spec.model.traverse(TpuGroupedExperts.Config)
+    ]
+    self.assertNotEmpty(experts)
+    for expert in experts:
+      dim, hidden = expert.dim, expert.hidden_dim
+      # The tile resolution of expert_segment_matmul._grouped_mm_bwd's dWeight:
+      # W1 / W3 (weight (E, D, F)): lhs has D columns, dout F.
+      m, k, n = expert.pallas_grouped_mm_tgmm_tiling
+      w13_kernel_tiles = _tiling(m, k, n, dim, hidden)
+      # Transposed W2 (weight stored (E, D, F)): dout has D columns, lhs F.
+      m, k, n = expert.pallas_grouped_mm_w2_transposed_tgmm_tiling
+      w2_transposed_kernel_tiles = _tiling(m, n, k, dim, hidden)
+      self.assertEqual(w2_transposed_kernel_tiles, w13_kernel_tiles)
+      self.assertEqual(w2_transposed_kernel_tiles, (512, 1024, 2048))
+      # The untransposed W2 dWeight keeps its tiling.
+      self.assertEqual(expert.pallas_grouped_mm_w2_tgmm_tiling, (512, 256, 0))
+
+
 class TestDeepSeekV3GraphSplitRecipe(parameterized.TestCase):
   """Rung 7: the GraphTrainer graph-split recipes match their per-block twins.
 

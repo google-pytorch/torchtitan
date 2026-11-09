@@ -16,9 +16,11 @@ adapter) for the TPU lane:
   parallelism is not supported on TPU, so ``pipelining_fn`` is None.
 
 Flavors: the small test flavors, upstream's ``debugmodel`` / ``16B`` /
-``236B`` / ``671B``, and ``671B-31L``, the 31-layer proxy of 671B (3 dense + 28
+``236B`` / ``671B``, ``671B-31L``, the 31-layer proxy of 671B (3 dense + 28
 MoE layers, same widths) that matches MaxText's half-depth DeepSeek-V3 run on
-one 4x4x4 v7x slice.
+one 4x4x4 v7x slice, and ``671B-2L-16E``, the smallest real-width proxy that
+trains on 4 v6e chips (671B's widths and routing, 1 dense + 1 MoE layer, 16
+instead of 256 routed experts), for per-rung measurements.
 """
 
 import dataclasses
@@ -28,13 +30,17 @@ import torchtitan.models.deepseek_v3 as deepseek_v3_models
 from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
 from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .infra.parallelize import parallelize_deepseek_v3
+from .infra.parallelize import parallelize_deepseek_v3_graph_trainer
 
 __all__ = [
     "PROXY_31L_N_LAYERS",
+    "REDUCED_671B_FLAVOR",
     "deepseekv3_configs",
+    "graph_trainer_model_registry",
     "model_registry",
     "parallelize_deepseek_v3",
     "parallelize_deepseekv3",
@@ -48,6 +54,14 @@ PROXY_31L_N_LAYERS = 31
 # Upstream flavors this module wraps, plus the proxy built from 671B.
 _UPSTREAM_FLAVORS = ("debugmodel", "16B", "236B", "671B")
 _PROXY_FLAVORS = {"671B-31L": ("671B", PROXY_31L_N_LAYERS)}
+
+# The per-rung measurement proxy: 671B widths on every axis except depth and
+# the routed-expert count, sized for 4 v6e chips (3.37B parameters, ~13.5 GB of
+# fp32 parameters + gradients + AdamW state per chip under FSDP over 4). A
+# third (MoE) layer (4.31B) still trains per-block compiled but leaves the
+# GraphTrainer joint program 2.2 GB short on the SDPA path (measured).
+REDUCED_671B_FLAVOR = "671B-2L-16E"
+_REDUCED_671B_SHAPE = dict(n_dense_layers=1, n_moe_layers=1, num_experts=16)
 
 
 def use_tpu_attention(
@@ -181,6 +195,56 @@ def _upstream_flavor(
   return use_tpu_attention(config)
 
 
+def _reduced_671b(
+    *,
+    n_dense_layers: int,
+    n_moe_layers: int,
+    num_experts: int,
+    seq_len: int,
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  """671B with fewer layers and routed experts, everything else unchanged.
+
+  Upstream's ``_671b`` has no knob for the expert count, so its layer
+  arguments are repeated here (``TestDeepSeekV3Flavors`` checks them against
+  ``transformers.DeepseekV3Config``); embeddings, final norm and head come from
+  upstream's 671B config. Group-limited routing keeps 8 groups / top-4 groups /
+  top-8 experts, so with 16 experts every group holds 2 and the top-8 are the
+  experts of the 4 chosen groups.
+  """
+  config = _upstream_flavor("671B")
+  rope = config.layers[0].attention.rope
+  # pylint: disable-next=protected-access
+  config.layers = deepseek_v3_models._build_dsv3_layers(
+      n_layers=n_dense_layers + n_moe_layers,
+      n_dense_layers=n_dense_layers,
+      dim=7168,
+      n_heads=128,
+      q_lora_rank=1536,
+      kv_lora_rank=512,
+      qk_nope_head_dim=128,
+      qk_rope_head_dim=64,
+      v_head_dim=128,
+      mscale=1.0,
+      dense_hidden_dim=18432,
+      moe_hidden_dim=2048,
+      num_experts=num_experts,
+      num_shared_experts=1,
+      router_top_k=8,
+      router_score_func="sigmoid",
+      router_num_expert_groups=8,
+      router_num_limited_groups=4,
+      router_route_scale=2.5,
+      router_route_norm=True,
+      aux_loss_coeff=1e-3,
+      attn_backend="sdpa",
+      moe_comm_backend="standard",
+      non_blocking_capacity_factor=None,
+      rope=dataclasses.replace(rope, max_context_length=seq_len),
+  )
+  config.mtp_layers = []
+  return use_tpu_attention(config)
+
+
 deepseekv3_configs = {
     "testmodel": _testmodel(),
     "testmodel_moe": _testmodel_moe(),
@@ -188,6 +252,7 @@ deepseekv3_configs = {
         flavor: _upstream_flavor(flavor)
         for flavor in (*_UPSTREAM_FLAVORS, *_PROXY_FLAVORS)
     },
+    REDUCED_671B_FLAVOR: _reduced_671b(**_REDUCED_671B_SHAPE, seq_len=4096),
 }
 
 
@@ -210,11 +275,24 @@ def model_registry(
   Returns:
     The model spec, using ``parallelize_deepseek_v3``.
   """
+  if flavor == REDUCED_671B_FLAVOR:
+    if num_mtp_layers:
+      raise ValueError(f"{flavor} has no MTP layers")
+    model_spec = model_registry("671B", seq_len=seq_len)
+    config = _reduced_671b(
+        **_REDUCED_671B_SHAPE, seq_len=model_spec.max_context_length
+    )
+    # As upstream's model_registry: converters see the final layer list.
+    if converters is not None:
+      validate_converter_order(converters)
+      for converter in converters:
+        config = converter.build().convert(config)
+    return dataclasses.replace(model_spec, flavor=flavor, model=config)
   base_flavor, n_layers = _PROXY_FLAVORS.get(flavor, (flavor, None))
   if base_flavor not in _UPSTREAM_FLAVORS:
     raise ValueError(
         f"Unsupported DeepSeek-V3 flavor on TPU: {flavor!r}. Supported:"
-        f" {_UPSTREAM_FLAVORS + tuple(_PROXY_FLAVORS)}"
+        f" {_UPSTREAM_FLAVORS + tuple(_PROXY_FLAVORS) + (REDUCED_671B_FLAVOR,)}"
     )
   model_spec = deepseek_v3_models.model_registry(
       base_flavor,
@@ -232,6 +310,29 @@ def model_registry(
       flavor=flavor,
       parallelize_fn=parallelize_deepseek_v3,
       # PP is not supported on TPU; parallelize_deepseek_v3 rejects it.
+      pipelining_fn=None,
+  )
+
+
+def graph_trainer_model_registry(flavor: str, **kwargs) -> ModelSpec:
+  """Returns the TPU GraphTrainer ``ModelSpec`` for a DeepSeek-V3 flavor.
+
+  ``model_registry``'s spec (TPU attention, MoE balancers, state-dict adapter,
+  optimizer hooks) with ``parallelize_deepseek_v3_graph_trainer``. The model
+  class stays ``DeepSeekV3Model``: every parameterized module has a
+  ``param_init``, so ``init_states`` needs no SimpleFSDP-parametrization
+  wrapper (skill ``references/model.md``).
+
+  Args:
+    flavor: As for ``model_registry``.
+    **kwargs: Forwarded to ``model_registry``.
+
+  Returns:
+    The GraphTrainer model spec.
+  """
+  return dataclasses.replace(
+      model_registry(flavor, **kwargs),
+      parallelize_fn=parallelize_deepseek_v3_graph_trainer,
       pipelining_fn=None,
   )
 

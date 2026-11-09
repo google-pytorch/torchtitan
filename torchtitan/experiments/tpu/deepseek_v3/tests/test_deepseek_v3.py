@@ -110,15 +110,15 @@ def _tiny_hf_config():
 
 
 def _tiny_titan_config(
-    num_mtp_layers: int = 0,
+    num_mtp_layers: int = 0, **overrides
 ) -> deepseek_v3_models.DeepSeekV3Model.Config:
   """The TorchTitan side of ``_tiny_hf_config``, built like the 671B flavor.
 
   The aux loss is off: HF has none, and it only adds a router gradient.
   The expert-bias balancer stays on, so ``expert_bias_E`` exists and carries
-  HF's ``e_score_correction_bias``.
+  HF's ``e_score_correction_bias``. ``overrides`` replace ``_TINY`` entries.
   """
-  t = _TINY
+  t = {**_TINY, **overrides}
   # pylint: disable=protected-access
   layers = deepseek_v3_models._build_dsv3_layers(
       n_layers=t["n_layers"],
@@ -707,6 +707,26 @@ class TestDeepSeekV3Flavors(parameterized.TestCase):
     )
     self.assertLen(config.mtp_layers, 1)
     self.assertIsNotNone(config.mtp_layers[0].moe)
+
+  def test_671b_2l_16e_measurement_proxy(self):
+    """671B's widths with 1 dense + 1 MoE layer and 16 routed experts."""
+    if transformers is None:
+      self.skipTest("transformers is required")
+    spec = deepseek_v3_tpu.model_registry(
+        deepseek_v3_tpu.REDUCED_671B_FLAVOR, seq_len=4096
+    )
+    config = spec.model
+    self.assertEqual(spec.flavor, "671B-2L-16E")
+    self._check_widths(config, transformers.DeepseekV3Config(n_routed_experts=16))
+    self.assertEqual(
+        [layer.moe is None for layer in config.layers], [True, False]
+    )
+    self.assertEmpty(config.mtp_layers)
+    self.assertEqual(config.layers[0].attention.rope.max_context_length, 4096)
+    with torch.device("meta"):
+      model = config.build()
+    params, _ = config.get_nparams_and_flops(model, 4096)
+    self.assertAlmostEqual(params / 1e9, 3.373, places=3)
 
   def _check_widths(self, config, hf):
     self.assertEqual(config.vocab_size, hf.vocab_size)

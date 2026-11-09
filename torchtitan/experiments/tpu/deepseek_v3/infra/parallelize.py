@@ -16,6 +16,11 @@ compile -> FSDP -- with three TPU differences:
   not, as in TPU Qwen3).
 
 CP, PP and EP are rejected until they are validated on TPU.
+
+``parallelize_deepseek_v3_graph_trainer`` is the GraphTrainer counterpart
+(whole-step joint graph): the same checks and shard-dim planner, then upstream
+GraphTrainer's DeepSeek-V3 setup (FQN annotation -> SimpleFSDP -> GraphTrainer
+compile).
 """
 
 import torch
@@ -24,6 +29,7 @@ import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed.compile import _maybe_regional_inductor_backend
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import parallelize_deepseekv3 as graph_trainer_parallelize_deepseekv3
 from torchtitan.experiments.tpu.qwen3_sharding import configure_qwen_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import MoE
@@ -176,3 +182,40 @@ def parallelize_deepseek_v3(
     apply_spmd_safe(model)
     model = torch.compile(model, fullgraph=True, backend="tpu")
   return model
+
+
+def parallelize_deepseek_v3_graph_trainer(
+    model: nn.Module,
+    *,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallelism: torchtitan.config.ParallelismConfig,
+    **kwargs,
+) -> nn.Module:
+  """Parallelizes a DeepSeek-V3 model for the TPU GraphTrainer.
+
+  SimpleFSDP / HSDP only. TP is rejected too: upstream's GraphTrainer TP path
+  goes through ``Module.parallelize`` with ``spmd_types``, which the TPU lane
+  does not use.
+
+  Args:
+    model: The ``DeepSeekV3Model`` (may be on meta device).
+    parallel_dims: Parallel dimensions for this run.
+    parallelism: Parallelism config.
+    **kwargs: Forwarded to upstream GraphTrainer's ``parallelize_deepseekv3``.
+
+  Returns:
+    The parallelized model.
+  """
+  _validate_supported(parallel_dims, parallelism)
+  if parallel_dims.tp_enabled:
+    raise NotImplementedError(
+        "Tensor parallelism is not supported for DeepSeek-V3 on the TPU"
+        " GraphTrainer; use SimpleFSDP / HSDP."
+    )
+  configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
+  return graph_trainer_parallelize_deepseekv3(
+      model,
+      parallel_dims=parallel_dims,
+      parallelism=parallelism,
+      **kwargs,
+  )

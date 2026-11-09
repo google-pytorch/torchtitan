@@ -30,6 +30,12 @@ _MODELS = [
 ]
 
 
+# DeepSeek-V3 GraphTrainer vs per-block compile, relative loss bound over
+# steps 1-3 (fp32 params and reductions, bf16 grouped expert matmuls).
+# Measured on v6e-4: 6.0e-8 / 8.1e-6 / 5.8e-6.
+_DSV3_GRAPH_TRAINER_RTOL = 1e-4
+
+
 def _train_args(
     module: str,
     config: str,
@@ -190,6 +196,22 @@ class TpuGraphTrainerDistributedTest(
               "--parallelism.fsdp_reshard_after_forward=always",
               "--compile.enable_remat_barriers",
               "--compile.fsdp_barrier_policy=interleave",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      # DeepSeek-V3 (MLA + MoE with the expert-bias balancer). Plain
+      # document-masked SDPA until its Splash rung; context 256 so a packed row
+      # holds several documents. SimpleFSDP / HSDP only.
+      dict(
+          testcase_name="deepseek_v3_simple_fsdp",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="graph_trainer_deepseek_v3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          use_splash_attention_kernel=False,
+          args=[
+              "--parallelism.use_simple_fsdp",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
@@ -457,6 +479,93 @@ class TpuGraphTrainerDistributedTest(
       self.assertGreater(
           abs(control_losses[step] - eager_losses[step]),
           abs(eager_losses[step]) * 1e-4,
+          msg=f"control, step {step}",
+      )
+
+  def test_deepseek_v3_graph_trainer_matches_per_block_compile(self):
+    """GraphTrainer trains DeepSeek-V3 to the per-block-compile losses.
+
+    Same recipe, data and seed, fp32 params and reductions; only the trainer
+    differs (one joint program vs one program per block). Both keep the
+    expert-bias balancer and the microbatch aux loss, so a GraphTrainer that
+    dropped the MoE counter update (the bias would never move) or a gradient
+    would diverge here once the optimizer has stepped. The match is to rounding
+    order; bound and measurement in the assertion below.
+
+    The control arm warms the learning rate up over 3 steps instead of 2 and
+    must land outside the bound at steps 2 and 3.
+    """
+    module = "torchtitan.experiments.tpu.deepseek_v3"
+    shape = [
+        "--parallelism.use_simple_fsdp",
+        "--training.max_context_length=256",
+        "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+        "--debug.seed=42",
+        "--debug.deterministic",
+    ]
+    graph_trainer_args = _train_args(
+        module,
+        "graph_trainer_deepseek_v3_debugmodel",
+        use_splash_attention_kernel=False,
+    ) + shape
+    arms = {
+        "per_block_compile": (
+            _train_args(
+                module,
+                "deepseek_v3_debugmodel",
+                use_splash_attention_kernel=False,
+            )
+            + shape,
+            True,
+        ),
+        "graph_trainer": (graph_trainer_args, False),
+        "control": (
+            graph_trainer_args + ["--lr_scheduler.warmup_steps=3"],
+            False,
+        ),
+    }
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    for arm, (config_args, enable_compile) in arms.items():
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=config_args,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=enable_compile,
+      )
+      with open(path) as f:
+        losses[arm] = json.load(f)
+
+    reference = dict(losses["per_block_compile"])
+    self.assertEqual(sorted(reference), [1, 2, 3])
+    self.assertEqual([step for step, _ in losses["graph_trainer"]], [1, 2, 3])
+    for step, graph in losses["graph_trainer"]:
+      layer = reference[step]
+      logging.info(
+          "deepseek_v3 step %d: graph_trainer loss %.7f, per_block_compile"
+          " loss %.7f, |diff| %.2e (%.2e relative)",
+          step,
+          graph,
+          layer,
+          abs(graph - layer),
+          abs(graph - layer) / abs(layer),
+      )
+      self.assertAlmostEqual(
+          graph, layer, delta=abs(layer) * _DSV3_GRAPH_TRAINER_RTOL,
+          msg=f"step {step}",
+      )
+    control_losses = dict(losses["control"])
+    for step in (2, 3):
+      logging.info(
+          "deepseek_v3 control step %d: |diff| %.2e relative",
+          step,
+          abs(control_losses[step] - reference[step]) / abs(reference[step]),
+      )
+      self.assertGreater(
+          abs(control_losses[step] - reference[step]),
+          abs(reference[step]) * _DSV3_GRAPH_TRAINER_RTOL,
           msg=f"control, step {step}",
       )
 

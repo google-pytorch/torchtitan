@@ -43,7 +43,10 @@ class TrainMinimalDistributedTest(
               # TODO(alexanderb14): Error initializing torch.distributed
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
-              # b/487028245 - Timing out w/Math Backend
+              # train_minimal does not drive upstream's MoE aux loss: "AuxLoss.
+              # set_step_denominator() must be called ... before the first
+              # forward" (v6e, 2026-11-09). test_train_distributed covers the
+              # TPU deepseek_v3 cases.
               device_type.AcceleratorDeviceType.TPU,
           ],
           loss_atol=2e-1,

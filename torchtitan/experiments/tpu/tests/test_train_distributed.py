@@ -46,15 +46,19 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
+      # The debugmodel recipe defaults to SimpleFSDP; the *_fsdp cases use
+      # FSDP2. Context 256 so a packed row holds several c4_test documents
+      # (the document-masked SDPA has work to do); 4 sequences per rank.
       dict(
           testcase_name="deepseek_v3_fsdp",
           module="torchtitan.experiments.tpu.deepseek_v3",
           config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          skip_devices=[
-              # b/487028245 - Timing out w/Math Backend
-              device_type.AcceleratorDeviceType.TPU,
+          args=[
+              "--parallelism.no-use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
       dict(
@@ -64,13 +68,40 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
+          args=[
+              "--parallelism.no-use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
           skip_devices=[
-              # b/487028245 - Timing out w/Math Backend
-              device_type.AcceleratorDeviceType.TPU,
               # b/501466433 - Bug with torch.compile
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
+      ),
+      dict(
+          testcase_name="deepseek_v3_simplefsdp",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
+          testcase_name="deepseek_v3_simplefsdp_compile",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[device_type.AcceleratorDeviceType.CUDA],
       ),
       # flux
       dict(

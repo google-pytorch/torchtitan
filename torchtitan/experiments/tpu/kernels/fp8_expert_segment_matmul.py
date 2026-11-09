@@ -216,6 +216,10 @@ def _to_i8(x: jax.Array) -> jax.Array:
 
 
 def _from_i8(x: jax.Array) -> jax.Array:
+    # Pre-quantized weights arrive as e4m3 already. On TPU an s8 -> f8
+    # bitcast-convert is a real copy, not a no-op, so skip it when possible.
+    if x.dtype == FWD_DTYPE:
+        return x
     return jax.lax.bitcast_convert_type(x, FWD_DTYPE)
 
 
@@ -656,6 +660,183 @@ _fp8_swiglu_fwd.register_autograd(
 )
 
 
+# ---------------------------------------------------------------------------
+# Pre-quantized weights. Under scan FSDP every rank gathers each layer's whole
+# expert weight and then quantizes all of it -- the same work on every rank,
+# twice per step (forward and recompute). Instead each rank quantizes only its
+# own shard, with the global per-column scale (an all-gather of the shards'
+# column absmax), and the layer is gathered as FP8: 1/world of the
+# quantization work and half the gather bytes. The weight stays e4m3 typed all
+# the way to the kernels -- on TPU an s8 -> f8 bitcast-convert is a real copy
+# of the whole gathered layer. The ops below take that FP8
+# weight plus the BF16 gathered weight; they ignore the BF16 value, which only
+# routes the weight gradient back to FSDP's reduce-scatter, so XLA drops its
+# forward all-gather.
+# ---------------------------------------------------------------------------
+
+
+@pallas.jax_op("tt_experts::weight_col_amax")
+def _weight_col_amax(w: jax.Array) -> jax.Array:
+    """``[1, N]`` FP32 absmax of ``w[..., N]`` over all other axes."""
+    w2d = w.reshape(-1, w.shape[-1])
+    return jnp.max(jnp.abs(w2d), axis=0, keepdims=True).astype(jnp.float32)
+
+
+def _scale_from_amax(amax: jax.Array) -> jax.Array:
+    return fp8_scale.scale_from_amax(amax, FWD_DTYPE)
+
+
+@pallas.jax_op("tt_experts::weight_quant_fp8")
+def _weight_quant_fp8(w: jax.Array, amax: jax.Array) -> jax.Array:
+    """e4m3 ``w`` with per-column scale from ``amax [1, N]``."""
+    scale = _scale_from_amax(amax).reshape((1,) * (w.ndim - 1) + (-1,))
+    return (w.astype(jnp.float32) / scale).astype(FWD_DTYPE)
+
+
+def prequantize_weight_shard(
+    shard: torch.Tensor, all_gather
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantizes this rank's weight shard and gathers the FP8 layer.
+
+    Args:
+      shard: ``[E_local, K, N]`` this rank's experts of one layer (any float).
+      all_gather: gathers a tensor along dim 0 across the FSDP group.
+
+    Returns:
+      ``(rhs_q [E, K, N] float8_e4m3fn, rhs_scale [1, N] FP32)``, identical to
+      quantizing the gathered weight with `quantize_operands`.
+    """
+    shard = shard.detach()
+    amax = all_gather(_weight_col_amax(shard)).amax(dim=0, keepdim=True)
+    rhs_q = all_gather(_weight_quant_fp8(shard, amax))
+    rhs_scale = torch.clamp(
+        amax / float(jnp.finfo(FWD_DTYPE).max), min=fp8_scale.MIN_SCALE
+    )
+    return rhs_q, rhs_scale
+
+
+@pallas.jax_op("tt_experts::fp8_paired_grouped_mm_pre")
+def _fp8_paired_pre_fwd(
+    lhs: jax.Array,
+    rhs_a: jax.Array,
+    rhs_b: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    fused_lhs: int,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Paired W1/W3 GEMM on the pre-quantized ``[W1 | W3]``; ignores rhs_a/b."""
+    del rhs_a, rhs_b, dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk, drhs_tn
+    rhs_q = _from_i8(rhs_q)
+    lhs_q, lhs_scale = _quantize(lhs, FWD_DTYPE, axis=1)
+    if fused_lhs:
+        out = fp8_gmm_fwd_fused_lhs(
+            lhs, rhs_q, rhs_scale, group_sizes, lhs.dtype
+        )
+    else:
+        out = fp8_gmm_fwd_quantized(
+            lhs_q,
+            lhs_scale,
+            rhs_q,
+            rhs_scale,
+            group_sizes,
+            (fwd_tm, fwd_tk, fwd_tn),
+            lhs.dtype,
+        )
+    return out, _to_i8(lhs_q), lhs_scale
+
+
+def _paired_pre_setup_context(ctx, inputs, output):
+    _, _, _, rhs_q, rhs_scale, group_sizes, *static = inputs
+    _, lhs_q, lhs_scale = output
+    ctx.mark_non_differentiable(lhs_q, lhs_scale)
+    ctx.save_for_backward(lhs_q, lhs_scale, rhs_q, rhs_scale, group_sizes)
+    ctx.num_static = len(static)
+    # Drop fused_lhs and the forward tiling.
+    ctx.bwd_tilings = tuple(static[4:])
+
+
+def _paired_pre_backward(ctx, grad_out, *unused_residual_grads):
+    del unused_residual_grads
+    grad_lhs, grad_a, grad_b = _fp8_paired_grouped_mm_bwd(
+        grad_out, *ctx.saved_tensors, *ctx.bwd_tilings
+    )
+    # lhs, rhs_a, rhs_b, rhs_q, rhs_scale, group_sizes, static ints.
+    return (grad_lhs, grad_a, grad_b, None, None, None) + (
+        None,
+    ) * ctx.num_static
+
+
+_fp8_paired_pre_fwd.register_autograd(
+    _paired_pre_backward, setup_context=_paired_pre_setup_context
+)
+
+
+@pallas.jax_op("tt_experts::fp8_swiglu_grouped_mm_pre")
+def _fp8_swiglu_pre_fwd(
+    gate_up: jax.Array,
+    rhs: jax.Array,
+    rhs_q: jax.Array,
+    rhs_scale: jax.Array,
+    group_sizes: jax.Array,
+    fused_quant: int,
+    fwd_tm: int,
+    fwd_tk: int,
+    fwd_tn: int,
+    dlhs_tm: int,
+    dlhs_tk: int,
+    dlhs_tn: int,
+    drhs_tm: int,
+    drhs_tk: int,
+    drhs_tn: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_fp8_swiglu_fwd` on the pre-quantized W2; ignores ``rhs``'s value."""
+    del rhs, dlhs_tm, dlhs_tk, dlhs_tn, drhs_tm, drhs_tk, drhs_tn
+    h_q, h_scale = swiglu_quantize(gate_up, bool(fused_quant))
+    out = fp8_gmm_fwd_quantized(
+        h_q,
+        h_scale,
+        _from_i8(rhs_q),
+        rhs_scale,
+        group_sizes,
+        (fwd_tm, fwd_tk, fwd_tn),
+        gate_up.dtype,
+    )
+    return out, _to_i8(h_q), h_scale
+
+
+def _swiglu_pre_setup_context(ctx, inputs, output):
+    gate_up, _, rhs_q, rhs_scale, group_sizes, fused_quant, *tilings = inputs
+    _, h_q, h_scale = output
+    ctx.mark_non_differentiable(h_q, h_scale)
+    ctx.save_for_backward(gate_up, h_q, h_scale, rhs_q, rhs_scale, group_sizes)
+    ctx.num_static = 1 + len(tilings)
+    ctx.bwd_static = (fused_quant, *tilings[3:])
+
+
+def _swiglu_pre_backward(ctx, grad_out, *unused_residual_grads):
+    del unused_residual_grads
+    d_gate_up, grad_rhs = _fp8_swiglu_bwd(
+        grad_out, *ctx.saved_tensors, *ctx.bwd_static
+    )
+    # gate_up, rhs, rhs_q, rhs_scale, group_sizes, fused_quant + tiling ints.
+    return (d_gate_up, grad_rhs, None, None, None) + (None,) * ctx.num_static
+
+
+_fp8_swiglu_pre_fwd.register_autograd(
+    _swiglu_pre_backward, setup_context=_swiglu_pre_setup_context
+)
+
+
 def _static(fwd: Tiling, dlhs: Tiling, drhs: Tiling) -> tuple[int, ...]:
     static = (*fwd, *dlhs, *drhs)
     assert len(static) == 9, static
@@ -705,14 +886,30 @@ def fp8_paired_segment_matmul_pallas_2d(
     drhs_tiling: Tiling = (512, 0, 0),
     split: bool = True,
     fused_lhs_quant: bool = False,
+    rhs_q: torch.Tensor | None = None,
+    rhs_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     """``(lhs @ rhs_a, lhs @ rhs_b)`` per expert as one FP8 GEMM over ``[a | b]``.
 
     Tilings are as in `fp8_segment_matmul_pallas_2d`, for N = 2 * rhs_a's N.
     With ``split=False`` returns the ``[M, 2N]`` concatenation instead. With
     ``fused_lhs_quant`` the forward GEMM quantizes lhs in-kernel (GMM v2, which
-    picks its own forward tiling).
+    picks its own forward tiling). ``rhs_q``/``rhs_scale``, from
+    `prequantize_weight_shard` on ``[a | b]``, replace quantizing ``[a | b]``;
+    ``rhs_a``/``rhs_b`` then only carry the weight gradients.
     """
+    if rhs_q is not None:
+        out, *_ = _fp8_paired_pre_fwd(
+            lhs,
+            rhs_a,
+            rhs_b,
+            rhs_q,
+            rhs_scale,
+            _int32(group_sizes),
+            int(fused_lhs_quant),
+            *_static(fwd_tiling, dlhs_tiling, drhs_tiling),
+        )
+        return out.chunk(2, dim=-1) if split else out
     op = (
         _fp8_paired_grouped_mm_fq_fwd
         if fused_lhs_quant
@@ -737,12 +934,27 @@ def fp8_swiglu_segment_matmul_pallas_2d(
     fwd_tiling: Tiling = (512, 0, 0),
     dlhs_tiling: Tiling = (512, 0, 0),
     drhs_tiling: Tiling = (512, 0, 0),
+    rhs_q: torch.Tensor | None = None,
+    rhs_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``(silu(gate) * up) @ rhs`` per expert, with ``gate_up = [gate | up]``.
 
     The hidden is quantized per row to e4m3 (by a fused Pallas kernel when
     ``fused_quant``); tilings are as in `fp8_segment_matmul_pallas_2d`.
+    ``rhs_q``/``rhs_scale`` from `prequantize_weight_shard` replace quantizing
+    ``rhs``, which then only carries the weight gradient.
     """
+    if rhs_q is not None:
+        out, *_ = _fp8_swiglu_pre_fwd(
+            gate_up,
+            rhs,
+            rhs_q,
+            rhs_scale,
+            _int32(group_sizes),
+            int(fused_quant),
+            *_static(fwd_tiling, dlhs_tiling, drhs_tiling),
+        )
+        return out
     out, *_ = _fp8_swiglu_fwd(
         gate_up,
         rhs,
@@ -761,5 +973,6 @@ __all__ = [
     "fp8_paired_segment_matmul_pallas_2d",
     "fp8_segment_matmul_pallas_2d",
     "fp8_swiglu_segment_matmul_pallas_2d",
+    "prequantize_weight_shard",
     "quantize_operands",
 ]

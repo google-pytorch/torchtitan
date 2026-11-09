@@ -287,6 +287,15 @@ class _ReduceGradOnly(torch.autograd.Function):
         return grad.to(ctx.replica_dtype), None, None, None
 
 
+def gather_like(x: torch.Tensor, spec: ScanFSDPSpec) -> torch.Tensor:
+    """All-gathers ``x`` as ``gather_slice`` gathers a sharded layer, no grad.
+
+    For tensors derived from a shard -- e.g. its FP8 bits or per-column
+    amax -- that must be gathered across the same group along the same axis.
+    """
+    return _gather_on(x, spec.gather_dim, spec.group_name)
+
+
 def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor:
     """Turns one layer's local shard into that layer's whole weight."""
     if spec is None:

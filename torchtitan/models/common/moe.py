@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal
 
@@ -18,6 +19,7 @@ import torch_remat as remat
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.experimental import implicit_replication
 
 from torchtitan.distributed.spmd_types import (
     maybe_set_sparse_mesh,
@@ -583,6 +585,44 @@ class RoutedExperts(Module):
         )
 
 
+def _replicate_plain_tensors(t: torch.Tensor):
+    """Lets ``t``'s ops mix in plain tensors (the iotas below) when it is a
+    DTensor, as under TP; a no-op for plain tensors."""
+    return implicit_replication() if isinstance(t, DTensor) else nullcontext()
+
+
+@spmd.register_local_autograd_function
+class _GatherTopKScores(torch.autograd.Function):
+    """``scores_TE.gather(-1, ids_TK)`` with a dense backward.
+
+    The stock backward scatter-adds ``grad_TK`` into a zero ``(T, E)``
+    tensor, which XLA lowers on TPU to a slow element-serial scatter. This one
+    builds it as a compare-select-sum over the K slots,
+    ``grad_TE[t, e] = sum_k where(ids_TK[t, k] == e, grad_TK[t, k], 0)``.
+    Top-k ids are distinct within a row, so each ``(t, e)`` gets at most one
+    nonzero term and the result equals the scatter-add exactly.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx, scores_TE: torch.Tensor, ids_TK: torch.Tensor
+    ) -> torch.Tensor:
+        ctx.save_for_backward(ids_TK)
+        ctx.num_experts = scores_TE.size(-1)
+        return scores_TE.gather(dim=-1, index=ids_TK)
+
+    @staticmethod
+    def backward(ctx, grad_TK: torch.Tensor):  # pyrefly: ignore[bad-override]
+        (ids_TK,) = ctx.saved_tensors
+        experts_E = torch.arange(
+            ctx.num_experts, device=ids_TK.device, dtype=ids_TK.dtype
+        )
+        with _replicate_plain_tensors(ids_TK):
+            hit_TKE = ids_TK.unsqueeze(-1) == experts_E
+            grad_TE = torch.where(hit_TKE, grad_TK.unsqueeze(-1), 0).sum(dim=-2)
+        return grad_TE, None
+
+
 class TokenChoiceTopKRouter(Module):
     """This class implements token-choice routing. In token-choice top-K routing, each token is
         routed to top K experts based on the router scores.
@@ -650,7 +690,7 @@ class TokenChoiceTopKRouter(Module):
             ).reshape(num_tokens, self.top_k)
             % self.num_experts
         )
-        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
+        topk_scores_TK = _GatherTopKScores.apply(scores_TE, topk_expert_ids_TK)
         return topk_expert_ids_TK, topk_scores_TK
 
     def _get_node_limited_routing_scores(
@@ -681,8 +721,22 @@ class TokenChoiceTopKRouter(Module):
         scores_grouped = scores_for_choice_TE.unflatten(
             -1, (self.num_expert_groups, experts_per_group)
         )
-        top2_scores_in_group, _ = scores_grouped.topk(2, dim=-1)
-        group_scores = top2_scores_in_group.sum(dim=-1)
+        # Sum of each group's top 2 scores without topk, which on TPU falls
+        # back to a bitonic sort at 32 experts per group: the max, plus the max
+        # with the first argmax masked out. Masking one position (not every
+        # copy of the max) keeps a tied max as the second value, as topk does.
+        max1_scores_in_group = scores_grouped.amax(dim=-1)
+        max1_idx_in_group = scores_grouped.argmax(dim=-1, keepdim=True)
+        experts_in_group = torch.arange(
+            experts_per_group,
+            device=max1_idx_in_group.device,
+            dtype=max1_idx_in_group.dtype,
+        )
+        with _replicate_plain_tensors(scores_grouped):
+            max2_scores_in_group = scores_grouped.masked_fill(
+                experts_in_group == max1_idx_in_group, float("-inf")
+            ).amax(dim=-1)
+        group_scores = max1_scores_in_group + max2_scores_in_group
         _, group_idx = torch.topk(
             group_scores, k=self.num_limited_groups, dim=-1, sorted=False
         )
@@ -758,7 +812,7 @@ class TokenChoiceTopKRouter(Module):
 
             # The expert bias is only used for routing. The gating value is
             # still derived from the original scores.
-            topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
+            topk_scores_TK = _GatherTopKScores.apply(scores_TE, topk_expert_ids_TK)
 
         if self.route_norm:
             denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20

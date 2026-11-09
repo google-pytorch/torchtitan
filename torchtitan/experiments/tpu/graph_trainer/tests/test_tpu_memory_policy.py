@@ -213,8 +213,8 @@ class _Attention(nn.Module):
 def _router(num_expert_groups: int | None) -> TokenChoiceTopKRouter:
     """Upstream's router: softmax top-2 of 4 experts, optionally in 2 groups.
 
-    With groups, the router keeps the best of 2 groups and then takes the
-    top-2 of its experts, so it runs three top-ks in all.
+    With groups, the router keeps the best of 2 groups (scored without a
+    top-k) and then takes the top-2 of its experts, so it runs two top-ks.
     """
     return TokenChoiceTopKRouter.Config(
         num_experts=_EXPERTS,
@@ -456,7 +456,7 @@ class TestRoutingRegion(unittest.TestCase):
             self.assertEqual(node.meta["custom"][REMAT_REGION], MOE_ROUTING)
 
     def test_selects_the_last_topk_of_each_router(self) -> None:
-        for num_expert_groups, topks_per_router in ((None, 1), (2, 3)):
+        for num_expert_groups, topks_per_router in ((None, 1), (2, 2)):
             with self.subTest(num_expert_groups=num_expert_groups):
                 torch.manual_seed(0)
                 traced, _ = _trace_toy(_MoEToy(num_expert_groups=num_expert_groups))
@@ -746,12 +746,12 @@ class TestTpuSelectivePolicy(unittest.TestCase):
     def test_saved_routing_skips_the_router_topk_recompute(self) -> None:
         # Backward needs each router's expert ids to scatter the gate-score
         # gradients. Unless they are saved, it re-runs every top-k behind
-        # them: three per router with group-limited routing, three layers.
+        # them: two per router with group-limited routing, three layers.
         for save_regions, last_n_layers, recomputed_topks in (
-            (("attention.inner_attention",), {}, 9),
+            (("attention.inner_attention",), {}, 6),
             (_ROUTING_SPLASH, {}, 0),
             # Routing saved in the last layer only: layers 0 and 1 re-run theirs.
-            (("attention.inner_attention",), {"moe.routing": 1}, 6),
+            (("attention.inner_attention",), {"moe.routing": 1}, 4),
         ):
             with self.subTest(save_regions=save_regions, last_n_layers=last_n_layers):
                 torch.manual_seed(0)

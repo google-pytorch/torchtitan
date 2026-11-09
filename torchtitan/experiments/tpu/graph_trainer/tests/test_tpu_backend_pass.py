@@ -12,6 +12,41 @@ from torchtitan.experiments.tpu.graph_trainer import tpu_backend_pass
 
 class PartitionDonationTest(absltest.TestCase):
 
+  def test_compiled_additive_buffer_updates_survive_replay(self):
+    """An add_ on a non-grad input buffer must reach the caller's tensor.
+
+    MoE.tokens_per_expert_E is such a buffer; the expert-bias balancer reads it
+    in an optimizer pre-hook. The fake compiler below returns values only, as
+    the StaticCompiler executable does, so the update survives only if the pass
+    returns it and copies it back.
+    """
+
+    def fn(counts, assignments):
+      counts.add_(assignments)
+      return assignments.sum(), "tag"
+
+    gm = make_fx(fn, tracing_mode="fake")(torch.zeros(3), torch.ones(3))
+
+    class ValueOnlyCompiler:
+
+      def __call__(self, graph, inputs, **kwargs):
+        del inputs, kwargs
+        forward = graph.forward
+        return lambda *args: forward(*(arg.clone() for arg in args))
+
+    counts = torch.zeros(3)
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=ValueOnlyCompiler,
+    ):
+      tpu_backend_pass.tpu_backend_compile_pass(gm, (counts, torch.ones(3)))
+    for total in (1, 2):
+      loss, tag = gm(counts, torch.ones(3))
+      self.assertEqual(loss.item(), 3)
+      self.assertEqual(tag, "tag")
+      torch.testing.assert_close(counts, torch.full((3,), float(total)))
+
   def _split(self, fn, inputs, partition_names):
     gm = make_fx(fn, tracing_mode="fake")(*inputs)
     partition_map = {

@@ -551,6 +551,88 @@ class TestDeepSeekV3CompiledBiasBalancer(BaseAcceleratorDeviceTest):
       self.assertEqual(moe.tokens_per_expert_E.abs().sum().item(), 0.0)
 
 
+class TestDeepSeekV3GraphTrainerBiasBalancer(BaseAcceleratorDeviceTest):
+  """The auxiliary-loss-free balancer survives the GraphTrainer compile.
+
+  GraphTrainer traces forward + loss + backward into one FX graph
+  (``minimal_fx_tracer``) and lowers it with ``tpu_backend_compile_pass``. The
+  executable returns values only, so ``MoE.tokens_per_expert_E.add_`` reaches
+  the live buffer only because the pass returns the buffer and copies it back.
+  Without that the counts stay zero, the optimizer pre-hook sees no load, and
+  ``expert_bias_E`` never moves (measured: this test fails with the pass's
+  buffer-update lifting removed).
+  """
+
+  def test_counter_and_bias_update_on_the_compiled_graph(self):
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("Validates the TPU joint-graph compiler")
+    # pylint: disable=g-import-not-at-top
+    from torchtitan.components.optimizer.optimizer import default_adamw
+    from torchtitan.components.optimizer.optimizer import register_moe_load_balancing_hook
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import run_traced
+    from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import tpu_backend_compile_pass
+    # pylint: enable=g-import-not-at-top
+
+    torch.manual_seed(0)
+    model = _tiny_titan_config().build()
+    model.init_states(buffer_device=torch.device("cpu"))
+    model = model.to(self.accelerator_device).train()
+    optimizer = default_adamw(lr=1e-3, implementation="foreach").build(
+        model_parts=[model]
+    )
+
+    class _ParallelDims:
+      ep_enabled = False
+      tp = 1
+
+      def get_optional_mesh(self, name):
+        del name
+        return None
+
+    register_moe_load_balancing_hook(optimizer, [model], _ParallelDims())
+    num_tokens = _BATCH * _SEQ_LEN
+    tokens = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    labels = torch.randint(0, _TINY["vocab_size"], (num_tokens,))
+    tokens = tokens.to(self.accelerator_device)
+    labels = labels.to(self.accelerator_device)
+    positions = _packed_positions().to(self.accelerator_device)
+
+    def step(inputs, targets, positions):
+      # The tracer swaps the module's parameters for graph inputs, so read them
+      # inside the traced function.
+      loss = F.cross_entropy(model(inputs, positions).float(), targets)
+      return loss, torch.autograd.grad(loss, tuple(model.parameters()))
+
+    moes = [layer.moe for layer in model.layers.values() if layer.moe_enabled]
+    self.assertNotEmpty(moes)
+    with set_unflatten_seq_len(_SEQ_LEN):
+      traced = minimal_fx_tracer(step, module=model)(tokens, labels, positions)
+      # Tracing runs on fake tensors; the live counters must still be zero.
+      for moe in moes:
+        self.assertEqual(moe.tokens_per_expert_E.abs().sum().item(), 0.0)
+      traced.gm = tpu_backend_compile_pass(traced.gm, traced.example_inputs)
+      run = run_traced(traced, module=model)
+      previous_bias = [moe.expert_bias_E.clone() for moe in moes]
+      for _ in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        loss, grads = run(tokens, labels, positions)
+        self.assertTrue(torch.isfinite(loss).item())
+        for param, grad in zip(model.parameters(), grads, strict=True):
+          param.grad = grad
+        for moe in moes:
+          self.assertEqual(
+              moe.tokens_per_expert_E.sum().item(), num_tokens * _TINY["top_k"]
+          )
+        optimizer.step()
+        for moe, before in zip(moes, previous_bias, strict=True):
+          self.assertEqual(moe.tokens_per_expert_E.abs().sum().item(), 0.0)
+          self.assertGreater(
+              (moe.expert_bias_E - before).abs().sum().item(), 0.0
+          )
+        previous_bias = [moe.expert_bias_E.clone() for moe in moes]
+
+
 class TestDeepSeekV3StateDictAdapter(absltest.TestCase):
 
   def test_round_trip_with_mtp(self):

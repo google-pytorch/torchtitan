@@ -1080,6 +1080,73 @@ class TestDeepSeekV3GraphTrainerBiasBalancer(BaseAcceleratorDeviceTest):
         previous_bias = [moe.expert_bias_E.clone() for moe in moes]
 
 
+class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
+  """The 64-chip recipe and its reduced proxy parse with the intended setup.
+
+  The pre-dispatch gate: the exact launch config (``--module`` / ``--config``
+  only) through ``ConfigManager``, checked for every switch the run depends
+  on; the proxy must carry the same switches on 671B-2L-16E.
+  """
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="target",
+          config="deepseek_v3_671b_31l_4x4x4",
+          flavor="671B-31L",
+          moe_layers=28,
+          ep=16,
+      ),
+      dict(
+          testcase_name="proxy",
+          config="deepseek_v3_671b_2l_16e_target_proxy",
+          flavor="671B-2L-16E",
+          moe_layers=1,
+          ep=4,
+      ),
+  )
+  def test_parses_with_the_target_setup(self, config, flavor, moe_layers, ep):
+    # pylint: disable=g-import-not-at-top
+    import torchtitan.config
+    from torchtitan.distributed.activation_checkpoint import FullAC
+    from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+    from torchtitan.experiments.tpu.ragged_ep_dispatcher import TpuRaggedEPTokenDispatcher
+    # pylint: enable=g-import-not-at-top
+
+    job = torchtitan.config.ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.deepseek_v3",
+        f"--config={config}",
+    ])
+    model = job.model_spec.model
+    self.assertEqual(job.model_spec.flavor, flavor)
+    self.assertEqual(sum(l.moe is not None for l in model.layers), moe_layers)
+    self.assertLen(
+        list(model.traverse(TpuRaggedEPTokenDispatcher.Config)), moe_layers
+    )
+    experts = [e for _, e, _, _ in model.traverse(TpuGroupedExperts.Config)]
+    self.assertLen(experts, moe_layers)
+    self.assertTrue(all(e.use_pallas_grouped_mm for e in experts))
+    self.assertFalse(
+        any(
+            r.scale_before_down_proj
+            for _, r, _, _ in model.traverse(TpuRoutedExperts.Config)
+        )
+    )
+    self.assertEqual(job.parallelism.expert_parallel_degree, ep)
+    self.assertEqual(job.parallelism.data_parallel_shard_degree, -1)
+    self.assertTrue(job.parallelism.use_simple_fsdp)
+    self.assertEqual(job.training.max_context_length, 4096)
+    self.assertEqual(job.training.num_tokens_per_microbatch_per_dp_rank, 4096)
+    self.assertIsInstance(job.loss, PallasCrossEntropyLoss.Config)
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head",
+        job.override.imports,
+    )
+    self.assertTrue(job.splash_attention_kernel.use_splash_attention_kernel)
+    self.assertIsInstance(job.activation_checkpoint, FullAC.Config)
+    self.assertTrue(job.compile.enable)
+    self.assertEqual(job.compile.backend, "tpu")
+
+
 class TestDeepSeekV3StateDictAdapter(absltest.TestCase):
 
   def test_round_trip_with_mtp(self):

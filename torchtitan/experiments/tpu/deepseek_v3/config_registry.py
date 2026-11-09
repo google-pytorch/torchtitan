@@ -9,11 +9,14 @@ from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
+from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
@@ -23,6 +26,8 @@ __all__ = [
     "deepseek_v3_671b_2l_16e_tpu_moe",
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas",
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4",
+    "deepseek_v3_671b_2l_16e_target_proxy",
+    "deepseek_v3_671b_31l_4x4x4",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
     "deepseek_v3_debugmodel_tpu_moe",
@@ -296,3 +301,83 @@ def deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4() -> TPUTrainerConfig:
       expert_parallel_degree=4,
   )
 
+
+# The 64-chip target: one tpu7x 4x4x4 slice, 128 ranks (one per TensorCore).
+_TARGET_EP_DEGREE = 16
+
+
+def _target_recipe(flavor: str, expert_parallel_degree: int) -> TPUTrainerConfig:
+  """The 64-chip target recipe's settings on any flavor (see below)."""
+  config = _enable_pallas_cross_entropy(deepseek_v3_debugmodel())
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.deepseek_v3 import model_registry, tpu_moe_converters, use_tpu_moe_kernels
+
+  config.model_spec = model_registry(
+      flavor,
+      seq_len=_PROXY_CONTEXT_LENGTH,
+      converters=tpu_moe_converters(),
+  )
+  use_tpu_moe_kernels(
+      config.model_spec.model,
+      pallas_grouped_mm=True,
+      scale_before_down_proj=False,
+  )
+  config.optimizer = default_adamw(lr=2.2e-4, implementation="foreach")
+  config.lr_scheduler = LRSchedulersContainer.Config(
+      warmup_steps=10,
+      decay_ratio=0.8,
+      decay_type="linear",
+      min_lr_factor=0.0,
+  )
+  config.training = TrainingConfig(
+      num_tokens_per_microbatch_per_dp_rank=_PROXY_CONTEXT_LENGTH,
+      max_context_length=_PROXY_CONTEXT_LENGTH,
+      steps=30,
+  )
+  config.parallelism = ParallelismConfig(
+      use_simple_fsdp=True,
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=expert_parallel_degree,
+  )
+  config.activation_checkpoint = FullAC.Config()
+  config.splash_attention_kernel = SplashAttentionKernelConfig(
+      use_splash_attention_kernel=True
+  )
+  config.compile = TpuTrainerCompileConfig(enable=True, backend="tpu")
+  config.checkpoint = CheckpointManager.Config(enable=False)
+  config.tpu_config = TPUConfig(
+      enable_mfu_benchmark=True, mfu_benchmark_start_step=10
+  )
+  config.metrics = MetricsProcessor.Config(log_freq=1)
+  return config
+
+
+def deepseek_v3_671b_31l_4x4x4() -> TPUTrainerConfig:
+  """``671B-31L`` (3 dense + 28 MoE, 256 experts top-8) on tpu7x-4x4x4.
+
+  Per-block compile, SimpleFSDP over all 128 ranks (one per TensorCore) for
+  the dense weights, EP 16 (16 experts per rank; expert banks FSDP-sharded
+  over the 8-way EDP mesh), the static-shape ragged EP dispatcher, Pallas
+  grouped matmul (scores after the return exchange), Splash with segment ids,
+  fused linear + CE, full AC. Global batch 128 x 4096 (one 4096-token sequence
+  per rank), MaxText Lineage's. bf16 experts, dropless, MTP 0 (the TPU
+  trainer has no MTP loss yet); MaxText's run is fp8 experts, capacity factor
+  3.0, MTP 1, so compare tokens/s/device, not MFU.
+
+  EP degree: the dropless receive buffer is ``EP x 32768`` rows of 7168 bf16
+  (7.5 GB at EP 16, 30 GB at EP 64, 60 GB at EP 128), so EP 64 / 128 do not
+  fit a 96 GiB rank next to ~42 GB of FP32 state; lower EP gathers more
+  expert weights per layer over the EDP mesh. ``--parallelism.
+  expert_parallel_degree=32`` is the next step up if EP 16's peak HBM leaves
+  room. Per-rank estimate in the onboarding record.
+  """
+  return _target_recipe("671B-31L", _TARGET_EP_DEGREE)
+
+
+def deepseek_v3_671b_2l_16e_target_proxy() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_31l_4x4x4``'s exact settings on ``671B-2L-16E``, EP 4.
+
+  The pre-dispatch gate's reduced proxy: same dispatcher, kernels, AC, loss,
+  attention, compile and token budget per rank, on 4 v6e chips.
+  """
+  return _target_recipe("671B-2L-16E", 4)

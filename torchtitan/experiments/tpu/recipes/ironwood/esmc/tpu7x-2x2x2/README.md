@@ -26,10 +26,10 @@ export DATA=PATH_TO_DATA       # holds uniref50/ parquet, see ../README.md
   run as 2 hosts x 8 processes. Throughput and MFU below are per device (per
   TensorCore) against the per-core bf16 peak of 1,153.5 TFLOP/s.
 - **No rematerialization (`memory_policy="default"`)**: 16 sequences of 2,048
-  tokens per device per microbatch (32,768 tokens, 65.4 GiB HBM) is the largest
+  tokens per device per microbatch (32,768 tokens, 65.2 GiB HBM) is the largest
   power-of-two divisor of 64 sequences that fits 96 GiB without activation
   rematerialization (32 sequences exceeds 96 GiB; 1-microbatch 64 x 2,048 with
-  `tpu_selective` remat runs at 25.1% MFU). 16 devices x 8 microbatches x 32,768
+  `tpu_selective` remat runs at 30.7% MFU). 16 devices x 8 microbatches x 32,768
   tokens = 4,194,304 tokens per optimizer step.
 
 ## Training Configuration Details
@@ -46,8 +46,11 @@ protein packing, MLM with `r_mask = 0.15`, AdamW (`lr=3.1e-4`, `betas=(0.9, 0.95
 100-step warmup then cosine decay to 10%, `TpuGraphTrainer` (`aot_fx_trace`,
 joint forward+loss+backward XLA program with `memory_policy="default"`,
 `compile_grad_norm`, `compile_optimizer`), SimpleFSDP, fused Pallas
-QK-LayerNorm + RoPE + heads-first kernel (`esmc_fused_qk_norm_rope`), and Splash
-Attention with 2,048 blocks.
+QK-LayerNorm + RoPE + heads-first kernel (`esmc_fused_qk_norm_rope`, single
+cross-lane reduction per row tile, adaptive `block_s=1024`), saved-sigmoid
+SwiGLU (`esmc_swiglu_saved_sigmoid`), Splash Attention with 2,048 blocks, and
+`libtpu_init_flags` (`xla_tpu_reduce_window_reduction_dim_max=0`,
+`xla_tpu_scoped_vmem_limit_kib=65472`, `xla_tpu_dvfs_p_state=7`).
 
 ## Training Command
 
@@ -94,14 +97,14 @@ Measured on a `tpu7x-16` slice (`2x2x2`, 16 devices across 2 hosts), libtpu
 
 | config | devices | microbatches / step | tokens / step | TPS/device | TFLOP/s/device | MFU | s/step | HBM |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `hf_esmc600m_mlm_uniref50_tpu7x16` (no remat) | 16 | 8 | 4.19M | **69,500** | 311 | **27.0%** | 3.77 | 65.4 GiB |
-| `hf_esmc_mlm_uniref50_graph` (1-microbatch, no remat) | 16 | 1 | 524k | **72,400** | 324 | **28.0%** | 0.45 | 65.4 GiB |
+| `hf_esmc600m_mlm_uniref50_tpu7x16` (no remat) | 16 | 8 | 4.19M | **84,200** | 376 | **32.6%** | 3.11 | 65.2 GiB |
+| `hf_esmc_mlm_uniref50_graph` (1-microbatch, no remat) | 16 | 1 | 524k | **87,700** | 392 | **34.0%** | 0.37 | 65.2 GiB |
 | `hf_esmc_mlm_uniref50` (per-layer compile + AC) | 16 | 4 | 4.19M | 53,318 | 238 | 20.7% | 4.92 | 6.0 GiB |
 
-Total cluster throughput at the 4.19M-token step on `tpu7x-16`: **1.11M tokens/s**
-(up from 0.85M tokens/s / 20.7% MFU with per-layer `torch.compile` + activation
-checkpointing, and up from 0.90M tokens/s / 21.9% MFU for per-layer
-`torch.compile` without rematerialization).
+Total cluster throughput at the 4.19M-token step on `tpu7x-16`: **1.35M tokens/s**
+(up from 1.11M tokens/s / 27.0% MFU before the kernel, SwiGLU and compiler-flag
+tuning, and up from 0.85M tokens/s / 20.7% MFU with per-layer `torch.compile` +
+activation checkpointing).
 
 ## Convergence Parity (5.0B UniRef50 Tokens)
 
@@ -110,5 +113,7 @@ Head-to-head UniRef50 MLM pretraining over 4,770 steps of 1,048,576 tokens
 identical MLM loss and gradient-norm trajectories (`2.3684` vs `2.3680` at 5.0B,
 `mean Δloss = -0.00098` nats, zero gradient spikes) while cutting 8-TC wall time
 from **3.14h to 2.49h (1.26x, −20.6%)**:
+
+![ESMC-600M 34.0% MFU Waterfall & 600-Step UniRef50 Parity](../assets/esmc_600m_mfu34_waterfall_and_parity.png)
 
 ![ESMC-600M 5.0B UniRef50 MLM Loss Parity](../assets/esmc_600m_5b_loss_parity.png)

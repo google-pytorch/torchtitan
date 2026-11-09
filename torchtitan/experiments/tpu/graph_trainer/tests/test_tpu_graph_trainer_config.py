@@ -1788,13 +1788,33 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     from torchtitan.experiments.tpu.transformers_modeling_backend.config_registry import (
         as_cpu_reference,
         hf_esmc600m_mlm_uniref50_tpu7x16,
+        hf_esmc_mlm_uniref50,
         hf_esmc_mlm_uniref50_graph,
     )
+    from torchtitan.experiments.tpu.transformers_modeling_backend.model import (
+        _EsmcTPUSwiGLUMLP,
+        _SwiGLUSavedSigmoid,
+        _use_tpu_esmc_attention,
+    )
+
+    base_esmc = hf_esmc_mlm_uniref50()
+    self.assertEqual(dict(base_esmc.libtpu_init_flags), {})
+    self.assertFalse(base_esmc.esmc_swiglu_saved_sigmoid)
 
     tpu7x16 = hf_esmc600m_mlm_uniref50_tpu7x16()
     self.assertEqual(tpu7x16.hf_model, "biohub/ESMC-600M")
     self.assertTrue(tpu7x16.tpu_config.use_graph_trainer)
     self.assertEqual(tpu7x16.tpu_config.graph_trainer_memory_policy, "default")
+    self.assertTrue(tpu7x16.esmc_fused_qk_norm_rope)
+    self.assertTrue(tpu7x16.esmc_swiglu_saved_sigmoid)
+    self.assertEqual(
+        dict(tpu7x16.libtpu_init_flags),
+        {
+            "xla_tpu_dvfs_p_state": "7",
+            "xla_tpu_scoped_vmem_limit_kib": "65472",
+            "xla_tpu_reduce_window_reduction_dim_max": "0",
+        },
+    )
     self.assertEqual(
         tpu7x16.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
     )
@@ -1808,6 +1828,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertFalse(cpu_ref.tpu_config.compile_grad_norm)
     self.assertFalse(cpu_ref.tpu_config.compile_optimizer)
     self.assertFalse(cpu_ref.esmc_fused_qk_norm_rope)
+    self.assertFalse(cpu_ref.esmc_swiglu_saved_sigmoid)
 
     config = hf_esmc_mlm_uniref50_graph()
     self.assertTrue(config.tpu_config.use_graph_trainer)
@@ -1815,6 +1836,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertTrue(config.tpu_config.compile_grad_norm)
     self.assertTrue(config.tpu_config.compile_optimizer)
     self.assertTrue(config.esmc_fused_qk_norm_rope)
+    self.assertTrue(config.esmc_swiglu_saved_sigmoid)
+    self.assertEqual(
+        dict(config.libtpu_init_flags),
+        {
+            "xla_tpu_dvfs_p_state": "7",
+            "xla_tpu_scoped_vmem_limit_kib": "65472",
+            "xla_tpu_reduce_window_reduction_dim_max": "0",
+        },
+    )
     self.assertEqual(config.metrics.log_freq, 25)
 
     assert config.model_spec is not None
@@ -1831,11 +1861,65 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.model_spec.model.n_layers, orig_n_layers)
 
     self.assertTrue(graph_config.esmc_fused_qk_norm_rope)
+    self.assertTrue(graph_config.esmc_swiglu_saved_sigmoid)
     self.assertEqual(graph_config.metrics.log_freq, 25)
     self.assertIs(
         graph_config.model_spec.parallelize_fn,
         hf_gt.parallelize_hf_transformers_graph,
     )
+
+    # Verify `_SwiGLUSavedSigmoid` numerics and class-level `_EsmcTPUSwiGLUMLP`
+    # installation (shared unbound `forward` across layers, SiLU-only guard).
+    torch.manual_seed(0)
+    gate = torch.randn(4, 32, dtype=torch.bfloat16, requires_grad=True)
+    up = torch.randn(4, 32, dtype=torch.bfloat16, requires_grad=True)
+    dh = torch.randn(4, 32, dtype=torch.bfloat16)
+    out = _SwiGLUSavedSigmoid.apply(gate, up)
+    out.backward(dh)
+    gate_ref = gate.detach().float().requires_grad_(True)
+    up_ref = up.detach().float().requires_grad_(True)
+    out_ref = torch.nn.functional.silu(gate_ref) * up_ref
+    out_ref.backward(dh.float())
+    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        gate.grad.float(), gate_ref.grad, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        up.grad.float(), up_ref.grad, rtol=1e-2, atol=1e-2
+    )
+
+    EsmcMLP = type(
+        "EsmcMLP",
+        (torch.nn.Module,),
+        {
+            "__init__": lambda self, act: (
+                torch.nn.Module.__init__(self),
+                setattr(self, "gate_proj", torch.nn.Linear(16, 32, bias=False)),
+                setattr(self, "up_proj", torch.nn.Linear(16, 32, bias=False)),
+                setattr(self, "down_proj", torch.nn.Linear(32, 16, bias=False)),
+                setattr(self, "act_fn", act),
+            )[-1],
+            "forward": lambda self, x: self.down_proj(
+                self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            ),
+        },
+    )
+    SiLUActivation = type("SiLUActivation", (torch.nn.Module,), {})
+    holder = torch.nn.Module()
+    holder.config = SimpleNamespace(tpu_swiglu_saved_sigmoid=True)
+    holder.mlp0 = EsmcMLP(SiLUActivation())
+    holder.mlp1 = EsmcMLP(SiLUActivation())
+    holder.mlp_torch_silu = EsmcMLP(torch.nn.SiLU())
+    holder.mlp_gelu = EsmcMLP(torch.nn.GELU())
+    _use_tpu_esmc_attention(holder)
+    self.assertIsInstance(holder.mlp0, _EsmcTPUSwiGLUMLP)
+    self.assertIs(type(holder.mlp0), type(holder.mlp1))
+    self.assertIsInstance(holder.mlp_torch_silu, _EsmcTPUSwiGLUMLP)
+    self.assertNotIn("forward", holder.mlp0.__dict__)
+    self.assertNotIsInstance(holder.mlp_gelu, _EsmcTPUSwiGLUMLP)
+    x_mlp = torch.randn(2, 16, dtype=torch.bfloat16, requires_grad=True)
+    holder.mlp0.to(torch.bfloat16)(x_mlp).float().sum().backward()
+    self.assertIsNotNone(x_mlp.grad)
 
     self.assertEqual(
         _infer_layer_topology(

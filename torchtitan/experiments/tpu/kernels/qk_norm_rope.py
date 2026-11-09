@@ -13,6 +13,9 @@ import torch
 NUM_LANES = 128
 SUBLANE_ALIGN = 8
 DEFAULT_BLOCK_S = 512
+MAX_BLOCK_S = 1024
+_KERNEL_VMEM_BUDGET_BYTES = 63 * 1024 * 1024
+_BLOCK_S_CANDIDATES = (1024, 512, 256, 128, 64, 32, 16, 8)
 
 
 def lane_group_width(head_dim: int) -> int:
@@ -36,6 +39,63 @@ def pick_seq_block(seq: int, block_s: int = DEFAULT_BLOCK_S) -> int | None:
   return bs
 
 
+def _estimate_bwd_vmem_bytes(
+    bs: int, heads: int, head_dim: int, dtype_bytes: int = 2
+) -> int:
+  """Conservative backward VMEM estimate matching `qk_norm_rope_kernel`."""
+  hidden_dim = heads * head_dim
+  d_pad = lane_group_width(head_dim)
+  io_double_buffered = (
+      10 * bs * hidden_dim * dtype_bytes
+      + 6 * bs * heads * d_pad * dtype_bytes
+      + 4 * bs * d_pad * dtype_bytes
+  )
+  fixed_io = 32 * hidden_dim * (dtype_bytes + 4)
+  fp32_spills = 8 * bs * hidden_dim + 20 * bs * d_pad
+  return io_double_buffered + fixed_io + fp32_spills
+
+
+def default_block_s(
+    seq: int, heads: int, head_dim: int, dtype_bytes: int = 2
+) -> int | None:
+  """Picks the largest VMEM-safe sequence tile (<= 1024) dividing `seq`."""
+  if seq <= 0 or seq % SUBLANE_ALIGN != 0 or heads <= 0:
+    return None
+  try:
+    group = lane_group_width(head_dim)
+  except ValueError:
+    return None
+  if (heads * head_dim) % group != 0:
+    return None
+  if (
+      seq <= MAX_BLOCK_S
+      and _estimate_bwd_vmem_bytes(seq, heads, head_dim, dtype_bytes)
+      <= _KERNEL_VMEM_BUDGET_BYTES
+  ):
+    return seq
+  for bs in _BLOCK_S_CANDIDATES:
+    if (
+        bs <= seq
+        and seq % bs == 0
+        and _estimate_bwd_vmem_bytes(bs, heads, head_dim, dtype_bytes)
+        <= _KERNEL_VMEM_BUDGET_BYTES
+    ):
+      return bs
+  return None
+
+
+def _resolve_seq_block(
+    seq: int,
+    heads: int,
+    head_dim: int,
+    block_s: int | None,
+    dtype_bytes: int = 2,
+) -> int | None:
+  if block_s is None:
+    return default_block_s(seq, heads, head_dim, dtype_bytes)
+  return pick_seq_block(seq, block_s)
+
+
 def supported(
     xq: torch.Tensor,
     heads: int,
@@ -43,7 +103,7 @@ def supported(
     *,
     cos: torch.Tensor | None = None,
     sin: torch.Tensor | None = None,
-    block_s: int = DEFAULT_BLOCK_S,
+    block_s: int | None = None,
 ) -> str | None:
   """Returns why `fused_qk_norm_rope` cannot run on these inputs, or `None`."""
   if xq.device.type != "tpu":
@@ -65,7 +125,10 @@ def supported(
   group = lane_group_width(head_dim)
   if hidden_dim % group != 0:
     return f"H*D={hidden_dim} is not a whole number of {group}-lane groups"
-  if pick_seq_block(seq, block_s) is None:
+  if (
+      _resolve_seq_block(seq, heads, head_dim, block_s, xq.element_size())
+      is None
+  ):
     return (
         f"sequence {seq} with block_s={block_s} is not a {SUBLANE_ALIGN}-"
         "aligned tile multiple"
@@ -199,7 +262,7 @@ def fused_qk_norm_rope(
     heads: int,
     eps: float,
     q_scale: float = 1.0,
-    block_s: int = DEFAULT_BLOCK_S,
+    block_s: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Runs the fused QK-LayerNorm + `rotate_half` RoPE + heads-first prologue.
 
@@ -212,7 +275,8 @@ def fused_qk_norm_rope(
     eps: Shared LayerNorm epsilon.
     q_scale: Multiplier folded into `q` (exact in bf16 for powers of two such as
       `64 ** -0.5 = 0.125`, allowing the attention kernel to run with scale 1).
-    block_s: Sequence tile size per Pallas grid step.
+    block_s: Sequence tile size per Pallas grid step, or `None` to pick the
+      largest VMEM-safe tile (up to 1024) dividing `S`.
 
   Returns:
     Heads-first `(B, H, S, D)` `(q, k, v)` tensors.
@@ -237,7 +301,9 @@ def fused_qk_norm_rope(
         f"Expected wq/wk shape ({hidden_dim},), got {tuple(wq.shape)} and"
         f" {tuple(wk.shape)}"
     )
-  bs = pick_seq_block(xq.shape[1], block_s)
+  bs = _resolve_seq_block(
+      xq.shape[1], heads, head_dim, block_s, xq.element_size()
+  )
   assert bs is not None
   fwd_op, _ = _get_pallas_ops()
   return fwd_op(

@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.autograd.function import once_differentiable
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface, PreTrainedModel
 
@@ -146,6 +147,9 @@ class TPUHFTransformerModel(HFTransformerModel):
       # Opt-in fused ESM-C attention prologue (_EsmcTPUAttention reads it).
       self._titan_injected_model_args["tpu_fused_qk_norm_rope"] = bool(
           getattr(config, "esmc_fused_qk_norm_rope", False)
+      )
+      self._titan_injected_model_args["tpu_swiglu_saved_sigmoid"] = bool(
+          getattr(config, "esmc_swiglu_saved_sigmoid", False)
       )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
@@ -1170,11 +1174,77 @@ class _EsmcTPUAttention(nn.Module):
     return self.o_proj(attn_output.reshape(*input_shape, -1)), attn_weights
 
 
+class _SwiGLUSavedSigmoid(torch.autograd.Function):
+  """``silu(gate) * up`` that saves ``sigmoid(gate)`` for the backward.
+
+  Saving ``sigmoid(gate)`` in activation dtype turns the SwiGLU backward into
+  multiplies and adds -- ``d_up = dh * gate * s``,
+  ``d_gate = dh * up * s * (1 + gate * (1 - s))`` -- instead of recomputing
+  ``sigmoid(gate)`` inside the fused ``down_proj`` dX epilogue.
+  """
+
+  @staticmethod
+  def forward(ctx, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    gf = gate.float()
+    s = torch.sigmoid(gf)
+    ctx.save_for_backward(gate, up, s.to(gate.dtype))
+    return (gf * s * up.float()).to(gate.dtype)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, dh: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    gate, up, s = ctx.saved_tensors
+    g, u, sf, d = gate.float(), up.float(), s.float(), dh.float()
+    d_up = d * g * sf
+    d_gate = d * u * sf * (1.0 + g * (1.0 - sf))
+    return d_gate.to(gate.dtype), d_up.to(up.dtype)
+
+
+class _EsmcTPUSwiGLUMLP:
+  """``EsmcMLP`` whose SiLU-gated product saves ``sigmoid(gate)`` for backward.
+
+  Installed by swapping the instance's class (like ``_EsmcTPUAttention``) so all
+  layers share one unbound ``forward`` method -- avoiding per-instance closure
+  guard misses under per-layer ``torch.compile`` -- while keeping submodules,
+  parameter names, and the state dict identical to ``EsmcMLP``.
+  """
+
+  @classmethod
+  def install(cls, mlp: nn.Module) -> None:
+    mlp.__class__ = cls._derive(type(mlp))
+
+  @classmethod
+  @functools.cache
+  def _derive(cls, hf_cls: type) -> type:
+    return type(f"TPU{hf_cls.__name__}", (cls, hf_cls), {})
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return self.down_proj(
+        _SwiGLUSavedSigmoid.apply(self.gate_proj(x), self.up_proj(x))
+    )
+
+
+def _is_silu_esmc_mlp(mlp: nn.Module) -> bool:
+  if not all(hasattr(mlp, a) for a in ("gate_proj", "up_proj", "down_proj")):
+    return False
+  act_fn = getattr(mlp, "act_fn", None)
+  return isinstance(act_fn, nn.SiLU) or type(act_fn).__name__ in (
+      "SiLU",
+      "SiLUActivation",
+  )
+
+
 def _use_tpu_esmc_attention(model: nn.Module) -> None:
-  """Swaps every ``EsmcAttention`` in ``model`` for ``_EsmcTPUAttention``."""
+  """Installs TPU ``EsmcAttention`` (and opt-in saved-sigmoid ``EsmcMLP``) swaps."""
+  swiglu_saved_sigmoid = getattr(
+      getattr(model, "config", None), "tpu_swiglu_saved_sigmoid", False
+  )
   for module in model.modules():
-    if type(module).__name__ == "EsmcAttention" and getattr(module, "head_dim", 0) % 2 == 0:
+    cls_name = type(module).__name__
+    if cls_name == "EsmcAttention" and getattr(module, "head_dim", 0) % 2 == 0:
       _EsmcTPUAttention.install(module)
+    elif cls_name == "EsmcMLP" and swiglu_saved_sigmoid and _is_silu_esmc_mlp(module):
+      _EsmcTPUSwiGLUMLP.install(module)
 
 
 def as_tpu_model_config(

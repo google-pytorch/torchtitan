@@ -33,3 +33,8 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   # norm / relayout-copy / RoPE passes. Read by the model config's
   # ``update_from_config`` and carried as ``tpu_fused_qk_norm_rope``.
   esmc_fused_qk_norm_rope: bool = False
+  # ESM-C only: SwiGLU that saves sigmoid(gate) so the backward does not
+  # recompute it in the fused down-projection dX epilogue (+1 activation of
+  # (tokens, intermediate_size) per layer). Carried as
+  # ``tpu_swiglu_saved_sigmoid``.
+  esmc_swiglu_saved_sigmoid: bool = False

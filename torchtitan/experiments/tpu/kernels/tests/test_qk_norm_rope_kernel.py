@@ -96,7 +96,7 @@ class QkNormRopeKernelTest(parameterized.TestCase):
         )
         or "",
     )
-    # Non-8-sublane-aligned block_s.
+    # Non-8-sublane-aligned or non-positive block_s.
     self.assertIn(
         "aligned tiles",
         kernel.validate_geometry(
@@ -108,6 +108,20 @@ class QkNormRopeKernelTest(parameterized.TestCase):
             cos_shape=(1, 24, 64),
             sin_shape=(1, 24, 64),
             block_s=12,
+        )
+        or "",
+    )
+    self.assertIn(
+        "aligned tiles",
+        kernel.validate_geometry(
+            batch=1,
+            seq=24,
+            hidden_dim=2 * 64,
+            heads=2,
+            head_dim=64,
+            cos_shape=(1, 24, 64),
+            sin_shape=(1, 24, 64),
+            block_s=0,
         )
         or "",
     )
@@ -149,12 +163,48 @@ class QkNormRopeKernelTest(parameterized.TestCase):
           asymmetric_tables=True,
           dtype=jnp.bfloat16,
       ),
+      dict(
+          testcase_name="d64_single_lane_group",
+          batch=2,
+          seq=32,
+          block_s=None,
+          heads=2,
+          head_dim=64,
+          cos_batch=1,
+          q_scale=0.125,
+          asymmetric_tables=False,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="d128_single_head_single_group",
+          batch=2,
+          seq=32,
+          block_s=16,
+          heads=1,
+          head_dim=128,
+          cos_batch=2,
+          q_scale=1.0,
+          asymmetric_tables=True,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="d256_multi_tile",
+          batch=2,
+          seq=32,
+          block_s=16,
+          heads=2,
+          head_dim=256,
+          cos_batch=1,
+          q_scale=0.0625,
+          asymmetric_tables=False,
+          dtype=jnp.float32,
+      ),
   )
   def test_interpret_forward_and_backward_match_reference(
       self,
       batch: int,
       seq: int,
-      block_s: int,
+      block_s: int | None,
       heads: int,
       head_dim: int,
       cos_batch: int,
@@ -256,6 +306,23 @@ class QkNormRopeKernelTest(parameterized.TestCase):
           np.linalg.norm(ref_f), 1e-12
       )
       self.assertLessEqual(rel_err, tol, msg=f"Mismatch in {name}: {rel_err}")
+
+  def test_adaptive_default_block_s_and_vmem_bounds(self):
+    # ESMC-600M (18 x 64 = 1152, bf16): 2048 -> 1024; 1536 / 2560 -> 512.
+    self.assertEqual(kernel.default_block_s(2048, 18, 64, dtype_bytes=2), 1024)
+    self.assertEqual(kernel.default_block_s(1536, 18, 64, dtype_bytes=2), 512)
+    self.assertEqual(kernel.default_block_s(2560, 18, 64, dtype_bytes=2), 512)
+    # ESMC-600M in fp32 steps down to 512 so backward stays under 64 MiB VMEM.
+    self.assertEqual(kernel.default_block_s(2048, 18, 64, dtype_bytes=4), 512)
+    # ESMC-6B (40 x 64 = 2560, bf16) and large D=128 (32 x 128 = 4096, bf16)
+    # step down to 256 instead of exceeding 64 MiB VMEM.
+    self.assertEqual(kernel.default_block_s(2048, 40, 64, dtype_bytes=2), 256)
+    self.assertEqual(kernel.default_block_s(768, 40, 64, dtype_bytes=2), 256)
+    self.assertEqual(kernel.default_block_s(2048, 32, 128, dtype_bytes=2), 256)
+    self.assertIsNone(kernel.default_block_s(2048, 3, 64, dtype_bytes=2))
+    for bs, heads, head_dim in ((1024, 18, 64), (256, 40, 64), (256, 32, 128)):
+      limit = kernel.default_vmem_limit_bytes(bs, heads, head_dim)
+      self.assertLessEqual(limit, kernel.MAX_SCOPED_VMEM_BYTES)
 
 
 if __name__ == "__main__":

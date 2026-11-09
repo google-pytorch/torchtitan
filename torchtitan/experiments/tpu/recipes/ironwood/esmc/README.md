@@ -16,9 +16,9 @@ unless noted; ESMC-6B rows use `--config=hf_esmc_mlm_uniref50` (selective AC).
 
 | model | config | hosts | tokens/rank | tokens/step | tok/s per TC | TFLOP/s | MFU | s/step | HBM |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ESMC-600M | `hf_esmc_mlm_uniref50_graph` (no remat) | 1 | 16 x 2048 | 262k | **72,400** | 324 | **28.0%** | 0.45 | 65.4 GiB |
-| ESMC-600M | `hf_esmc_mlm_uniref50_graph` (no remat, 8x accum) | 2 | 16 x 2048 | 4.19M | **69,500** | 311 | **27.0%** | 3.77 | 65.4 GiB |
-| ESMC-600M | `hf_esmc_mlm_uniref50_graph` (`tpu_selective` remat) | 1 | 64 x 2048 | 1.05M | 64,800 | 290 | 25.1% | 2.02 | 40.7 GiB |
+| ESMC-600M | `hf_esmc_mlm_uniref50_graph` (no remat) | 1 | 16 x 2048 | 262k | **87,700** | 392 | **34.0%** | 0.37 | 65.2 GiB |
+| ESMC-600M | `hf_esmc_mlm_uniref50_graph` (no remat, 8x accum) | 2 | 16 x 2048 | 4.19M | **84,200** | 376 | **32.6%** | 3.11 | 65.2 GiB |
+| ESMC-600M | `hf_esmc_mlm_uniref50_graph` (`tpu_selective` remat) | 1 | 64 x 2048 | 1.05M | 79,100 | 354 | 30.7% | 1.65 | 77.8 GiB |
 | ESMC-600M | `hf_esmc_mlm_uniref50` (layer compile, AC) | 1 | 32 x 2048 | 524k | 52,568 | 235 | 20.4% | 1.25 | 6.0 GiB |
 | ESMC-600M | `hf_esmc_mlm_uniref50` (layer compile, AC) | 2 | 32 x 2048 | 4.19M | 53,318 | 238 | 20.7% | 4.92 | 6.0 GiB |
 | ESMC-6B | `hf_esmc_mlm_uniref50` | 1 | 8 x 2048 | 131k | 7,850 | 339 | 29.4% | 2.09 | 3.4 GiB |
@@ -37,7 +37,11 @@ How the ESMC-600M number was reached, one host, ms per 2048 tokens:
 | 16 x 2048 tokens/rank, no AC (`layer` compile, `log_freq=1`) | 54,100 | 21.0% | 37.9 |
 | + `metrics.log_freq=25` (amortize scalar `.item()` host sync) | 59,600 | 23.1% | 34.4 |
 | + `TpuGraphTrainer` (`aot_fx_trace`, `compile_grad_norm`, `compile_optimizer`) | 64,200 | 24.9% | 31.9 |
-| + `esmc_fused_qk_norm_rope` (fused Pallas QK-LayerNorm + RoPE + heads-first) | **72,400** | **28.0%** | **28.3** |
+| + `esmc_fused_qk_norm_rope` (fused Pallas QK-LayerNorm + RoPE + heads-first, `block_s=512`) | 70,337 | 27.3% | 29.1 |
+| + `qk_norm_rope` single cross-lane reduce per tile, adaptive `block_s=1024` | 71,314 | 27.6% | 28.7 |
+| + `xla_tpu_reduce_window_reduction_dim_max=0`, `xla_tpu_scoped_vmem_limit_kib=65472` | 76,379 | 29.6% | 26.8 |
+| + `esmc_swiglu_saved_sigmoid` (`_EsmcTPUSwiGLUMLP` saves `sigmoid(gate)` for backward) | 77,007 | 29.8% | 26.6 |
+| + `xla_tpu_dvfs_p_state=7` (`TPU7X_THROUGHPUT_P_STATE`, `log_freq=25`) | **87,663** | **34.0%** | **23.4** |
 
 For ESMC-6B the initial ladder is 4,810 -> 7,654 (8 x 2048, unfold) -> 7,897
 (2048 splash blocks) tok/s per TC.
@@ -54,6 +58,13 @@ the model uses context):
   `hf_esmc_mlm_uniref50` (**3.14h**, 55.3k tok/s/TC, 21.4% MFU) — `+0.0004` nats
   at 5.0B (`mean Δloss = -0.00098` nats, `median |Δloss| = 0.00745` nats),
   grad-norm `0.120` vs `0.117`, zero spikes (**1.26x** faster, −20.6% TPU hours).
+- **ESMC-600M 600-step MFU-recipe parity (`seed=42`, `16 x 2048` tokens/rank, `157M` tokens)**:
+  `4.4081` (step 1) -> `2.7251` (step 25) -> `2.5634` (step 100) -> `2.5434`
+  (step 300) -> **`2.4876`** (step 600; steps 300-600 mean `2.4947`) vs
+  `4.4081 -> 2.7260 -> 2.5672 -> 2.5444 ->` **`2.4882`** (steps 300-600 mean
+  `2.4957`) without the compiler flags or saved-sigmoid SwiGLU (`mean Δloss =
+  -0.00147` nats, `median |Δloss| = 0.00105` nats; grad-norm `30.9 -> 0.33`,
+  zero spikes).
 - **ESMC-600M 600-step A/B (`hf_esmc_mlm_uniref50` vs `hf_esmc_mlm_uniref50_graph`)**,
   1 host, 600 steps of 262k tokens (`157M` tokens, `seed=0`, 100-step warmup):
   4.25 -> 2.88 (step 20) -> 2.65 (step 100) -> 2.59 (step 300) -> **2.586**
@@ -67,6 +78,8 @@ the model uses context):
 - ESMC-6B, 2 hosts, 150 steps of 4.19M tokens (the paper's batch), 50-step
   warmup, cosine to 10%: 4.52 -> 2.82 (step 30) -> 2.61 (step 150); grad-norm
   46 -> 0.3, no spikes.
+
+![ESMC-600M 34.0% MFU Waterfall & 600-Step UniRef50 Parity](./assets/esmc_600m_mfu34_waterfall_and_parity.png)
 
 ![ESMC-600M 5.0B UniRef50 MLM Loss Parity](./assets/esmc_600m_5b_loss_parity.png)
 
@@ -109,8 +122,8 @@ packed-document segment masking, `mixed_precision_reduce=float32`,
 
 `--config=hf_esmc_mlm_uniref50_graph` (`metrics.log_freq=25`) runs the same
 model, data, loss and SimpleFSDP on **`TpuGraphTrainer`**
-(`experiments/tpu/graph_trainer/hf_transformers.py`) with two additional TPU
-optimizations:
+(`experiments/tpu/graph_trainer/hf_transformers.py`) with the TPU step, kernel,
+activation, and compiler optimizations enabled:
 
 - **Joint forward + loss + backward XLA program** (`use_graph_trainer=True`,
   `compile_mode="aot_fx_trace"`, `compile_grad_norm=True`,
@@ -122,7 +135,23 @@ optimizations:
   `experiments/tpu/kernels/qk_norm_rope.py`): fuses `q_ln`, `k_ln`,
   `rotate_half` RoPE, `1/sqrt(64)` query scaling, and the
   `[B, S, H*D] <-> [B, H, S, D]` attention prologue/epilogue in forward and
-  backward (+13% on GraphTrainer).
+  backward (+11% on GraphTrainer). LayerNorm row statistics and backward sums
+  add the 128-lane groups elementwise on the VPU and reduce across lanes once
+  per row tile, with adaptive VMEM-safe sequence tiling (`block_s=1024` on
+  ESMC-600M at `seq=2048`, stepping down automatically for larger `H*D` such as
+  ESMC-6B or non-1024-multiple sequences).
+- **Saved-sigmoid SwiGLU** (`esmc_swiglu_saved_sigmoid`, `_EsmcTPUSwiGLUMLP` /
+  `_SwiGLUSavedSigmoid` in `model.py`): saves `sigmoid(gate)` in `bf16` so the
+  MLP backward uses multiplies and adds instead of recomputing `sigmoid(gate)`
+  inside the fused `down_proj` dX epilogue (+0.8% tok/s).
+- **Compiler & TPU7x throughput flags** (`libtpu_init_flags`):
+  `xla_tpu_reduce_window_reduction_dim_max=0` (prevents XLA from rewriting
+  residual LayerNorm backward row reductions + broadcasts into full-row
+  `1x1x2303` `reduce-window` convolutions over the 1152 hidden lanes) and
+  `xla_tpu_scoped_vmem_limit_kib=65472` (+7.1% tok/s), plus
+  `xla_tpu_dvfs_p_state=7` (`tpu_flags.TPU7X_THROUGHPUT_P_STATE`, +13.8% clock
+  headroom on `tpu7x`; drop on non-`tpu7x` chips via
+  `--extra-libtpu-init-flags='!xla_tpu_dvfs_p_state'`).
 
 ## Data
 
@@ -142,7 +171,7 @@ python experiments/tpu/recipes/ironwood/esmc/fasta_to_parquet.py $DATA/uniref50 
 ## Training
 
 One host (8 TensorCores), ESMC-600M on `TpuGraphTrainer` + fused kernels (`32768`
-tokens/rank = `16 x 2048`, 65.4 GiB HBM; for ESMC-6B use
+tokens/rank = `16 x 2048`, 65.2 GiB HBM; for ESMC-6B use
 `--config=hf_esmc_mlm_uniref50` and drop `num_tokens_per_microbatch_per_dp_rank`):
 
 ```bash

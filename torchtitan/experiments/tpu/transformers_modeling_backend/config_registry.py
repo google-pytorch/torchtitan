@@ -35,6 +35,7 @@ from torchtitan.experiments.transformers_modeling_backend import (
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
@@ -374,17 +375,26 @@ def hf_esmc_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
   """``hf_esmc_mlm_uniref50`` on the TPU GraphTrainer + fused Pallas QK-LN/RoPE.
 
   Same model, data, loss, optimizer and SimpleFSDP as ``hf_esmc_mlm_uniref50``,
-  with two TPU step optimizations enabled:
+  with TPU step, kernel, activation and compiler optimizations enabled:
   1. Joint forward + loss + backward compilation (``TpuGraphTrainer`` with
      ``aot_fx_trace``) so saved activations stay inside one XLA program and are
      not relaid out at per-layer forward/backward boundaries, plus standalone
      compiled grad-norm and AdamW programs.
   2. Fused Pallas QK-LayerNorm + RoPE + heads-first prologue/epilogue
-     (``esmc_fused_qk_norm_rope``, folding ``1/sqrt(64)`` into ``q``).
+     (``esmc_fused_qk_norm_rope``, folding ``1/sqrt(64)`` into ``q``, single
+     cross-lane reduction per row tile, adaptive ``block_s`` up to 1024).
+  3. Saved-sigmoid SwiGLU (``esmc_swiglu_saved_sigmoid``) so the MLP backward
+     uses multiplies and adds instead of recomputing ``sigmoid(gate)`` inside
+     the fused ``down_proj`` dX epilogue.
+  4. ``xla_tpu_reduce_window_reduction_dim_max=0`` (keeps residual LayerNorm
+     backward row reductions as reduce + broadcast instead of full-row
+     ``reduce-window`` convolutions), ``xla_tpu_scoped_vmem_limit_kib=65472``,
+     and ``tpu_flags.TPU7X_THROUGHPUT_P_STATE`` (``xla_tpu_dvfs_p_state=7``).
 
-  Measured on ``tpu7x-16`` (ESMC-600M, per TensorCore, no remat): 16 x 2048
-  tokens/rank reaches ~72.4k tok/s (28.0% MFU, 65.4 GiB HBM). When
-  rematerialization is needed (e.g. 64 x 2048 in one microbatch or ESMC-6B),
+  Measured on ``tpu7x`` (ESMC-600M, per TensorCore, no remat): 16 x 2048
+  tokens/rank reaches ~87.7k tok/s (34.0% MFU, 65.2 GiB HBM; 77.0k / 29.8% MFU
+  without ``xla_tpu_dvfs_p_state=7``). When rematerialization is needed (e.g.
+  64 x 2048 in one microbatch or ESMC-6B),
   pass ``--tpu_config.graph_trainer_memory_policy=tpu_selective``,
   ``--tpu_config.graph_trainer_save_regions attention.inner_attention``,
   ``--tpu_config.enable_graph_trainer_remat_schedule`` and
@@ -396,6 +406,13 @@ def hf_esmc_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
   cfg.tpu_config.compile_grad_norm = True
   cfg.tpu_config.compile_optimizer = True
   cfg.esmc_fused_qk_norm_rope = True
+  cfg.esmc_swiglu_saved_sigmoid = True
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+      xla_tpu_scoped_vmem_limit_kib=65472,
+      xla_tpu_reduce_window_reduction_dim_max=0,
+  )
   cfg.metrics.log_freq = 25
   return cfg
 
@@ -404,10 +421,10 @@ def hf_esmc600m_mlm_uniref50_tpu7x16() -> TPUTransformersBackendConfig:
   """ESMC-600M at the paper's 4.19M-token step on an 8-chip ``tpu7x-16`` slice.
 
   ``hf_esmc_mlm_uniref50_graph`` (no rematerialization) with the microbatch set
-  to 16 x 2048 tokens per rank (65.4 GiB HBM; the largest power-of-two divisor
+  to 16 x 2048 tokens per rank (65.2 GiB HBM; the largest power-of-two divisor
   of 64 x 2048 that fits 96 GiB without remat): 16 ranks x 8 microbatches x
-  32,768 tokens = 4,194,304 tokens per optimizer step (69,500 tok/s/TC, 27.0%
-  MFU, 3.77s/step, vs 53,318 tok/s/TC / 20.7% MFU on per-layer compile with AC).
+  32,768 tokens = 4,194,304 tokens per optimizer step (84,200 tok/s/TC, 32.6%
+  MFU, 3.11s/step, vs 53,318 tok/s/TC / 20.7% MFU on per-layer compile with AC).
   See recipes/ironwood/esmc/tpu7x-2x2x2/.
   """
   cfg = hf_esmc_mlm_uniref50_graph()
@@ -477,4 +494,5 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   config.tpu_config.compile_optimizer = False
   config.tpu_config.optimizer_in_graph = False
   config.esmc_fused_qk_norm_rope = False
+  config.esmc_swiglu_saved_sigmoid = False
   return config

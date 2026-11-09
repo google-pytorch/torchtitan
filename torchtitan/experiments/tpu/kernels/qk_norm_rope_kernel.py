@@ -46,7 +46,13 @@ from jax.experimental.pallas import tpu as pltpu
 NUM_LANES = 128
 SUBLANE_ALIGN = 8
 DEFAULT_BLOCK_S = 512
+MAX_BLOCK_S = 1024
 DEFAULT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+# Maximum valid scoped VMEM on 64 MiB TPUs (tpu7x / v5p), where 64 KiB is
+# reserved by the compiler overlay (`64 MiB - 64 KiB = 65,472 KiB`).
+MAX_SCOPED_VMEM_BYTES = 65472 * 1024
+_KERNEL_VMEM_BUDGET_BYTES = 63 * 1024 * 1024
+_BLOCK_S_CANDIDATES = (1024, 512, 256, 128, 64, 32, 16, 8)
 
 
 def lane_group_width(head_dim: int) -> int:
@@ -74,6 +80,74 @@ def pick_seq_block(seq: int, block_s: int = DEFAULT_BLOCK_S) -> int | None:
   return bs
 
 
+def _estimate_bwd_vmem_bytes(
+    bs: int, heads: int, head_dim: int, dtype_bytes: int = 2
+) -> int:
+  """Conservative backward VMEM estimate (double-buffered I/O + fp32 spills)."""
+  hidden_dim = heads * head_dim
+  # Mosaic pads minor-most `head_dim == 64` to 128 lanes in `(1, H, bs, D)`.
+  d_pad = lane_group_width(head_dim)
+  io_double_buffered = (
+      10 * bs * hidden_dim * dtype_bytes
+      + 6 * bs * heads * d_pad * dtype_bytes
+      + 4 * bs * d_pad * dtype_bytes
+  )
+  fixed_io = 32 * hidden_dim * (dtype_bytes + 4)
+  fp32_spills = 8 * bs * hidden_dim + 20 * bs * d_pad
+  return io_double_buffered + fixed_io + fp32_spills
+
+
+def default_block_s(
+    seq: int, heads: int, head_dim: int, dtype_bytes: int = 2
+) -> int | None:
+  """Picks the largest VMEM-safe sequence tile (<= 1024) dividing `seq`."""
+  if seq <= 0 or seq % SUBLANE_ALIGN != 0 or heads <= 0:
+    return None
+  try:
+    group = lane_group_width(head_dim)
+  except ValueError:
+    return None
+  if (heads * head_dim) % group != 0:
+    return None
+  if (
+      seq <= MAX_BLOCK_S
+      and _estimate_bwd_vmem_bytes(seq, heads, head_dim, dtype_bytes)
+      <= _KERNEL_VMEM_BUDGET_BYTES
+  ):
+    return seq
+  for bs in _BLOCK_S_CANDIDATES:
+    if (
+        bs <= seq
+        and seq % bs == 0
+        and _estimate_bwd_vmem_bytes(bs, heads, head_dim, dtype_bytes)
+        <= _KERNEL_VMEM_BUDGET_BYTES
+    ):
+      return bs
+  return None
+
+
+def default_vmem_limit_bytes(
+    bs: int, heads: int, head_dim: int, dtype_bytes: int = 2
+) -> int:
+  """Returns per-call scoped VMEM limit (`48 MiB` for small tiles, `65,472 KiB` for large)."""
+  est = _estimate_bwd_vmem_bytes(bs, heads, head_dim, dtype_bytes)
+  if est <= 40 * 1024 * 1024:
+    return DEFAULT_VMEM_LIMIT_BYTES
+  return MAX_SCOPED_VMEM_BYTES
+
+
+def _resolve_seq_block(
+    seq: int,
+    heads: int,
+    head_dim: int,
+    block_s: int | None,
+    dtype_bytes: int = 2,
+) -> int | None:
+  if block_s is None:
+    return default_block_s(seq, heads, head_dim, dtype_bytes)
+  return pick_seq_block(seq, block_s)
+
+
 def validate_geometry(
     *,
     batch: int,
@@ -83,7 +157,8 @@ def validate_geometry(
     head_dim: int,
     cos_shape: tuple[int, ...],
     sin_shape: tuple[int, ...],
-    block_s: int = DEFAULT_BLOCK_S,
+    block_s: int | None = None,
+    dtype_bytes: int = 2,
 ) -> str | None:
   """Returns a human-readable rejection reason, or `None` when supported."""
   if batch <= 0 or seq <= 0:
@@ -100,7 +175,7 @@ def validate_geometry(
   group = lane_group_width(head_dim)
   if hidden_dim % group != 0:
     return f"H*D={hidden_dim} is not a multiple of {group}-lane group width"
-  if pick_seq_block(seq, block_s) is None:
+  if _resolve_seq_block(seq, heads, head_dim, block_s, dtype_bytes) is None:
     return (
         f"sequence {seq} with block_s={block_s} does not form {SUBLANE_ALIGN}-"
         "aligned tiles"
@@ -147,13 +222,26 @@ def _rotate_half_partner(
   return jnp.where(first_half_mask, ahead, behind)
 
 
+def _lane_group_row_sum(x: jax.Array, group_width: int) -> jax.Array:
+  """`(rows, 1)` sum over the last axis via elementwise group adds + 1 XLU reduce."""
+  acc = x[:, :group_width]
+  for start in range(group_width, x.shape[-1], group_width):
+    acc = acc + x[:, start : start + group_width]
+  return jnp.sum(acc, axis=-1, keepdims=True)
+
+
 def _layernorm_row_stats(
-    x: jax.Array, eps: float
+    x: jax.Array, eps: float, group_width: int
 ) -> tuple[jax.Array, jax.Array]:
   """Returns per-token `(mean, rstd)` in fp32 over the last axis of `x`."""
-  mu = jnp.mean(x, axis=-1, keepdims=True)
-  xc = x - mu
-  var = jnp.mean(xc * xc, axis=-1, keepdims=True)
+  inv_n = 1.0 / x.shape[-1]
+  mu = _lane_group_row_sum(x, group_width) * inv_n
+  d0 = x[:, :group_width] - mu
+  var_acc = d0 * d0
+  for start in range(group_width, x.shape[-1], group_width):
+    d = x[:, start : start + group_width] - mu
+    var_acc = var_acc + d * d
+  var = jnp.sum(var_acc, axis=-1, keepdims=True) * inv_n
   return mu, jax.lax.rsqrt(var + eps)
 
 
@@ -205,7 +293,7 @@ def _qk_norm_rope_fwd_kernel(
       (xk_ref, wk_ref, ok_ref, 1.0),
   ):
     x = x_ref[0].astype(jnp.float32)
-    mu, rstd = _layernorm_row_stats(x, eps)
+    mu, rstd = _layernorm_row_stats(x, eps, group_width)
     for gi in range(n_groups):
       sl = slice(gi * group_width, (gi + 1) * group_width)
       w = w_ref[:, sl].astype(jnp.float32)
@@ -282,9 +370,9 @@ def _qk_norm_rope_bwd_kernel(
       (xk_ref, wk_ref, gk_ref, dxk_ref, dwk_ref, 1.0),
   ):
     x = x_ref[0].astype(jnp.float32)
-    mu, rstd = _layernorm_row_stats(x, eps)
-    sum_dxhat = jnp.zeros((bs, 1), jnp.float32)
-    sum_dxhat_xhat = jnp.zeros((bs, 1), jnp.float32)
+    mu, rstd = _layernorm_row_stats(x, eps, group_width)
+    acc_dxhat: jax.Array | None = None
+    acc_dxhat_xhat: jax.Array | None = None
     group_terms = []
     for gi in range(n_groups):
       sl = slice(gi * group_width, (gi + 1) * group_width)
@@ -300,14 +388,22 @@ def _qk_norm_rope_bwd_kernel(
       xhat = (x[:, sl] - mu) * rstd
       dw_ref[0, :, sl] += jnp.sum(dnormed * xhat, axis=0, keepdims=True)
       dxhat = dnormed * w_ref[:, sl].astype(jnp.float32)
-      sum_dxhat = sum_dxhat + jnp.sum(dxhat, axis=-1, keepdims=True)
-      sum_dxhat_xhat = sum_dxhat_xhat + jnp.sum(
-          dxhat * xhat, axis=-1, keepdims=True
-      )
+      dxhat_xhat = dxhat * xhat
+      # Accumulate per-lane partial sums across groups, then reduce across lanes
+      # once after the loop.
+      if acc_dxhat is None:
+        acc_dxhat, acc_dxhat_xhat = dxhat, dxhat_xhat
+      else:
+        acc_dxhat = acc_dxhat + dxhat
+        assert acc_dxhat_xhat is not None
+        acc_dxhat_xhat = acc_dxhat_xhat + dxhat_xhat
       group_terms.append((sl, dxhat, xhat))
+    assert acc_dxhat is not None and acc_dxhat_xhat is not None
     inv_hidden = 1.0 / hidden_dim
-    mean_dxhat = sum_dxhat * inv_hidden
-    mean_dxhat_xhat = sum_dxhat_xhat * inv_hidden
+    mean_dxhat = jnp.sum(acc_dxhat, axis=-1, keepdims=True) * inv_hidden
+    mean_dxhat_xhat = (
+        jnp.sum(acc_dxhat_xhat, axis=-1, keepdims=True) * inv_hidden
+    )
     for sl, dxhat, xhat in group_terms:
       dx_ref[0, :, sl] = (
           rstd * (dxhat - mean_dxhat - xhat * mean_dxhat_xhat)
@@ -346,7 +442,7 @@ def _check_common_inputs(
     *,
     heads: int,
     head_dim: int,
-    block_s: int,
+    block_s: int | None,
 ) -> tuple[int, int, int, int]:
   if xq.ndim != 3 or xk.shape != xq.shape:
     raise ValueError(
@@ -358,6 +454,7 @@ def _check_common_inputs(
     raise ValueError(
         f"Expected wq/wk shape ({hidden_dim},), got {wq.shape} and {wk.shape}"
     )
+  dtype_bytes = xq.dtype.itemsize
   reason = validate_geometry(
       batch=batch,
       seq=seq,
@@ -367,10 +464,11 @@ def _check_common_inputs(
       cos_shape=tuple(cos.shape),
       sin_shape=tuple(sin.shape),
       block_s=block_s,
+      dtype_bytes=dtype_bytes,
   )
   if reason is not None:
     raise ValueError(f"Unsupported qk_norm_rope geometry: {reason}")
-  bs = pick_seq_block(seq, block_s)
+  bs = _resolve_seq_block(seq, heads, head_dim, block_s, dtype_bytes)
   assert bs is not None
   return batch, seq, hidden_dim, bs
 
@@ -387,8 +485,8 @@ def qk_norm_rope_fwd(
     heads: int,
     eps: float,
     q_scale: float = 1.0,
-    block_s: int = DEFAULT_BLOCK_S,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    block_s: int | None = None,
+    vmem_limit_bytes: int | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Fused forward: `(B, S, H*D)` projections -> heads-first `(B, H, S, D)`.
@@ -401,7 +499,8 @@ def qk_norm_rope_fwd(
     eps: LayerNorm epsilon.
     q_scale: Scale multiplied onto `q` inside the kernel (for folding a
       power-of-two attention softmax scale `D ** -0.5` at zero extra HBM pass).
-    block_s: Sequence tile size per Pallas grid step.
+    block_s: Sequence tile size per Pallas grid step, or `None` to select the
+      largest VMEM-safe tile (up to 1024) dividing `S`.
     vmem_limit_bytes: Compiler VMEM limit for Mosaic TPU lowering.
     interpret: Run Pallas in CPU interpret mode for unit tests.
   """
@@ -415,6 +514,10 @@ def qk_norm_rope_fwd(
   batch, seq, hidden_dim, bs = _check_common_inputs(
       xq, xk, wq, wk, cos, sin, heads=heads, head_dim=head_dim, block_s=block_s
   )
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = default_vmem_limit_bytes(
+        bs, heads, head_dim, xq.dtype.itemsize
+    )
   row, weight, rope_table, heads_first = _make_block_specs(
       hidden_dim, heads, head_dim, bs, cos_batched=cos.shape[0] > 1
   )
@@ -457,8 +560,8 @@ def qk_norm_rope_bwd(
     *,
     eps: float,
     q_scale: float = 1.0,
-    block_s: int = DEFAULT_BLOCK_S,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    block_s: int | None = None,
+    vmem_limit_bytes: int | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Fused backward returning `(dxq, dxk, dxv)` in `(B, S, H*D)` and `(dwq, dwk)`."""
@@ -471,6 +574,10 @@ def qk_norm_rope_bwd(
   batch, seq, hidden_dim, bs = _check_common_inputs(
       xq, xk, wq, wk, cos, sin, heads=heads, head_dim=head_dim, block_s=block_s
   )
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = default_vmem_limit_bytes(
+        bs, heads, head_dim, xq.dtype.itemsize
+    )
   if gq.shape != (batch, heads, seq, head_dim):
     raise ValueError(
         f"Expected gradient shape {(batch, heads, seq, head_dim)}, got"

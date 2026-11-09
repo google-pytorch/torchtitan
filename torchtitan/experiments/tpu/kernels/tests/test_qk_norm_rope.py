@@ -96,6 +96,10 @@ class QkNormRopeTest(
     self.assertEqual(qk_norm_rope.pick_seq_block(128, 512), 128)
     self.assertIsNone(qk_norm_rope.pick_seq_block(24, 12))
     self.assertIsNone(qk_norm_rope.pick_seq_block(1000, 512))
+    self.assertEqual(qk_norm_rope.default_block_s(2048, 18, 64), 1024)
+    self.assertEqual(qk_norm_rope.default_block_s(1536, 18, 64), 512)
+    self.assertEqual(qk_norm_rope.default_block_s(2048, 40, 64), 256)
+    self.assertEqual(qk_norm_rope.default_block_s(2048, 32, 128), 256)
 
   def test_lazy_pallas_registration_signature_eval_str(self):
     # `torch.tpu.pallas.jax_op` calls `inspect.signature(fn, eval_str=True)`.
@@ -182,11 +186,47 @@ class QkNormRopeTest(
           cos_batch=2,
           q_scale=1.0,
       ),
+      dict(
+          testcase_name="adaptive_default_s2048_esmc600m_bs1024",
+          seq=2048,
+          block_s=None,
+          heads=18,
+          head_dim=64,
+          cos_batch=1,
+          q_scale=0.125,
+      ),
+      dict(
+          testcase_name="adaptive_default_s1536_esmc600m_bs512",
+          seq=1536,
+          block_s=None,
+          heads=18,
+          head_dim=64,
+          cos_batch=1,
+          q_scale=0.125,
+      ),
+      dict(
+          testcase_name="adaptive_default_s2048_esmc6b_bs256",
+          seq=2048,
+          block_s=None,
+          heads=40,
+          head_dim=64,
+          cos_batch=1,
+          q_scale=0.125,
+      ),
+      dict(
+          testcase_name="adaptive_default_s512_h32_d128_bs256",
+          seq=512,
+          block_s=None,
+          heads=32,
+          head_dim=128,
+          cos_batch=1,
+          q_scale=1.0,
+      ),
   )
   def test_matches_reference_forward_and_backward(
       self,
       seq: int,
-      block_s: int,
+      block_s: int | None,
       heads: int,
       head_dim: int,
       cos_batch: int,

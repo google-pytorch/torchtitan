@@ -664,3 +664,13 @@ def deepseek_v3_671b_31l_4x4x4_native_gmm() -> TPUTrainerConfig:
   native also won (0.600 vs 0.630 s/step). Same checkpoint keys.
   """
   return _target_recipe("671B-31L", _TARGET_EP_DEGREE, pallas_grouped_mm=False)
+
+
+def deepseek_v3_671b_2l_16e_target_proxy_native_gmm() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_2l_16e_target_proxy`` with native ``torch._grouped_mm``.
+
+  v7x bring-up: the Pallas expert-weight-gradient kernel's v6e tiles exceed
+  v7x's scoped VMEM (CompileTimeScopedVmemOom at 128 ranks, EP 1), so this
+  isolates the EP exchange from the expert kernel on tpu7x.
+  """
+  return _target_recipe("671B-2L-16E", 4, pallas_grouped_mm=False)

@@ -617,6 +617,108 @@ class TestDeepSeekV3SplashAttention(BaseAcceleratorDeviceTest):
       self.assertGreater(relative, floor, name)
 
 
+class TestDeepSeekV3FusedCrossEntropy(BaseAcceleratorDeviceTest):
+  """The ``*_fused_ce`` recipes and the fused kernel at DeepSeek-V3's vocab.
+
+  The kernel's numerics are ``kernels/tests``' at tile-multiple vocabularies.
+  DeepSeek-V3's 129280 is not a multiple of the default 2048-wide vocab tile
+  (63 full tiles + 256), so the test runs the fused loss at the real hidden
+  size and vocabulary against fp32 ``F.cross_entropy`` on full logits, with a
+  half of the labels in the partial last tile. Bounds and measurement in
+  the assertions.
+
+  Control: the same reference with the partial tile's weight rows zeroed (a
+  kernel that padded the tail instead of reading it) moves the loss far
+  outside the bound.
+  """
+
+  @parameterized.named_parameters(
+      dict(testcase_name="debugmodel", recipe="deepseek_v3_debugmodel_fused_ce"),
+      dict(testcase_name="proxy", recipe="deepseek_v3_671b_2l_16e_fused_ce"),
+      dict(
+          testcase_name="proxy_graph_trainer",
+          recipe="graph_trainer_deepseek_v3_671b_2l_16e_fused_ce",
+      ),
+  )
+  def test_recipe_swaps_lm_head_for_fused_loss(self, recipe):
+    # pylint: disable=g-import-not-at-top
+    from torchtitan.config import apply_overrides
+    from torchtitan.experiments.tpu import workarounds
+    from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+    from torchtitan.experiments.tpu.overrides.fused_loss import FusedLossLinearWrapper
+    # pylint: enable=g-import-not-at-top
+
+    config = getattr(deepseek_v3_tpu, recipe)()
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+    self.assertIsNone(config.loss.soft_cap)
+    self.assertEqual(config.loss.output_multiplier, 1.0)
+    apply_overrides(config.override, config)
+    self.assertIsInstance(
+        config.model_spec.model.lm_head, FusedLossLinearWrapper.Config
+    )
+    with torch.device("meta"):
+      model = config.model_spec.model.build()
+    self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
+    # Same checkpoint key, so plain-CE checkpoints and the HF adapter still fit.
+    self.assertEqual(
+        [k for k in model.state_dict() if k.endswith("lm_head.weight")],
+        ["lm_head.weight"],
+    )
+    workarounds._check_fused_loss_logit_transform(model, config)  # pylint: disable=protected-access
+
+  def test_matches_fp32_cross_entropy_at_real_vocab(self):
+    if self.accelerator_device.type != "tpu":
+      self.skipTest("The fused loss is a TPU Mosaic kernel")
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.experiments.tpu.loss import pallas_cross_entropy_loss
+
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous)
+    device = self.accelerator_device
+    tokens, hidden, vocab, full_tiles = 1024, 7168, 129280, 63 * 2048
+    torch.manual_seed(0)
+    # Trainer dtypes: bf16 activations and (all-gathered) bf16 head weight.
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device)
+    weight = (
+        torch.randn(vocab, hidden, device=device) * hidden**-0.5
+    ).to(torch.bfloat16)
+    labels = torch.randint(0, vocab, (tokens,), device=device)
+    labels[::2] = torch.randint(full_tiles, vocab, (tokens // 2,), device=device)
+
+    def reference(x, weight):
+      logits = x.float() @ weight.float().t()
+      return F.cross_entropy(logits, labels, reduction="sum")
+
+    ref_inputs = [t.detach().clone().requires_grad_() for t in (x, weight)]
+    expected = reference(*ref_inputs)
+    expected_grads = torch.autograd.grad(expected, ref_inputs)
+
+    inputs = [t.detach().clone().requires_grad_() for t in (x, weight)]
+    actual = pallas_cross_entropy_loss((inputs[0], inputs[1].t()), labels)
+    actual_grads = torch.autograd.grad(actual, inputs)
+
+    loss_error = abs(actual.item() - expected.item()) / abs(expected.item())
+    print(f"fused CE loss rel {loss_error:.3e}")
+    # Measured on v6e: loss 7.8e-8 relative, worst gradient rel L2 2.3e-4.
+    self.assertLessEqual(loss_error, 1e-5)
+    worst = assert_gradients(
+        self,
+        {"x": actual_grads[0], "weight": actual_grads[1]},
+        {"x": expected_grads[0], "weight": expected_grads[1]},
+        bound=2e-3,
+    )
+    print(f"fused CE worst gradient rel L2 {worst[0]:.3e} ({worst[1]})")
+    with torch.no_grad():
+      tail_zeroed = weight.clone()
+      tail_zeroed[full_tiles:] = 0
+      dropped_tail = reference(x, tail_zeroed)
+    control = abs(dropped_tail.item() - expected.item()) / abs(expected.item())
+    # Measured 2.3e-3, 230x the loss bound.
+    print(f"fused CE control (no partial tile): loss moves {control:.3e}")
+    self.assertGreater(control, 1e-3)
+
+
 class TestDeepSeekV3CompiledBiasBalancer(BaseAcceleratorDeviceTest):
   """The auxiliary-loss-free balancer survives per-block compile.
 

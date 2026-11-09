@@ -124,6 +124,22 @@ class TrainDistributedTest(
           ],
       ),
       dict(
+          testcase_name="deepseek_v3_simplefsdp_fused_ce",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel_fused_ce",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
           testcase_name="deepseek_v3_simplefsdp_use_tokamax_splash_attention_kernel",
           module="torchtitan.experiments.tpu.deepseek_v3",
           config="deepseek_v3_debugmodel",

@@ -11,19 +11,42 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 __all__ = [
     "deepseek_v3_671b_2l_16e",
+    "deepseek_v3_671b_2l_16e_fused_ce",
     "deepseek_v3_debugmodel",
+    "deepseek_v3_debugmodel_fused_ce",
     "graph_trainer_deepseek_v3_671b_2l_16e",
+    "graph_trainer_deepseek_v3_671b_2l_16e_fused_ce",
     "graph_trainer_deepseek_v3_debugmodel",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
 # The target's sequence length (MaxText Lineage and the 671B-31L proxy).
 _PROXY_CONTEXT_LENGTH = 4096
+# Overrides are identified by the import path of the decorated factory.
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+)
+
+
+def _enable_pallas_cross_entropy(config):
+  """Select the fused loss and its pre-construction LM-head override together.
+
+  The override swaps the plain ``Linear`` lm_head for
+  ``FusedLossLinearWrapper`` (same weight and checkpoint key), which hands
+  ``(hidden, weight.T)`` to the fused kernel, so the ``[tokens, vocab]`` fp32
+  logits are never materialized (vocab 129280 at 671B). DeepSeek-V3 has no
+  logit soft-cap or multiplier, so the loss keeps its defaults.
+  """
+  config.loss = PallasCrossEntropyLoss.Config()
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+  return config
 
 
 def deepseek_v3_debugmodel() -> TPUTrainerConfig:
@@ -151,3 +174,18 @@ def graph_trainer_deepseek_v3_671b_2l_16e() -> TpuGraphTrainer.Config:
   config.compile.fsdp_barrier_policy = "interleave"
   config.parallelism.fsdp_reshard_after_forward = "always"
   return config
+
+
+def deepseek_v3_debugmodel_fused_ce() -> TPUTrainerConfig:
+  """``deepseek_v3_debugmodel`` with the fused Pallas linear + cross entropy."""
+  return _enable_pallas_cross_entropy(deepseek_v3_debugmodel())
+
+
+def deepseek_v3_671b_2l_16e_fused_ce() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_2l_16e`` with the fused Pallas linear + cross entropy."""
+  return _enable_pallas_cross_entropy(deepseek_v3_671b_2l_16e())
+
+
+def graph_trainer_deepseek_v3_671b_2l_16e_fused_ce() -> TpuGraphTrainer.Config:
+  """``graph_trainer_deepseek_v3_671b_2l_16e`` with the fused linear + CE."""
+  return _enable_pallas_cross_entropy(graph_trainer_deepseek_v3_671b_2l_16e())

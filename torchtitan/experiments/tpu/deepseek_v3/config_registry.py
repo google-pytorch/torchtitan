@@ -30,11 +30,15 @@ __all__ = [
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas",
     "deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4",
     "deepseek_v3_671b_2l_16e_target_proxy",
+    "deepseek_v3_671b_2l_16e_target_proxy_cap2",
     "deepseek_v3_671b_2l_16e_target_proxy_mtp",
     "deepseek_v3_671b_31l_4x4x4",
+    "deepseek_v3_671b_31l_4x4x4_cap2",
     "deepseek_v3_671b_31l_4x4x4_mtp",
+    "deepseek_v3_671b_31l_4x4x4_mtp_cap2",
     "deepseek_v3_671b_31l_4x4x4_native_gmm",
     "deepseek_v3_671b_4l_16e_target_proxy",
+    "deepseek_v3_671b_4l_16e_target_proxy_cap2",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
     "deepseek_v3_debugmodel_fused_ce_mtp",
@@ -378,6 +382,11 @@ def deepseek_v3_671b_2l_16e_tpu_moe_pallas_ep4() -> TPUTrainerConfig:
 
 # The 64-chip target: one tpu7x 4x4x4 slice, 128 ranks (one per TensorCore).
 _TARGET_EP_DEGREE = 16
+# ``_cap2`` recipes: bounded EP receive buffer at 2x the average rows per rank
+# (65,536 rows at the target instead of EP 16 x 32,768 = 524,288); an
+# overflowed step is replayed at 4x, then on the worst-case program.
+_CAP2_RECEIVE_FACTOR = 2.0
+_CAP2_REPLAY_FACTOR = 4.0
 
 
 def _target_recipe(
@@ -385,11 +394,16 @@ def _target_recipe(
     expert_parallel_degree: int,
     num_mtp_layers: int = 0,
     pallas_grouped_mm: bool = True,
+    receive_capacity_factor: float | None = None,
 ) -> TPUTrainerConfig:
-  """The 64-chip target recipe's settings on any flavor (see below)."""
+  """The 64-chip target recipe's settings on any flavor (see below).
+
+  ``receive_capacity_factor`` bounds the ragged EP dispatcher's receive
+  buffer (``_cap2`` recipes; replay factor ``_CAP2_REPLAY_FACTOR``).
+  """
   config = _enable_pallas_cross_entropy(deepseek_v3_debugmodel())
   # pylint: disable-next=g-import-not-at-top
-  from torchtitan.experiments.tpu.deepseek_v3 import model_registry, tpu_moe_converters, use_tpu_moe_kernels
+  from torchtitan.experiments.tpu.deepseek_v3 import model_registry, tpu_moe_converters, use_bounded_receive_buffer, use_tpu_moe_kernels
 
   config.model_spec = model_registry(
       flavor,
@@ -402,6 +416,12 @@ def _target_recipe(
       pallas_grouped_mm=pallas_grouped_mm,
       scale_before_down_proj=False,
   )
+  if receive_capacity_factor is not None:
+    use_bounded_receive_buffer(
+        config.model_spec.model,
+        receive_capacity_factor,
+        receive_replay_capacity_factor=_CAP2_REPLAY_FACTOR,
+    )
   config.optimizer = default_adamw(lr=2.2e-4, implementation="foreach")
   config.lr_scheduler = LRSchedulersContainer.Config(
       warmup_steps=10,
@@ -454,6 +474,54 @@ def deepseek_v3_671b_31l_4x4x4() -> TPUTrainerConfig:
   room. Per-rank estimate in the onboarding record.
   """
   return _target_recipe("671B-31L", _TARGET_EP_DEGREE)
+
+
+def deepseek_v3_671b_31l_4x4x4_cap2() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_31l_4x4x4`` with a bounded EP receive buffer (2x).
+
+  The ragged dispatcher's receive buffer holds 2 x 32,768 = 65,536 rows per
+  rank (the Pallas row tile divides it) instead of the worst case EP 16 x
+  32,768 = 524,288, whose grouped-matmul temporaries alone are ~40 GiB (one
+  v6e chip, measured). Still dropless and bit-identical: a step in which any
+  rank of any layer receives more is replayed before the optimizer on the
+  same batches at 4x (131,072 rows), then on the worst-case program; TPUTrainer
+  logs ``ep_receive/max_load`` (most rows one rank received / average) and
+  ``ep_receive/replays`` every step. The worst-case program is only compiled
+  if a step needs it. The buffer no longer grows with EP, so
+  ``--parallelism.expert_parallel_degree=32`` / ``64`` keep the same buffer.
+
+  Factor from the proxies' measured max / average rows per rank (30 steps,
+  test data): 1.14-1.25 (2L-16E) / 1.25-1.48 (4L-16E) / 1.18-1.65 (2L-32E)
+  over the first 5-6 steps, then routing collapses as the LR warms up and the
+  load sits at each layout's ceiling (2.0 / 2.0 / 2.5). If the target's
+  routing collapses the same way (no ceiling below 16x at 16 experts per
+  rank), every step replays and this recipe is slower than the worst-case one.
+  """
+  return _target_recipe(
+      "671B-31L",
+      _TARGET_EP_DEGREE,
+      receive_capacity_factor=_CAP2_RECEIVE_FACTOR,
+  )
+
+
+def deepseek_v3_671b_31l_4x4x4_mtp_cap2() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_31l_4x4x4_mtp`` with the ``_cap2`` receive buffer."""
+  return _target_recipe(
+      "671B-31L",
+      _TARGET_EP_DEGREE,
+      num_mtp_layers=1,
+      receive_capacity_factor=_CAP2_RECEIVE_FACTOR,
+  )
+
+
+def deepseek_v3_671b_2l_16e_target_proxy_cap2() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_2l_16e_target_proxy`` with the ``_cap2`` buffer.
+
+  At 16 experts / EP 4 a rank holds 4 experts < top 8, so a token sends it
+  at most 4 rows and 2 x N is already the exact worst case (the proxy never
+  replays at 2x; it does at smaller factors).
+  """
+  return _target_recipe("671B-2L-16E", 4, receive_capacity_factor=_CAP2_RECEIVE_FACTOR)
 
 
 def deepseek_v3_671b_2l_16e_target_proxy() -> TPUTrainerConfig:
@@ -536,6 +604,16 @@ def deepseek_v3_671b_4l_16e_target_proxy() -> TPUTrainerConfig:
   from torchtitan.experiments.tpu.deepseek_v3 import DEEP_671B_FLAVOR
 
   return _target_recipe(DEEP_671B_FLAVOR, 4)
+
+
+def deepseek_v3_671b_4l_16e_target_proxy_cap2() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_4l_16e_target_proxy`` with the ``_cap2`` buffer."""
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.deepseek_v3 import DEEP_671B_FLAVOR
+
+  return _target_recipe(
+      DEEP_671B_FLAVOR, 4, receive_capacity_factor=_CAP2_RECEIVE_FACTOR
+  )
 
 
 def graph_trainer_deepseek_v3_671b_4l_16e_target_proxy() -> (

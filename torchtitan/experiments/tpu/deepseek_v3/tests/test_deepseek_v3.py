@@ -1428,9 +1428,49 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
           ep=4,
           mtp_layers=1,
       ),
+      dict(
+          testcase_name="target_cap2",
+          config="deepseek_v3_671b_31l_4x4x4_cap2",
+          flavor="671B-31L",
+          moe_layers=28,
+          ep=16,
+          receive=(2.0, 4.0),
+      ),
+      dict(
+          testcase_name="target_mtp_cap2",
+          config="deepseek_v3_671b_31l_4x4x4_mtp_cap2",
+          flavor="671B-31L",
+          moe_layers=28,
+          ep=16,
+          mtp_layers=1,
+          receive=(2.0, 4.0),
+      ),
+      dict(
+          testcase_name="proxy_cap2",
+          config="deepseek_v3_671b_2l_16e_target_proxy_cap2",
+          flavor="671B-2L-16E",
+          moe_layers=1,
+          ep=4,
+          receive=(2.0, 4.0),
+      ),
+      dict(
+          testcase_name="proxy_4l_cap2",
+          config="deepseek_v3_671b_4l_16e_target_proxy_cap2",
+          flavor="671B-4L-16E",
+          moe_layers=2,
+          ep=4,
+          receive=(2.0, 4.0),
+      ),
   )
   def test_parses_with_the_target_setup(
-      self, config, flavor, moe_layers, ep, mtp_layers=0, pallas=True
+      self,
+      config,
+      flavor,
+      moe_layers,
+      ep,
+      mtp_layers=0,
+      pallas=True,
+      receive=(None, None),
   ):
     # pylint: disable=g-import-not-at-top
     import torchtitan.config
@@ -1449,10 +1489,20 @@ class TestDeepSeekV3TargetRecipe(parameterized.TestCase):
     self.assertEqual(sum(l.moe is not None for l in model.layers), moe_layers)
     # MTP blocks are MoE blocks too (built from the last layer).
     self.assertLen(model.mtp_layers, mtp_layers)
-    self.assertLen(
-        list(model.traverse(TpuRaggedEPTokenDispatcher.Config)),
-        moe_layers + mtp_layers,
-    )
+    dispatchers = [
+        d for _, d, _, _ in model.traverse(TpuRaggedEPTokenDispatcher.Config)
+    ]
+    self.assertLen(dispatchers, moe_layers + mtp_layers)
+    # Recipes without ``_cap2`` keep the worst-case receive buffer.
+    for dispatcher in dispatchers:
+      self.assertEqual(
+          (
+              dispatcher.receive_capacity_factor,
+              dispatcher.receive_replay_capacity_factor,
+          ),
+          receive,
+      )
+      self.assertEqual(dispatcher.receive_capacity_multiple, 512)
     experts = [e for _, e, _, _ in model.traverse(TpuGroupedExperts.Config)]
     self.assertLen(experts, moe_layers + mtp_layers)
     self.assertEqual({e.use_pallas_grouped_mm for e in experts}, {pallas})

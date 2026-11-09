@@ -7,12 +7,14 @@
 """Trainer compatible with TorchTpu."""
 
 import contextlib
+from collections.abc import Iterator
 import json
 from typing import Any, cast
 
 import os
 import torch
 import torch.distributed as dist
+import torch.utils._pytree as pytree
 from torchtitan.config.configurable import Configurable
 from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
@@ -28,6 +30,8 @@ import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
+from torchtitan.experiments.tpu.ragged_ep_dispatcher import ReceiveBufferOverflow
+from torchtitan.experiments.tpu.ragged_ep_dispatcher import ReceiveOverflowReplay
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
@@ -50,6 +54,12 @@ class TPUTrainer(torchtitan.train.Trainer):
   compile.compile_grad_norm:
     Compiles the DTensor-aware global gradient norm as a standalone static XLA
     graph. In-place clipping remains on PyTorch's eager path.
+
+  Bounded EP receive buffers (``TpuRaggedEPTokenDispatcher.Config.
+  receive_capacity_factor``):
+    Each step runs on the bounded program; before the optimizer one host read
+    checks every layer's overflow flag, and an overflowed step is re-run on
+    the same batches with a larger buffer (see ``ReceiveOverflowReplay``).
   """
 
   def __init__(self, job_config: Configurable.Config):
@@ -69,14 +79,61 @@ class TPUTrainer(torchtitan.train.Trainer):
         from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
         apply_compiled_optimizer(self)
 
+    self._receive_overflow_replay = ReceiveOverflowReplay.maybe_create(
+        self.model_parts, self.device
+    )
+    if self._receive_overflow_replay is not None:
+      if self.parallel_dims.pp_enabled:
+        raise NotImplementedError(
+            "bounded EP receive buffers do not support pipeline parallelism"
+        )
+      logger.info(
+          "Bounded EP receive buffer on"
+          f" {len(self._receive_overflow_replay.dispatchers)} MoE dispatchers;"
+          " overflowed steps are replayed"
+      )
+
+  def train_step(self, data_iterator: Iterator[dict[str, Any]]):
+    replay = self._receive_overflow_replay
+    if replay is None:
+      return super().train_step(data_iterator)
+    batches = _RecordedBatches(data_iterator)
+    ntokens_seen = self.ntokens_seen
+    replay.begin_step()
+    attempt_batches: Iterator[dict[str, Any]] = batches
+    for level in replay.levels():
+      with replay.at_level(level):
+        try:
+          super().train_step(attempt_batches)
+          break
+        except ReceiveBufferOverflow:
+          # Nothing past the gradients was touched: undo the forward's buffer
+          # updates and token count, re-run the same batches one level up.
+          replay.restore()
+          self.ntokens_seen = ntokens_seen
+          attempt_batches = batches.replay()
+    if self.metrics_processor.should_log(self.step):
+      metrics = replay.metrics()
+      self.metrics_processor.logger.log(metrics, self.step)
+      if dist.get_rank() == 0:
+        logger.info(
+            f"step {self.step} EP receive: "
+            + ", ".join(f"{k.split('/')[1]} {v:g}" for k, v in metrics.items())
+        )
+
   def _clip_grad_norm(self) -> torch.Tensor:
     if self._compiled_grad_norm is None:
-      return super()._clip_grad_norm()
-    parameters = [p for m in self.model_parts for p in m.parameters()]
-    return self._compiled_grad_norm.clip_grad_norm_(
-        parameters,
-        self.config.training.max_norm,
-    )
+      grad_norm = super()._clip_grad_norm()
+    else:
+      parameters = [p for m in self.model_parts for p in m.parameters()]
+      grad_norm = self._compiled_grad_norm.clip_grad_norm_(
+          parameters,
+          self.config.training.max_norm,
+      )
+    if self._receive_overflow_replay is not None:
+      # Last point before the optimizer (and its balancer pre-hook) runs.
+      self._receive_overflow_replay.check(self.step)
+    return grad_norm
 
   def forward_backward_step(
       self,
@@ -138,6 +195,35 @@ class TPUTrainer(torchtitan.train.Trainer):
         loss.backward()
 
       return loss
+
+
+class _RecordedBatches:
+  """Passes batches through and keeps copies, for an overflow replay.
+
+  ``train_step`` pops keys from and moves tensors in the dicts it draws, so
+  the copies are taken before it sees them (host tensors cloned).
+  """
+
+  def __init__(self, iterator: Iterator[dict[str, Any]]):
+    self._iterator = iterator
+    self._batches: list[dict[str, Any]] = []
+
+  def __iter__(self):
+    return self
+
+  def __next__(self) -> dict[str, Any]:
+    batch = next(self._iterator)
+    self._batches.append(_copy_batch(batch))
+    return batch
+
+  def replay(self) -> Iterator[dict[str, Any]]:
+    return iter([_copy_batch(batch) for batch in self._batches])
+
+
+def _copy_batch(batch: dict[str, Any]) -> dict[str, Any]:
+  return pytree.tree_map(
+      lambda v: v.clone() if isinstance(v, torch.Tensor) else v, batch
+  )
 
 
 def _apply_flux_img_size(

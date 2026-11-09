@@ -39,6 +39,8 @@ import torchtitan.models.deepseek_v3 as deepseek_v3_models
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.ragged_ep_dispatcher import DEFAULT_RECEIVE_CAPACITY_MULTIPLE
+from torchtitan.experiments.tpu.ragged_ep_dispatcher import TpuRaggedEPTokenDispatcher
 from torchtitan.experiments.tpu.ragged_ep_dispatcher import TpuRaggedEPTokenDispatcherConverter
 from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExperts
 from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExpertsConverter
@@ -61,6 +63,7 @@ __all__ = [
     "parallelize_deepseek_v3",
     "parallelize_deepseekv3",
     "tpu_moe_converters",
+    "use_bounded_receive_buffer",
     "use_tpu_attention",
     "use_tpu_moe_kernels",
 ]
@@ -223,6 +226,59 @@ def use_tpu_moe_kernels(
     scale_before_down_proj = pallas_grouped_mm
   for _, routed_config, _, _ in routed:
     routed_config.scale_before_down_proj = scale_before_down_proj
+  return config
+
+
+def use_bounded_receive_buffer(
+    config: deepseek_v3_models.DeepSeekV3Model.Config,
+    receive_capacity_factor: float,
+    *,
+    receive_replay_capacity_factor: float | None = None,
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  """Bounds the ragged EP dispatcher's receive buffer (dropless via replay).
+
+  Every MoE layer's ``TpuRaggedEPTokenDispatcher`` gets a receive buffer of
+  ``ceil(receive_capacity_factor x N)`` rows (N = tokens x top_k, the
+  average a rank receives) rounded up to the grouped-matmul row tile, instead
+  of the worst case ``EP x N``. A step in which any rank of any layer receives
+  more is replayed by ``TPUTrainer`` on the same batches, first with
+  ``receive_replay_capacity_factor`` (if set), then on the worst-case program;
+  no token is ever dropped. Per-block ``TPUTrainer`` only (GraphTrainer and
+  ``train_minimal`` refuse a bounded dispatcher). No effect at EP 1.
+
+  Args:
+    config: A DeepSeek-V3 model config built with ``tpu_moe_converters()``
+      (after ``use_tpu_moe_kernels``, whose Pallas row tile sets the multiple).
+    receive_capacity_factor: Buffer rows / N for the normal step.
+    receive_replay_capacity_factor: Buffer rows / N for the first replay.
+
+  Returns:
+    The same config, modified in place.
+  """
+  dispatchers = list(config.traverse(TpuRaggedEPTokenDispatcher.Config))
+  experts = list(config.traverse(TpuGroupedExperts.Config))
+  moe_layers = [
+      l for l in [*config.layers, *config.mtp_layers] if l.moe is not None
+  ]
+  if len(dispatchers) != len(moe_layers):
+    raise ValueError(
+        f"{len(moe_layers)} MoE layers but {len(dispatchers)} ragged EP"
+        " dispatcher configs; build the config with tpu_moe_converters()"
+    )
+  multiple = max(
+      (
+          e.pallas_grouped_mm_tile_m
+          for _, e, _, _ in experts
+          if e.use_pallas_grouped_mm
+      ),
+      default=DEFAULT_RECEIVE_CAPACITY_MULTIPLE,
+  )
+  for _, dispatcher_config, _, _ in dispatchers:
+    dispatcher_config.receive_capacity_factor = receive_capacity_factor
+    dispatcher_config.receive_replay_capacity_factor = (
+        receive_replay_capacity_factor
+    )
+    dispatcher_config.receive_capacity_multiple = multiple
   return config
 
 

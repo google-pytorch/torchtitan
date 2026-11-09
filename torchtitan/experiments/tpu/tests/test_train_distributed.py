@@ -71,6 +71,81 @@ class _RecordLossesAndExpertBias:
 _DSV3_EP_LOSS_RTOL = 1e-4
 
 
+class _RecordBoundedReceiveRun:
+  """Runs the trainer with a bounded EP receive buffer; rank 0 saves the run.
+
+  Saves each logged step's loss and grad norm and the number of attempts
+  whose receive buffer overflowed. Every arm runs the Pallas grouped matmul
+  (the ``_cap2`` recipes' kernel; scores after the return exchange, as under
+  EP). ``factor=None`` leaves the worst-case buffer. ``replay=False`` (the
+  control) swallows the overflow, so the trainer applies the clipped step:
+  the overflowing tokens are dropped. Module-level with ``__name__`` for the
+  spawned ``torchrun`` workers.
+  """
+
+  def __init__(
+      self,
+      output_path: str,
+      factor: float | None = None,
+      replay_factor: float | None = None,
+      replay: bool = True,
+  ):
+    self.output_path = output_path
+    self.factor = factor
+    self.replay_factor = replay_factor
+    self.replay = replay
+    self.__name__ = "_RecordBoundedReceiveRun"
+    self.__qualname__ = "_RecordBoundedReceiveRun"
+
+  def __call__(self, config):
+    # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu import ragged_ep_dispatcher
+    from torchtitan.experiments.tpu.deepseek_v3 import use_bounded_receive_buffer
+    from torchtitan.experiments.tpu.deepseek_v3 import use_tpu_moe_kernels
+    # pylint: enable=g-import-not-at-top
+
+    use_tpu_moe_kernels(
+        config.model_spec.model,
+        pallas_grouped_mm=True,
+        scale_before_down_proj=False,
+    )
+    if self.factor is not None:
+      use_bounded_receive_buffer(
+          config.model_spec.model,
+          self.factor,
+          receive_replay_capacity_factor=self.replay_factor,
+      )
+    history = []
+    overflows = [0]
+    original_log = metrics.MetricsProcessor.log
+    original_check = ragged_ep_dispatcher.ReceiveOverflowReplay.check
+
+    def log(processor, step, global_avg_loss, global_max_loss, grad_norm, *a, **k):
+      history.append([step, global_avg_loss, grad_norm])
+      return original_log(
+          processor, step, global_avg_loss, global_max_loss, grad_norm, *a, **k
+      )
+
+    def check(replay, step):
+      try:
+        original_check(replay, step)
+      except ragged_ep_dispatcher.ReceiveBufferOverflow:
+        overflows[0] += 1
+        if self.replay:
+          raise
+
+    with (
+        mock.patch.object(metrics.MetricsProcessor, "log", log),
+        mock.patch.object(
+            ragged_ep_dispatcher.ReceiveOverflowReplay, "check", check
+        ),
+    ):
+      torchtitan.experiments.tpu.train.start_trainer(config)
+    if int(os.environ.get("RANK", "0")) == 0:
+      with open(self.output_path, "w") as f:
+        json.dump({"history": history, "overflows": overflows[0]}, f)
+
+
 class TrainDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
@@ -1008,6 +1083,77 @@ class TrainDistributedTest(
           abs(reference[step][0]) * _DSV3_EP_LOSS_RTOL,
           msg=f"control step {step}",
       )
+
+  def test_deepseek_v3_bounded_receive_buffer_matches_unbounded(self):
+    """A bounded EP receive buffer trains bit-identically to the worst case.
+
+    DeepSeek-V3 debugmodel, TPU MoE recipe with Pallas experts (row tile
+    512), EP 4 (8 experts, 2 per rank, top 3; N = 1024 tokens x 3 = 3072
+    rows per rank), per-block compile, 20 steps, same data and seed. Arms:
+    the worst-case ``EP x N`` buffer (reference); ``fit`` (factor 4, capped
+    at the exact bound ``EP x T x min(top_k, 2)`` = 8192 rows, cannot
+    overflow); ``forced`` (factor 0.25 -> 1024 rows, below the average, so
+    every step overflows; replay factor 1.0 overflows too whenever a rank
+    receives more than N, then the worst-case program). Loss and grad norm
+    must be equal at every step, and ``forced`` must replay every step.
+    Control: the forced buffer with the replay swallowed (the clipped step is
+    applied, tokens are dropped) must differ. Bit-identity needs the Pallas
+    kernel: native ``torch._grouped_mm`` (XLA ragged dot) changes rounding
+    with the buffer's row count (measured: step-2 loss rel 4e-6 here).
+    """
+    shape = [
+        "--module=torchtitan.experiments.tpu.deepseek_v3",
+        "--config=deepseek_v3_debugmodel_tpu_moe",
+        "--dataloader.dataset_path=tests/assets/c4_test",
+        "--dataloader.dataset=c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
+        "--training.steps=20",
+        "--training.max_context_length=256",
+        "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+        "--parallelism.expert_parallel_degree=4",
+        "--debug.seed=42",
+        "--debug.deterministic",
+    ]
+    arms = {
+        "unbounded": {},
+        "fit": dict(factor=4.0),
+        "forced": dict(factor=0.25, replay_factor=1.0),
+        "control": dict(factor=0.25, replay=False),
+    }
+    tempdir = self.create_tempdir().full_path
+    runs = {}
+    for arm, kwargs in arms.items():
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=list(shape),
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+          start_trainer=_RecordBoundedReceiveRun(path, **kwargs),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        runs[arm] = json.load(f)
+
+    reference = runs["unbounded"]["history"]
+    self.assertEqual([s for s, _, _ in reference], list(range(1, 21)))
+    for arm in ("fit", "forced"):
+      self.assertEqual(runs[arm]["history"], reference, msg=arm)
+    logging.info(
+        "deepseek_v3 bounded receive: overflowing attempts fit %d, forced %d"
+        " (20 steps), control %d",
+        runs["fit"]["overflows"],
+        runs["forced"]["overflows"],
+        runs["control"]["overflows"],
+    )
+    self.assertEqual(runs["fit"]["overflows"], 0)
+    self.assertGreaterEqual(runs["forced"]["overflows"], 20)
+    self.assertGreaterEqual(runs["control"]["overflows"], 20)
+    control = runs["control"]["history"]
+    self.assertNotEqual(control[0][1], reference[0][1])
 
 
 if __name__ == "__main__":

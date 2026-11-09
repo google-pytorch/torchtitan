@@ -365,3 +365,72 @@ def test_scale_before_down_proj_matches_scaling_the_output():
         ),
         scale_before_down_proj=True,
     ).build()
+
+
+def _bounded_dispatcher(**kwargs):
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.ragged_ep_dispatcher import TpuRaggedEPTokenDispatcher
+
+  return TpuRaggedEPTokenDispatcher.Config(
+      num_experts=kwargs.pop("num_experts", 256),
+      top_k=kwargs.pop("top_k", 8),
+      **kwargs,
+  ).build()
+
+
+def test_ragged_ep_receive_capacity():
+  """Bounded receive buffer rows: factor x N, tile-rounded, exact caps."""
+  # 671B-31L at EP 16: 256 experts (16 per rank), top 8, N = 4096 x 8.
+  n = 4096 * 8
+  default = _bounded_dispatcher()
+  assert default.receive_capacity(n, 16) is None  # worst-case path
+  bounded = _bounded_dispatcher(
+      receive_capacity_factor=2.0, receive_replay_capacity_factor=4.0
+  )
+  assert bounded.receive_capacity(n, 16) == 2 * n
+  bounded.receive_level = 1
+  assert bounded.receive_capacity(n, 16) == 4 * n
+  bounded.receive_level = 2
+  assert bounded.receive_capacity(n, 16) is None
+  # Rounded up to the row multiple; capped at the worst case EP x N.
+  odd = _bounded_dispatcher(
+      receive_capacity_factor=1.01, receive_capacity_multiple=512
+  )
+  assert odd.receive_capacity(n, 16) == 33280  # ceil(33095.68) -> 65 x 512
+  assert _bounded_dispatcher(receive_capacity_factor=64.0).receive_capacity(
+      n, 16
+  ) == 16 * n
+  # 16 experts at EP 4 (4 per rank < top 8): a token sends at most 4 rows to
+  # one rank, so 2 x N is already the exact worst case.
+  proxy = _bounded_dispatcher(num_experts=16, receive_capacity_factor=3.0)
+  assert proxy.receive_capacity(n, 4) == 2 * n
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(receive_capacity_factor=0.0),
+        dict(receive_capacity_factor=-1.0),
+        dict(receive_capacity_multiple=0),
+        dict(receive_replay_capacity_factor=4.0),
+        dict(receive_capacity_factor=2.0, receive_replay_capacity_factor=2.0),
+    ],
+)
+def test_ragged_ep_receive_capacity_rejects_bad_config(kwargs):
+  with pytest.raises(ValueError):
+    _bounded_dispatcher(**kwargs)
+
+
+def test_bounded_ragged_ep_dispatcher_refuses_to_run_without_replay():
+  """No overflow replay installed (e.g. GraphTrainer): fail, never drop."""
+  dispatcher = _bounded_dispatcher(
+      num_experts=8, top_k=2, receive_capacity_factor=1.0
+  )
+  dispatcher.ep_mesh = mock.Mock(size=mock.Mock(return_value=4))
+  assert dispatcher.bounded
+  x = torch.randn(6, 4)
+  scores = torch.rand(6, 2)
+  ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7], [0, 7], [1, 6]])
+  counts = torch.bincount(ids.reshape(-1), minlength=8)
+  with pytest.raises(RuntimeError, match="would drop tokens"):
+    dispatcher.dispatch(x, scores, ids, counts)

@@ -586,7 +586,7 @@ class RoutedExperts(Module):
 
 
 def _replicate_plain_tensors(t: torch.Tensor):
-    """Lets ``t``'s ops mix in plain tensors (the iota below) when it is a
+    """Lets ``t``'s ops mix in plain tensors (the iotas below) when it is a
     DTensor, as under TP; a no-op for plain tensors."""
     return implicit_replication() if isinstance(t, DTensor) else nullcontext()
 
@@ -721,8 +721,22 @@ class TokenChoiceTopKRouter(Module):
         scores_grouped = scores_for_choice_TE.unflatten(
             -1, (self.num_expert_groups, experts_per_group)
         )
-        top2_scores_in_group, _ = scores_grouped.topk(2, dim=-1)
-        group_scores = top2_scores_in_group.sum(dim=-1)
+        # Sum of each group's top 2 scores without topk, which on TPU falls
+        # back to a bitonic sort at 32 experts per group: the max, plus the max
+        # with the first argmax masked out. Masking one position (not every
+        # copy of the max) keeps a tied max as the second value, as topk does.
+        max1_scores_in_group = scores_grouped.amax(dim=-1)
+        max1_idx_in_group = scores_grouped.argmax(dim=-1, keepdim=True)
+        experts_in_group = torch.arange(
+            experts_per_group,
+            device=max1_idx_in_group.device,
+            dtype=max1_idx_in_group.dtype,
+        )
+        with _replicate_plain_tensors(scores_grouped):
+            max2_scores_in_group = scores_grouped.masked_fill(
+                experts_in_group == max1_idx_in_group, float("-inf")
+            ).amax(dim=-1)
+        group_scores = max1_scores_in_group + max2_scores_in_group
         _, group_idx = torch.topk(
             group_scores, k=self.num_limited_groups, dim=-1, sorted=False
         )

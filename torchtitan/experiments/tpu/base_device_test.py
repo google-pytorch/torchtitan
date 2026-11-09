@@ -81,10 +81,15 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     # Instantiate component on CPU.
     module_cpu = module_class(*module_args, **module_kwargs).cpu()
     init_fn(module_cpu)
-    # Create an identical copy on the accelerator device.
-    module_device = (
-        copy.deepcopy(module_cpu)
-        .to(dtype=test_utils.EXPECTED_DEVICE_DTYPE, device=self.accelerator_device)
+    # Create an identical copy on the accelerator device. Only floating-point
+    # tensors take the device dtype: Module.to(dtype=...) would also cast
+    # complex buffers (ComplexRoPE's cache) to real, dropping the imaginary
+    # part, so the device copy would run a different RoPE than the CPU one.
+    module_device = copy.deepcopy(module_cpu).to(device=self.accelerator_device)
+    module_device._apply(  # pylint: disable=protected-access
+        lambda t: t.to(dtype=test_utils.EXPECTED_DEVICE_DTYPE)
+        if t.is_floating_point()
+        else t
     )
 
     cpu_weight = next(module_cpu.parameters())

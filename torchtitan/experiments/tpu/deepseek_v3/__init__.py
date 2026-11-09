@@ -14,6 +14,11 @@ adapter) for the TPU lane:
 * ``parallelize_fn`` is ``infra.parallelize.parallelize_deepseek_v3`` (AC ->
   per-block compile with ``dynamic=False`` -> SimpleFSDP or FSDP2); pipeline
   parallelism is not supported on TPU, so ``pipelining_fn`` is None.
+* ``tpu_moe_converters()`` / ``use_tpu_moe_kernels()`` select the lane's MoE
+  path (the Qwen3 TPU recipes' converters): the TPU token dispatcher (row
+  gathers and a fixed-K FP32 combine instead of upstream's element-wise
+  ``deterministic_scatter_add``, whose backward gather owned 84-97 % of a
+  ``671B-2L-16E`` step), ``TpuGroupedExperts`` and ``TpuRoutedExperts``.
 
 Flavors: the small test flavors, upstream's ``debugmodel`` / ``16B`` /
 ``236B`` / ``671B``, ``671B-31L``, the 31-layer proxy of 671B (3 dense + 28
@@ -27,7 +32,12 @@ import dataclasses
 
 import torchtitan.models.common as common_models
 import torchtitan.models.deepseek_v3 as deepseek_v3_models
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExperts
+from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExpertsConverter
+from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
 from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.models.utils import validate_converter_order
@@ -44,7 +54,9 @@ __all__ = [
     "model_registry",
     "parallelize_deepseek_v3",
     "parallelize_deepseekv3",
+    "tpu_moe_converters",
     "use_tpu_attention",
+    "use_tpu_moe_kernels",
 ]
 
 # The 671B proxy keeps upstream 671B's 3 dense layers and 28 of its 58 MoE
@@ -81,6 +93,86 @@ def use_tpu_attention(
     layer.attention.inner_attention = (
         SlidingWindowScaledDotProductInnerAttention.Config()
     )
+  return config
+
+
+def tpu_moe_converters() -> list[ModelConfigConverter.Config]:
+  """The lane's MoE converters, in the order the Qwen3 TPU recipes use.
+
+  ``TpuTokenDispatcherConverter`` swaps upstream's dispatcher for
+  ``TpuAllToAllTokenDispatcher`` (expert sort by inverse-permutation row
+  gathers; at EP 1 a stable sort + fixed-``top_k`` FP32 sum instead of the
+  element-wise scatter-add combine), ``TpuGroupedExpertsConverter`` the
+  experts for ``TpuGroupedExperts`` (still ``torch._grouped_mm`` until the
+  Pallas switches are set) and ``TpuRoutedExpertsConverter`` the routed
+  block for ``TpuRoutedExperts`` (optional score-before-W2). On their own they
+  change no parameter or checkpoint key.
+  """
+  return [
+      TpuTokenDispatcherConverter.Config(),
+      TpuGroupedExpertsConverter.Config(),
+      TpuRoutedExpertsConverter.Config(),
+  ]
+
+
+def use_tpu_moe_kernels(
+    config: deepseek_v3_models.DeepSeekV3Model.Config,
+    *,
+    pallas_grouped_mm: bool = False,
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  """Sets the Pallas switches on a config already built with ``tpu_moe_converters``.
+
+  With ``pallas_grouped_mm`` the experts run the MegaBlox grouped matmul
+  (kernel-native weight layout; checkpoint keys stay ``w1_EFD`` / ``w2_EDF`` /
+  ``w3_EFD`` through ``TpuGroupedExperts``' state-dict hooks) and routing
+  scores scale the hidden rows before W2 (``scale_before_down_proj``). The
+  paired W1/W3 kernel is not used: its forward loads both full ``[D, F]``
+  weights per expert (2 x 7168 x 2048 bf16) and the module needs 141.6 MB of
+  VMEM against v6e's 128 MB (measured). Untiled forward weights do not fit the
+  32 MB scoped limit either; K and N tiles of 1024 divide both D (7168) and F
+  (2048), so one forward tiling serves W1 / W3 (K=D) and W2 (K=F). Tile
+  sizes were checked on the ``671B-2L-16E`` proxy (16 experts, ~2048 rows per
+  expert per rank); the 256-expert target sees ~128 rows per expert per rank
+  under FSDP only, so they are a fitting choice, not a tuned one.
+
+  Args:
+    config: A DeepSeek-V3 model config built with ``tpu_moe_converters()``.
+    pallas_grouped_mm: Use the Pallas grouped matmul instead of
+      ``torch._grouped_mm``.
+
+  Returns:
+    The same config, modified in place.
+  """
+  experts = list(config.traverse(TpuGroupedExperts.Config))
+  routed = list(config.traverse(TpuRoutedExperts.Config))
+  moe_layers = [
+      l for l in [*config.layers, *config.mtp_layers] if l.moe is not None
+  ]
+  if len(experts) != len(moe_layers) or len(routed) != len(moe_layers):
+    raise ValueError(
+        f"{len(moe_layers)} MoE layers but {len(experts)} TpuGroupedExperts"
+        f" and {len(routed)} TpuRoutedExperts configs; build the config with"
+        " tpu_moe_converters()"
+    )
+  if not pallas_grouped_mm:
+    return config
+  def tile(size: int, preferred: int) -> int:
+    # 0 selects the full axis (small flavors fit VMEM untiled).
+    return preferred if size % preferred == 0 else 0
+
+  for _, expert_config, _, _ in experts:
+    dim, hidden = expert_config.dim, expert_config.hidden_dim
+    expert_config.use_pallas_grouped_mm = True
+    expert_config.use_kernel_native_weight_layout = True
+    expert_config.pallas_grouped_mm_tile_m = 512
+    expert_config.pallas_grouped_mm_tile_k = tile(dim, 1024) and tile(hidden, 1024)
+    expert_config.pallas_grouped_mm_tile_n = expert_config.pallas_grouped_mm_tile_k
+    # dWeight tiles run along the weight's input axis (K): D for W1 / W3, F
+    # for W2, whose full-N (D = 7168) FP32 accumulator needs the smaller K.
+    expert_config.pallas_grouped_mm_tgmm_tiling = (512, tile(dim, 1024), 0)
+    expert_config.pallas_grouped_mm_w2_tgmm_tiling = (512, tile(hidden, 256), 0)
+  for _, routed_config, _, _ in routed:
+    routed_config.scale_before_down_proj = True
   return config
 
 

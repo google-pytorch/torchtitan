@@ -23,8 +23,11 @@ import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 import torchtitan.experiments.tpu.deepseek_v3 as deepseek_v3_tpu
 from torchtitan.experiments.tpu.masked_sdpa import SlidingWindowScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.token_dispatcher import TpuRoutedExperts
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 import torchtitan.models.common as common_models
@@ -717,6 +720,220 @@ class TestDeepSeekV3FusedCrossEntropy(BaseAcceleratorDeviceTest):
     # Measured 2.3e-3, 230x the loss bound.
     print(f"fused CE control (no partial tile): loss moves {control:.3e}")
     self.assertGreater(control, 1e-3)
+
+
+class _CountOps(TorchDispatchMode):
+  """Counts the ops the rung-5 MoE path must remove or introduce.
+
+  ``combine_gathers``: ``aten.gather`` with a ``[N, dim]`` index, the backward
+  of upstream's ``deterministic_scatter_add`` combine (the element-wise gather
+  that owned 84-97 % of a ``671B-2L-16E`` step). ``grouped_mm``: native
+  ``torch._grouped_mm`` calls. ``pallas_gmm``: the lane's MegaBlox ops.
+  """
+
+  def __init__(self, dim):
+    super().__init__()
+    self.dim = dim
+    self.combine_gathers = 0
+    self.grouped_mm = 0
+    self.pallas_gmm = 0
+
+  def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    if func == torch.ops.aten.gather.default:
+      index = args[2]
+      if index.ndim == 2 and index.shape[1] == self.dim:
+        self.combine_gathers += 1
+    elif func == torch.ops.aten._grouped_mm.default:
+      self.grouped_mm += 1
+    elif "tt_experts" in str(func):
+      self.pallas_gmm += 1
+    return func(*args, **(kwargs or {}))
+
+
+_NATIVE_TO_CANONICAL_EXPERT_WEIGHT = {
+    "w1_EDF": "w1_EFD",
+    "w2_EFD": "w2_EDF",
+    "w3_EDF": "w3_EFD",
+}
+
+
+class TestDeepSeekV3TpuMoE(BaseAcceleratorDeviceTest):
+  """Rung 5: the lane's MoE converters vs upstream's MoE path.
+
+  Same weights (loaded through the converted model's ``state_dict`` keys, so
+  the TPU experts keep upstream's checkpoint contract), same packed rows, one
+  forward + backward in training mode. Two expert groups are forced empty
+  through ``expert_bias_E`` (a -1e3 bias drops group 0, experts 0-1, from
+  every top-k), so the grouped matmuls see empty groups. The bias balancer
+  must still move ``expert_bias_E`` after the upstream optimizer pre-hook.
+
+  ``native``: TPU dispatcher + ``TpuGroupedExperts`` on ``torch._grouped_mm``
+  (runs on CPU too). ``pallas``: MegaBlox grouped matmul and score-before-W2
+  (TPU only). The control: upstream's path has the ``[N, dim]`` combine
+  gather in its backward and the converted path does not, and the converted
+  Pallas path calls no native ``torch._grouped_mm``.
+  """
+
+  def setUp(self):
+    super().setUp()
+    use_cpu_safe_histc_patch()
+
+  @parameterized.named_parameters(
+      dict(testcase_name="native", pallas_grouped_mm=False),
+      dict(testcase_name="pallas", pallas_grouped_mm=True),
+  )
+  def test_matches_upstream_moe_with_empty_groups(self, pallas_grouped_mm):
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.components.optimizer import register_moe_load_balancing_hook
+
+    if pallas_grouped_mm and self.accelerator_device.type != "tpu":
+      self.skipTest("The Pallas grouped matmul runs on TPU only")
+    device = self.accelerator_device
+    # Lane-aligned expert width for the Pallas kernels (F % 128 == 0).
+    overrides = dict(moe_hidden_dim=128)
+    torch.manual_seed(0)
+    reference = _tiny_titan_config(**overrides).build()
+    reference.init_states(buffer_device=torch.device("cpu"))
+    with torch.no_grad():
+      for name, param in reference.named_parameters():
+        if name.endswith("router.gate.weight"):
+          param.copy_(0.1 * torch.randn_like(param))
+      for moe in [l.moe for l in reference.layers.values() if l.moe_enabled]:
+        moe.expert_bias_E.copy_(0.05 * torch.randn_like(moe.expert_bias_E))
+        moe.expert_bias_E[:2] = -1e3
+
+    config = _tiny_titan_config(**overrides)
+    converted_config = config
+    for converter in deepseek_v3_tpu.tpu_moe_converters():
+      converted_config = converter.build().convert(converted_config)
+    deepseek_v3_tpu.use_tpu_moe_kernels(
+        converted_config, pallas_grouped_mm=pallas_grouped_mm
+    )
+    converted = converted_config.build()
+    for layer in converted.layers.values():
+      if layer.moe_enabled:
+        routed = layer.moe.routed_experts
+        self.assertIsInstance(routed, TpuRoutedExperts)
+        self.assertIsInstance(
+            routed.token_dispatcher, TpuAllToAllTokenDispatcher
+        )
+        self.assertIsInstance(routed.inner_experts, TpuGroupedExperts)
+        self.assertEqual(
+            routed.inner_experts.use_pallas_grouped_mm, pallas_grouped_mm
+        )
+    # Checkpoint contract: the TPU experts expose upstream's keys and shapes.
+    reference_state = reference.state_dict()
+    converted_state = converted.state_dict()
+    self.assertEqual(set(converted_state), set(reference_state))
+    for key, value in reference_state.items():
+      self.assertEqual(converted_state[key].shape, value.shape, key)
+    missing, unexpected = converted.load_state_dict(reference_state)
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+    for key, value in converted.state_dict().items():
+      torch.testing.assert_close(value, reference_state[key], atol=0, rtol=0)
+    # And through the HF adapter, both ways.
+    adapter = DeepSeekV3StateDictAdapter(converted_config, None)
+    reference_adapter = DeepSeekV3StateDictAdapter(config, None)
+    self.assertEqual(
+        set(adapter.to_hf(converted.state_dict())),
+        set(reference_adapter.to_hf(reference_state)),
+    )
+
+    torch.manual_seed(1)
+    num_tokens = _BATCH * _SEQ_LEN
+    tokens = torch.randint(0, _TINY["vocab_size"], (num_tokens,)).to(device)
+    labels = torch.randint(0, _TINY["vocab_size"], (num_tokens,)).to(device)
+    positions = _packed_positions().to(device)
+
+    def run(model):
+      model = model.to(device).train()
+      counter = _CountOps(_TINY["dim"])
+      with counter, set_unflatten_seq_len(_SEQ_LEN):
+        logits = model(tokens, positions)
+        loss = F.cross_entropy(logits.float(), labels)
+        loss.backward()
+      grads = {}
+      for name, param in model.named_parameters():
+        if param.grad is None:
+          continue
+        # Kernel-native expert storage ([E, K, N]) -> upstream's names/layout.
+        prefix, _, leaf = name.rpartition(".")
+        if leaf in _NATIVE_TO_CANONICAL_EXPERT_WEIGHT:
+          grads[f"{prefix}.{_NATIVE_TO_CANONICAL_EXPERT_WEIGHT[leaf]}"] = (
+              param.grad.transpose(-2, -1)
+          )
+        else:
+          grads[name] = param.grad
+      self.assertLen(grads, len(list(model.parameters())))
+      return logits.detach().float().cpu(), loss.detach().cpu(), grads, counter
+
+    ref_logits, ref_loss, ref_grads, ref_ops = run(reference)
+    logits, loss, grads, ops = run(converted)
+    moes = [l.moe for l in converted.layers.values() if l.moe_enabled]
+    self.assertNotEmpty(moes)
+    for moe in moes:
+      counts = moe.tokens_per_expert_E.cpu()
+      self.assertEqual(counts.sum().item(), num_tokens * _TINY["top_k"])
+      self.assertEqual(counts[:2].sum().item(), 0)  # The empty groups.
+
+    # Control: the path really changed.
+    self.assertGreater(ref_ops.combine_gathers, 0)
+    self.assertEqual(ops.combine_gathers, 0)
+    if pallas_grouped_mm:
+      self.assertEqual(ops.grouped_mm, 0)
+      self.assertGreater(ops.pallas_gmm, 0)
+
+    # Experts run bf16 on both paths; the Pallas path also rounds the
+    # score-scaled hidden rows to bf16 before W2.
+    bound = 2e-2 if pallas_grouped_mm else 1e-5
+    test_utils.check_equivalence(
+        logits, ref_logits, atol=bound, rtol=bound, check_name="Logits",
+        test_label="TPU MoE path", ref_label="upstream MoE path",
+    )
+    test_utils.check_equivalence(
+        loss, ref_loss, atol=bound / 10, rtol=bound / 10, check_name="Loss",
+        test_label="TPU MoE path", ref_label="upstream MoE path",
+    )
+    worst = assert_gradients(self, grads, ref_grads, bound=bound)
+    print(
+        f"TPU MoE ({'pallas' if pallas_grouped_mm else 'native'},"
+        f" {device.type}) vs upstream: max |logit diff|"
+        f" {(logits - ref_logits).abs().max():.3e}, |loss diff|"
+        f" {(loss - ref_loss).abs():.3e}, worst gradient relative L2"
+        f" {worst[0]:.3e} ({worst[1]})"
+    )
+    for multiplier in (0.0, -1.0):
+      with self.assertRaises(AssertionError):
+        assert_gradients(
+            self,
+            {n: g * multiplier for n, g in ref_grads.items()},
+            ref_grads,
+            bound=bound,
+        )
+
+    # The bias balancer still sees the counts and moves the bias.
+    hooks = []
+
+    class _Optimizers:
+
+      def register_step_pre_hook(self, hook):
+        hooks.append(hook)
+
+    class _ParallelDims:
+      ep_enabled = False
+      tp = 1
+
+      def get_optional_mesh(self, name):
+        del name
+        return None
+
+    before = [moe.expert_bias_E.clone() for moe in moes]
+    register_moe_load_balancing_hook(_Optimizers(), [converted], _ParallelDims())
+    self.assertLen(hooks, 1)
+    hooks[0]()
+    for moe, previous in zip(moes, before, strict=True):
+      self.assertGreater((moe.expert_bias_E - previous).abs().sum().item(), 0)
 
 
 class TestDeepSeekV3CompiledBiasBalancer(BaseAcceleratorDeviceTest):

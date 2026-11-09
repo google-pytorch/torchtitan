@@ -1,5 +1,7 @@
 """TPU training recipes for DeepSeek-V3."""
 
+import dataclasses
+
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -18,11 +20,18 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 __all__ = [
     "deepseek_v3_671b_2l_16e",
     "deepseek_v3_671b_2l_16e_fused_ce",
+    "deepseek_v3_671b_2l_16e_tpu_moe",
+    "deepseek_v3_671b_2l_16e_tpu_moe_pallas",
     "deepseek_v3_debugmodel",
     "deepseek_v3_debugmodel_fused_ce",
+    "deepseek_v3_debugmodel_tpu_moe",
+    "deepseek_v3_debugmodel_tpu_moe_pallas",
     "graph_trainer_deepseek_v3_671b_2l_16e",
     "graph_trainer_deepseek_v3_671b_2l_16e_fused_ce",
+    "graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe",
+    "graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe_pallas",
     "graph_trainer_deepseek_v3_debugmodel",
+    "graph_trainer_deepseek_v3_debugmodel_tpu_moe",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -46,6 +55,33 @@ def _enable_pallas_cross_entropy(config):
   config.loss = PallasCrossEntropyLoss.Config()
   if _FUSED_LOSS_OVERRIDE not in config.override.imports:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+  return config
+
+
+def _enable_tpu_moe(config, *, pallas_grouped_mm: bool):
+  """Rebuild the recipe's model with the lane's MoE converters (rung 5).
+
+  Same flavor and context length, built through ``model_registry(...,
+  converters=tpu_moe_converters())`` so the converters see the final layer
+  list (the reduced and 31-layer proxies included), then the Pallas switches.
+  """
+  # pylint: disable-next=g-import-not-at-top
+  from torchtitan.experiments.tpu.deepseek_v3 import model_registry, tpu_moe_converters, use_tpu_moe_kernels
+
+  spec = config.model_spec
+  config.model_spec = dataclasses.replace(
+      model_registry(
+          spec.flavor,
+          seq_len=spec.max_context_length,
+          converters=tpu_moe_converters(),
+          num_mtp_layers=len(spec.model.mtp_layers),
+      ),
+      parallelize_fn=spec.parallelize_fn,
+      pipelining_fn=spec.pipelining_fn,
+  )
+  use_tpu_moe_kernels(
+      config.model_spec.model, pallas_grouped_mm=pallas_grouped_mm
+  )
   return config
 
 
@@ -189,3 +225,52 @@ def deepseek_v3_671b_2l_16e_fused_ce() -> TPUTrainerConfig:
 def graph_trainer_deepseek_v3_671b_2l_16e_fused_ce() -> TpuGraphTrainer.Config:
   """``graph_trainer_deepseek_v3_671b_2l_16e`` with the fused linear + CE."""
   return _enable_pallas_cross_entropy(graph_trainer_deepseek_v3_671b_2l_16e())
+
+
+def deepseek_v3_debugmodel_tpu_moe() -> TPUTrainerConfig:
+  """``deepseek_v3_debugmodel`` with the TPU dispatcher (rung 5), native experts."""
+  return _enable_tpu_moe(deepseek_v3_debugmodel(), pallas_grouped_mm=False)
+
+
+def deepseek_v3_debugmodel_tpu_moe_pallas() -> TPUTrainerConfig:
+  """``deepseek_v3_debugmodel_tpu_moe`` with the Pallas grouped matmul."""
+  return _enable_tpu_moe(deepseek_v3_debugmodel(), pallas_grouped_mm=True)
+
+
+def graph_trainer_deepseek_v3_debugmodel_tpu_moe() -> TpuGraphTrainer.Config:
+  """``graph_trainer_deepseek_v3_debugmodel`` with the TPU dispatcher."""
+  return _graph_trainer(deepseek_v3_debugmodel_tpu_moe())
+
+
+def deepseek_v3_671b_2l_16e_tpu_moe() -> TPUTrainerConfig:
+  """Rung-5 proxy recipe: fused CE + the TPU dispatcher, native experts.
+
+  Builds on ``deepseek_v3_671b_2l_16e_fused_ce`` (Splash stays a command-line
+  flag, as for rungs 3-4).
+  """
+  return _enable_tpu_moe(
+      deepseek_v3_671b_2l_16e_fused_ce(), pallas_grouped_mm=False
+  )
+
+
+def deepseek_v3_671b_2l_16e_tpu_moe_pallas() -> TPUTrainerConfig:
+  """``deepseek_v3_671b_2l_16e_tpu_moe`` with the Pallas grouped matmul."""
+  return _enable_tpu_moe(
+      deepseek_v3_671b_2l_16e_fused_ce(), pallas_grouped_mm=True
+  )
+
+
+def graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe() -> TpuGraphTrainer.Config:
+  """``graph_trainer_deepseek_v3_671b_2l_16e_fused_ce`` with the TPU dispatcher."""
+  return _enable_tpu_moe(
+      graph_trainer_deepseek_v3_671b_2l_16e_fused_ce(), pallas_grouped_mm=False
+  )
+
+
+def graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe_pallas() -> (
+    TpuGraphTrainer.Config
+):
+  """``graph_trainer_deepseek_v3_671b_2l_16e_tpu_moe`` with Pallas experts."""
+  return _enable_tpu_moe(
+      graph_trainer_deepseek_v3_671b_2l_16e_fused_ce(), pallas_grouped_mm=True
+  )

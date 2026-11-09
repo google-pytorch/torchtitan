@@ -217,6 +217,19 @@ class TpuGraphTrainerDistributedTest(
           ],
       ),
       dict(
+          testcase_name="deepseek_v3_simple_fsdp_tpu_moe",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="graph_trainer_deepseek_v3_debugmodel_tpu_moe",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          use_splash_attention_kernel=False,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
           testcase_name="gemma4_graph_split_offload",
           module="torchtitan.experiments.tpu.examples.gemma4",
           config="graph_trainer_gemma4_debugmodel",

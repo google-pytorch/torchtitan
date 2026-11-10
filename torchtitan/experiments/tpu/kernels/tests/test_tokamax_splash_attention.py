@@ -109,7 +109,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       # (B, S, H, N, D)
       ("qwen3_235b", (16, 4096, 64, 4, 128)),
       ("group1_dim64", (2, 4096, 16, 16, 64)),
-      ("group16_seq12288", (1, 12288, 32, 2, 128)),
+      ("group16_seq10240", (1, 10240, 32, 2, 128)),
       ("tile256", (1, 4352, 8, 2, 128)),
       ("dim512_group1", (1, 4096, 4, 4, 512)),
   )
@@ -123,7 +123,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("dim48", (2, 4096, 16, 1, 48), "bfloat16", "head_dim"),
       ("seq4100", (2, 4100, 16, 1, 128), "bfloat16", "multiple of 128"),
       ("vmem_dim256_group16", (2, 4096, 16, 1, 256), "bfloat16", "VMEM"),
-      ("vmem_seq16384", (1, 16384, 32, 2, 128), "bfloat16", "VMEM"),
+      ("vmem_seq12288", (1, 12288, 32, 2, 128), "bfloat16", "VMEM"),
       ("smem_batch64_seq16384", (64, 16384, 4, 4, 64), "bfloat16", "SMEM"),
   )
   def test_unsupported(self, shape, dtype, expected):

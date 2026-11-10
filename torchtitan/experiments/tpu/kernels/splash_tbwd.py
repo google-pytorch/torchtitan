@@ -62,21 +62,26 @@ Supported shapes
   512 if it divides S, else 256, else 128. Upper bound from VMEM (below).
 - B: any; the upper bound comes from SMEM (below).
 - VMEM: K / V and the dK^T / dV^T accumulators stay resident for the whole
-  sequence, so VMEM grows with D * S. With Dl = D rounded up to 128,
-  G8 = G rounded up to 8 and kv_buffers = 1 (2 when it fits), the estimate
-  (`_vmem_bytes`) must stay <= 60 MiB:
+  sequence, so VMEM grows with D * S. This estimate (`_vmem_bytes`, bytes)
+  must stay <= 60 MiB, with Dl = D rounded up to 128 lanes and
+  kv_buffers = 1 (2 when that fits):
 
-    2 * block * (6*G*D + 4*G8 + 512 + 2*G*Dl)   per-step blocks, 2 buffers
-    + kv_buffers * S * (8*D + 2*Dl + 32)        per-(example, kv head) blocks
-    + 4*G*block*Dl + 8*D*S + 8*G8*block         f32 scratch
-    + 10 MiB + 1126 * G * max(0, D - 128)       compiler temporaries
+    12 * G * block * D           q^T, dO^T, o^T blocks: bf16, 2 buffers
+    + 8 * G * block * Dl         dq block: bf16, 2 buffers, + f32 accumulator
+    + kv_buffers * S * (8 * D    K^T, V^T, dK^T, dV^T blocks: [D, S] bf16
+        + 2 * Dl + 32)           K block: [S, Dl] bf16; kv segment ids: int32
+    + 8 * S * D                  f32 dK^T, dV^T accumulators
+    + 1 KiB * G * D + 11 MiB     compiler temporaries (fit to TPU7x compile
+                                 reports) + small blocks (q segment ids, lse2)
 
-  With 512 tiles (S a multiple of 512):
-    G = 16, D = 64:  S <= 28160
-    G = 16, D = 128: S <= 12800
-    G = 8,  D = 256: S <= 6144
-    G = 16, D = 256: S <= 1536
-  Past the limit Mosaic fails at compile time with RESOURCE_EXHAUSTED.
+  It is never below the exact block sizes plus a temporaries fit that matched
+  every compile failure seen (D = 128..512, G = 8 / 16, S = 4k..128k). With
+  512 tiles (S a multiple of 512):
+    G = 16, D = 64:  S <= 27136
+    G = 16, D = 128: S <= 11776
+    G = 8,  D = 256: S <= 5632
+    G = 16, D = 256: S <= 1024
+  Past the real limit Mosaic fails at compile time with RESOURCE_EXHAUSTED.
 - SMEM: the 8 int32 schedule arrays hold every causal tile, so
   8 * 4 * B * nb * (nb + 1) / 2 bytes (nb = S / block) must stay
   <= 1 MiB - 16 KiB.
@@ -87,10 +92,12 @@ Other limitations
 - No context parallelism (kv length must equal q length).
 - No logit soft cap, no dropout, no attention sinks.
 - Packed documents only via segment ids (optional; None = one document).
-- Code size: the kernel unrolls all G heads in each of its 2 tile-kind
-  branches. An 81k-bundle variant overflowed TPU7x instruction memory and ran
-  3.5x slower (53k was fine), so check the final LLO bundle count
-  (--xla_jf_dump_to) before adding branches.
+- Code size: the body has two copies (masked and unmasked tile), each with
+  all G heads unrolled, so the program grows with 2 * G. A TPU7x program
+  that does not fit in the core's instruction memory is not rejected: it
+  runs, but with instruction fetch stalls (an 81k-bundle variant ran 3.5x
+  slower; 53k bundles fit). Before adding branches or per-head work, check
+  the bundle count in the compiler dump (--xla_jf_dump_to).
 """
 
 import functools
@@ -218,9 +225,18 @@ def _find_bounds(
 ) -> tuple[jax.Array, jax.Array]:
   """First / last step of each run of equal `row_T` among valid steps, [T].
 
+  The kernel zeroes an accumulator on a run's start step and writes it out on
+  its end step. E.g. with row_T = b * num_blocks + qi (the dQ runs):
+
+    step      0  1  2  3  4  5  6
+    row_T     0  0  1  1  1  1  1   (steps 5, 6: padding, repeat the last row)
+    valid_T   1  1  1  1  1  0  0
+              [run ]  [run   ]
+    start_T   1  0  1  0  0  0  0
+    end_T     0  1  0  0  1  0  0
+
   Same as Tokamax / MSL `splash_attention_mask_info.find_bounds`, except that
-  the padding steps (valid_T False) repeat the last row and must not extend
-  its run.
+  the padding steps must not extend the last run.
   """
   prev_T = jnp.concatenate([jnp.full((1,), -1, row_T.dtype), row_T[:-1]])
   next_T = jnp.concatenate([row_T[1:], jnp.full((1,), -1, row_T.dtype)])
@@ -541,31 +557,17 @@ def _num_steps(num_b: int, s: int, block: int) -> int:
 def _vmem_bytes(
     d: int, g: int, s: int, block: int, single_buffer_kv: bool
 ) -> int:
-  """Upper estimate of one call's VMEM bytes (formula: module docstring).
-
-  Arrays with D on lanes pad it to Dl = round_up(D, 128); [G, block] arrays
-  pad G to G8 = round_up(G, 8). The temporaries term is fit to TPU7x compile
-  reports with 2 MiB of margin.
-  """
-  d_lanes, g_rows = _round_up(d, NUM_LANES), _round_up(g, 8)
-  # Blocks that change every step, double-buffered (bf16 = 2 B, f32 = 4 B).
-  q_do_o = 3 * g * d * block * 2  # q^T, dO^T, o^T  [G, D, block] bf16
-  lse2 = g_rows * block * 4  # [G8, block] f32
-  q_segment_ids = block * NUM_LANES * 4  # [block, 128] int32
-  dq = g * block * d_lanes * 2  # [G, block, Dl] bf16
-  step_blocks = q_do_o + lse2 + q_segment_ids + dq
-  # Blocks that change only per (example, kv head): kv_buffers copies.
-  kt_vt = 2 * d * s * 2  # K^T, V^T  [D, S] bf16
-  k = s * d_lanes * 2  # K  [S, Dl] bf16
-  kv_segment_ids = 8 * s * 4  # [8, S] int32
-  dkt_dvt = 2 * d * s * 2  # dK^T, dV^T outputs  [D, S] bf16
-  per_kv_head = kt_vt + k + kv_segment_ids + dkt_dvt
+  """Conservative VMEM bytes of one call (formula: module docstring)."""
   kv_buffers = 1 if single_buffer_kv else 2
-  # f32 scratch: dq accumulator [G, block, Dl], dK^T / dV^T accumulators
-  # [D, S], lse2 / di [G8, block].
-  scratch = g * block * d_lanes * 4 + 2 * d * s * 4 + 2 * g_rows * block * 4
-  temporaries = (10 << 20) + max(0, d - 128) * g * 1126
-  return 2 * step_blocks + kv_buffers * per_kv_head + scratch + temporaries
+  d_lanes = _round_up(d, NUM_LANES)
+  # q^T, dO^T, o^T: bf16, 2 buffers. dq: bf16, 2 buffers, + f32 accumulator.
+  per_step = 12 * g * block * d + 8 * g * block * d_lanes
+  # K^T, V^T, dK^T, dV^T [D, S] and K [S, Dl]: bf16. kv segment ids: int32.
+  per_kv_head = kv_buffers * s * (8 * d + 2 * d_lanes + 32)
+  dkv_accumulators = 8 * s * d  # f32 dK^T, dV^T
+  # Compiler temporaries (fit to TPU7x compile reports) + small blocks.
+  other = g * d * 1024 + (11 << 20)
+  return per_step + per_kv_head + dkv_accumulators + other
 
 
 def unsupported_reason(

@@ -285,6 +285,7 @@ def start_trainer(
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
       if model_spec.name in (
+          "deepseek_v3",
           "llama3",
           "muse_glimmer",
           "qwen3",

@@ -15,6 +15,17 @@ _SAVED_COLLECTIVES = frozenset({
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
 })
 
+# The Tokamax KDA forward ops (``qwen3_5/tokamax_gated_delta.py``): their
+# outputs are the kernel output and every residual of the KDA backward, which
+# needs nothing else. ``torch_tpu`` ``jax_op`` custom ops, registered when that
+# module is imported (the ``override.imports`` entry), so they are matched by
+# qualified name. A copy of ``tokamax_gated_delta.KDA_FWD_OPS``, so that this
+# module does not import JAX or ``torch_tpu``; a test keeps the two equal.
+_KDA_FWD_OPS = frozenset({
+    "tt_qwen35::gated_delta_segments_fwd_res",
+    "tt_qwen35::gated_delta_fwd_res",
+})
+
 
 def _op_name(op) -> str:
   """Qualified name of an OpOverload, however this torch build spells it."""
@@ -49,14 +60,38 @@ class TPUSelectiveAC(SelectiveAC):
 
   TODO: Save the collectives again once torch-tpu accepts a wait on a saved
   tensor.
+
+  One flag tunes the save set further; off (the default) is the policy above,
+  unchanged:
+
+  - ``save_kda_residuals``: also save the Tokamax KDA forward op
+    (``tt_qwen35::gated_delta[_segments]_fwd_res``: the output and the
+    backward's residuals, matched by name), so the backward runs only the KDA
+    backward kernels instead of replaying the forward kernel. Never the
+    ``_bwd_res`` ops.
+
+  Saving or recomputing an op runs the same op on the same inputs, so the
+  values do not change.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(SelectiveAC.Config):
-    pass
+    save_kda_residuals: bool = False
+    """Also save the Tokamax KDA forward op (output + residuals) by name."""
 
   def get_save_ops(self) -> set:
-    return super().get_save_ops() - _SAVED_COLLECTIVES
+    config = self.config
+    save_ops = super().get_save_ops() - _SAVED_COLLECTIVES
+    if getattr(config, "save_kda_residuals", False):
+      # One by-name matcher for both rules: it also keeps the splash forward
+      # when the config sets ``save_pallas_attention``.
+      return _SaveOpsIncludingKdaForward(
+          save_ops,
+          pallas_attention=bool(
+              getattr(config, "save_pallas_attention", False)
+          ),
+      )
+    return save_ops
 
 
 def tpu_selective_ac_config(ac_config: Any) -> Any:
@@ -88,6 +123,34 @@ class _SaveOpsIncludingPallasAttention(set):
     if super().__contains__(op):
       return True
     return _PALLAS_ATTENTION_FWD_MARKER in _op_name(op)
+
+
+class _SaveOpsIncludingKdaForward(set):
+  """The save set, plus the Tokamax KDA forward ops (``save_kda_residuals``).
+
+  Matched by qualified name, like the splash forward: the KDA ops are
+  ``torch_tpu`` ``jax_op`` custom ops registered when
+  ``qwen3_5/tokamax_gated_delta.py`` is imported. Saving the forward op hands
+  its output and the backward's residuals from the compiled forward to the
+  compiled backward, so the backward runs only the KDA backward kernels; a
+  recomputed forward would replay the forward kernel inside the backward. The
+  backward ops (``..._bwd_res``) and the forward-only ops that run without a
+  gradient (``tt_qwen35::gated_delta[_segments]_fwd``) are never matched. With
+  ``pallas_attention``, the Pallas splash-attention forward is matched too
+  (``_SaveOpsIncludingPallasAttention``'s rule).
+  """
+
+  def __init__(self, ops=(), *, pallas_attention: bool = False):
+    super().__init__(ops)
+    self.pallas_attention = pallas_attention
+
+  def __contains__(self, op) -> bool:
+    if super().__contains__(op):
+      return True
+    name = _op_name(op)
+    if self.pallas_attention and _PALLAS_ATTENTION_FWD_MARKER in name:
+      return True
+    return name in _KDA_FWD_OPS
 
 
 class AttentionSavingSelectiveAC(SelectiveAC):

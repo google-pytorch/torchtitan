@@ -702,7 +702,7 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     got = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
     for name, g, d, t in zip(("dq", "dk", "dv"), got, dense, tokamax):
       # Both kernels round P / dS to bf16 for the MXU (~3-5e-3 off dense f32, growing with head_dim), so bound
-      # splash_tbwd's error by Tokamax's own on the same inputs. TPU7x: ratio 0.68-0.97 on these cases.
+      # splash_tbwd's error by Tokamax's own on the same inputs. TPU7x: ratio 0.77-0.97 on these cases.
       error = ((g - d).norm() / d.norm()).item()
       tokamax_error = ((t - d).norm() / d.norm()).item()
       self.assertLess(error, 1.25 * tokamax_error, name)

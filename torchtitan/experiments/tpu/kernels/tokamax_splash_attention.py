@@ -435,6 +435,11 @@ def _transposed_bwd_unsupported_reason(
         "it does not support context parallelism (kv_seq_len"
         f" {k.shape[1]} != seq_len {q.shape[1]})"
     )
+  if q.shape[2] == k.shape[2]:
+    # Supported, but slower: with one q head per step, the per-step work
+    # (K / V tile loads, lse / di, step overhead) is not shared across heads.
+    # TPU7x shape sweep: 0.51-0.90x Tokamax's best backward config.
+    return "with one q head per kv head the Tokamax backward is faster"
   return splash_tbwd.unsupported_reason(q.shape, k.shape, q.dtype)
 
 

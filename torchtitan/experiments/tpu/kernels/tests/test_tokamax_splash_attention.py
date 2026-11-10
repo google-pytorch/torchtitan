@@ -585,7 +585,7 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
   @parameterized.named_parameters(
       dict(testcase_name="group16", n_heads=16, n_kv_heads=1, head_dim=128),
       dict(testcase_name="group8", n_heads=16, n_kv_heads=2, head_dim=128),
-      dict(testcase_name="group1_dim64", n_heads=4, n_kv_heads=4, head_dim=64),
+      dict(testcase_name="group2_dim64", n_heads=8, n_kv_heads=4, head_dim=64),
       dict(testcase_name="group5_dim192", n_heads=10, n_kv_heads=2, head_dim=192),
       dict(testcase_name="group16_no_segment_ids", n_heads=16, n_kv_heads=1, head_dim=128, packed=False),
       # 1792 tokens: 256-token tiles; 1920 tokens: 128-token tiles.
@@ -643,14 +643,16 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       ("non_causal", dict(is_causal=False)),
       ("window", dict(local_window_size=128)),
       ("group32", dict(n_heads=32)),
+      ("group1", dict(n_kv_heads=16)),
   )
   def test_transposed_bwd_falls_back_to_tokamax(self, attn):
-    """Attention splash_tbwd does not support takes Tokamax's backward, with a warning."""
+    """Attention splash_tbwd does not support (or is slower at) takes Tokamax's backward, with a warning."""
     torch.manual_seed(7)
     n_heads = attn.pop("n_heads", 16)
+    n_kv_heads = attn.pop("n_kv_heads", 1)
     segment_ids = _packed_segment_ids(_DOCUMENTS).to(self.accelerator_device)
     q, grad_out = (torch.randn(2, 2048, n_heads, 128, dtype=torch.bfloat16) for _ in range(2))
-    k, v = (torch.randn(2, 2048, 1, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(2, 2048, n_kv_heads, 128, dtype=torch.bfloat16) for _ in range(2))
     tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
     self._set_tokamax_config(use_transposed_bwd=True)
     tokamax_splash_attention._warn_transposed_bwd_fallback.cache_clear()

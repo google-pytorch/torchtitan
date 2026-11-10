@@ -6,12 +6,14 @@ import logging
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax.numpy as jnp
 import numpy as np
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
+from torchtitan.experiments.tpu.kernels import splash_tbwd
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
 
 
@@ -98,6 +100,36 @@ class HeadTailMaskTest(parameterized.TestCase):
   def test_non_causal_mask_is_full(self):
     mask = tokamax_splash_attention._make_mask((32, 32), False, None, 2)
     self.assertTrue(np.all(mask[:, :]))
+
+
+class SplashTbwdSupportTest(parameterized.TestCase):
+  """splash_tbwd.unsupported_reason: hard caps and the VMEM / SMEM estimates (no device needed)."""
+
+  @parameterized.named_parameters(
+      # (B, S, H, N, D)
+      ("qwen3_235b", (16, 4096, 64, 4, 128)),
+      ("group1_dim64", (2, 4096, 16, 16, 64)),
+      ("group16_seq12288", (1, 12288, 32, 2, 128)),
+      ("tile256", (1, 4352, 8, 2, 128)),
+      ("dim512_group1", (1, 4096, 4, 4, 512)),
+  )
+  def test_supported(self, shape):
+    b, s, h, n, d = shape
+    self.assertIsNone(splash_tbwd.unsupported_reason((b, s, h, d), (b, s, n, d), jnp.dtype(jnp.bfloat16)))
+
+  @parameterized.named_parameters(
+      ("float32", (2, 4096, 16, 1, 128), "float32", "bf16"),
+      ("group32", (2, 4096, 32, 1, 128), "bfloat16", "q heads per kv head"),
+      ("dim48", (2, 4096, 16, 1, 48), "bfloat16", "head_dim"),
+      ("seq4100", (2, 4100, 16, 1, 128), "bfloat16", "multiple of 128"),
+      ("vmem_dim256_group16", (2, 4096, 16, 1, 256), "bfloat16", "VMEM"),
+      ("vmem_seq16384", (1, 16384, 32, 2, 128), "bfloat16", "VMEM"),
+      ("smem_batch64_seq16384", (64, 16384, 4, 4, 64), "bfloat16", "SMEM"),
+  )
+  def test_unsupported(self, shape, dtype, expected):
+    b, s, h, n, d = shape
+    reason = splash_tbwd.unsupported_reason((b, s, h, d), (b, s, n, d), jnp.dtype(dtype))
+    self.assertIn(expected, reason or "")
 
 
 class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
@@ -545,39 +577,58 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
   def _packed_grads(self, q, k, v, grad_out, segment_ids, **attn):
     q, k, v = (x.to(self.accelerator_device).requires_grad_(True) for x in (q, k, v))
     out = tokamax_splash_attention.splash_sdpa(
-        q, k, v, segment_ids=segment_ids, enable_gqa=True, **attn
+        q, k, v, segment_ids=segment_ids, enable_gqa=q.shape[2] != k.shape[2], **attn
     )
     out.backward(grad_out.to(self.accelerator_device))
     return [x.grad.float().cpu() for x in (q, k, v)]
 
-  @parameterized.named_parameters(("group8", 2), ("group16", 1))
-  def test_transposed_bwd_matches_reference(self, n_kv_heads):
+  @parameterized.named_parameters(
+      dict(testcase_name="group16", n_heads=16, n_kv_heads=1, head_dim=128),
+      dict(testcase_name="group8", n_heads=16, n_kv_heads=2, head_dim=128),
+      dict(testcase_name="group1_dim64", n_heads=4, n_kv_heads=4, head_dim=64),
+      dict(testcase_name="group5_dim192", n_heads=10, n_kv_heads=2, head_dim=192),
+      dict(testcase_name="group16_no_segment_ids", n_heads=16, n_kv_heads=1, head_dim=128, packed=False),
+      # 1792 tokens: 256-token tiles; 1920 tokens: 128-token tiles.
+      dict(testcase_name="tile256", n_heads=8, n_kv_heads=2, head_dim=128,
+           documents=((300, 517, 77, 898), (1000, 48, 744)), block=256),
+      dict(testcase_name="tile128_dim96", n_heads=4, n_kv_heads=2, head_dim=96,
+           documents=((300, 517, 77, 1026), (1000, 48, 872)), block=128),
+  )
+  def test_transposed_bwd_matches_reference(
+      self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, block=None
+  ):
     """use_transposed_bwd (splash_tbwd) gradients match dense f32 attention and Tokamax's backward.
 
     _DOCUMENTS yields both tile kinds: boundaries inside 512-token blocks (masked tiles) and a 1154-token document
-    spanning whole blocks below the diagonal (full tiles, no element mask).
+    spanning whole blocks below the diagonal (full tiles, no element mask). Also covers G not a multiple of 8,
+    head dims other than 128, no segment ids and the smaller tiles chosen for seq_len not a multiple of 512.
     """
     torch.manual_seed(7)
-    segment_ids = _packed_segment_ids(_DOCUMENTS)
+    if block is not None:
+      blocks = ("block_q", "block_kv", "block_kv_compute", "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute")
+      self._set_tokamax_config(**{name: block for name in blocks})
+    segment_ids = _packed_segment_ids(documents)
     b, seq_len = segment_ids.shape
-    q, grad_out = (torch.randn(b, seq_len, 16, 128, dtype=torch.bfloat16) for _ in range(2))
-    k, v = (torch.randn(b, seq_len, n_kv_heads, 128, dtype=torch.bfloat16) for _ in range(2))
+    q, grad_out = (torch.randn(b, seq_len, n_heads, head_dim, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.bfloat16) for _ in range(2))
 
     # Dense f32 reference, [B, H, S, D]: causal and same-document.
-    mask = (segment_ids[:, :, None] == segment_ids[:, None, :]) & torch.ones(
-        seq_len, seq_len, dtype=torch.bool
-    ).tril()
+    mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+    if packed:
+      mask = (segment_ids[:, :, None] == segment_ids[:, None, :]) & mask
+    else:
+      mask = mask.expand(b, seq_len, seq_len)
     ref = [x.float().transpose(1, 2).requires_grad_(True) for x in (q, k, v)]
     with attention.sdpa_kernel([attention.SDPBackend.MATH]):
       out_ref = F.scaled_dot_product_attention(
           ref[0],
-          *(x.repeat_interleave(16 // n_kv_heads, dim=1) for x in ref[1:]),
+          *(x.repeat_interleave(n_heads // n_kv_heads, dim=1) for x in ref[1:]),
           attn_mask=mask[:, None],
       )
     out_ref.backward(grad_out.float().transpose(1, 2))
     dense = [x.grad.transpose(1, 2) for x in ref]
 
-    segment_ids = segment_ids.to(self.accelerator_device)
+    segment_ids = segment_ids.to(self.accelerator_device) if packed else None
     tokamax = self._packed_grads(q, k, v, grad_out, segment_ids)
     self._set_tokamax_config(use_transposed_bwd=True)
     got = self._packed_grads(q, k, v, grad_out, segment_ids)
@@ -589,17 +640,25 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       self.assertLess(abs((g.norm() / t.norm()).item() - 1), 1e-3, name)
 
   @parameterized.named_parameters(
-      ("no_segment_ids", dict(segment_ids=None)),
       ("non_causal", dict(is_causal=False)),
       ("window", dict(local_window_size=128)),
+      ("group32", dict(n_heads=32)),
   )
-  def test_transposed_bwd_rejects_unsupported_attention(self, attn):
+  def test_transposed_bwd_falls_back_to_tokamax(self, attn):
+    """Attention splash_tbwd does not support takes Tokamax's backward, with a warning."""
+    torch.manual_seed(7)
+    n_heads = attn.pop("n_heads", 16)
     segment_ids = _packed_segment_ids(_DOCUMENTS).to(self.accelerator_device)
-    q = torch.randn(2, 2048, 16, 128, dtype=torch.bfloat16)
-    k = torch.randn(2, 2048, 1, 128, dtype=torch.bfloat16)
+    q, grad_out = (torch.randn(2, 2048, n_heads, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(2, 2048, 1, 128, dtype=torch.bfloat16) for _ in range(2))
+    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
     self._set_tokamax_config(use_transposed_bwd=True)
-    with self.assertRaisesRegex(Exception, "use_transposed_bwd"):
-      self._packed_grads(q, k, k, q, **dict(dict(segment_ids=segment_ids), **attn))
+    tokamax_splash_attention._warn_transposed_bwd_fallback.cache_clear()
+    with self.assertLogs(level="WARNING") as logged:
+      got = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
+    self.assertIn("using the Tokamax backward instead of splash_tbwd", "\n".join(logged.output))
+    for g, t in zip(got, tokamax):
+      torch.testing.assert_close(g, t, rtol=0, atol=0)
 
   def test_config_change_retraces_kernel(self):
     """A TokamaxConfig change must not reuse a kernel compiled for the old one.

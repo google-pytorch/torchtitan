@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import jaxtyping
 import numpy as np
 from torchtitan.experiments.tpu.kernels import splash_tbwd
+from torchtitan.tools.logging import logger
 from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
@@ -417,6 +418,33 @@ def jax_attention_fwd(
   return out, logsumexp
 
 
+def _transposed_bwd_unsupported_reason(
+    q: jax.Array,
+    k: jax.Array,
+    is_causal: bool,
+    local_window_size: int | None,
+) -> str | None:
+  """Why splash_tbwd cannot compute this backward, or None if it can."""
+  if not is_causal or local_window_size is not None:
+    return (
+        "it implements causal attention without a window; got"
+        f" is_causal={is_causal}, local_window_size={local_window_size}"
+    )
+  if k.shape[1] != q.shape[1]:
+    return (
+        "it does not support context parallelism (kv_seq_len"
+        f" {k.shape[1]} != seq_len {q.shape[1]})"
+    )
+  return splash_tbwd.unsupported_reason(q.shape, k.shape, q.dtype)
+
+
+@functools.cache
+def _warn_transposed_bwd_fallback(reason: str) -> None:
+  logger.warning(
+      f"use_transposed_bwd: using the Tokamax backward instead of splash_tbwd: {reason}."
+  )
+
+
 def jax_attention_bwd(
     q: jax.Array,
     k: jax.Array,
@@ -450,7 +478,8 @@ def jax_attention_bwd(
 
   With ``use_transposed_bwd`` the gradients come from splash_tbwd (one call
   for the whole batch, see splash_tbwd.py) instead of Tokamax's dkv kernel;
-  the forward residuals are the same.
+  the forward residuals are the same. Attention splash_tbwd does not support
+  falls back to the Tokamax backward with a warning.
   """
   seq_len = q.shape[1]
   kv_seq_len = k.shape[1]
@@ -459,20 +488,16 @@ def jax_attention_bwd(
 
   local_window_size_opt = local_window_size if local_window_size != -1 else None
 
-  if use_transposed_bwd:
-    # splash_tbwd checks shapes and dtypes itself; these attention settings are not its inputs.
-    if segment_ids is None:
-      raise ValueError("use_transposed_bwd needs segment_ids [B, S] (packed documents); got None.")
-    if not is_causal or local_window_size_opt is not None:
-      raise ValueError(
-          "use_transposed_bwd implements causal attention without a window; got"
-          f" is_causal={is_causal}, local_window_size={local_window_size_opt}."
+  tbwd_reason = (
+      _transposed_bwd_unsupported_reason(
+          q, k, is_causal, local_window_size_opt
       )
-    if kv_seq_len != seq_len:
-      raise ValueError(
-          "use_transposed_bwd does not support context parallelism (kv_seq_len"
-          f" {kv_seq_len} != seq_len {seq_len})."
-      )
+      if use_transposed_bwd
+      else None
+  )
+  if tbwd_reason is not None:
+    _warn_transposed_bwd_fallback(tbwd_reason)
+  if use_transposed_bwd and tbwd_reason is None:
     # Tokamax's logsumexp residual is already in the log2 domain splash_tbwd
     # takes (SplashConfig.use_base2_exp, the default): it is the log2-sum-exp2
     # of q_scaled.k * log2(e). splash_tbwd applies the scale itself (so q stays

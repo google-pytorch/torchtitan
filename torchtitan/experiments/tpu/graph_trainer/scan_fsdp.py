@@ -28,9 +28,6 @@ from typing import Any
 import torch  # isort: skip
 
 import spmd_types as spmd
-# Imported only so `_apply_op_dtype` can be patched below; see
-# `_contiguous_apply_op_dtype`.
-import spmd_types._dtype_utils as _spmd_dtype_utils
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch import nn
@@ -215,32 +212,22 @@ funcol.reduce_scatter_single = _movedim_reduce_scatter_tensor
 funcol.reduce_scatter_tensor = _movedim_reduce_scatter_tensor
 
 
-def _contiguous_apply_op_dtype(
-    x: torch.Tensor, op_dtype: torch.dtype
-) -> torch.Tensor:
-    """Cast tensor to ``op_dtype`` and ensure contiguity.
-
-    ``spmd_types._collectives._AllReduce.forward`` asserts ``x.is_contiguous()``
-    immediately after ``_apply_op_dtype``, and backward passes (e.g.
-    ``(weight.sum() * scale).backward()`` or ``linear`` backward) frequently
-    produce expanded/strided gradient views. Ensuring contiguity here makes
-    ``spmd.convert(I -> R)`` / ``spmd.all_reduce`` safe on arbitrary backward
-    gradients.
-    """
-    if x.dtype != op_dtype:
-        x = x.to(op_dtype)
-    return x.contiguous()
+# spmd_types 0.2.5 asserts a contiguous input on both all_reduce paths, but
+# only the in-place one needs it; the backward of ``convert(I -> R)`` hands the
+# out-of-place path strided gradients. Copy there, as funcol would anyway.
+# Mirrors meta-pytorch/spmd_types@e80d154.
+# TODO(jeremiahhsu): drop this patch once the pinned spmd_types includes
+# https://github.com/meta-pytorch/spmd_types/issues/13.
+_orig_all_reduce_forward = spmd._collectives._AllReduce.forward
 
 
-# TODO(jeremiahhsu): drop this patch once
-# https://github.com/meta-pytorch/spmd_types/issues/13 lands.
-for _module in (_spmd_dtype_utils, spmd._collectives, spmd._local):
-    assert getattr(_module, "_apply_op_dtype", None) is (
-        _spmd_dtype_utils._apply_op_dtype
-    ), f"{_module.__name__}._apply_op_dtype missing; spmd_types changed"
-for _module in (_spmd_dtype_utils, spmd._collectives, spmd._local):
-    _module._apply_op_dtype = _contiguous_apply_op_dtype
-del _module
+def _all_reduce_forward_contiguous(ctx, x, axis, dst, inplace, dtype_options):
+    if not inplace and not x.is_contiguous():
+        x = x.contiguous()
+    return _orig_all_reduce_forward(ctx, x, axis, dst, inplace, dtype_options)
+
+
+spmd._collectives._AllReduce.forward = staticmethod(_all_reduce_forward_contiguous)
 
 
 def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor:

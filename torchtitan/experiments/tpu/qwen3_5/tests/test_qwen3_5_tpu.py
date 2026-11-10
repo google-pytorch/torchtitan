@@ -17,6 +17,7 @@ Covers:
 """
 
 import copy
+import dataclasses
 import functools
 from types import SimpleNamespace
 from unittest import mock
@@ -29,19 +30,19 @@ import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.config.override import OverrideConfig
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
 from torchtitan.experiments.tpu.graph_trainer.config import apply_tpu_graph_trainer_model_transforms
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
@@ -49,9 +50,9 @@ from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
-from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.qwen3_5 import model as qwen3_5_model
@@ -199,6 +200,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           flavor="debugmodel_moe",
           use_tpu_grouped_experts=True,
           use_pallas_paired_grouped_mm=True,
+          tile_m=256,
+      ),
+      dict(
+          testcase_name="_moe_pallas_paired_grouped_mm_tile512",
+          flavor="debugmodel_moe",
+          use_tpu_grouped_experts=True,
+          use_pallas_paired_grouped_mm=True,
+          tile_m=512,
       ),
   )
   def test_qwen3_5_hf_reference_parity(
@@ -206,6 +215,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       flavor: str,
       use_tpu_grouped_experts: bool,
       use_pallas_paired_grouped_mm: bool = False,
+      tile_m: int = 256,
   ):
     """Tests forward logits, loss, and all gradients against HF Qwen3.5."""
     if use_pallas_paired_grouped_mm and not self._is_tpu():
@@ -224,8 +234,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       for _, experts, _, _ in tt_config.traverse(TpuGroupedExperts.Config):
         experts.use_pallas_grouped_mm = True
         experts.use_pallas_paired_grouped_mm = True
-        experts.pallas_grouped_mm_tile_m = 256
-        experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+        experts.pallas_grouped_mm_tile_m = tile_m
+        experts.pallas_grouped_mm_tgmm_tiling = (tile_m, 0, 0)
     tt_config.vocab_size = 2048
     tt_config.tok_embeddings.num_embeddings = 2048
     tt_config.lm_head.out_features = 2048
@@ -556,9 +566,13 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       return F.silu(gated_delta._causal_conv(x_in, w_in, seg))  # pylint: disable=protected-access
 
     # fp64 on the bf16 values: only the backward's own rounding counts.
+    # Call `_CausalConvSilu.apply` directly so whole-row slice backward is not
+    # bypassed on TPU when `causal_conv1d` is installed.
     expected_grads = conv_grads(autograd_conv_silu, "cpu", torch.float64)
     dev = self.accelerator_device
-    grads = conv_grads(gated_delta.causal_conv_silu, dev, torch.bfloat16)
+    grads = conv_grads(
+        gated_delta._CausalConvSilu.apply, dev, torch.bfloat16  # pylint: disable=protected-access
+    )
     autograd_grads = conv_grads(autograd_conv_silu, dev, torch.bfloat16)
     for name, grad_bf16, autograd_bf16, expected_grad in zip(
         ("x", "weight"), grads, autograd_grads, expected_grads, strict=True
@@ -572,6 +586,104 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           msg=f"d{name}: {err:.2e} vs autograd {autograd_err:.2e}",
       )
       self.assertLess(err, 1e-2, msg=f"d{name}: {err:.2e}")
+
+  def test_causal_conv_silu_dispatches_to_pallas_when_supported(self):
+    """Tests whole-row TPU dispatch to Pallas causal_conv1d and fallbacks."""
+    dev = self.accelerator_device
+    x = torch.randn(2, 64, 128, device=dev, dtype=torch.bfloat16)
+    weight = torch.randn(128, 1, 4, device=dev, dtype=torch.bfloat16) * 0.5
+    seg = segment_ids_from_positions(_packed_positions((24, 40))).expand(2, -1)
+    seg = seg.to(dev)
+
+    if self._is_tpu() and gated_delta.causal_conv1d is not None:
+      gated_delta._logged_conv_fallback_reasons.clear()  # pylint: disable=protected-access
+      with (
+          mock.patch.object(
+              gated_delta.causal_conv1d,
+              "causal_conv_silu",
+              wraps=gated_delta.causal_conv1d.causal_conv_silu,
+          ) as pallas_spy,
+          mock.patch.object(gated_delta.logger, "info") as log_info_spy,
+      ):
+        out_pallas = gated_delta.causal_conv_silu(x, weight, None)
+        self.assertEqual(pallas_spy.call_count, 1)
+        _ = gated_delta.causal_conv_silu(x, weight, seg)
+        self.assertEqual(log_info_spy.call_count, 0)
+        _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
+        _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
+        self.assertEqual(pallas_spy.call_count, 1)
+        self.assertEqual(log_info_spy.call_count, 1)
+        self.assertIn("seq_len=7", log_info_spy.call_args.args[1])
+      out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
+      self.assertLess(_relative_l2_error(out_pallas, out_slice), 5e-3)
+    else:
+      out_fallback = gated_delta.causal_conv_silu(x, weight, None)
+      out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
+      torch.testing.assert_close(out_fallback, out_slice)
+
+  def test_tpu_rms_norm_gated_dispatches_to_pallas_when_supported(self):
+    """Tests TpuRMSNormGated Pallas dispatch at >=2048 rows and fallbacks."""
+    dev = self.accelerator_device
+    torch.manual_seed(17)
+    x_cpu = torch.randn(512, 4, 128, dtype=torch.bfloat16)
+    gate_cpu = torch.randn(512, 4, 128, dtype=torch.bfloat16)
+    w_cpu = (1.0 + 0.1 * torch.randn(128)).to(torch.bfloat16)
+    dy_cpu = torch.randn(512, 4, 128, dtype=torch.bfloat16)
+
+    ref_norm = gated_delta.RMSNormGated(
+        gated_delta.RMSNormGated.Config(dim=128)
+    )
+    with torch.no_grad():
+      ref_norm.weight.copy_(w_cpu)
+    ref_norm = ref_norm.to(dev)
+    x_ref = x_cpu.to(dev).requires_grad_(True)
+    gate_ref = gate_cpu.to(dev).requires_grad_(True)
+    out_ref = ref_norm(x_ref, gate_ref)
+    grads_ref = torch.autograd.grad(
+        out_ref, (x_ref, gate_ref, ref_norm.weight), dy_cpu.to(dev)
+    )
+
+    tpu_norm = gated_delta.TpuRMSNormGated(
+        gated_delta.TpuRMSNormGated.Config(dim=128)
+    )
+    with torch.no_grad():
+      tpu_norm.weight.copy_(w_cpu)
+    tpu_norm = tpu_norm.to(dev)
+    x_dev = x_cpu.to(dev).requires_grad_(True)
+    gate_dev = gate_cpu.to(dev).requires_grad_(True)
+
+    # Verify nn.Module forward hooks run (not bypassed by free helper).
+    hook_calls = 0
+
+    def _post_hook(_mod, _inp, _out):
+      nonlocal hook_calls
+      hook_calls += 1
+
+    handle = tpu_norm.register_forward_hook(_post_hook)
+    self.addCleanup(handle.remove)
+
+    if self._is_tpu() and gated_delta.rms_norm_gated is not None:
+      with mock.patch.object(
+          gated_delta.rms_norm_gated,
+          "rms_norm_gated",
+          wraps=gated_delta.rms_norm_gated.rms_norm_gated,
+      ) as pallas_spy:
+        out_dev = tpu_norm(x_dev, gate_dev)
+        self.assertEqual(pallas_spy.call_count, 1)
+        # Rows = 256 * 4 = 1024 (< 2048 block size) falls back cleanly.
+        _ = tpu_norm(x_dev[:256], gate_dev[:256])
+        self.assertEqual(pallas_spy.call_count, 1)
+    else:
+      out_dev = tpu_norm(x_dev, gate_dev)
+      _ = tpu_norm(x_dev[:256], gate_dev[:256])
+    self.assertEqual(hook_calls, 2)
+
+    grads_dev = torch.autograd.grad(
+        out_dev, (x_dev, gate_dev, tpu_norm.weight), dy_cpu.to(dev)
+    )
+    self.assertLess(_relative_l2_error(out_dev, out_ref), 1e-2)
+    for g_actual, g_expected in zip(grads_dev, grads_ref, strict=True):
+      self.assertLess(_relative_l2_error(g_actual, g_expected), 1e-2)
 
   def test_causal_conv_silu_backward_avoids_scatter_adds(self):
     """Tests that the conv backward does not add slices into zero buffers.
@@ -968,6 +1080,52 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         0.1,
         msg="Negative control failed: no GDN leak without positions",
     )
+    # Config.reset_at_documents=False (pretraining) ignores positions in both
+    # forward and backward: whole rows match gdn(x, positions=None).
+    gdn_no_reset_cfg = dataclasses.replace(
+        config.layers[0].delta_net,
+        document_resets=gated_delta.GatedDeltaDocumentResets.Config(
+            enabled=False
+        ),
+    )
+    self.assertFalse(gdn_no_reset_cfg.reset_at_documents)
+    gdn_no_reset = gdn_no_reset_cfg.build()
+    gdn_no_reset.init_states(buffer_device=torch.device("cpu"))
+    gdn_no_reset.load_state_dict(gdn.state_dict())
+    gdn_no_reset = gdn_no_reset.to(self.accelerator_device)
+    self.assertFalse(gdn_no_reset.reset_at_documents)
+
+    grad_out = torch.randn_like(out_leaky)
+    x_ref = x.detach().clone().requires_grad_(True)
+    x_no_reset = x.detach().clone().requires_grad_(True)
+    gdn.zero_grad()
+    gdn_no_reset.zero_grad()
+    with set_unflatten_seq_len(seq_len):
+      out_ref_bwd = gdn(x_ref)
+      out_no_reset = gdn_no_reset(x_no_reset, positions=positions)
+    out_ref_bwd.backward(grad_out)
+    out_no_reset.backward(grad_out)
+
+    test_utils.check_equivalence(
+        out_no_reset.detach().cpu(),
+        out_ref_bwd.detach().cpu(),
+        atol=tol,
+        rtol=tol,
+        check_name="GDN Without Document Resets",
+    )
+    grad_tol = 2e-2 if self._is_tpu() else 5e-4
+    self.assertLessEqual(
+        _relative_l2_error(x_no_reset.grad, x_ref.grad),
+        grad_tol,
+        msg="GDN reset_at_documents=False input grad mismatch",
+    )
+    ref_grads = dict(gdn.named_parameters())
+    for name, param in gdn_no_reset.named_parameters():
+      self.assertLessEqual(
+          _relative_l2_error(param.grad, ref_grads[name].grad),
+          grad_tol,
+          msg=f"GDN reset_at_documents=False param grad mismatch for {name}",
+      )
 
   def test_per_row_segment_ids(self):
     """Tests per-row 1-based document ids capped at max_num_segments."""
@@ -1495,6 +1653,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
                 layer.delta_net.inner_gated_delta_net,
                 gated_delta.TpuInnerGatedDeltaNet.Config,
             )
+            self.assertIsInstance(
+                layer.delta_net.norm, gated_delta.TpuRMSNormGated.Config
+            )
             for conv in (
                 layer.delta_net.conv_q,
                 layer.delta_net.conv_k,
@@ -1574,6 +1735,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         (1024,) * 6,
     )
     self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        (cfg.loss.b_block_size, cfg.loss.h_block_size, cfg.loss.v_block_size),
+        (1024, 512, 2048),
+    )
     self.assertIn(config_registry.FUSED_LOSS_OVERRIDE, cfg.override.imports)
     self.assertEqual(
         cfg.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
@@ -1610,8 +1775,27 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertIsNone(gt_cfg.model_spec.pipelining_fn)
     self.assertEqual(gt_cfg.compile.memory_policy, "tpu_selective")
-    # The conversion re-wraps the model config: the kernels must survive it.
-    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model)
+    self.assertIsInstance(gt_cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        (
+            gt_cfg.loss.b_block_size,
+            gt_cfg.loss.h_block_size,
+            gt_cfg.loss.v_block_size,
+        ),
+        (1024, 2048, 640),
+    )
+    # The conversion re-wraps the model config: the kernels and GDN reset
+    # setting must survive it.
+    self._assert_uses_tpu_moe_kernels(gt_cfg.model_spec.model, tile_m=512)
+    self.assertEqual(
+        [
+            d.reset_at_documents
+            for _, d, _, _ in gt_cfg.model_spec.model.traverse(
+                gated_delta.TpuGatedDeltaNet.Config
+            )
+        ],
+        [False] * 30,
+    )
     splitter = GraphSplitter.from_trainer_config(
         gt_cfg,
         optimizer_in_graph=(gt_cfg.compile.optimizer_compile == "in_graph"),
@@ -1689,6 +1873,43 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     bench_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
     self.assertIsInstance(bench_cfg, TpuGraphTrainer.Config)
     self.assertEqual(bench_cfg.model_spec.flavor, "35B-A3B")
+
+    # Pretraining: no GatedDeltaNet packed-document resets (RL keeps them).
+    def resets(cfg):
+      return [
+          d.reset_at_documents
+          for _, d, _, _ in cfg.model_spec.model.traverse(
+              gated_delta.TpuGatedDeltaNet.Config
+          )
+      ]
+
+    self.assertEqual(resets(bench_cfg), [False] * 30)
+    self.assertEqual(resets(config_registry.qwen35_moe_35b()), [True] * 30)
+    re_enabled_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    doc_resets_override = (
+        "torchtitan.experiments.tpu.qwen3_5.gated_delta."
+        "gated_delta_document_resets"
+    )
+    # Combining with the recipe's own overrides (including Tokamax KDA) keeps
+    # both FusedLossLinearWrapper and TokamaxGatedDeltaKernel active without
+    # nested-override conflicts.
+    apply_overrides(
+        OverrideConfig(
+            imports=[*re_enabled_cfg.override.imports, doc_resets_override]
+        ),
+        re_enabled_cfg,
+    )
+    self.assertEqual(resets(re_enabled_cfg), [True] * 30)
+    for layer in re_enabled_cfg.model_spec.model.layers:
+      if layer.delta_net is not None:
+        self.assertEqual(
+            type(layer.delta_net.inner_gated_delta_net.kernel).__qualname__,
+            "TokamaxGatedDeltaKernel.Config",
+        )
+    self.assertEqual(
+        type(re_enabled_cfg.model_spec.model.lm_head).__qualname__,
+        "FusedLossLinearWrapper.Config",
+    )
     self.assertEqual(
         bench_cfg.override.imports,
         [
@@ -1696,7 +1917,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             config_registry.TOKAMAX_GATED_DELTA_OVERRIDE,
         ],
     )
-    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model)
+    self._assert_uses_tpu_moe_kernels(bench_cfg.model_spec.model, tile_m=512)
     self.assertEqual(bench_cfg.parallelism.fsdp_reshard_after_forward, "always")
     self.assertEqual(bench_cfg.parallelism.expert_parallel_degree, 1)
     self.assertTrue(bench_cfg.parallelism.enable_tpu_topo_mesh)
@@ -1740,6 +1961,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         bench_cfg.splash_attention_kernel.use_splash_attention_kernel
     )
     self.assertIsInstance(bench_cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(
+        (
+            bench_cfg.loss.b_block_size,
+            bench_cfg.loss.h_block_size,
+            bench_cfg.loss.v_block_size,
+        ),
+        (1024, 2048, 640),
+    )
 
     # Apply both recipe overrides (`tokamax_gated_delta` imports KDA lazily).
     apply_overrides(bench_cfg.override, bench_cfg)
@@ -1793,6 +2022,174 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertEqual(parsed.model_spec.flavor, "35B-A3B")
     self.assertEqual(parsed.model_spec.max_context_length, 262144)
+    self.assertEqual(resets(parsed), [False] * 30)
+    self.assertEqual(
+        (
+            parsed.loss.b_block_size,
+            parsed.loss.h_block_size,
+            parsed.loss.v_block_size,
+        ),
+        (1024, 2048, 640),
+    )
+    self._assert_uses_tpu_moe_kernels(parsed.model_spec.model, tile_m=512)
+
+    # CLI `--override.imports` can re-enable document resets alongside the
+    # recipe's fused-loss and Tokamax KDA overrides (with custom segments).
+    parsed_rl = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--override.imports",
+        config_registry.FUSED_LOSS_OVERRIDE,
+        (
+            f'{config_registry.TOKAMAX_GATED_DELTA_OVERRIDE}={{"max_num_segments":'
+            " 32}"
+        ),
+        doc_resets_override,
+    ])
+    apply_overrides(parsed_rl.override, parsed_rl)
+    self.assertEqual(resets(parsed_rl), [True] * 30)
+    first_gdn_kernel = parsed_rl.model_spec.model.layers[
+        0
+    ].delta_net.inner_gated_delta_net.kernel
+    self.assertEqual(
+        type(first_gdn_kernel).__qualname__, "TokamaxGatedDeltaKernel.Config"
+    )
+    self.assertEqual(first_gdn_kernel.max_num_segments, 32)
+
+    # 1-layer split + selective save_last_n_layers CLI flags (used at 96K
+    # tokens/rank) also parse.
+    parsed_96k = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_benchmark",
+        "--compile.graph_split.forward_layers_per_executable=1",
+        "--compile.graph_split.backward_layers_per_executable=1",
+        "--compile.save_regions",
+        "moe.routing",
+        "--compile.save_last_n_layers",
+        "attention.inner_attention",
+        "2",
+    ])
+    apply_tpu_graph_trainer_model_transforms(parsed_96k)
+    self.assertEqual(
+        parsed_96k.compile.graph_split.forward_layers_per_executable, 1
+    )
+    self.assertEqual(
+        parsed_96k.compile.graph_split.backward_layers_per_executable, 1
+    )
+    self.assertEqual(parsed_96k.compile.save_regions, ("moe.routing",))
+    self.assertEqual(
+        parsed_96k.compile.save_last_n_layers,
+        {"attention.inner_attention": 2},
+    )
+
+  def test_tpu_rms_norm_gated_wiring_and_fallback(self):
+    """Tests ``use_tpu_modules`` wiring and ``TpuRMSNormGated`` dispatch/fallback."""
+    cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
+    norms = [
+        layer.delta_net.norm
+        for layer in cfg.model_spec.model.layers
+        if layer.delta_net is not None
+    ]
+    self.assertLen(norms, 30)
+    for norm_cfg in norms:
+      self.assertIsInstance(norm_cfg, gated_delta.TpuRMSNormGated.Config)
+
+    dev = self.accelerator_device
+    mod = gated_delta.TpuRMSNormGated.Config(dim=128, eps=1e-6).build().to(dev)
+    ref_mod = gated_delta.RMSNormGated.Config(dim=128, eps=1e-6).build().to(dev)
+    with torch.no_grad():
+      mod.weight.uniform_(0.8, 1.2)
+      ref_mod.weight.copy_(mod.weight)
+
+    # Small debug shapes (`rows < 2048`) fall back cleanly to `RMSNormGated`.
+    x_small = torch.randn(
+        16, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g_small = torch.randn(
+        16, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    out_small = mod(x_small, g_small)
+    out_small_ref = ref_mod(x_small.detach(), g_small.detach())
+    torch.testing.assert_close(out_small.cpu(), out_small_ref.cpu())
+
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      return
+
+    self.assertIsNotNone(gated_delta.rms_norm_gated)
+    x_tpu = torch.randn(
+        1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g_tpu = torch.randn(
+        1024, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    with mock.patch.object(
+        gated_delta.rms_norm_gated,
+        "rms_norm_gated",
+        wraps=gated_delta.rms_norm_gated.rms_norm_gated,
+    ) as spy:
+      out_tpu = mod(x_tpu, g_tpu)
+      self.assertEqual(spy.call_count, 1)
+    out_tpu_ref = ref_mod(x_tpu, g_tpu)
+    torch.testing.assert_close(
+        out_tpu.cpu(), out_tpu_ref.cpu(), rtol=1e-2, atol=1e-2
+    )
+
+  def test_tokamax_gated_delta_compile_matches_eager(self):
+    """Tokamax KDA residual-list custom ops: torch.compile matches eager."""
+    if (
+        self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU
+        or not tokamax_gated_delta.supports_current_tpu()
+        or not tokamax_gated_delta.has_tokamax_kda()
+    ):
+      self.skipTest("Requires TPU >= v6 with Tokamax KDA installed.")
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+    dev = self.accelerator_device
+    torch.manual_seed(17)
+    kernel = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
+        max_num_segments=4
+    ).build()
+
+    def step(q, k, v, g, beta, seg):
+      y = kernel(q, k, v, g, beta, segment_ids_BS=seg)
+      return y.float().square().mean()
+
+    q = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    k = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    v = torch.randn(
+        1, 128, 2, 128, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    g = -torch.rand(
+        1, 128, 2, device=dev, dtype=torch.float32, requires_grad=True
+    )
+    beta = torch.rand(
+        1, 128, 2, device=dev, dtype=torch.bfloat16, requires_grad=True
+    )
+    seg = torch.cat(
+        [
+            torch.zeros(1, 64, device=dev, dtype=torch.int32),
+            torch.ones(1, 64, device=dev, dtype=torch.int32),
+        ],
+        dim=1,
+    )
+
+    eager_loss = step(q, k, v, g, beta, seg)
+    eager_grads = torch.autograd.grad(eager_loss, (q, k, v, g, beta))
+
+    compiled_step = torch.compile(step, backend="tpu")
+    comp_loss = compiled_step(q, k, v, g, beta, seg)
+    comp_grads = torch.autograd.grad(comp_loss, (q, k, v, g, beta))
+
+    torch.testing.assert_close(
+        comp_loss.cpu(), eager_loss.cpu(), rtol=2e-2, atol=2e-2
+    )
+    for g_comp, g_eager in zip(comp_grads, eager_grads, strict=True):
+      torch.testing.assert_close(
+          g_comp.cpu(), g_eager.cpu(), rtol=3e-2, atol=3e-2
+      )
 
 
 if __name__ == "__main__":

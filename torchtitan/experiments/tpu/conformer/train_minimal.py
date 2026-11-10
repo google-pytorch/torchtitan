@@ -26,12 +26,12 @@ import torchtitan.distributed
 from torchtitan.distributed import utils as dist_utils
 import torchtitan.experiments.tpu.conformer  # trigger conformer_tpu model registration
 import torchtitan.experiments.tpu.gmain as gmain
-import torchtitan.experiments.tpu.model_annotator as model_annotator
+import torchtitan.experiments.tpu.profiling.model_annotator as model_annotator
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
 from torchtitan.tools import utils
 import torchtitan.tools.logging
-import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
 import torchtitan.tools.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP

@@ -11,8 +11,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
 from torchtitan.components import metrics
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 import torchtitan.experiments.tpu.train
 
 

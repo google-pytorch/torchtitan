@@ -13,7 +13,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
     data_parallel as simple_fsdp_data_parallel,
 )
-from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.llama3 import parallelize as dtensor_parallelize
 from torchtitan.tools.logging import logger
 

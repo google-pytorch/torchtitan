@@ -43,7 +43,7 @@ from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
+from torchtitan.experiments.tpu.components.grad_norm import CompiledGradNorm
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
     apply_tpu_graph_trainer_model_transforms,
@@ -346,7 +346,7 @@ class TpuGraphTrainer(GraphTrainer):
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Include AdamW when the in-graph optimizer mode is selected."""
-        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 
         with set_unflatten_seq_len(self.config.training.max_context_length):
             if not self._optimizer_in_graph:

@@ -7,7 +7,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
 )
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
     TpuTokenDispatcherConverter,

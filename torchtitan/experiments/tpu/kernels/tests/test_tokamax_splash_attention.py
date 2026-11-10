@@ -132,6 +132,71 @@ class SplashTbwdSupportTest(parameterized.TestCase):
     self.assertIn(expected, reason or "")
 
 
+class SplashTbwdScheduleTest(parameterized.TestCase):
+  """splash_tbwd.build_schedule against a brute-force tile list (no device)."""
+
+  @staticmethod
+  def _reference(seg, block):
+    """Active tiles in (b, qi, kj) order, their kinds and accumulator bounds."""
+    num_b, s = seg.shape
+    nb = s // block
+    blocks = seg.reshape(num_b, nb, block)
+    tiles = []
+    for b in range(num_b):
+      for qi in range(nb):
+        for kj in range(qi + 1):
+          q_ids, kv_ids = blocks[b, qi], blocks[b, kj]
+          if q_ids.max() < kv_ids.min() or kv_ids.max() < q_ids.min():
+            continue
+          single_doc = (
+              q_ids.min() == q_ids.max() == kv_ids.min() == kv_ids.max()
+          )
+          tiles.append((b, qi, kj, 1 if kj < qi and single_doc else 2))
+    bounds = {}
+    for name, run in (("q", lambda t: t[:2]), ("b", lambda t: t[0])):
+      runs = [run(t) for t in tiles]
+      bounds[f"{name}_bounds_start"] = [
+          int(i == 0 or runs[i - 1] != r) for i, r in enumerate(runs)
+      ]
+      bounds[f"{name}_bounds_end"] = [
+          int(i == len(runs) - 1 or runs[i + 1] != r)
+          for i, r in enumerate(runs)
+      ]
+    return tiles, bounds
+
+  @parameterized.named_parameters(
+      ("packed_512", _DOCUMENTS, 512),
+      ("packed_256", ((300, 517, 77, 898), (1000, 48, 744)), 256),
+      ("one_document", ((2048,), (2048,)), 512),
+      ("unsorted_ids", None, 128),
+  )
+  def test_matches_brute_force(self, documents, block):
+    if documents is None:
+      # Ids that repeat out of order: the [min, max] test stays conservative.
+      seg = np.array([[0] * 128 + [1] * 128 + [0] * 128 + [2] * 128], np.int32)
+    else:
+      seg = _packed_segment_ids(documents).numpy()
+    sched = {
+        k: np.asarray(v)
+        for k, v in splash_tbwd.build_schedule(jnp.asarray(seg), block).items()
+    }
+    tiles, bounds = self._reference(seg, block)
+    n = len(tiles)
+    num_b, s = seg.shape
+    self.assertEqual(int(sched["num_active"]), n)
+    self.assertLen(sched["b"], splash_tbwd._num_steps(num_b, s, block))
+    got = list(
+        zip(*(sched[k][:n].tolist() for k in ("b", "qi", "kj", "kind")))
+    )
+    self.assertEqual(got, tiles)
+    for name, want in bounds.items():
+      self.assertEqual(sched[name][:n].tolist(), want, name)
+    # Padding steps: kind 0, all bounds 0.
+    self.assertTrue(np.all(sched["kind"][n:] == 0))
+    for name in bounds:
+      self.assertTrue(np.all(sched[name][n:] == 0), name)
+
+
 class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
 
   def check_forward_parity(
@@ -588,6 +653,7 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="group2_dim64", n_heads=8, n_kv_heads=4, head_dim=64),
       dict(testcase_name="group5_dim192", n_heads=10, n_kv_heads=2, head_dim=192),
       dict(testcase_name="group16_no_segment_ids", n_heads=16, n_kv_heads=1, head_dim=128, packed=False),
+      dict(testcase_name="group8_scale", n_heads=16, n_kv_heads=2, head_dim=128, scale=0.05),
       # 1792 tokens: 256-token tiles; 1920 tokens: 128-token tiles.
       dict(testcase_name="tile256", n_heads=8, n_kv_heads=2, head_dim=128,
            documents=((300, 517, 77, 898), (1000, 48, 744)), block=256),
@@ -595,13 +661,14 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
            documents=((300, 517, 77, 1026), (1000, 48, 872)), block=128),
   )
   def test_transposed_bwd_matches_reference(
-      self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, block=None
+      self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, block=None, scale=None
   ):
     """use_transposed_bwd (splash_tbwd) gradients match dense f32 attention and Tokamax's backward.
 
     _DOCUMENTS yields both tile kinds: boundaries inside 512-token blocks (masked tiles) and a 1154-token document
     spanning whole blocks below the diagonal (full tiles, no element mask). Also covers G not a multiple of 8,
-    head dims other than 128, no segment ids and the smaller tiles chosen for seq_len not a multiple of 512.
+    head dims other than 128, no segment ids, a non-default scale and the smaller tiles chosen for seq_len
+    not a multiple of 512.
     """
     torch.manual_seed(7)
     if block is not None:
@@ -624,14 +691,15 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
           ref[0],
           *(x.repeat_interleave(n_heads // n_kv_heads, dim=1) for x in ref[1:]),
           attn_mask=mask[:, None],
+          scale=scale,
       )
     out_ref.backward(grad_out.float().transpose(1, 2))
     dense = [x.grad.transpose(1, 2) for x in ref]
 
     segment_ids = segment_ids.to(self.accelerator_device) if packed else None
-    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids)
+    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
     self._set_tokamax_config(use_transposed_bwd=True)
-    got = self._packed_grads(q, k, v, grad_out, segment_ids)
+    got = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
     for name, g, d, t in zip(("dq", "dk", "dv"), got, dense, tokamax):
       # bf16 inputs and bf16 P / dS on the MXU: ~3e-3 off the dense reference.
       self.assertLess(((g - d).norm() / d.norm()).item(), 1e-2, name)

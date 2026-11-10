@@ -18,13 +18,13 @@ import jax.numpy as jnp
 # the duration of the tokamax import.
 import jaxtyping
 import numpy as np
-from torchtitan.experiments.tpu.kernels import splash_tbwd
-from torchtitan.tools.logging import logger
 from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
     slice_cp_mask_info,
 )
+from torchtitan.experiments.tpu.kernels import splash_tbwd
+from torchtitan.tools.logging import logger
 
 _real_jaxtyped = jaxtyping.jaxtyped
 

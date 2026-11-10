@@ -14,7 +14,7 @@ import torch
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.experiments.tpu import activation_checkpoint as tpu_ac
+from torchtitan.experiments.tpu.components import activation_checkpoint as tpu_ac
 
 _FLAGS = ("recompute_bmm", "save_pallas_attention")
 _COLLECTIVES = {

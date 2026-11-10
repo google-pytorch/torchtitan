@@ -45,7 +45,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
 )
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
 

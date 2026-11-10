@@ -22,7 +22,7 @@ from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
-from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
 # Muse Glimmer's ``tok_embeddings`` is an ``EmbeddingWithNorm``; its weight

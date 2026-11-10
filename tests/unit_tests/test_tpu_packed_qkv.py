@@ -12,7 +12,7 @@ from typing import cast
 import pytest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
-from torchtitan.experiments.tpu.qkv import (
+from torchtitan.experiments.tpu.components.qkv import (
     TpuPackedQKVConverter,
     TpuPackedQKVLinear,
 )

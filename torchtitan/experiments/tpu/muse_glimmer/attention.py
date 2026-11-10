@@ -98,7 +98,7 @@ def _unflatten_to_4d(
     return q, k, v, False
   seq_len = None
   try:
-    from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len  # pylint: disable=g-import-not-at-top
 
     seq_len = get_unflatten_seq_len()
   except ImportError:

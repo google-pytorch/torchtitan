@@ -1481,6 +1481,35 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             segment_ids=segment_ids_from_positions(positions)[:-1],
         )
 
+  def test_gated_delta_net_drops_given_segment_ids_without_document_resets(
+      self,
+  ):
+    """Tests given ``segment_ids`` with ``document_resets.enabled=False``.
+
+    Like ``positions``, they are dropped, so the row runs as one stream.
+    """
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn_cfg = dataclasses.replace(
+        config.layers[0].delta_net,
+        document_resets=gated_delta.GatedDeltaDocumentResets.Config(
+            enabled=False
+        ),
+    )
+    gdn = gdn_cfg.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    seq_len = 32
+    torch.manual_seed(0)
+    x = torch.randn(seq_len, config.dim)
+    positions = _packed_positions((10, 22))
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      stream = gdn(x)
+      given = gdn(
+          x,
+          positions=positions,
+          segment_ids=segment_ids_from_positions(positions),
+      )
+    self.assertTrue(torch.equal(given, stream))
+
   def test_gated_delta_net_given_segment_ids_go_through_document_ids(self):
     """Tests given ``segment_ids`` with a kernel that merges documents.
 

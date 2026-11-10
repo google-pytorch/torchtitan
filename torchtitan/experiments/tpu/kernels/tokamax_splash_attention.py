@@ -441,7 +441,8 @@ def _transposed_bwd_unsupported_reason(
 @functools.cache
 def _warn_transposed_bwd_fallback(reason: str) -> None:
   logger.warning(
-      f"use_transposed_bwd: using the Tokamax backward instead of splash_tbwd: {reason}."
+      "use_transposed_bwd: using the Tokamax backward instead of splash_tbwd:"
+      f" {reason}."
   )
 
 

@@ -26,8 +26,9 @@ D = 64 the per-tile elementwise work (exp2, mask, dS), which does not shrink wit
 Schedule and accumulation
 -------------------------
 One pallas_call covers the whole batch. The grid is (N, T). The T steps walk a schedule, built on device from
-the segment ids (`build_schedule`), of the active (example, q block, kv block) tiles in that lexicographic order,
-padded with no-op steps to the data-independent bound B * nb * (nb + 1) / 2 (nb = S / block). Because of that order:
+the segment ids (`build_schedule`), of the active (example, q block, kv block) tiles in that lexicographic order;
+T is the traced number of active tiles (a dynamic grid, as Tokamax's), while the schedule arrays are sized to the
+data-independent bound B * nb * (nb + 1) / 2 (nb = S / block). Because of that order:
   - dQ of one (example, q block) accumulates in VMEM over its run of steps and is written once;
   - dK^T / dV^T of one (example, kv head) stay resident in VMEM as [D, S] f32 for the whole sequence, and so do
     K / V; there are no HBM partial sums and no reduction op;
@@ -39,12 +40,12 @@ strictly below the diagonal skip the element mask; every other active tile is co
 Limits
 ------
 Causal self-attention, optionally with segment ids (no window, no CP, no soft cap, no dropout), bf16 inputs, D a
-multiple of 32 and >= 64, G <= 16, S a multiple of 128 (tiles of 512, else 256, else 128). Because K / V and dK^T / dV^T stay resident for the whole
-sequence, VMEM grows with D * S and the schedule in SMEM with B * S^2; `unsupported_reason` checks both against an
-estimate fit to compile reports (Mosaic fails at compile time with RESOURCE_EXHAUSTED past them). Code size: the kernel unrolls _HEAD_UNROLL heads per loop
-iteration in each of its 2 tile-kind branches. An 81k-bundle variant overflowed TPU7x instruction memory and ran
-3.5x slower (53k was still fine), so check the final LLO bundle count (--xla_jf_dump_to) before raising the unroll
-or adding branches.
+multiple of 32 and >= 64, G <= 16, S a multiple of 128 (tiles of 512, else 256, else 128). Because K / V and
+dK^T / dV^T stay resident for the whole sequence, VMEM grows with D * S and the schedule in SMEM with B * S^2;
+`unsupported_reason` checks both against an estimate fit to compile reports (Mosaic fails at compile time with
+RESOURCE_EXHAUSTED past them). Code size: the kernel unrolls _HEAD_UNROLL heads per loop iteration in each of its 2
+tile-kind branches. An 81k-bundle variant overflowed TPU7x instruction memory and ran 3.5x slower (53k was still
+fine), so check the final LLO bundle count (--xla_jf_dump_to) before raising the unroll or adding branches.
 """
 
 import functools
@@ -79,12 +80,13 @@ _SCHEDULE_KEYS = ("b", "qi", "kj", "kind", "q_bounds_start", "q_bounds_end", "b_
 def build_schedule(segment_ids_BS: jax.Array, block: int) -> dict[str, jax.Array]:
   """Tile schedule [T] for `splash_tbwd_call`, built from (traced) segment ids [B, S].
 
-  Returns a dict of int32 [T] arrays: b, qi, kj (example, q block, kv block) and kind (0: padding step, no compute;
-  1: every pair causal and same-document, no element mask; 2: masked tile), plus the accumulator bounds (as
-  Tokamax's `find_bounds`, 1 on the first / last step of a run): q_bounds_start / q_bounds_end for each
-  (example, q block) run (dQ) and b_bounds_start / b_bounds_end for each example (dK^T / dV^T). Active tiles come
-  first in (b, qi, kj) order; the remaining steps, up to the data-independent bound of every causal tile, are
-  kind-0 copies of the last active tile's indices (so they trigger no DMA) with all bounds 0. Uses only
+  Returns num_active (int32 scalar: the number of active tiles, the grid's step count) and int32 [T] arrays: b, qi,
+  kj (example, q block, kv block) and kind (0: padding step, no compute; 1: every pair causal and same-document, no
+  element mask; 2: masked tile), plus the accumulator bounds (as Tokamax's `find_bounds`, 1 on the first / last
+  step of a run): q_bounds_start / q_bounds_end for each (example, q block) run (dQ) and b_bounds_start /
+  b_bounds_end for each example (dK^T / dV^T). Active tiles come first in (b, qi, kj) order; the remaining entries,
+  up to the data-independent bound of every causal tile, are kind-0 copies of the last active tile's indices with
+  all bounds 0 (the grid does not reach them). Uses only
   reductions, compares and one sort (no gathers, which XLA TPU may offload to SparseCore).
   """
   num_b, s = segment_ids_BS.shape
@@ -122,7 +124,8 @@ def build_schedule(segment_ids_BS: jax.Array, block: int) -> dict[str, jax.Array
 
   q_bounds_start, q_bounds_end = _find_bounds(b_T * num_blocks + qi_T, valid_T)
   b_bounds_start, b_bounds_end = _find_bounds(b_T, valid_T)
-  return dict(b=b_T, qi=qi_T, kj=kj_T, kind=kind_T, q_bounds_start=q_bounds_start, q_bounds_end=q_bounds_end,
+  return dict(num_active=num_active, b=b_T, qi=qi_T, kj=kj_T, kind=kind_T, q_bounds_start=q_bounds_start,
+              q_bounds_end=q_bounds_end,
               b_bounds_start=b_bounds_start, b_bounds_end=b_bounds_end)
 
 
@@ -324,7 +327,8 @@ def splash_tbwd_call(
   ]
   # XLA's latency-hiding scheduler treats a custom call without a cost estimate as free, and then delays async
   # collectives (FSDP reduce-scatters) until after it instead of overlapping them with it. Count every
-  # scheduled step as a full tile of 5 matmuls per q head; padding steps make this an upper bound.
+  # tile the schedule can hold as a full tile of 5 matmuls per q head (an upper bound: the grid runs only the active
+  # ones, and a cost estimate must be static).
   operands = (q_BHDS, do_BHDS, k_BNDS, k_BNSD, v_BNDS, lse2_BNGS, o_BHDS, qseg_BSL, kvseg_B8S)
   tile_heads = num_kv * num_steps * g
   cost = pl.CostEstimate(
@@ -335,7 +339,8 @@ def splash_tbwd_call(
   return pl.pallas_call(
       functools.partial(_kernel, group_size=g, block=block, log2_scale=scale * log2e, grad_scale=scale),
       grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=len(_SCHEDULE_KEYS), in_specs=in_specs, out_specs=out_specs, grid=(num_kv, num_steps),
+          num_scalar_prefetch=len(_SCHEDULE_KEYS), in_specs=in_specs, out_specs=out_specs,
+          grid=(num_kv, sched["num_active"]),
           scratch_shapes=scratch),
       out_shape=out_shape,
       compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary"),
@@ -365,9 +370,10 @@ def _vmem_bytes(d: int, g: int, s: int, block: int, single_buffer_kv: bool) -> i
 
   Blocks that move every step (q / dO / o, lse2, q segment ids, dq) are double-buffered; the per-(example, kv
   head) arrays (K^T, K, V^T, kv segment ids, dK^T / dV^T; double- or single-buffered) and the f32 dK^T / dV^T
-  accumulators, all [D, S] or [S, D], are what limit S. Arrays with D on lanes pad D to a multiple of 128. The temporaries term
-  is fit to TPU7x compile reports at 512 tiles (7.8 MiB at D = 128 up to 14 MiB at D = 512, G = 16) with 2 MiB of
-  margin. The estimate is exact to that margin on every reported failure (D = 128..512, G = 8 / 16, S = 4096..131072).
+  accumulators, all [D, S] or [S, D], are what limit S. Arrays with D on lanes pad D to a multiple of 128. The
+  temporaries term is fit to TPU7x compile reports at 512 tiles (7.8 MiB at D = 128 up to 14 MiB at D = 512, G = 16)
+  with 2 MiB of margin; it overestimates smaller tiles. The estimate is within that margin of every reported
+  failure (D = 128..512, G = 8 / 16, S = 4096..131072).
   """
   d_lanes, g_rows = _round_up(d, NUM_LANES), _round_up(g, 8)
   step_blocks = 3 * g * d * block * 2 + g_rows * block * 4 + block * NUM_LANES * 4 + g * block * d_lanes * 2

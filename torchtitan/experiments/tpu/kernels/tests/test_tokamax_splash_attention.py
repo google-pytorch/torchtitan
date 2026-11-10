@@ -701,10 +701,13 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     self._set_tokamax_config(use_transposed_bwd=True)
     got = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
     for name, g, d, t in zip(("dq", "dk", "dv"), got, dense, tokamax):
-      # bf16 inputs and bf16 P / dS on the MXU: ~3e-3 off the dense reference.
-      self.assertLess(((g - d).norm() / d.norm()).item(), 1e-2, name)
-      # No systematic scale difference from Tokamax's backward: a log2(e) that did not match the forward's once
-      # biased every gradient by -0.2%.
+      # Both kernels round P / dS to bf16 for the MXU (~3-5e-3 off dense f32, growing with head_dim), so bound
+      # splash_tbwd's error by Tokamax's own on the same inputs. TPU7x: ratio 0.68-0.97 on these cases.
+      error = ((g - d).norm() / d.norm()).item()
+      tokamax_error = ((t - d).norm() / d.norm()).item()
+      self.assertLess(error, 1.25 * tokamax_error, name)
+      # No systematic scale difference from Tokamax's backward (TPU7x: <= 3.1e-4 here). A log2(e) or scale ratio
+      # that did not match the forward's bf16 rounding biased every gradient by 1-2e-3.
       self.assertLess(abs((g.norm() / t.norm()).item() - 1), 1e-3, name)
 
   @parameterized.named_parameters(

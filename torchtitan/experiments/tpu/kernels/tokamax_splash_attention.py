@@ -512,10 +512,15 @@ def jax_attention_bwd(
     # q.dtype, and bf16(1/sqrt(128)) is 1.1e-4 below the exact value. With the
     # exact value P would no longer match the saved lse and the gradients
     # would carry a systematic bias (measured: step-1 grad-norm 1.1e-3 rel).
+    # A non-default scale is applied in jax_attention_fwd as
+    # q_tr * (scale / default_scale): a bf16 multiply that rounds the ratio to
+    # bf16 too (e.g. 0.5657 -> 0.5664, +1.3e-3), so use the rounded ratio.
     default_scale = 1.0 / math.sqrt(q.shape[-1])
-    forward_scale = float(np.asarray(default_scale, dtype=q.dtype)) * (
-        scale / default_scale
-    )
+    forward_scale = float(np.asarray(default_scale, dtype=q.dtype))
+    if abs(scale - default_scale) > 1e-6:
+      forward_scale *= float(
+          np.asarray(scale / default_scale, dtype=q.dtype)
+      )
     # Likewise the Tokamax forward kernel (use_base2_exp) multiplies bf16 q by
     # log2(e), i.e. by bf16(log2(e)) = 1.4453125, 1.8e-3 above log2(e). The
     # exact constant left P 0.2% low against the saved lse (measured: dq/dk/dv

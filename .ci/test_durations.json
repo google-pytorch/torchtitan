@@ -85,6 +85,7 @@
   "torchtitan.experiments.tpu.kernels.tests.test_paired_segment_matmul": 11,
   "torchtitan.experiments.tpu.kernels.tests.test_route_score": 6,
   "torchtitan.experiments.tpu.kernels.tests.test_splash_attention": 8,
+  "torchtitan.experiments.tpu.kernels.tests.test_splash_attention_mfu": 25,
   "torchtitan.experiments.tpu.kernels.tests.test_splash_bias_dropout": 12,
   "torchtitan.experiments.tpu.kernels.tests.test_tokamax_splash_attention": 8,
   "torchtitan.experiments.tpu.llama3.tests.test_dtensor_parallelize_distributed": 78,

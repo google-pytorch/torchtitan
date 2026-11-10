@@ -1,16 +1,16 @@
 # Copyright 2026 Google LLC
 
-"""Full-attention parity and MFU regression tests for TPU Splash kernels.
+"""TPU v7x full-attention parity and MFU regression tests for Splash kernels.
 
 Lives in its own module so ``setUpModule`` can raise
 ``xla_tpu_scoped_vmem_limit_kib`` to 64 MiB before the first TPU program
-compiles on TPU >= v6 (unlocking 2048x4096 tiles at 32K context) without
+compiles on TPU v7x (unlocking 2048x4096 tiles at 32K context) without
 changing the default scoped VMEM budget for the rest of ``kernels/tests/``.
 
 By default, CI runs multi-tile forward/backward parity across all three Splash
 wrappers plus FLUX's ``use_tokamax_splash_attention_patch(...,
 is_causal=False)``
-path, and benchmarks compiled 32K MFU on ``tokamax_splash_sdpa`` (~22s total).
+path, and benchmarks compiled 32K MFU on ``tokamax_splash_sdpa`` (~25s total).
 Pass ``--benchmark_all_kernels`` to benchmark all three kernels at 32K, or
 ``--norun_mfu_benchmark`` for parity-only execution.
 """
@@ -42,21 +42,46 @@ from torchtitan.tools import utils
 _RUN_MFU_BENCHMARK = flags.DEFINE_bool(
     "run_mfu_benchmark",
     True,
-    "Whether to run the compiled full-scale FLUX attention MFU benchmark.",
+    "Whether to run the compiled 32K FLUX attention MFU benchmark.",
 )
 _BENCHMARK_ALL_KERNELS = flags.DEFINE_bool(
     "benchmark_all_kernels",
     False,
-    "Whether to benchmark all three Splash kernels at full scale instead of"
-    " only tokamax_splash_sdpa.",
+    "Whether to benchmark all three Splash kernels at 32K instead of only"
+    " tokamax_splash_sdpa.",
 )
 _MIN_ATTENTION_MFU = flags.DEFINE_float(
     "min_attention_mfu",
     0.30,
-    "Minimum required steady-state full-attention MFU.",
+    "Minimum required steady-state full-attention MFU on TPU v7x.",
 )
 
 _ALL_KERNELS = ("splash_sdpa", "tokamax_splash_sdpa", "sbd_splash_attention")
+_FLUX_32K_BHSD = (1, 32, 32768, 128)
+_V7X_32K_BLOCKS = dict(
+    block_q=2048,
+    block_kv=4096,
+    block_kv_compute=512,
+    block_q_dkv=2048,
+    block_kv_dkv=4096,
+    block_kv_dkv_compute=512,
+)
+_V7X_SBD_32K_BLOCKS = dict(
+    block_q=2048,
+    block_kv=4096,
+    block_kv_compute=512,
+    block_q_dkv=2048,
+    block_kv_dkv=2048,
+    block_kv_dkv_compute=2048,
+)
+_PARITY_BLOCKS = dict(
+    block_q=512,
+    block_kv=1024,
+    block_kv_compute=512,
+    block_q_dkv=512,
+    block_kv_dkv=1024,
+    block_kv_dkv_compute=512,
+)
 
 
 def _tpu_device_name() -> str | None:
@@ -81,7 +106,7 @@ def setUpModule():  # pylint: disable=invalid-name
   # PCI sysfs lookup does not initialize PJRT, so libtpu / XLA flags applied
   # here take effect when the first TPU tensor or compiled kernel runs.
   gen = _tpu_generation()
-  if gen is not None and gen >= 6:
+  if gen is not None and gen >= 7:
     tpu_flags.apply_init_flags(
         types.SimpleNamespace(
             libtpu_init_flags={"xla_tpu_scoped_vmem_limit_kib": "65536"},
@@ -143,14 +168,18 @@ class _FluxInnerAttentionModule(nn.Module):
 
 
 class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
-  """Verifies multi-tile full-attention parity and >30% attention MFU on TPU."""
+  """Verifies TPU v7x full-attention parity and >30% 32K attention MFU."""
 
-  def _require_tpu(self) -> tuple[torch.device, str, int]:
+  def _require_tpu_v7x(self) -> tuple[torch.device, str]:
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
-      self.skipTest("Splash Attention MFU test requires a TPU device.")
-    device_name = _tpu_device_name() or "TPU"
-    gen = _tpu_generation(device_name) or 5
-    return self.accelerator_device, device_name, gen
+      self.skipTest("Splash Attention MFU test requires a TPU v7x device.")
+    device_name = _tpu_device_name() or ""
+    gen = _tpu_generation(device_name)
+    if gen is None or gen < 7:
+      self.skipTest(
+          f"Splash Attention 32K MFU test targets TPU v7x, got {device_name!r}."
+      )
+    return self.accelerator_device, device_name
 
   def _save_and_update(self, cfg_cls, **updates) -> None:
     for key, value in updates.items():
@@ -161,51 +190,15 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
     for key in keys:
       self.addCleanup(setattr, cfg_cls, key, getattr(cfg_cls, key))
 
-  def _benchmark_spec(
-      self, gen: int
-  ) -> tuple[tuple[int, int, int, int], dict[str, int]]:
-    if gen >= 6:
-      # FLUX 32K full-attention benchmark shape on TPU v6e / TPU v7x (64 MiB
-      # scoped VMEM unlocked in setUpModule).
-      bhsd = (1, 32, 32768, 128)
-      blocks = dict(
-          block_q=2048,
-          block_kv=4096,
-          block_kv_compute=512,
-          block_q_dkv=2048,
-          block_kv_dkv=2048,
-          block_kv_dkv_compute=2048,
-      )
-    else:
-      # TPU v5e has 16 GiB HBM per core (128 MiB VMEM, 16 MiB default scoped
-      # VMEM limit).
-      bhsd = (1, 16, 16384, 128)
-      blocks = dict(
-          block_q=512,
-          block_kv=1024,
-          block_kv_compute=512,
-          block_q_dkv=512,
-          block_kv_dkv=1024,
-          block_kv_dkv_compute=512,
-      )
-    return bhsd, blocks
-
   def _make_kernel_fn(
       self,
       kernel_kind: str,
-      blocks: dict[str, int],
-      gen: int,
       *,
-      use_large_dkv: bool = True,
+      for_benchmark: bool,
   ) -> tuple[callable, bool]:
-    """Returns ``(attn_fn, heads_first)`` configured with ``blocks``."""
+    """Returns ``(attn_fn, heads_first)`` for ``kernel_kind``."""
     if kernel_kind == "splash_sdpa":
-      stock_kwargs = dict(blocks, k_layout="SEQ_MINOR")
-      if gen >= 6 and use_large_dkv:
-        stock_kwargs.update(
-            block_kv_dkv=4096,
-            block_kv_dkv_compute=512,
-        )
+      blocks = _V7X_32K_BLOCKS if for_benchmark else _PARITY_BLOCKS
 
       def run_stock(q, k, v):
         return splash_attention.splash_sdpa(
@@ -215,22 +208,19 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
             is_causal=False,
             enable_gqa=False,
             use_vmap_bwd=True,
-            **stock_kwargs,
+            k_layout="SEQ_MINOR",
+            **blocks,
         )
 
       return run_stock, True
 
     if kernel_kind == "tokamax_splash_sdpa":
-      tokamax_kwargs = dict(blocks, k_layout="SEQ_MINOR")
-      if gen >= 6 and use_large_dkv:
-        tokamax_kwargs.update(
-            block_kv_dkv=4096,
-            block_kv_dkv_compute=512,
-        )
+      blocks = _V7X_32K_BLOCKS if for_benchmark else _PARITY_BLOCKS
       self._save_and_update(
           tokamax_splash_attention.TokamaxConfig,
           use_vmap_bwd=True,
-          **tokamax_kwargs,
+          k_layout="SEQ_MINOR",
+          **blocks,
       )
 
       def run_tokamax(q, k, v):
@@ -241,11 +231,12 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
       return run_tokamax, False
 
     if kernel_kind == "sbd_splash_attention":
+      blocks = _V7X_SBD_32K_BLOCKS if for_benchmark else _PARITY_BLOCKS
       self._save_and_update(
           splash_bias_dropout.SbdConfig,
           use_base2_exp=True,
           dq_reduction_steps=3,
-          use_experimental_scheduler=(gen >= 7),
+          use_experimental_scheduler=True,
           **blocks,
       )
 
@@ -271,17 +262,9 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
   )
   def test_full_attention_multi_tile_parity(self, kernel_kind: str):
     """Verifies forward + backward parity across non-square Q/KV tiles."""
-    dev, _, gen = self._require_tpu()
-    parity_blocks = dict(
-        block_q=512,
-        block_kv=1024,
-        block_kv_compute=512,
-        block_q_dkv=512,
-        block_kv_dkv=1024,
-        block_kv_dkv_compute=512,
-    )
+    dev, _ = self._require_tpu_v7x()
     attn_fn, heads_first = self._make_kernel_fn(
-        kernel_kind, parity_blocks, gen, use_large_dkv=False
+        kernel_kind, for_benchmark=False
     )
 
     torch.manual_seed(0)
@@ -320,7 +303,7 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_flux_tokamax_patch_non_causal_parity(self):
     """Verifies FLUX's ``ScaledDotProductInnerAttention(..., is_causal=False)`` patch."""
-    dev, _, _ = self._require_tpu()
+    dev, _ = self._require_tpu_v7x()
     self._snapshot_config(
         tokamax_splash_attention.TokamaxConfig,
         tokamax_splash_attention._KERNEL_CONFIG_FIELDS,  # pylint: disable=protected-access
@@ -384,10 +367,9 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
       kernel_kind: str,
       dev: torch.device,
       device_name: str,
-      gen: int,
   ) -> None:
-    (batch_size, heads, seq_len, head_dim), blocks = self._benchmark_spec(gen)
-    attn_fn, heads_first = self._make_kernel_fn(kernel_kind, blocks, gen)
+    batch_size, heads, seq_len, head_dim = _FLUX_32K_BHSD
+    attn_fn, heads_first = self._make_kernel_fn(kernel_kind, for_benchmark=True)
 
     torch.manual_seed(42)
     bench_shape = (
@@ -500,10 +482,10 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_full_attention_mfu_above_threshold(self):
-    """Measures compiled FLUX full-attention MFU (tokamax_splash_sdpa by default)."""
+    """Measures compiled FLUX 32K full-attention MFU on TPU v7x."""
     if not _RUN_MFU_BENCHMARK.value:
       self.skipTest("Skipped because --norun_mfu_benchmark was set.")
-    dev, device_name, gen = self._require_tpu()
+    dev, device_name = self._require_tpu_v7x()
     kernels = (
         _ALL_KERNELS
         if _BENCHMARK_ALL_KERNELS.value
@@ -511,7 +493,7 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
     )
     for kernel_kind in kernels:
       with self.subTest(kernel_kind=kernel_kind):
-        self._run_single_mfu_benchmark(kernel_kind, dev, device_name, gen)
+        self._run_single_mfu_benchmark(kernel_kind, dev, device_name)
 
 
 if __name__ == "__main__":

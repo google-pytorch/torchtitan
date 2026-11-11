@@ -100,9 +100,19 @@ class TrainerMinimal:
           enable_cpu_backend=job_config.training.enable_cpu_offload,
           base_folder=job_config.dump_folder,
       )
-    # A single-process run (e.g. a parity test's CPU reference) has no device
-    # mesh; the spmd_types helpers (`spmd_mesh_size`, `spmd_mesh_group`) treat
-    # a missing mesh as all-singleton axes, so no fallback is needed.
+    elif not dist.is_initialized():
+      # A single-process run (a parity test's CPU reference, or a one-chip run
+      # outside torchrun) still needs a process group: spmd_types annotates the
+      # model inputs against `ParallelDims`' device mesh, and torch builds that
+      # mesh from the default group. Use a one-rank gloo group over an
+      # in-process store: no rendezvous, and no TPU backend, which refuses a
+      # group smaller than the host's chip count. Every mesh axis has size 1,
+      # so the spmd_types helpers never issue a collective on it.
+      dist_utils.enable_fp32_matmul_emulation_with_bf16x9()
+      torch.autograd.set_multithreading_enabled(False)
+      dist.init_process_group(
+          backend="gloo", rank=0, world_size=1, store=dist.HashStore()
+      )
 
     parallelism_config = self.job_config.parallelism
     self.parallel_dims = ParallelDims(

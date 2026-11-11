@@ -2,12 +2,16 @@
 
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.distributed.spmd_types import spmd_local_context
+from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.experiments.tpu.components.layer_loop import TpuLayerLoop, register_layer_loop_forward
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35TransformerBlock
+from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -106,3 +110,56 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
+
+
+def _layer_loop_forward(
+    self,
+    tokens: torch.Tensor,
+    *,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.Tensor | None = None,
+    grid_thw: torch.Tensor | None = None,
+    grid_thw_videos: torch.Tensor | None = None,
+    attention_masks: Qwen35AttentionMaskDict | None = None,
+    positions: torch.Tensor | None = None,
+    special_tokens: dict[str, int] | None = None,
+):
+  """``Qwen35Model.forward``, but ``model.layers`` runs the layers.
+
+  A copy of upstream's forward; only the layer loop differs. Lets
+  ``tpu_model_class`` (and so layer stacking and scan) apply to Qwen3.5.
+  """
+  with spmd_local_context("dp"):
+    if self.tok_embeddings is not None:
+      x = self._prepare_multimodal_embeds(
+          tokens,
+          pixel_values=pixel_values,
+          pixel_values_videos=pixel_values_videos,
+          grid_thw=grid_thw,
+          grid_thw_videos=grid_thw_videos,
+          special_tokens=special_tokens,
+      )
+    else:
+      x = tokens
+
+  if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+    spmd.assert_type(
+        x,
+        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},
+        spmd.PartitionSpec(("dp", "cp"), None),
+    )
+
+  # The only change from upstream: let the container run the layers.
+  if isinstance(self.layers, TpuLayerLoop):
+    x = self.layers(x, attention_masks, positions)
+  else:
+    for layer in self.layers.values():
+      x = layer(x, attention_masks, positions)
+
+  x = self.norm(x) if self.norm is not None else x
+  if self._skip_lm_head:
+    return x
+  return self.lm_head(x) if self.lm_head is not None else x
+
+
+register_layer_loop_forward(Qwen35Model, _layer_loop_forward)

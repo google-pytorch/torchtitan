@@ -590,6 +590,9 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
 
   def __init__(self, config: Config):
     super().__init__(config)
+    # Read here, eagerly: a scan body is traced by Dynamo, which cannot trace
+    # the sysfs scan inside `get_device_properties`.
+    self._tpu_gen = _tpu_generation()
     if not MIN_SUPPORTED_LOG_DECAY <= config.min_log_decay < 0:
       raise ValueError(
           f"min_log_decay must be in [{MIN_SUPPORTED_LOG_DECAY}, 0), got"
@@ -629,7 +632,7 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
     """Why the Mosaic kernels cannot run these inputs, or None."""
     if q_BSHK.device.type != "tpu":
       return f"device {q_BSHK.device.type}"
-    gen = _tpu_generation()
+    gen = self._tpu_gen
     if gen is not None and gen < _MIN_TPU_GENERATION:
       return f"TPU v{gen} (needs >= v{_MIN_TPU_GENERATION})"
     if 0 in q_BSHK.shape or 0 in v_BSHV.shape:

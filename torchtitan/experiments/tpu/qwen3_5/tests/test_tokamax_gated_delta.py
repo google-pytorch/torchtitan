@@ -328,13 +328,9 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         # Include decays below `min_log_decay` (-5.0) to verify fallback clamping.
         g = -10.0 * torch.rand(*shape, device=dev)
         beta = torch.sigmoid(torch.randn(*shape, device=dev)).to(q_dtype)
+        # The kernel reads the TPU generation once, at construction.
         gen_ctx = (
-            mock.patch.object(
-                tokamax_gated_delta,
-                "_tpu_generation",
-                autospec=True,
-                return_value=mock_gen,
-            )
+            mock.patch.object(kernel, "_tpu_gen", mock_gen)
             if mock_gen is not None
             else contextlib.nullcontext()
         )

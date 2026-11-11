@@ -434,10 +434,22 @@ class DistributedUnitTestRunner:
     gathered_gradients = {}
 
     # Pass 1: Enqueue all collectives asynchronously without calling `.cpu()` yet.
+    debug_local = {}
     for name, par_param in self.parallel_model.named_parameters():
       if par_param.grad is None:
         continue
 
+      g = par_param.grad
+      if isinstance(g, DTensor):
+        gl = g.to_local()
+        debug_local[name] = (
+            str(g.placements), tuple(g.shape), tuple(gl.shape),
+            float(gl.float().abs().sum().cpu()), str(gl.dtype),
+            str(getattr(par_param, "placements", None)),
+        )
+      else:
+        debug_local[name] = ("local", tuple(g.shape), tuple(g.shape),
+                             float(g.float().abs().sum().cpu()), str(g.dtype), "")
       # Gather unshard natively on device without implicit `.cpu()`
       gathered_gradients[name] = self._gather_weights_wrapper(par_param.grad)
 
@@ -447,12 +459,34 @@ class DistributedUnitTestRunner:
       _ = dummy_sync.cpu()
 
     dist.barrier()
+    all_debug = [None] * self.world_size
+    dist.all_gather_object(all_debug, debug_local)
 
     # Pass 2: Rank 0 fetches the fully evaluated tensors to CPU for checking.
     if self.rank == 0:
       for name, par_tensor in gathered_gradients.items():
         if name in reference_grads_recorded:
           full_grad = par_tensor.cpu()
+          ref = reference_grads_recorded[name]
+          if "tok_embeddings" in name or "output" in name:
+            diff = (full_grad.float() - ref.float()).abs()
+            row_max = diff.reshape(diff.shape[0], -1).max(dim=1).values
+            bad_rows = (row_max > 1e-3).nonzero().flatten()
+            print(
+                "[GRADDBG] %s step=%d full=%s ref=%s max_diff=%.4g bad_rows=%d/%d"
+                " first_bad=%s last_bad=%s ref_absmean=%.4g test_absmean=%.4g"
+                " ratio_on_bad=%s" % (
+                name, self.current_step, tuple(full_grad.shape), tuple(ref.shape),
+                diff.max().item(), bad_rows.numel(), row_max.numel(),
+                bad_rows[:8].tolist(), bad_rows[-8:].tolist(),
+                ref.float().abs().mean().item(), full_grad.float().abs().mean().item(),
+                ((full_grad.float()[bad_rows].abs().sum() + 1e-12)
+                 / (ref.float()[bad_rows].abs().sum() + 1e-12)).item()
+                if bad_rows.numel() else "n/a"),
+                flush=True,
+            )
+            for r, d in enumerate(all_debug):
+              print("[GRADDBG]   rank%d %s -> %s" % (r, name, d.get(name)), flush=True)
           test_utils.check_equivalence(
               tensor_test=full_grad,
               tensor_reference=reference_grads_recorded[name],

@@ -33,6 +33,9 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.deepseek_v3 import model_registry
+from torchtitan.experiments.tpu.deepseek_v3.mla_attention import (
+    TpuMLAAttentionConverter,
+)
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
 )
@@ -379,4 +382,24 @@ def deepseek_v3_236b_fsdp_smoke() -> TpuGraphTrainer.Config:
   config.training.num_tokens_per_microbatch_per_dp_rank = 1 * 1024
   config.training.num_tokens_per_train_step = -1
   config.training.steps = 10
+  return config
+
+
+def _use_mla_splash_kernel(config: TPUTrainerConfig) -> None:
+  """Run MLA attention on the packed-q MLA Splash kernel (TpuMLAAttention).
+
+  The kernel reads ``wq_b`` / ``wkv_b`` outputs as they are and ropes q_pe
+  in VMEM, so the q/k concat, k_pe broadcast and [B, H, S, D] transposes the
+  Tokamax path needs are gone. Same parameters and state dict.
+  """
+  assert config.model_spec is not None
+  config.model_spec.model = TpuMLAAttentionConverter(
+      TpuMLAAttentionConverter.Config()
+  ).convert(config.model_spec.model)
+
+
+def deepseek_v3_236b_fsdp_smoke_mla() -> TpuGraphTrainer.Config:
+  """``deepseek_v3_236b_fsdp_smoke`` with the MLA Splash kernel."""
+  config = deepseek_v3_236b_fsdp_smoke()
+  _use_mla_splash_kernel(config)
   return config

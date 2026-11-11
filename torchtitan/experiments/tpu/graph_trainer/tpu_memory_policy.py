@@ -162,9 +162,11 @@ ROUTING_REGION = SaveRegion(name=MOE_ROUTING, select=select_routing)
 # (``kernels/splash_attention.py``) registers one op per kernel configuration,
 # ``pallas::splash_attn_fwd_<16 hex digits>``; Tokamax Splash
 # (``kernels/tokamax_splash_attention.py``) registers
-# ``pallas::tokamax_splash_attn_fwd``.
+# ``pallas::tokamax_splash_attn_fwd``; the DeepSeek MLA kernel
+# (``kernels/mla_attention.py``) registers ``pallas::mla_splash_attn_fwd``.
 _SPLASH_FORWARD_OP_NAME = re.compile(
-    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd)"
+    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd"
+    r"|mla_splash_attn_fwd)"
 )
 
 
@@ -180,15 +182,28 @@ def _is_splash_forward_op(target: object) -> bool:
 
 
 def _is_splash_output(value: object) -> bool:
-    """Whether ``value`` is a (4-D BF16 output, 3-D FP32 LSE) pair.
+    """Whether ``value`` is a Splash (BF16 output, FP32 LSE) pair.
 
-    The LSE is (batch, heads, seq) for both kernels. Stock Splash returns the
-    output in kernel layout (batch, heads, seq, head_dim); Tokamax returns it
-    in model layout (batch, seq, heads, head_dim).
+    Stock and Tokamax Splash: 4-D output and (batch, heads, seq) LSE. Stock
+    Splash returns the output in kernel layout (batch, heads, seq, head_dim);
+    Tokamax returns it in model layout (batch, seq, heads, head_dim). The MLA
+    kernel returns (batch, seq, heads * head_dim) and a (batch, heads, 1, seq)
+    LSE.
     """
     if not (isinstance(value, (tuple, list)) and len(value) == 2):
         return False
     output, lse = value
+    if (
+        isinstance(output, torch.Tensor)
+        and isinstance(lse, torch.Tensor)
+        and output.ndim == 3
+        and lse.ndim == 4
+        and output.dtype == torch.bfloat16
+        and lse.dtype == torch.float32
+    ):
+        return (lse.shape[0], lse.shape[3]) == tuple(output.shape[:2]) and (
+            lse.shape[2] == 1
+        )
     if not (
         isinstance(output, torch.Tensor)
         and isinstance(lse, torch.Tensor)

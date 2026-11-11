@@ -286,6 +286,23 @@ class DistributedUnitTestRunner:
 
     self.current_step = start_step + num_steps
 
+  def _install_graddbg_hooks(self):
+    rank = self.rank
+    def mk(tag):
+      def hook(mod, grad_input, grad_output):
+        def st(t):
+          if t is None: return "None"
+          tl = t.to_local() if isinstance(t, DTensor) else t
+          return "shape=%s dtype=%s absmean=%.4g contig=%s" % (
+              tuple(tl.shape), tl.dtype, tl.float().abs().mean().cpu().item(), tl.is_contiguous())
+        print("[GRADDBG] HOOK rank%d %s grad_out=[%s] grad_in=[%s]" % (
+            rank, tag, "; ".join(st(g) for g in grad_output), "; ".join(st(g) for g in grad_input)), flush=True)
+      return hook
+    for n, m in self.parallel_model.named_modules():
+      if n.endswith("tok_embeddings.embedding") or n.endswith("tok_embeddings.norm") or n.endswith("tok_embeddings") or n.endswith("layers.0"):
+        m.register_full_backward_hook(mk(n))
+        print("[GRADDBG] hooked %s (%s)" % (n, type(m).__name__), flush=True)
+
   def _create_parallel_model(self, func: Callable[[nn.Module], None]):
     """Creates a parallel model and applies the parallelism function."""
     if self.use_meta_init:
@@ -298,6 +315,8 @@ class DistributedUnitTestRunner:
     modified_model = func(self.parallel_model)
     if modified_model is not None:
       self.parallel_model = modified_model
+    if os.environ.get("GRADDBG_HOOKS") == "1":
+      self._install_graddbg_hooks()
 
     # Materialize weights if they are still on Meta device
     if any(p.device.type == "meta" for p in self.parallel_model.parameters()):
@@ -465,6 +484,13 @@ class DistributedUnitTestRunner:
     # Pass 2: Rank 0 fetches the fully evaluated tensors to CPU for checking.
     if self.rank == 0:
       for name, par_tensor in gathered_gradients.items():
+        _rn = name
+        for _w in ("_checkpoint_wrapped_module.", "_fsdp_wrapped_module.", "_orig_mod."):
+          _rn = _rn.replace(_w, "")
+        if _rn != name and _rn in reference_grads_recorded and name not in reference_grads_recorded:
+          reference_grads_recorded[name] = reference_grads_recorded[_rn]
+        if name not in reference_grads_recorded:
+          print("[GRADDBG] NOREF %s" % name, flush=True)
         if name in reference_grads_recorded:
           full_grad = par_tensor.cpu()
           ref = reference_grads_recorded[name]

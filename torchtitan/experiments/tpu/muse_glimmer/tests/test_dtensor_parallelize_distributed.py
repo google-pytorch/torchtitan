@@ -79,7 +79,7 @@ def _tp_wrapper(world_size: int, parallel_dims: ParallelDims):
     # pytype: disable=wrong-arg-types
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=(None if _os.environ.get("MUSE_DBG_NOAC") == "1" else SelectiveAC.Config()),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -253,6 +253,32 @@ class MuseGlimmerParallelizeTest(
       # ranks are in TP collectives. TP backward passes on TPU.
       self.skipTest("TP forward hangs on TPU: b/567185409")
     self._run(_verify_tp_forward_worker, "TP forward")
+
+  def test_tp_backward_equivalence_noac_distributed(self):
+    import os as _os
+    _os.environ["MUSE_DBG_NOAC"] = "1"
+    _os.environ["GRADDBG_HOOKS"] = "1"
+    try:
+      distributed.run_distributed(
+          num_devices=self.num_devices,
+          accelerator_device_type=self.accelerator_device_type,
+          func=_verify_tp_backward_worker,
+      )  # type: ignore
+    finally:
+      _os.environ.pop("MUSE_DBG_NOAC", None)
+      _os.environ.pop("GRADDBG_HOOKS", None)
+
+  def test_tp_backward_equivalence_hooks_distributed(self):
+    import os as _os
+    _os.environ["GRADDBG_HOOKS"] = "1"
+    try:
+      distributed.run_distributed(
+          num_devices=self.num_devices,
+          accelerator_device_type=self.accelerator_device_type,
+          func=_verify_tp_backward_worker,
+      )  # type: ignore
+    finally:
+      _os.environ.pop("GRADDBG_HOOKS", None)
 
   def test_tp_backward_equivalence_bf16_params_distributed(self):
     import os as _os

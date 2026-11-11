@@ -17,7 +17,6 @@ import torch.nn.functional as F
 import torch_remat as remat
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import (
     maybe_set_sparse_mesh,
@@ -290,16 +289,7 @@ class MoELoadBalanceAuxLoss(AuxLoss):
         """
         # The expert counts are all-reduced explicitly over the meshes wired by
         # ``configure_moe_aux_loss_reduction``, so the loss works on this
-        # rank's local tokens. ``to_local`` keeps the gradient placement of the
-        # router output.
-        scores_TE = (
-            scores_TE.to_local() if isinstance(scores_TE, DTensor) else scores_TE
-        )
-        routing_map_TE = (
-            routing_map_TE.to_local()
-            if isinstance(routing_map_TE, DTensor)
-            else routing_map_TE
-        )
+        # rank's local tokens.
         num_experts = scores_TE.size(-1)
         if self.global_batch_size is None:
             # Falling back to B would drop the 1 / dp-degree factor, making the
@@ -321,12 +311,7 @@ class MoELoadBalanceAuxLoss(AuxLoss):
             )
         local_counts_E = None
         if routing_map_TE is None:
-            ids_TK = (
-                expert_ids_TK.to_local()
-                if isinstance(expert_ids_TK, DTensor)
-                else expert_ids_TK
-            )
-            local_counts_E = _tokens_per_expert(ids_TK, num_experts)
+            local_counts_E = _tokens_per_expert(expert_ids_TK, num_experts)
         # This rank's share of the global batch, B / global_batch_size, counted
         # in tokens so the batch-wise loss never regroups tokens into sequences.
         num_local_tokens = scores_TE.numel() // num_experts

@@ -100,17 +100,9 @@ class TrainerMinimal:
           enable_cpu_backend=job_config.training.enable_cpu_offload,
           base_folder=job_config.dump_folder,
       )
-    elif job_config.parallelism.spmd_backend == "spmd_types":
-      # spmd_types needs a device mesh, and a mesh needs torch.distributed.
-      # A single-process run (e.g. a parity test's CPU reference) has neither,
-      # and with one rank the backends are numerically identical.
-      logger.info(
-          "Single-process run: using the partial_dtensor SPMD backend"
-          " (spmd_types needs an initialized process group)"
-      )
-      job_config.parallelism.spmd_backend = "partial_dtensor"
-    # Same activation as Trainer.__init__: the backend is a process global.
-    dist_utils.set_spmd_backend(job_config.parallelism.spmd_backend)
+    # A single-process run (e.g. a parity test's CPU reference) has no device
+    # mesh; the spmd_types helpers (`spmd_mesh_size`, `spmd_mesh_group`) treat
+    # a missing mesh as all-singleton axes, so no fallback is needed.
 
     parallelism_config = self.job_config.parallelism
     self.parallel_dims = ParallelDims(
@@ -121,7 +113,6 @@ class TrainerMinimal:
         pp=parallelism_config.pipeline_parallel_degree,
         ep=parallelism_config.expert_parallel_degree,
         world_size=self.world_size,
-        spmd_backend=parallelism_config.spmd_backend,
     )
 
     logger.info(f"parallel_dims: {self.parallel_dims}")
@@ -290,11 +281,9 @@ class TrainerMinimal:
         "You can disable this by setting --optimizer.implementation=foreach")
     self.optimizers = job_config.optimizer.build(model_parts=[self.model])
 
-    # get_spmd_context activates the configured SPMD backend (default,
-    # full_dtensor, or spmd_types) and global DeviceMesh. Components such as
-    # ChunkedLossWrapper then natively support loss parallelism automatically,
-    # eliminating need to handle loss_parallellism explicitly in the training
-    # loop.
+    # get_spmd_context sets the process-wide SPMD mesh the spmd_types
+    # collectives read, so components such as ChunkedLossWrapper support loss
+    # parallelism without the training loop handling it explicitly.
     self.train_context = dist_utils.get_spmd_context(
         parallel_dims=self.parallel_dims,
     )

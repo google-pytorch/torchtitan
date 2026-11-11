@@ -54,7 +54,6 @@ def _run_model_distributed(
   model_args.update_from_config(config=train_config)
 
   parallelism_config = train_config.parallelism
-  dist_utils.set_spmd_backend(parallelism_config.spmd_backend)
   parallel_dims = torchtitan.distributed.ParallelDims(
       dp_shard=parallelism_config.data_parallel_shard_degree,
       dp_replicate=parallelism_config.data_parallel_replicate_degree,
@@ -63,7 +62,6 @@ def _run_model_distributed(
       pp=parallelism_config.pipeline_parallel_degree,
       ep=parallelism_config.expert_parallel_degree,
       world_size=world_size,
-      spmd_backend=parallelism_config.spmd_backend,
   )
 
   # Initializing model consistently with the way TorchTitan does it.

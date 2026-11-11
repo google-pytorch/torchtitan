@@ -95,11 +95,10 @@ class DistributedUnitTestRunner:
     """
     Args:
       parallel_dims: The ``ParallelDims`` that ``parallelism_func`` parallelizes
-        with. Under ``spmd_types`` the runner needs it to seed the DTensor RNG
-        for ``init_weights`` and to enter ``get_spmd_context`` (the process-wide
-        SPMD mesh the collectives read) around the parallel model's forward,
-        which the trainer normally does. Also selects the module-level
-        ``spmd_backend`` that ``apply_simple_fsdp`` reads.
+        with. The runner needs it to seed the DTensor RNG for ``init_weights``
+        and to enter ``get_spmd_context`` (the process-wide SPMD mesh the
+        collectives read) around the parallel model's forward, which the
+        trainer normally does.
     """
     self.device = device
     self.rank = rank
@@ -109,8 +108,6 @@ class DistributedUnitTestRunner:
     self.input_distribution = input_distribution
     self.use_meta_init = use_meta_init
     self.parallel_dims = parallel_dims
-    if parallel_dims is not None:
-      dist_utils.set_spmd_backend(parallel_dims.spmd_backend)
 
     # Apply parallelism to the model.
     self.parallel_model = None
@@ -406,8 +403,7 @@ class DistributedUnitTestRunner:
         if isinstance(output, DTensor):
           output = output.full_tensor()
         elif (
-            self.parallel_dims.spmd_backend == "spmd_types"
-            and self.parallel_dims.tp_enabled
+            self.parallel_dims.tp_enabled
             and hasattr(self.model_args, "vocab_size")
             and output.shape[-1] != self.model_args.vocab_size
         ):

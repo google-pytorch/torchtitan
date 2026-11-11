@@ -49,8 +49,7 @@ def parallelize_qwen3_5(
     annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
-  if parallelism.spmd_backend == "spmd_types":
-    model.parallelize(parallel_dims)
+  model.parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
   configure_simple_fsdp_shard_dims(model, parallel_dims)

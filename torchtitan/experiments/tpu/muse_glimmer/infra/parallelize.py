@@ -1,10 +1,8 @@
 """Parallelization for Muse Glimmer models on TPU.
 
-Upstream ``torchtitan.models.muse_glimmer.parallelize.parallelize_muse_glimmer``
-hard-requires ``parallelism.spmd_backend == "spmd_types"``, which the Google3
-fork deliberately does not use (it pins ``partial_dtensor``; see
-``UPSTREAM_IMPORT_NOTES.md`` D1/D7). This module is the TPU-owned replacement,
-mirroring upstream ``models/qwen3/parallelize.py``'s ``partial_dtensor`` path:
+TPU-owned replacement for upstream
+``torchtitan.models.muse_glimmer.parallelize.parallelize_muse_glimmer`` that
+adds SimpleFSDP and the TPU compile modes (``fullgraph`` / ``aot_fx_trace``):
 
   TP (``Module.parallelize``) -> AC -> per-block compile -> SimpleFSDP / FSDP2.
 
@@ -165,8 +163,7 @@ def parallelize_muse_glimmer(
   if tpu_compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
-  if parallelism.spmd_backend == "spmd_types" or parallel_dims.tp_enabled:
-    model.parallelize(parallel_dims)
+  model.parallelize(parallel_dims)
 
   if ac_config is not None:
     ac_config.build(dump_folder=dump_folder).apply(model)
@@ -183,33 +180,20 @@ def parallelize_muse_glimmer(
 
   if not skip_dp:
     if parallelism.use_simple_fsdp:
-      # Like the FSDP2 branch below, run even without a DP axis: under
-      # spmd_types `model.parallelize` only annotates the parameters, and the
-      # SimpleFSDP wrapper is what adds the mixed-precision casts and the
-      # backward reductions over the TP axis for replicated / SP-norm weights.
-      # The `fsdp` mesh always exists, even at degree 1 (ParallelDims._mesh_exist).
+      # Like the FSDP2 branch below, run even without a DP axis:
+      # `model.parallelize` only annotates the parameters, and the SimpleFSDP
+      # wrapper is what adds the mixed-precision casts and the backward
+      # reductions over the TP axis for replicated / SP-norm weights. The
+      # `fsdp` mesh always exists, even at degree 1 (ParallelDims._mesh_exist).
       configure_muse_glimmer_simple_fsdp_shard_dims(model, parallel_dims)
       model = apply_simple_fsdp(
           model, parallel_dims=parallel_dims, training=training
       )
-    elif (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.dp_shard_enabled
-        or parallel_dims.dp_replicate_enabled
-    ):
-      # Under spmd_types, run FSDP2 even without a DP axis (TP-only / single
-      # device): `model.parallelize` above only annotates the parameters, and
+    else:
+      # Run FSDP2 even without a DP axis (TP-only / single device):
+      # `model.parallelize` above only annotates the parameters, and
       # `fully_shard` is what turns them into DTensors on the mesh.
-      if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-      else:
-        dp_mesh_names = (
-            ["dp_replicate", "fsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["fsdp"]
-        )
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
+      dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
       apply_fsdp_to_decoder(
           model,
           dp_mesh,

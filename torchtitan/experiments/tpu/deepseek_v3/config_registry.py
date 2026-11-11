@@ -28,6 +28,7 @@ from torchtitan.experiments.tpu.components.grouped_experts import (
 )
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.components.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuRoutedExpertsConverter,
     TpuTokenDispatcherConverter,
 )
@@ -167,6 +168,14 @@ def _with_tpu_kernels(config: TPUTrainerConfig) -> None:
       attn_backend="sdpa",
       converters=_tpu_moe_converters(),
   )
+  # top_k = 6 is not a multiple of the tile height, so the default [T, K, D]
+  # route sum relays an FP32 copy every layer; sum [K, T, D] instead. Same
+  # values per token, but XLA may associate the FP32 sum differently: the
+  # 236B smoke matches at step 1 and drifts in the 5th digit after.
+  for _, dispatcher, _, _ in config.model_spec.model.traverse(
+      TpuAllToAllTokenDispatcher.Config
+  ):
+    dispatcher.slot_major_reduce = True
   _disable_expert_bias_balancer(config)
   config.parallelism = ParallelismConfig(
       use_simple_fsdp=True,

@@ -71,8 +71,11 @@ def _tp_wrapper(world_size: int, parallel_dims: ParallelDims):
     # TP-only test still compares against the fp32 CPU reference at the
     # tolerance it always used.
     training = TrainingConfig()
-    training.mixed_precision_param = "float32"
-    training.mixed_precision_reduce = "float32"
+    import os as _os
+    if _os.environ.get("MUSE_DBG_FP32", "1") == "1":
+      training.mixed_precision_param = "float32"
+      training.mixed_precision_reduce = "float32"
+    print("[GRADDBG] TP wrapper mixed_precision_param=%s" % training.mixed_precision_param, flush=True)
     # pytype: disable=wrong-arg-types
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
@@ -250,6 +253,18 @@ class MuseGlimmerParallelizeTest(
       # ranks are in TP collectives. TP backward passes on TPU.
       self.skipTest("TP forward hangs on TPU: b/567185409")
     self._run(_verify_tp_forward_worker, "TP forward")
+
+  def test_tp_backward_equivalence_bf16_params_distributed(self):
+    import os as _os
+    _os.environ["MUSE_DBG_FP32"] = "0"
+    try:
+      distributed.run_distributed(
+          num_devices=self.num_devices,
+          accelerator_device_type=self.accelerator_device_type,
+          func=_verify_tp_backward_worker,
+      )  # type: ignore
+    finally:
+      _os.environ["MUSE_DBG_FP32"] = "1"
 
   def test_tp_backward_equivalence_distributed(self):
     self._run(_verify_tp_backward_worker, "TP backward")

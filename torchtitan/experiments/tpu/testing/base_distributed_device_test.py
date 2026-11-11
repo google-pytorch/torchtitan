@@ -487,14 +487,26 @@ class DistributedUnitTestRunner:
             )
             for r, d in enumerate(all_debug):
               print("[GRADDBG]   rank%d %s -> %s" % (r, name, d.get(name)), flush=True)
-          test_utils.check_equivalence(
-              tensor_test=full_grad,
-              tensor_reference=reference_grads_recorded[name],
-              atol=atol,
-              rtol=rtol,
-              check_name=f"Gradient {name}",
-              step=self.current_step,
-          )
+          try:
+            test_utils.check_equivalence(
+                tensor_test=full_grad,
+                tensor_reference=reference_grads_recorded[name],
+                atol=atol,
+                rtol=rtol,
+                check_name=f"Gradient {name}",
+                step=self.current_step,
+            )
+            print("[GRADDBG] OK   %s" % name, flush=True)
+          except AssertionError as e:
+            _d = (full_grad.float() - reference_grads_recorded[name].float()).abs()
+            print("[GRADDBG] BAD  %s max_diff=%.4g ref_absmean=%.4g test_absmean=%.4g"
+                  % (name, _d.max().item(),
+                     reference_grads_recorded[name].float().abs().mean().item(),
+                     full_grad.float().abs().mean().item()), flush=True)
+            _first_err = globals().setdefault("_GRADDBG_FIRST_ERR", e)
+      if self.rank == 0 and "_GRADDBG_FIRST_ERR" in globals():
+        _e = globals().pop("_GRADDBG_FIRST_ERR")
+        raise _e
 
   def _gather_output_to_cpu(
       self,

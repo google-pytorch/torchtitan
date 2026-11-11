@@ -245,6 +245,11 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
     shard_dtype = shard.dtype
     out_dtype = spec.param_dtype or shard_dtype
     bw_op_dtype = spec.reduce_dtype or out_dtype
+    # Dtype of the tensor between two hops. Autograd casts each hop's incoming
+    # gradient to that hop's output dtype, so it must be wide enough to hold
+    # the previous reduction's `bw_op_dtype` result (bf16 master weights with
+    # `reduce_dtype=float32` would otherwise round between reductions).
+    mid_dtype = torch.promote_types(shard_dtype, bw_op_dtype)
     # Already-resolved `ProcessGroup`s: the body must not resolve names itself
     # (see `ScanFSDPSpec.group`).
     pg = spec.group
@@ -260,15 +265,15 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
                 return shard if spec.param_dtype is None else shard.to(spec.param_dtype)
             # Replicated on every axis it has: `spmd.convert(src=I, dst=R)` is a
             # forward identity (with optional `param_dtype` cast) whose backward
-            # runs `spmd.all_reduce(src=P, dst=I)` in `bw_op_dtype`.
-            group_pgs = (pg,) if rep_pg is None else (pg, rep_pg)
+            # runs `spmd.all_reduce(src=P, dst=I)` in `bw_op_dtype`. Autograd
+            # unwinds the hops in reverse, so the replicate axis goes first
+            # here for the backward to reduce the shard axis first, as the
+            # unrolled path does.
+            group_pgs = (pg,) if rep_pg is None else (rep_pg, pg)
             x = shard
-            # Only the last hop casts to `param_dtype`. Autograd casts each
-            # hop's incoming gradient to that hop's output dtype, so a
-            # `param_dtype` tensor between two hops would round the first
-            # reduction's `bw_op_dtype` result to bf16 before the second one.
-            # Keeping the earlier hops in `shard_dtype` keeps every reduction
-            # in `bw_op_dtype`.
+            # Only the last hop casts to `param_dtype`; earlier hops stay in
+            # `mid_dtype` so every reduction sees an unrounded input, and only
+            # the first hop's backward casts back to `shard_dtype`.
             for i, group_pg in enumerate(group_pgs):
                 is_last = i == len(group_pgs) - 1
                 x = spmd.convert(
@@ -276,11 +281,11 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
                     group_pg,
                     src=spmd.I,
                     dst=spmd.R,
-                    op_dtype=out_dtype if is_last else shard_dtype,
-                    out_dtype=out_dtype if is_last else shard_dtype,
+                    op_dtype=out_dtype if is_last else mid_dtype,
+                    out_dtype=out_dtype if is_last else mid_dtype,
                     backward_options={
                         "op_dtype": bw_op_dtype,
-                        "out_dtype": shard_dtype,
+                        "out_dtype": shard_dtype if i == 0 else mid_dtype,
                     },
                 )
             return x
@@ -290,17 +295,17 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
             # shard-axis `all_gather` below. In the backward, `all_gather`
             # reduce-scatters along the shard axis, and `convert` then
             # all-reduces the already-scattered `1/shard_degree` shard across
-            # the replicate axis. The `convert` stays in `shard_dtype` so the
-            # gradient between the two reductions is not rounded to
-            # `param_dtype` (see the replicated case above); only the
-            # `all_gather` casts.
+            # the replicate axis. The `convert` stays in `mid_dtype` so the
+            # gradient between the two reductions is not rounded (see the
+            # replicated case above); only the `all_gather` casts to
+            # `param_dtype`.
             shard = spmd.convert(
                 shard,
                 rep_pg,
                 src=spmd.I,
                 dst=spmd.R,
-                op_dtype=shard_dtype,
-                out_dtype=shard_dtype,
+                op_dtype=mid_dtype,
+                out_dtype=mid_dtype,
                 backward_options={
                     "op_dtype": bw_op_dtype,
                     "out_dtype": shard_dtype,
@@ -315,7 +320,7 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
             out_dtype=out_dtype,
             backward_options={
                 "op_dtype": bw_op_dtype,
-                "out_dtype": shard_dtype,
+                "out_dtype": mid_dtype if rep_pg is not None else shard_dtype,
             },
         )
 

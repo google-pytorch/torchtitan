@@ -203,13 +203,16 @@ class TestShardDimPicker(unittest.TestCase):
         )
 
     def test_mixed_precision_reduces_every_hop_in_reduce_dtype(self):
-        # `param_dtype=bf16, reduce_dtype=f32`. Each hop is its own autograd
-        # Function, and autograd casts a hop's incoming gradient to that hop's
-        # output dtype; a bf16 tensor between two hops would round the first
-        # reduction's f32 result before the second. Every backward collective
-        # must see an f32 input that is not just bf16 values widened, and the
-        # gradient must match `main`'s single-function arithmetic bitwise:
-        # grad -> f32 -> reduce-scatter -> all-reduce -> shard dtype.
+        # `param_dtype=bf16, reduce_dtype=f32`, with f32 and bf16 master
+        # weights. Each hop is its own autograd Function, and autograd casts a
+        # hop's incoming gradient to that hop's output dtype; a bf16 tensor
+        # between two hops would round the first reduction's f32 result before
+        # the second. Every backward collective must see an f32 input that is
+        # not just bf16 values widened, and the gradient must match `main`'s
+        # single-function arithmetic bitwise: grad -> f32 -> reduce-scatter ->
+        # all-reduce on the shard axis -> all-reduce on the replicate axis ->
+        # shard dtype. The all-reduce mock depends on its group so the test
+        # also sees the order of the two axes.
         shard_ranks, rep_ranks = 4, 2
         seen = []
 
@@ -219,70 +222,81 @@ class TestShardDimPicker(unittest.TestCase):
 
         def fake_all_reduce(x, reduceOp, group, tag="", **_):
             seen.append(x)
-            return x + x / 3  # the other rank's partial, not bf16-exact
+            # The other rank's partial, not bf16-exact, and different per
+            # axis so that reducing the axes in the wrong order shows.
+            return x + x / 3 if group is rep_pg else x * 1.25 + 1 / 7
 
-        def reference_grad(grad_out, sharded, n_all_reduce):
+        def reference_grad(grad_out, sharded, groups, master_dtype):
             g = grad_out.float()
             if sharded:
                 g = fake_reduce_scatter(g, "sum", 0, None)
-            for _ in range(n_all_reduce):
-                g = fake_all_reduce(g, "sum", None)
-            return g.to(torch.float32)
+            for group in groups:
+                g = fake_all_reduce(g, "sum", group)
+            return g.to(master_dtype)
 
         with _fake_pg(shard_ranks * rep_ranks):
             mesh = init_device_mesh(
                 "cpu", (rep_ranks, shard_ranks), mesh_dim_names=("replicate", "fsdp")
             )
             rep_pg, pg = mesh.get_group(0), mesh.get_group(1)
+            # (spec kwargs, all-reduce groups in `main`'s order)
             cases = {
-                "fsdp": dict(sharded=True),
-                "hsdp": dict(
-                    sharded=True,
-                    replicate_group_name=rep_pg.group_name,
-                    replicate_group=rep_pg,
+                "fsdp": (dict(sharded=True), ()),
+                "hsdp": (
+                    dict(
+                        sharded=True,
+                        replicate_group_name=rep_pg.group_name,
+                        replicate_group=rep_pg,
+                    ),
+                    (rep_pg,),
                 ),
-                "replicated_2_axes": dict(
-                    sharded=False,
-                    replicate_group_name=rep_pg.group_name,
-                    replicate_group=rep_pg,
+                "replicated_2_axes": (
+                    dict(
+                        sharded=False,
+                        replicate_group_name=rep_pg.group_name,
+                        replicate_group=rep_pg,
+                    ),
+                    (pg, rep_pg),
                 ),
             }
-            for name, kwargs in cases.items():
-                with self.subTest(name):
-                    spec = scan_fsdp.ScanFSDPSpec(
-                        group_name=pg.group_name,
-                        group=pg,
-                        param_dtype=torch.bfloat16,
-                        reduce_dtype=torch.float32,
-                        **kwargs,
-                    )
-                    torch.manual_seed(0)
-                    shard = torch.randn(8, 16, requires_grad=True)
-                    seen.clear()
-                    with (
-                        unittest.mock.patch.object(
-                            scan_fsdp, "_orig_reduce_scatter_single", fake_reduce_scatter
-                        ),
-                        unittest.mock.patch.object(
-                            scan_fsdp.funcol, "all_reduce", fake_all_reduce
-                        ),
-                    ):
-                        whole = scan_fsdp.gather_slice(shard, spec)
-                        self.assertEqual(whole.dtype, torch.bfloat16)
-                        grad_out = torch.randn_like(whole)
-                        whole.backward(grad_out)
+            for master_dtype in (torch.float32, torch.bfloat16):
+                for name, (kwargs, groups) in cases.items():
+                    with self.subTest(name, master_dtype=master_dtype):
+                        spec = scan_fsdp.ScanFSDPSpec(
+                            group_name=pg.group_name,
+                            group=pg,
+                            param_dtype=torch.bfloat16,
+                            reduce_dtype=torch.float32,
+                            **kwargs,
+                        )
+                        torch.manual_seed(0)
+                        shard = torch.randn(8, 16, dtype=master_dtype, requires_grad=True)
+                        seen.clear()
+                        with (
+                            unittest.mock.patch.object(
+                                scan_fsdp, "_orig_reduce_scatter_single", fake_reduce_scatter
+                            ),
+                            unittest.mock.patch.object(
+                                scan_fsdp.funcol, "all_reduce", fake_all_reduce
+                            ),
+                        ):
+                            whole = scan_fsdp.gather_slice(shard, spec)
+                            self.assertEqual(whole.dtype, torch.bfloat16)
+                            grad_out = torch.randn_like(whole)
+                            whole.backward(grad_out)
 
-                    n_all_reduce = ("replicate_group" in kwargs) + (not spec.sharded)
-                    self.assertEqual(len(seen), int(spec.sharded) + n_all_reduce)
-                    for x in seen:
-                        self.assertEqual(x.dtype, torch.float32)
-                    # Only the first reduction's input is bf16-valued (it is the
-                    # bf16 grad widened); later ones are sums and must not be.
-                    for x in seen[1:]:
-                        self.assertFalse(torch.equal(x, x.bfloat16().float()))
-                    seen.clear()
-                    expected = reference_grad(grad_out, spec.sharded, n_all_reduce)
-                    self.assertTrue(torch.equal(shard.grad, expected))
+                        self.assertEqual(len(seen), int(spec.sharded) + len(groups))
+                        for x in seen:
+                            self.assertEqual(x.dtype, torch.float32)
+                        # Only the first reduction's input is bf16-valued (it is
+                        # the bf16 grad widened); later ones are sums and must
+                        # not be.
+                        for x in seen[1:]:
+                            self.assertFalse(torch.equal(x, x.bfloat16().float()))
+                        seen.clear()
+                        expected = reference_grad(grad_out, spec.sharded, groups, master_dtype)
+                        self.assertEqual(shard.grad.dtype, master_dtype)
+                        self.assertTrue(torch.equal(shard.grad, expected))
 
     def test_a_spec_without_its_resolved_group_is_refused(self):
         # Resolving a group by name is the C++ call Dynamo cannot trace inside

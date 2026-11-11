@@ -41,7 +41,7 @@ from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
     TpuRMSNormGated,
 )
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
-from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35TransformerBlock
+from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35Model, TpuQwen35TransformerBlock
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
 from torchtitan.protocols.model import ModelConfigConverter
@@ -57,7 +57,7 @@ __all__ = [
 _CONV1D_INIT = {"weight": partial(nn.init.kaiming_uniform_, a=math.sqrt(5))}
 
 
-def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
+def use_tpu_modules(config: Qwen35Model.Config) -> TpuQwen35Model.Config:
   """Returns ``config`` as a text-only TPU config (see the module docstring).
 
   Args:
@@ -65,7 +65,7 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
       place.
 
   Returns:
-    A ``Qwen35Model.Config`` without a vision encoder.
+    A ``TpuQwen35Model.Config`` without a vision encoder.
   """
   for i, layer in enumerate(config.layers):
     if layer.attention is not None:
@@ -93,7 +93,7 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
     if layer.moe is not None:
       layer.moe.load_balance_coeff = None
     config.layers[i] = derive(layer, TpuQwen35TransformerBlock.Config)
-  return dataclasses.replace(config, vision_encoder=None)
+  return derive(config, TpuQwen35Model.Config, vision_encoder=None)
 
 
 def model_registry(

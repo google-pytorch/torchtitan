@@ -19,6 +19,7 @@ Covers:
 import copy
 import dataclasses
 import functools
+import re
 from types import SimpleNamespace
 from unittest import mock
 
@@ -50,11 +51,17 @@ from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
-from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
+from torchtitan.experiments.tpu.components.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
+    TpuRoutedExperts,
+)
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.qwen3_5.model import Qwen35Model
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 from transformers import (
     Qwen3_5ForCausalLM,
@@ -1694,8 +1701,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertIsInstance(parsed, TpuGraphTrainer.Config)
 
   def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
-    """Tests that TP, CP, PP and EP fail before the model is touched."""
-    for name in ("tp", "cp", "pp", "ep"):
+    """Tests that TP, CP, and PP fail before the model is touched."""
+    for name in ("tp", "cp", "pp"):
       enabled = dict(
           tp_enabled=False,
           cp_enabled=False,
@@ -1704,7 +1711,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       )
       enabled[f"{name}_enabled"] = True
       with self.subTest(name), self.assertRaisesRegex(
-          NotImplementedError, "TP, CP, PP or EP"
+          NotImplementedError, "TP, CP, or PP"
       ):
         gt_qwen3_5.parallelize_qwen3_5(
             None,
@@ -1715,6 +1722,74 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             ac_config=None,
             dump_folder="",
         )
+
+  def test_graph_trainer_parallelize_ep_requires_simplefsdp(self):
+    """Tests that GraphTrainer EP without SimpleFSDP fails before the model is touched."""
+    parallel_dims = SimpleNamespace(
+        tp_enabled=False, cp_enabled=False, pp_enabled=False, ep_enabled=True
+    )
+    with self.assertRaisesRegex(NotImplementedError, "EP requires SimpleFSDP"):
+      gt_qwen3_5.parallelize_qwen3_5(
+          None,
+          parallel_dims=parallel_dims,
+          training=None,
+          parallelism=SimpleNamespace(use_simple_fsdp=False),
+          compile_config=None,
+          ac_config=None,
+          dump_folder="",
+      )
+
+  def _moe_debug_trainer_config(self, *args):
+    """Parses ``qwen35_moe_debugmodel`` with extra CLI ``args``."""
+    return ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_debugmodel",
+        *args,
+    ])
+
+  def test_ep1_update_from_config_matches_upstream(self):
+    """At EP=1 the TPU model config updates exactly like upstream Qwen3.5."""
+    tpu_cfg = self._moe_debug_trainer_config()
+    upstream_cfg = self._moe_debug_trainer_config()
+    batch_sizes = dict(global_batch_size=1, local_global_batch_size=1)
+    tpu_cfg.model_spec.model.update_from_config(config=tpu_cfg, **batch_sizes)
+    Qwen35Model.Config.update_from_config(
+        upstream_cfg.model_spec.model, config=upstream_cfg, **batch_sizes
+    )
+
+    def without_addresses(config):
+      return re.sub(r" at 0x[0-9a-f]+", "", repr(config))
+
+    self.assertEqual(
+        without_addresses(tpu_cfg.model_spec.model),
+        without_addresses(upstream_cfg.model_spec.model),
+    )
+    self.assertIsInstance(
+        tpu_cfg.model_spec.model.build(), tpu_model.TpuQwen35Model
+    )
+
+  def test_ep2_update_from_config_uses_ragged_transport(self):
+    """At EP=2 the routed experts use the shared ragged all-to-all path."""
+    cfg = self._moe_debug_trainer_config("--parallelism.expert_parallel_degree=2")
+    model_config = cfg.model_spec.model
+    model_config.update_from_config(
+        config=cfg, global_batch_size=1, local_global_batch_size=1
+    )
+    routed = [c for _, c, _, _ in model_config.traverse(RoutedExperts.Config)]
+    dispatchers = [
+        c for _, c, _, _ in model_config.traverse(AllToAllTokenDispatcher.Config)
+    ]
+    grouped = [c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)]
+    self.assertTrue(routed)
+    self.assertTrue(dispatchers)
+    for experts in routed:
+      self.assertIsInstance(experts, TpuRoutedExperts.Config)
+    for dispatcher in dispatchers:
+      self.assertIsInstance(dispatcher, TpuAllToAllTokenDispatcher.Config)
+      self.assertEqual(dispatcher.ep_transport, "ragged_all_to_all")
+    for experts in grouped:
+      self.assertFalse(experts.use_pallas_paired_grouped_mm)
+    self.assertIsInstance(model_config.build(), tpu_model.TpuQwen35Model)
 
   def test_35b_recipes(self):
     """Tests the 35B-A3B recipes, their TPU kernels and MFU accounting."""

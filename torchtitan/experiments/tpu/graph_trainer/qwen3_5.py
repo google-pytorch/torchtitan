@@ -9,12 +9,12 @@ from torchtitan.distributed.activation_checkpoint import ActivationCheckpointing
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
-    apply_simple_fsdp,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.tpu import qwen3_5 as tpu_qwen3_5
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import apply_qwen3_5_simple_fsdp
 from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 from torchtitan.models.qwen3_5.model import Qwen35Model
 from torchtitan.protocols.model_spec import ModelSpec
@@ -39,22 +39,25 @@ def parallelize_qwen3_5(
       parallel_dims.tp_enabled
       or parallel_dims.cp_enabled
       or parallel_dims.pp_enabled
-      or parallel_dims.ep_enabled
   ):
     raise NotImplementedError(
-        "TPU GraphTrainer Qwen3.5 does not support TP, CP, PP or EP."
+        "TPU GraphTrainer Qwen3.5 does not support TP, CP, or PP."
+    )
+  if parallel_dims.ep_enabled and not parallelism.use_simple_fsdp:
+    raise NotImplementedError(
+        "TPU GraphTrainer Qwen3.5 EP requires SimpleFSDP (use_simple_fsdp=True)."
     )
 
   if any(layer.moe is not None for layer in model.config.layers):
     annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
-  if parallelism.spmd_backend == "spmd_types":
+  if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
     model.parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
   configure_simple_fsdp_shard_dims(model, parallel_dims)
-  model = apply_simple_fsdp(
+  model = apply_qwen3_5_simple_fsdp(
       model, parallel_dims=parallel_dims, training=training
   )  # pyrefly: ignore[bad-assignment]
 

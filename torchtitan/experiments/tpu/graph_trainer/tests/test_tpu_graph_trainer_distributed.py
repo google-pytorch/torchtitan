@@ -1,6 +1,7 @@
 """Tests for the minimal distributed training setup under TpuGraphTrainer."""
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -379,6 +380,42 @@ class TpuGraphTrainerDistributedTest(
           abs(layer_losses[step]) * 1e-5,
           msg=f"control, step {step}",
       )
+
+  def test_qwen3_5_moe_graph_trainer_ep2_matches_ep1(self):
+    """GraphTrainer Qwen3.5 MoE at EP=2 (ragged all-to-all) matches EP=1 at step 1."""
+    tempdir = self.create_tempdir().full_path
+    step1_loss = {}
+    for ep, extra_args in (
+        (1, []),
+        (
+            2,
+            [
+                "--parallelism.expert_parallel_degree=2",
+                "--compile.no-compile_grad_norm",
+            ],
+        ),
+    ):
+      path = os.path.join(tempdir, f"ep{ep}.json")
+      self._test_train_distributed(
+          config_args=_train_args(
+              "torchtitan.experiments.tpu.qwen3_5",
+              "graph_trainer_qwen35_moe_debugmodel",
+              use_splash_attention_kernel=False,
+          )
+          + ["--training.steps=1"]
+          + extra_args,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        step1_loss[ep] = dict(json.load(f))[1]
+    logging.info("qwen3_5 MoE GraphTrainer step-1 loss by EP: %s", step1_loss)
+    self.assertTrue(math.isfinite(step1_loss[2]))
+    self.assertLess(
+        abs(step1_loss[2] - step1_loss[1]), abs(step1_loss[1]) * 1e-3
+    )
 
   def test_qwen3_5_graph_trainer_matches_eager(self):
     """The graph-split GraphTrainer must train Qwen3.5 MoE to eager's losses.

@@ -592,6 +592,22 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
       ),
+      dict(
+          testcase_name="qwen3_5_moe_ep2_simplefsdp",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.expert_parallel_degree=2",
+              "--compile.no-compile_grad_norm",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       # The routed experts of qwen35_moe_35b: Pallas paired grouped matmuls on
       # kernel-native weights and the fused route-score backward, which needs
       # bf16 expert outputs (as in the recipe).
@@ -602,6 +618,25 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=["--training.mixed_precision_param=bfloat16"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      # The same routed experts at EP=2 on the ragged all-to-all transport. The
+      # paired kernel is off under EP, so this runs the unpaired Pallas kernels.
+      dict(
+          testcase_name="qwen3_5_moe_ep2_tpu_moe_kernels",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_tpu_moe_kernels",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.mixed_precision_param=bfloat16",
+              "--parallelism.expert_parallel_degree=2",
+              "--optimizer.implementation=fused",
+              "--compile.no-compile_grad_norm",
+          ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,

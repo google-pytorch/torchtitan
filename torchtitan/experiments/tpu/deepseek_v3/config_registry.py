@@ -399,7 +399,36 @@ def _use_mla_splash_kernel(config: TPUTrainerConfig) -> None:
 
 
 def deepseek_v3_236b_fsdp_smoke_mla() -> TpuGraphTrainer.Config:
-  """``deepseek_v3_236b_fsdp_smoke`` with the MLA Splash kernel."""
+  """``deepseek_v3_236b_fsdp_smoke`` with the MLA Splash kernel.
+
+  Each layer's reduce-scatters run in the next backward executable, with the
+  latency-hiding layer scheduler off. The layer scheduler pairs the deferred
+  expert-gradient reduce-scatter's wait with a small fusion right after the
+  forward all-gathers, about 40 ms into the program, which exposes it. Without
+  the layer scheduler, the middle backward executables wait on no
+  reduce-scatter (1.38 -> 1.35 s / step at 4096 x 8, +6.4 GiB peak).
+  """
   config = deepseek_v3_236b_fsdp_smoke()
   _use_mla_splash_kernel(config)
+  config.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
+  config.compile.graph_split.pipeline_kinds = ("rs",)
+  config.libtpu_init_flags = tpu_flags.merge_flags(
+      config.libtpu_init_flags,
+      xla_tpu_enable_latency_hiding_layer_scheduler=tpu_flags.REMOVE,
+  )
+  return config
+
+
+def deepseek_v3_236b_fsdp_activation_offload_4x4x4_mla() -> (
+    TpuGraphTrainer.Config
+):
+  """``deepseek_v3_236b_fsdp_activation_offload_4x4x4`` with the MLA Splash
+  kernel and the latency-hiding layer scheduler off (see
+  ``deepseek_v3_236b_fsdp_smoke_mla``)."""
+  config = deepseek_v3_236b_fsdp_activation_offload_4x4x4()
+  _use_mla_splash_kernel(config)
+  config.libtpu_init_flags = tpu_flags.merge_flags(
+      config.libtpu_init_flags,
+      xla_tpu_enable_latency_hiding_layer_scheduler=tpu_flags.REMOVE,
+  )
   return config

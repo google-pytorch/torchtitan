@@ -29,7 +29,7 @@ from torch.autograd.function import once_differentiable
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
     MOE_ROUTING,
 )

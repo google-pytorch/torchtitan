@@ -17,8 +17,8 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
 )
-from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import distributed
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import distributed
 from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
     TpuReplicateComputation,

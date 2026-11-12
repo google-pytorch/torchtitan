@@ -34,6 +34,7 @@ from torchtitan.components.optimizer.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     to_graph_trainer_config,
@@ -43,7 +44,7 @@ from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
+from torchtitan.experiments.tpu.components.grad_norm import CompiledGradNorm
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
     apply_tpu_graph_trainer_model_transforms,
@@ -159,6 +160,13 @@ class TpuGraphTrainer(GraphTrainer):
         # Ensure the 'tpu' pass pipeline is registered before GraphTrainer traces/compiles
         register_tpu_pipeline()
 
+        # Trainer.__init__ builds `self.loss_fn` from `config.loss`; fill
+        # `global_vocab_size` (spmd_types loss-parallel CE under TP) from the
+        # final model config first, as TPUTrainer.__init__ does.
+        from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+        set_global_vocab_size(config.loss, config.model_spec.model)
+
         super().__init__(config)
 
         if _split_optimizers_by_mesh(self.optimizers):
@@ -272,7 +280,6 @@ class TpuGraphTrainer(GraphTrainer):
     ) -> None:
         """Run the TPU/PJRT joint fwd+loss+bwd+optimizer training loop."""
         from torchtitan.components.loss import IGNORE_INDEX
-        from torchtitan.distributed import utils as dist_utils
         from torchtitan.models.common.aux_loss import AuxLoss
 
         self._register_optimizer_buffers()
@@ -349,7 +356,7 @@ class TpuGraphTrainer(GraphTrainer):
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Include AdamW when the in-graph optimizer mode is selected."""
-        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 
         with set_unflatten_seq_len(self.config.training.max_context_length):
             if not self._optimizer_in_graph:
@@ -398,7 +405,11 @@ class TpuGraphTrainer(GraphTrainer):
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
                 maybe_register_blockmask_pytree_node()
-                with self.train_context():
+                trace_context = dist_utils.get_spmd_context(
+                    parallel_dims=self.parallel_dims,
+                    spmd_typechecking=False,
+                )
+                with self.train_context(), trace_context():
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
@@ -545,7 +556,11 @@ class TpuGraphTrainer(GraphTrainer):
                 collect_moe_routing_metrics=self._collect_moe_routing_metrics,
             )
 
-            with self.train_context():
+            trace_context = dist_utils.get_spmd_context(
+                parallel_dims=self.parallel_dims,
+                spmd_typechecking=False,
+            )
+            with self.train_context(), trace_context():
                 self._traced_step = minimal_fx_tracer(
                     fwd_bwd_adamw,
                     module=model,

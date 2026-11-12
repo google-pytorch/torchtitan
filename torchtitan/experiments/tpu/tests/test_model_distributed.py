@@ -10,9 +10,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torchtitan.config
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import local_tpu_device
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import local_tpu_device
+from torchtitan.experiments.tpu.components import loss as tpu_loss
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
@@ -53,6 +54,7 @@ def _run_model_distributed(
   model_args.update_from_config(config=train_config)
 
   parallelism_config = train_config.parallelism
+  dist_utils.set_spmd_backend(parallelism_config.spmd_backend)
   parallel_dims = torchtitan.distributed.ParallelDims(
       dp_shard=parallelism_config.data_parallel_shard_degree,
       dp_replicate=parallelism_config.data_parallel_replicate_degree,
@@ -61,6 +63,7 @@ def _run_model_distributed(
       pp=parallelism_config.pipeline_parallel_degree,
       ep=parallelism_config.expert_parallel_degree,
       world_size=world_size,
+      spmd_backend=parallelism_config.spmd_backend,
   )
 
   # Initializing model consistently with the way TorchTitan does it.
@@ -91,6 +94,9 @@ def _run_model_distributed(
   # TODO: b/45811390 - fused=False is required for torch_tpu
   optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, fused=False)
 
+  # Same as the trainers: fill `global_vocab_size` from the final model config
+  # before building the loss (spmd_types loss-parallel CE under TP).
+  tpu_loss.set_global_vocab_size(train_config.loss, model_args)
   loss_fn = train_config.loss.build(compile_config=train_config.compile)
   if isinstance(loss_fn, torchtitan.components.loss.ChunkedLossWrapper):
     loss_fn.set_lm_head(model.lm_head)
@@ -141,7 +147,7 @@ def _run_model_distributed(
         logging.info("calling loss.backward()")
         loss.backward()
     else:
-      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+      from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
 
       tokens_cpu = torch.randint(
           0, model_args.vocab_size, (batch_size * seq_len,), device="cpu"

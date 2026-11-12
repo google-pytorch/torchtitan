@@ -21,7 +21,7 @@ import unittest
 from unittest import mock
 
 from torchtitan.config.configs import ParallelismConfig
-from torchtitan.experiments.tpu import cloud_distributed_utils as cdu
+from torchtitan.experiments.tpu.distributed import cloud_distributed_utils as cdu
 
 
 def _gke_env(

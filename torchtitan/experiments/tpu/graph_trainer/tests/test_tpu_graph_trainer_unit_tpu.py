@@ -22,10 +22,10 @@ from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_graph_trainer_model_registry,
 )
-from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
+from torchtitan.experiments.tpu.testing.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
-from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import build_cross_entropy_loss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 

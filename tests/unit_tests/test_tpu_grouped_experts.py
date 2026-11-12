@@ -11,7 +11,7 @@ import torch  # isort: skip
 import spmd_types as spmd
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     _native_weight_sharding,
     _transpose_last_two_dims,
     TpuGroupedExperts,
@@ -70,7 +70,7 @@ def test_model_converter_preserves_config_fields():
 
     root = RootConfig()
     original = root.experts
-    with patch("torchtitan.experiments.tpu.grouped_experts.logger.info") as log_info:
+    with patch("torchtitan.experiments.tpu.components.grouped_experts.logger.info") as log_info:
         converted = TpuGroupedExpertsConverter.Config().build().convert(root)
 
     assert converted is root
@@ -159,7 +159,7 @@ def test_unpaired_kernels_get_bf16_weights_whatever_the_param_dtype(param_dtype)
         return torch._grouped_mm(x, weight, offs=offsets)
 
     with patch(
-        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
     ) as unpaired:
         out = experts.forward(x, counts)
@@ -276,10 +276,10 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
         return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
 
     with patch(
-        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
     ) as unpaired, patch(
-        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ) as paired:
         experts.forward(x, counts)
@@ -329,10 +329,10 @@ def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired, transposed):
         return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
 
     with patch(
-        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
     ) as unpaired, patch(
-        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ) as paired_kernel:
         experts.forward(x, counts)
@@ -451,10 +451,10 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
 
     expected = stock.forward(x, counts)
     with patch(
-        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
     ), patch(
-        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        "torchtitan.experiments.tpu.components.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ):
         actual = native.forward(x_native, counts)

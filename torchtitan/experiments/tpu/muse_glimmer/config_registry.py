@@ -10,11 +10,11 @@ from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import model_registry as graph_trainer_model_registry
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import LossKernelConfig
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig

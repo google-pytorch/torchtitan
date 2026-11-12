@@ -17,8 +17,8 @@ from absl.testing import parameterized
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import unflatten_shim
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.kernels import splash_bias_dropout
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
 

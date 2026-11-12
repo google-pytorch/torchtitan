@@ -14,8 +14,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 from torch import nn
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import test_utils
 import torchtitan.experiments.tpu.qwen3 as qwen3_tpu
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import GQAttention
@@ -163,7 +163,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
       with set_unflatten_seq_len(seq_len):
         out_cpu = attention_cpu(x_cpu, None, positions_cpu)
         out_device = attention_device(x_device, None, positions_device)
@@ -326,7 +326,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
       with set_unflatten_seq_len(seq_len):
         out_cpu = moe_cpu(x_cpu)
         out_device = moe_device(x_device)
@@ -390,7 +390,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").repeat(batch)
     positions_device = positions_cpu.to(self.accelerator_device)
 
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     with set_unflatten_seq_len(seq_len):
       out_cpu = transformer_block_cpu(x_cpu, None, positions_cpu)
       out_device = transformer_block_device(x_device, None, positions_device)

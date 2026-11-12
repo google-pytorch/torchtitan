@@ -24,7 +24,7 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.models.deepseek_v3.config_registry import model_registry
 
 

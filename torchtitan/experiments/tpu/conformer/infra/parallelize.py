@@ -4,11 +4,13 @@ import enum
 import torch
 from torch.distributed import fsdp
 from torch.distributed._composable import replicate
+from torch.distributed.device_mesh import DeviceMesh
 import torch.nn as nn
 import torchtitan.config
 import torchtitan.distributed
 import torchtitan.trainer
 from torchtitan.experiments.graph_trainer import simple_fsdp
+from torchtitan.experiments.graph_trainer.common_utils import get_simple_fsdp_mesh
 from torchtitan.experiments.tpu import tpu_job_config
 import torchtitan.experiments.tpu.utils as tpu_utils
 from torchtitan.tools import logging
@@ -76,14 +78,21 @@ def parallelize_conformer(
 
   # Resolve DeviceMesh and mode based on strategy
   if strategy in (ParallelStrategy.FSDP2, ParallelStrategy.SIMPLEFSDP):
+    # `partial_dtensor` builds a flattened `fsdp` axis into the dense mesh;
+    # `spmd_types` keeps `dp_shard` and `cp` separate, so the shared helper
+    # flattens them (the same way `apply_simple_fsdp` does for the LLMs).
+    fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
     if parallel_dims.dp_replicate_enabled:
-      dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
-      reshard = not parallel_dims.pp_enabled
+      dp_replicate_mesh = parallel_dims.get_optional_mesh(
+          "dp_replicate", include_singleton_axes=True
+      )
+      assert dp_replicate_mesh is not None
+      dp_mesh = DeviceMesh._concatenate([dp_replicate_mesh, fsdp_mesh])
       dp_mode = "hybrid_shard"
     else:
-      dp_mesh = parallel_dims.get_mesh(["fsdp"])
-      reshard = not parallel_dims.pp_enabled
+      dp_mesh = fsdp_mesh
       dp_mode = "fully_shard"
+    reshard = not parallel_dims.pp_enabled
   elif strategy in (
       ParallelStrategy.DDP,
       ParallelStrategy.DDP_W_FSDP2,

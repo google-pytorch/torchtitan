@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 import torchtitan.config
+from torchtitan.experiments.tpu import goodput_config
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.distributed.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
@@ -262,6 +263,10 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
       default_factory=TpuTrainerCompileConfig
   )
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
+  # Goodput recording/monitoring; only the graph trainer is instrumented.
+  goodput: goodput_config.GoodputConfig = dataclasses.field(
+      default_factory=goodput_config.GoodputConfig
+  )
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()

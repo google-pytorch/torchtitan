@@ -8,7 +8,7 @@ How to run on Ray Cluster:
    export HEAD_NODE=ray-tpu-cluster-head-wmtdh
    export RL_PATH="/your/local/path/of/torchtitan"
 3. Copy this file to the head container:
-   kubectl cp $RL_PATH/torchtitan/experiments/tpu/rl/mini_rl.py $HEAD_NODE:/home/ray/ray/torch_tpu/mini_rl.py -c ray-head
+   kubectl cp $RL_PATH/torchtitan/experiments/tpu/rl_nc_ray/scripts/mini_rl.py $HEAD_NODE:/home/ray/ray/torch_tpu/mini_rl.py -c ray-head
 4. Submit the Ray Job:
    kubectl exec $HEAD_NODE -c ray-head -- bash -c "ray job submit --address='http://localhost:8265' --working-dir /home/ray/ray/torch_tpu --runtime-env-json='{\"env_vars\": {\"RAY_DEDUP_LOGS\": \"0\"}}' -- python mini_rl.py"
 """

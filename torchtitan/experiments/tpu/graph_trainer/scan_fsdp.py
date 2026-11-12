@@ -212,24 +212,6 @@ funcol.reduce_scatter_single = _movedim_reduce_scatter_tensor
 funcol.reduce_scatter_tensor = _movedim_reduce_scatter_tensor
 
 
-# spmd_types 0.2.5 asserts a contiguous input on both all_reduce paths, but
-# only the in-place one needs it; the backward of ``convert(I -> R)`` hands the
-# out-of-place path strided gradients. Copy there, as funcol would anyway.
-# Mirrors meta-pytorch/spmd_types@e80d154.
-# TODO(jerryx99): drop this patch once the pinned spmd_types includes
-# https://github.com/meta-pytorch/spmd_types/issues/13.
-_orig_all_reduce_forward = spmd._collectives._AllReduce.forward
-
-
-def _all_reduce_forward_contiguous(ctx, x, axis, dst, inplace, dtype_options):
-    if not inplace and not x.is_contiguous():
-        x = x.contiguous()
-    return _orig_all_reduce_forward(ctx, x, axis, dst, inplace, dtype_options)
-
-
-spmd._collectives._AllReduce.forward = staticmethod(_all_reduce_forward_contiguous)
-
-
 def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor:
     """Turns one layer's local shard into that layer's whole weight.
 

@@ -24,6 +24,7 @@ import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.experiments.tpu.distributed import distributed_utils
 import torchtitan.experiments.tpu.conformer  # trigger conformer_tpu model registration
 import torchtitan.experiments.tpu.gmain as gmain
 import torchtitan.experiments.tpu.profiling.model_annotator as model_annotator
@@ -171,6 +172,11 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         base_folder=train_config.dump_folder,
     )
     torch.distributed.barrier()
+  else:
+    # spmd_types builds the device mesh from the default process group (the
+    # step runs under get_spmd_context below), so a single-process run still
+    # needs one (see init_single_rank_process_group).
+    distributed_utils.init_single_rank_process_group()
 
   dp_replicate = train_config.parallelism.data_parallel_replicate_degree
   dp_shard = train_config.parallelism.data_parallel_shard_degree

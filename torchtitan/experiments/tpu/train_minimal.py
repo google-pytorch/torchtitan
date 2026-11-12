@@ -20,6 +20,7 @@ import torchtitan.distributed
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu.distributed import distributed_utils
 from torchtitan.experiments.tpu.distributed.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
@@ -100,19 +101,10 @@ class TrainerMinimal:
           enable_cpu_backend=job_config.training.enable_cpu_offload,
           base_folder=job_config.dump_folder,
       )
-    elif not dist.is_initialized():
-      # A single-process run (a parity test's CPU reference, or a one-chip run
-      # outside torchrun) still needs a process group: spmd_types annotates the
-      # model inputs against `ParallelDims`' device mesh, and torch builds that
-      # mesh from the default group. Use a one-rank gloo group over an
-      # in-process store: no rendezvous, and no TPU backend, which refuses a
-      # group smaller than the host's chip count. Every mesh axis has size 1,
-      # so the spmd_types helpers never issue a collective on it.
-      dist_utils.enable_fp32_matmul_emulation_with_bf16x9()
-      torch.autograd.set_multithreading_enabled(False)
-      dist.init_process_group(
-          backend="gloo", rank=0, world_size=1, store=dist.HashStore()
-      )
+    else:
+      # spmd_types builds the device mesh from the default process group, so a
+      # single-process run still needs one (see init_single_rank_process_group).
+      distributed_utils.init_single_rank_process_group()
 
     parallelism_config = self.job_config.parallelism
     self.parallel_dims = ParallelDims(

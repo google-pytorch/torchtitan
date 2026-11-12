@@ -21,7 +21,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 # Imported for the same reason as in `test_layer_stack`: production scans run
 # with it installed, so these do too.
 from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
-from torchtitan.experiments.tpu.graph_trainer import scan_remat_policy
+from torchtitan.experiments.tpu.graph_trainer import scan_fsdp, scan_remat_policy
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_body_remat_window,
     tag_scan_body_joint_graph,
@@ -132,6 +132,21 @@ def _attention_wrapping_gather_term(scores: torch.Tensor) -> torch.Tensor:
         with annotate_region(FSDP_GATHER):
             gathered = torch.cos(scores)
         # The mul's backward reads `gathered`, so it is saved or recomputed.
+        return torch.sigmoid(gathered * scores).sum(dim=-1, keepdim=True)
+
+
+def _real_gather_term(scores: torch.Tensor) -> torch.Tensor:
+    """`scan_fsdp.gather_slice` itself (its `spmd_types` all-gather), inside a
+    save region: the region it sets must still win."""
+    spec = scan_fsdp.ScanFSDPSpec(
+        group_name=dist.group.WORLD.group_name,
+        group=dist.group.WORLD,
+        param_dtype=None,
+        reduce_dtype=None,
+        sharded=True,
+    )
+    with annotate_region(ATTENTION_INNER_ATTENTION):
+        gathered = scan_fsdp.gather_slice(scores, spec)
         return torch.sigmoid(gathered * scores).sum(dim=-1, keepdim=True)
 
 
@@ -290,6 +305,46 @@ class TestScanBodyRematWindow(unittest.TestCase):
         )
         ops = _ops(captured[0][1])
         self.assertIn("aten.cos.default", ops)
+        self.assertNotIn("aten.sigmoid.default", ops)
+        self._check_same_grads(got, want)
+
+    def test_the_real_gather_is_tagged_and_recomputed(self):
+        joints = []
+        tag = scan_remat_policy.tag_scan_body_joint_graph
+
+        def capture_tags(graph, save_regions):
+            tag(graph, save_regions)
+            joints.append(graph)
+
+        want, _ = _run(_legacy_window, extra=_real_gather_term)
+        with mock.patch.object(
+            scan_remat_policy, "tag_scan_body_joint_graph", capture_tags
+        ):
+            got, captured = _run(
+                lambda: scan_body_remat_window({ATTENTION_INNER_ATTENTION}),
+                extra=_real_gather_term,
+            )
+        # Every forward collective in the body is the gather's, and carries
+        # its region and a recompute tag.
+        forward_collectives = [
+            n
+            for n in joints[0].nodes
+            if n.op == "call_function"
+            and isinstance(n.target, torch._ops.OpOverload)
+            and n.target.namespace == "_c10d_functional"
+            and n not in scan_remat_policy._depends_on_tangents(joints[0])
+        ]
+        self.assertIn(
+            "_c10d_functional.all_gather_into_tensor.default",
+            [str(n.target) for n in forward_collectives],
+        )
+        for n in forward_collectives:
+            self.assertEqual(n.meta["custom"][REMAT_REGION], FSDP_GATHER, n.name)
+            self.assertEqual(
+                n.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE, n.name
+            )
+        ops = _ops(captured[0][1])
+        self.assertIn("_c10d_functional.all_gather_into_tensor.default", ops)
         self.assertNotIn("aten.sigmoid.default", ops)
         self._check_same_grads(got, want)
 

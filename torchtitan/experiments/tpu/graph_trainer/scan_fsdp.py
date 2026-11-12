@@ -22,8 +22,14 @@ import dataclasses
 import math
 from typing import Any
 
-import torch
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
+
+import spmd_types as spmd
 import torch.distributed._functional_collectives as funcol
+import torch.distributed.distributed_c10d as c10d
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
@@ -43,28 +49,55 @@ class ScanFSDPSpec:
     """How the scan body should gather one stacked parameter.
 
     Attributes:
-        group_name: resolved process-group name, in the form funcol collectives
-            take.
+        group_name: name of ``group``, kept for logging and ``repr``. The body
+            never resolves it: ``""`` when there is no mesh at all.
+        group: the shard axis's ``ProcessGroup``, or ``None`` when there is no
+            mesh at all. Resolved here, outside ``scan``, because ``spmd_types``
+            collectives take a ``ProcessGroup`` and resolving one by name is a
+            C++ call (``c10d._resolve_process_group``) that Dynamo cannot trace
+            inside ``scan``'s ``fullgraph=True`` capture of the body.
         param_dtype: compute dtype for the gathered weight; ``None`` leaves it
             alone.
         reduce_dtype: dtype to reduce the gradient in; ``None`` means reduce in
             whatever dtype the forward gathered in.
         sharded: ``False`` for a parameter SimpleFSDP left replicated. Nothing
             to gather in the forward; the gradient still has to be summed.
-        replicate_group_name: under ``hybrid_shard``, the process group of the
+        replicate_group_name: name of ``replicate_group``, for logging.
+        replicate_group: under ``hybrid_shard``, the ``ProcessGroup`` of the
             *replicate* mesh axis; ``None`` for a 1-D dp mesh. The forward needs
             nothing from it -- the weight is already replicated along it -- but
             the gradient is ``Partial`` on it and has to be summed.
         gather_dim: which axis of the per-layer slice to gather on -- the
             stack's shard axis minus the scan axis, so dim 1 becomes 0.
+
+    Raises:
+        ValueError: at construction, if a group name is given without its
+            resolved group or vice versa. Failing here is deliberate: a spec
+            that made the body resolve the name itself would only fail later,
+            at trace time, inside ``scan``.
     """
 
     group_name: str
+    group: c10d.ProcessGroup | None
     param_dtype: torch.dtype | None
     reduce_dtype: torch.dtype | None
     sharded: bool
     replicate_group_name: str | None = None
+    replicate_group: c10d.ProcessGroup | None = None
     gather_dim: int = 0
+
+    def __post_init__(self) -> None:
+        if bool(self.group_name) != (self.group is not None):
+            raise ValueError(
+                "ScanFSDPSpec needs group_name and group together: got "
+                f"group_name={self.group_name!r}, group={self.group!r}"
+            )
+        if (self.replicate_group_name is None) != (self.replicate_group is None):
+            raise ValueError(
+                "ScanFSDPSpec needs replicate_group_name and replicate_group "
+                f"together: got replicate_group_name={self.replicate_group_name!r}, "
+                f"replicate_group={self.replicate_group!r}"
+            )
 
 
 _orig_all_gather_single = funcol.all_gather_single
@@ -179,138 +212,117 @@ funcol.reduce_scatter_single = _movedim_reduce_scatter_tensor
 funcol.reduce_scatter_tensor = _movedim_reduce_scatter_tensor
 
 
-def _gather_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
-    """All-gather `x` along `dim`, always collecting on dim 0.
-
-    Off dim 0, `funcol` falls back to `cat(chunk(t, world_size))` unless every
-    axis before `dim` has size 1. A layer slice starts with `num_experts`, so it
-    never qualifies, and a 2048-rank gather would emit 2048 slices and a concat.
-    A transpose either side is two ops instead.
-    """
-    if dim == 0:
-        return funcol.all_gather_tensor(x, gather_dim=0, group=group_name)
-    out = funcol.all_gather_tensor(x.movedim(dim, 0), gather_dim=0, group=group_name)
-    return out.movedim(0, dim)
+# spmd_types 0.2.5 asserts a contiguous input on both all_reduce paths, but
+# only the in-place one needs it; the backward of ``convert(I -> R)`` hands the
+# out-of-place path strided gradients. Copy there, as funcol would anyway.
+# Mirrors meta-pytorch/spmd_types@e80d154.
+# TODO(jerryx99): drop this patch once the pinned spmd_types includes
+# https://github.com/meta-pytorch/spmd_types/issues/13.
+_orig_all_reduce_forward = spmd._collectives._AllReduce.forward
 
 
-def _scatter_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
-    """Reduce-scatter `x` along `dim`, always scattering on dim 0.
-
-    `reduce_scatter` has no fast path off dim 0 at all, so this is the same
-    trade as `_gather_on`.
-    """
-    if dim == 0:
-        return funcol.reduce_scatter_tensor(
-            x, reduceOp="sum", scatter_dim=0, group=group_name
-        )
-    out = funcol.reduce_scatter_tensor(
-        x.movedim(dim, 0), reduceOp="sum", scatter_dim=0, group=group_name
-    )
-    return out.movedim(0, dim)
+def _all_reduce_forward_contiguous(ctx, x, axis, dst, inplace, dtype_options):
+    if not inplace and not x.is_contiguous():
+        x = x.contiguous()
+    return _orig_all_reduce_forward(ctx, x, axis, dst, inplace, dtype_options)
 
 
-class _AllGatherReduceScatter(torch.autograd.Function):
-    """Gathers one sharded layer's weight, and reduces its gradient back.
-
-    This is the sharded case of ``gather_slice``: all-gather in the forward,
-    reduce-scatter in the backward, the same pair SimpleFSDP runs unrolled.
-
-    Written out by hand so the two halves can use different dtypes -- bf16 to
-    gather, to halve the comm volume, and fp32 to reduce, to keep the gradient
-    accurate. A plain collective reduces in whatever dtype the forward used,
-    and casting after the reduce is already too late.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        shard: torch.Tensor,
-        group_name: str,
-        param_dtype: torch.dtype | None,
-        reduce_dtype: torch.dtype | None,
-        replicate_group_name: str | None,
-        gather_dim: int,
-    ) -> torch.Tensor:
-        ctx.group_name = group_name
-        ctx.replicate_group_name = replicate_group_name
-        ctx.reduce_dtype = reduce_dtype
-        ctx.shard_dtype = shard.dtype
-        ctx.gather_dim = gather_dim
-        if param_dtype is not None:
-            shard = shard.to(param_dtype)
-        return _gather_on(shard, gather_dim, group_name)
-
-    @staticmethod
-    def backward(ctx: Any, grad: torch.Tensor):
-        if ctx.reduce_dtype is not None:
-            grad = grad.to(ctx.reduce_dtype)
-        out = _scatter_on(grad, ctx.gather_dim, ctx.group_name)
-        if ctx.replicate_group_name is not None:
-            # HSDP: the gradient is Partial on the replicate axis too. Reduce it
-            # after the scatter, not before -- same sum, on a tensor that is
-            # already `1/shard_degree` the size.
-            out = funcol.all_reduce(out, "sum", group=ctx.replicate_group_name)
-        return out.to(ctx.shard_dtype), None, None, None, None, None
-
-
-class _ReduceGradOnly(torch.autograd.Function):
-    """Sums the gradient of a weight SimpleFSDP left replicated.
-
-    This is the unsharded case of ``gather_slice``: the weight is already whole
-    on every rank, so the forward only casts. The gradient is not whole -- each
-    rank computed its own from its own microbatch -- so the backward all-reduces.
-
-    Unrolled, that sum comes from ``to_local(grad_placements=Partial)``. The
-    body reads the local tensor straight off the ``DTensor``, which promises no
-    such thing, so it has to ask for the sum itself.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        replica: torch.Tensor,
-        group_names: tuple[str, ...],
-        param_dtype: torch.dtype | None,
-        reduce_dtype: torch.dtype | None,
-    ) -> torch.Tensor:
-        ctx.group_names = group_names
-        ctx.reduce_dtype = reduce_dtype
-        ctx.replica_dtype = replica.dtype
-        return replica if param_dtype is None else replica.to(param_dtype)
-
-    @staticmethod
-    def backward(ctx: Any, grad: torch.Tensor):
-        if ctx.reduce_dtype is not None:
-            grad = grad.to(ctx.reduce_dtype)
-        for group_name in ctx.group_names:
-            grad = funcol.all_reduce(grad, "sum", group=group_name)
-        return grad.to(ctx.replica_dtype), None, None, None
+spmd._collectives._AllReduce.forward = staticmethod(_all_reduce_forward_contiguous)
 
 
 def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor:
-    """Turns one layer's local shard into that layer's whole weight."""
+    """Turns one layer's local shard into that layer's whole weight.
+
+    Uses ``spmd_types`` explicit local collectives (``spmd.all_gather`` and
+    ``spmd.convert``) so forward all-gather, backward reduce-scatter, HSDP
+    replicate all-reduce, and mixed-precision ``param_dtype`` / ``reduce_dtype``
+    casts all go through ``spmd_types``'s local autograd functions while routing
+    through ``_movedim_all_gather_tensor`` and ``_movedim_reduce_scatter_tensor``
+    above.
+    """
     if spec is None:
         return shard
-    if not spec.sharded:
-        if not spec.group_name:
-            # No mesh at all, so no other rank holds a gradient to add.
-            return shard if spec.param_dtype is None else shard.to(spec.param_dtype)
-        # Replicated on every axis it has, so the gradient is `Partial` on
-        # every axis and each one needs its own sum.
-        return _ReduceGradOnly.apply(
+    shard_dtype = shard.dtype
+    out_dtype = spec.param_dtype or shard_dtype
+    bw_op_dtype = spec.reduce_dtype or out_dtype
+    # Dtype of the tensor between two hops. Autograd casts each hop's incoming
+    # gradient to that hop's output dtype, so it must be wide enough to hold
+    # the previous reduction's `bw_op_dtype` result (bf16 master weights with
+    # `reduce_dtype=float32` would otherwise round between reductions).
+    mid_dtype = torch.promote_types(shard_dtype, bw_op_dtype)
+    # Already-resolved `ProcessGroup`s: the body must not resolve names itself
+    # (see `ScanFSDPSpec.group`).
+    pg = spec.group
+    rep_pg = spec.replicate_group
+
+    # Disable spmd_types's thread-local traceback filter while inside the
+    # `torch.ops.higher_order.scan` body so Dynamo does not reject `_tls`
+    # attribute mutation during `scan`'s sub-trace.
+    with spmd.traceback_filtering("off"):
+        if not spec.sharded:
+            if pg is None:
+                # No mesh at all, so no other rank holds a gradient to add.
+                return shard if spec.param_dtype is None else shard.to(spec.param_dtype)
+            # Replicated on every axis it has: `spmd.convert(src=I, dst=R)` is a
+            # forward identity (with optional `param_dtype` cast) whose backward
+            # runs `spmd.all_reduce(src=P, dst=I)` in `bw_op_dtype`. Autograd
+            # unwinds the hops in reverse, so the replicate axis goes first
+            # here for the backward to reduce the shard axis first, as the
+            # unrolled path does.
+            group_pgs = (pg,) if rep_pg is None else (rep_pg, pg)
+            x = shard
+            # Only the last hop casts to `param_dtype`; earlier hops stay in
+            # `mid_dtype` so every reduction sees an unrounded input, and only
+            # the first hop's backward casts back to `shard_dtype`.
+            for i, group_pg in enumerate(group_pgs):
+                is_last = i == len(group_pgs) - 1
+                x = spmd.convert(
+                    x,
+                    group_pg,
+                    src=spmd.I,
+                    dst=spmd.R,
+                    op_dtype=out_dtype if is_last else mid_dtype,
+                    out_dtype=out_dtype if is_last else mid_dtype,
+                    backward_options={
+                        "op_dtype": bw_op_dtype,
+                        "out_dtype": shard_dtype if i == 0 else mid_dtype,
+                    },
+                )
+            return x
+
+        if rep_pg is not None:
+            # HSDP: `convert(I -> R)` on the replicate axis first, then the
+            # shard-axis `all_gather` below. In the backward, `all_gather`
+            # reduce-scatters along the shard axis, and `convert` then
+            # all-reduces the already-scattered `1/shard_degree` shard across
+            # the replicate axis. The `convert` stays in `mid_dtype` so the
+            # gradient between the two reductions is not rounded (see the
+            # replicated case above); only the `all_gather` casts to
+            # `param_dtype`.
+            shard = spmd.convert(
+                shard,
+                rep_pg,
+                src=spmd.I,
+                dst=spmd.R,
+                op_dtype=mid_dtype,
+                out_dtype=mid_dtype,
+                backward_options={
+                    "op_dtype": bw_op_dtype,
+                    "out_dtype": shard_dtype,
+                },
+            )
+        return spmd.all_gather(
             shard,
-            tuple(g for g in (spec.group_name, spec.replicate_group_name) if g),
-            spec.param_dtype,
-            spec.reduce_dtype,
+            pg,
+            src=spmd.S(spec.gather_dim),
+            dst=spmd.R,
+            op_dtype=spec.param_dtype,
+            out_dtype=out_dtype,
+            backward_options={
+                "op_dtype": bw_op_dtype,
+                "out_dtype": mid_dtype if rep_pg is not None else shard_dtype,
+            },
         )
-    return _AllGatherReduceScatter.apply(
-        shard,
-        spec.group_name,
-        spec.param_dtype,
-        spec.reduce_dtype,
-        spec.replicate_group_name,
-        spec.gather_dim,
-    )
 
 
 def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
@@ -343,7 +355,13 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
         if not isinstance(param, DTensor):
             # Not under FSDP at all, so there is nothing to gather. Still
             # honour the compute dtype, so the scanned and unrolled paths agree.
-            plan[name] = ScanFSDPSpec("", param_dtype, reduce_dtype, sharded=False)
+            plan[name] = ScanFSDPSpec(
+                group_name="",
+                group=None,
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                sharded=False,
+            )
             continue
 
         mesh = param.device_mesh
@@ -352,9 +370,11 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
         # ("dp_replicate", "fsdp") -- so the shard axis is the last one, and the
         # first contributes only the backward all-reduce.
         if mesh.ndim == 1:
+            replicate_group = None
             replicate_group_name = None
         elif mesh.ndim == 2 and isinstance(param.placements[0], Replicate):
-            replicate_group_name = mesh.get_group(0).group_name
+            replicate_group = mesh.get_group(0)
+            replicate_group_name = replicate_group.group_name
         else:
             raise ValueError(
                 "the scan body's gather understands a 1-D dp mesh or a 2-D "
@@ -397,12 +417,15 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
                 f"{name} is {placement} on the shard axis, and the scan body's "
                 "gather handles only Shard and Replicate"
             )
+        shard_group = mesh.get_group(mesh.ndim - 1)
         plan[name] = ScanFSDPSpec(
-            group_name=mesh.get_group(mesh.ndim - 1).group_name,
+            group_name=shard_group.group_name,
+            group=shard_group,
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
             sharded=sharded,
             replicate_group_name=replicate_group_name,
+            replicate_group=replicate_group,
             gather_dim=gather_dim,
         )
 

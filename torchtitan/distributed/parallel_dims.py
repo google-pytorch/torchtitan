@@ -117,7 +117,7 @@ class ParallelDims:
     pp: int
     ep: int
     world_size: int
-    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "partial_dtensor"
+    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "spmd_types"
     enable_tpu_topo_mesh: bool = False
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
     # same object instead of re-slicing a submesh on every lookup.

@@ -19,7 +19,10 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed.compile import apply_compile
-from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan.distributed.fsdp import (
+    apply_fsdp_to_decoder,
+    resolve_fsdp_mesh,
+)
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
@@ -162,9 +165,7 @@ def parallelize_muse_glimmer(
   if tpu_compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
-  # Under partial_dtensor, Module.parallelize is only needed for TP; it applies
-  # the sharding configs set by MuseGlimmerModel.Config.update_from_config.
-  if parallel_dims.tp_enabled:
+  if parallelism.spmd_backend == "spmd_types" or parallel_dims.tp_enabled:
     model.parallelize(parallel_dims)
 
   if ac_config is not None:
@@ -180,23 +181,38 @@ def parallelize_muse_glimmer(
         parallel_dims=parallel_dims,
     )
 
-  if not skip_dp and (
-      parallel_dims.dp_shard_enabled or parallel_dims.dp_replicate_enabled
-  ):
+  if not skip_dp:
     if parallelism.use_simple_fsdp:
+      # Like the FSDP2 branch below, run even without a DP axis: under
+      # spmd_types `model.parallelize` only annotates the parameters, and the
+      # SimpleFSDP wrapper is what adds the mixed-precision casts and the
+      # backward reductions over the TP axis for replicated / SP-norm weights.
+      # The `fsdp` mesh always exists, even at degree 1 (ParallelDims._mesh_exist).
       configure_muse_glimmer_simple_fsdp_shard_dims(model, parallel_dims)
       model = apply_simple_fsdp(
           model, parallel_dims=parallel_dims, training=training
       )
-    else:
-      dp_mesh_names = (
-          ["dp_replicate", "fsdp"]
-          if parallel_dims.dp_replicate_enabled
-          else ["fsdp"]
-      )
+    elif (
+        parallelism.spmd_backend == "spmd_types"
+        or parallel_dims.dp_shard_enabled
+        or parallel_dims.dp_replicate_enabled
+    ):
+      # Under spmd_types, run FSDP2 even without a DP axis (TP-only / single
+      # device): `model.parallelize` above only annotates the parameters, and
+      # `fully_shard` is what turns them into DTensors on the mesh.
+      if parallelism.spmd_backend == "spmd_types":
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+      else:
+        dp_mesh_names = (
+            ["dp_replicate", "fsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["fsdp"]
+        )
+        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+        dp_mesh_dims = None
       apply_fsdp_to_decoder(
           model,
-          parallel_dims.get_mesh(dp_mesh_names),
+          dp_mesh,
           param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
               training.mixed_precision_param
           ],
@@ -206,7 +222,7 @@ def parallelize_muse_glimmer(
           pp_enabled=parallel_dims.pp_enabled,
           cpu_offload=training.enable_cpu_offload,
           reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-          dp_mesh_dims=None,
+          dp_mesh_dims=dp_mesh_dims,
           enable_symm_mem=parallelism.enable_fsdp_symm_mem,
       )
 

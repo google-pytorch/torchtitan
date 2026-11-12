@@ -10,8 +10,9 @@ changing the default scoped VMEM budget for the rest of ``kernels/tests/``.
 By default, CI runs multi-tile forward/backward parity across all three Splash
 wrappers plus FLUX's ``use_tokamax_splash_attention_patch(...,
 is_causal=False)``
-path, and benchmarks compiled 32K MFU on ``tokamax_splash_sdpa`` (~25s total).
-Pass ``--benchmark_all_kernels`` to benchmark all three kernels at 32K, or
+path, and benchmarks compiled 32K ``head_dim=256`` MFU (matching TPU v7x's
+256x256 MXU) on ``tokamax_splash_sdpa`` (~35s total). Pass
+``--benchmark_all_kernels`` to benchmark all three kernels at 32K, or
 ``--norun_mfu_benchmark`` for parity-only execution.
 """
 
@@ -52,12 +53,12 @@ _BENCHMARK_ALL_KERNELS = flags.DEFINE_bool(
 )
 _MIN_ATTENTION_MFU = flags.DEFINE_float(
     "min_attention_mfu",
-    0.30,
+    0.55,
     "Minimum required steady-state full-attention MFU on TPU v7x.",
 )
 
 _ALL_KERNELS = ("splash_sdpa", "tokamax_splash_sdpa", "sbd_splash_attention")
-_FLUX_32K_BHSD = (1, 32, 32768, 128)
+_V7X_32K_BHSD = (1, 32, 32768, 256)
 _V7X_32K_BLOCKS = dict(
     block_q=2048,
     block_kv=4096,
@@ -168,7 +169,7 @@ class _FluxInnerAttentionModule(nn.Module):
 
 
 class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
-  """Verifies TPU v7x full-attention parity and >30% 32K attention MFU."""
+  """Verifies TPU v7x full-attention parity and >55% 32K attention MFU."""
 
   def _require_tpu_v7x(self) -> tuple[torch.device, str]:
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
@@ -268,7 +269,7 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
     torch.manual_seed(0)
-    parity_bhsd = (1, 4, 2048, 128)
+    parity_bhsd = (1, 4, 2048, 256)
     q_cpu, k_cpu, v_cpu, do_cpu = (
         torch.randn(parity_bhsd, dtype=torch.bfloat16) for _ in range(4)
     )
@@ -325,7 +326,7 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
     workarounds.use_tokamax_splash_attention_patch(mod, sa_cfg)
 
     torch.manual_seed(11)
-    bshd = (1, 2048, 4, 128)
+    bshd = (1, 2048, 4, 256)
     q_cpu, k_cpu, v_cpu, do_cpu = (
         torch.randn(bshd, dtype=torch.bfloat16) for _ in range(4)
     )
@@ -368,7 +369,7 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
       dev: torch.device,
       device_name: str,
   ) -> None:
-    batch_size, heads, seq_len, head_dim = _FLUX_32K_BHSD
+    batch_size, heads, seq_len, head_dim = _V7X_32K_BHSD
     attn_fn, heads_first = self._make_kernel_fn(kernel_kind, for_benchmark=True)
 
     torch.manual_seed(42)
@@ -482,7 +483,7 @@ class SplashAttentionMfuTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_full_attention_mfu_above_threshold(self):
-    """Measures compiled FLUX 32K full-attention MFU on TPU v7x."""
+    """Measures compiled 32K head_dim=256 full-attention MFU on TPU v7x."""
     if not _RUN_MFU_BENCHMARK.value:
       self.skipTest("Skipped because --norun_mfu_benchmark was set.")
     dev, device_name = self._require_tpu_v7x()

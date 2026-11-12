@@ -196,7 +196,7 @@ class ParallelismConfig:
     enable_sequence_parallel: bool = True
     """Whether to use SequenceParallel as part of tensor parallelism. Enabled by default."""
 
-    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "partial_dtensor"
+    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "spmd_types"
     """
     SPMD backend selector.
 

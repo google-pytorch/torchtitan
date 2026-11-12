@@ -12,6 +12,10 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 from torch import nn
+import spmd_types as spmd
+from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.spmd_types import current_spmd_mesh
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.tpu.distributed import gdist
@@ -86,7 +90,17 @@ class DistributedUnitTestRunner:
       parallelism_func: ParallelismFunc,
       input_distribution: InputDistribution = InputDistribution.REPLICATE,
       use_meta_init: bool = True,
+      parallel_dims: ParallelDims | None = None,
   ):
+    """
+    Args:
+      parallel_dims: The ``ParallelDims`` that ``parallelism_func`` parallelizes
+        with. Under ``spmd_types`` the runner needs it to seed the DTensor RNG
+        for ``init_weights`` and to enter ``get_spmd_context`` (the process-wide
+        SPMD mesh the collectives read) around the parallel model's forward,
+        which the trainer normally does. Also selects the module-level
+        ``spmd_backend`` that ``apply_simple_fsdp`` reads.
+    """
     self.device = device
     self.rank = rank
     self.world_size = world_size
@@ -94,6 +108,9 @@ class DistributedUnitTestRunner:
     self.model_args = model_args
     self.input_distribution = input_distribution
     self.use_meta_init = use_meta_init
+    self.parallel_dims = parallel_dims
+    if parallel_dims is not None:
+      dist_utils.set_spmd_backend(parallel_dims.spmd_backend)
 
     # Apply parallelism to the model.
     self.parallel_model = None
@@ -285,6 +302,14 @@ class DistributedUnitTestRunner:
     # Materialize weights if they are still on Meta device
     if any(p.device.type == "meta" for p in self.parallel_model.parameters()):
       self.parallel_model.to_empty(device=self.device)
+      # Under spmd_types the params are already DTensors here, and DTensor
+      # random ops require the per-mesh RNG tracker to be seeded (the CPU
+      # reference then copies these weights, so one seed is enough).
+      torch.manual_seed(0)
+      if self.parallel_dims is not None and self.parallel_dims.world_size > 1:
+        torch.distributed.tensor._random.manual_seed(
+            0, self.parallel_dims.world_mesh
+        )
       with torch.device(self.device):
         self.parallel_model.init_weights()
 
@@ -369,8 +394,31 @@ class DistributedUnitTestRunner:
       ctx = contextlib.nullcontext()
       call_fn = lambda: model(inputs)
 
-    with ctx:
+    is_parallel = model is self.parallel_model and self.parallel_dims is not None
+    spmd_ctx = (
+        dist_utils.get_spmd_context(parallel_dims=self.parallel_dims)()
+        if is_parallel
+        else contextlib.nullcontext()
+    )
+    with ctx, spmd_ctx:
       output = call_fn()
+      if is_parallel:
+        if isinstance(output, DTensor):
+          output = output.full_tensor()
+        elif (
+            self.parallel_dims.spmd_backend == "spmd_types"
+            and self.parallel_dims.tp_enabled
+            and hasattr(self.model_args, "vocab_size")
+            and output.shape[-1] != self.model_args.vocab_size
+        ):
+          mesh = current_spmd_mesh()
+          if mesh is not None:
+            output = spmd.all_gather(
+                output,
+                mesh.get_group("tp"),
+                src=spmd.S(-1),
+                dst=spmd.I,
+            )
       if backward and targets is not None:
         if targets.dtype != output.dtype:
           targets = targets.to(output.dtype)

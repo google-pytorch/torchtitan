@@ -171,6 +171,18 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         base_folder=train_config.dump_folder,
     )
     torch.distributed.barrier()
+  # TODO(jerryx99): Drop the spmd_backend plumbing once #180 lands, keep
+  # get_spmd_context (see #158 review)
+  elif train_config.parallelism.spmd_backend == "spmd_types":
+    # Same single-process fallback as experiments/tpu/train_minimal.py:
+    # spmd_types needs a device mesh, and a mesh needs torch.distributed.
+    logger.info(
+        "Single-process run: using the partial_dtensor SPMD backend"
+        " (spmd_types needs an initialized process group)"
+    )
+    train_config.parallelism.spmd_backend = "partial_dtensor"
+  # Same activation as Trainer.__init__: the backend is a process global.
+  dist_utils.set_spmd_backend(train_config.parallelism.spmd_backend)
 
   dp_replicate = train_config.parallelism.data_parallel_replicate_degree
   dp_shard = train_config.parallelism.data_parallel_shard_degree
@@ -190,6 +202,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       pp=train_config.parallelism.pipeline_parallel_degree,
       ep=train_config.parallelism.expert_parallel_degree,
       world_size=world_size,
+      spmd_backend=train_config.parallelism.spmd_backend,
   )
   logger.info("parallel_dims: %s", parallel_dims)
   train_config.maybe_log()
@@ -401,6 +414,9 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   profiler_workaround.init(train_config)
 
   ntokens_seen = 0
+  # Same as Trainer / experiments/tpu/train_minimal.py: activates the
+  # configured SPMD backend and global DeviceMesh around forward/backward.
+  train_context = dist_utils.get_spmd_context(parallel_dims=parallel_dims)
   with torchtitan_profiler.Profiler(
       train_config.profiler,
       global_step=0,
@@ -431,7 +447,10 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         )
       targets = batch[1].to(device)
 
-      with jax_profiler.TraceAnnotation("train", step_num=step):
+      with (
+          jax_profiler.TraceAnnotation("train", step_num=step),
+          train_context(),  # pytype: disable=not-callable
+      ):
         use_ctc = (
             hasattr(train_config, "conformer")
             and train_config.conformer.use_ctc_loss

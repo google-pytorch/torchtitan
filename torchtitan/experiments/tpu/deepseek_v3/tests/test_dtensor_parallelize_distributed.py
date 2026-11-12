@@ -38,7 +38,15 @@ def _get_deepseek_v3_model_config(
   Defaults to 'testmodel' (which specifies dim=128, n_layers=3,
   n_dense_layers=3, vocab_size=2048).
   """
-  return deepseek_v3_tpu.deepseekv3_configs[model_name]
+  import copy
+  from torchtitan.models.deepseek_v3.sharding import set_deepseek_v3_sharding_config
+
+  # See the llama3 test: sharding spec is required by ``Module.parallelize``
+  # under spmd_types; deepcopy keeps the registry entry pristine. SP and EP are
+  # off because the test feeds unsharded inputs and runs TP only.
+  config = copy.deepcopy(deepseek_v3_tpu.deepseekv3_configs[model_name])
+  set_deepseek_v3_sharding_config(config, enable_sp=False, enable_ep=False)
+  return config
 
 
 def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
@@ -48,16 +56,17 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
   # Apply histc CPU workaround in worker process. Doesn't propagate from parent.
   use_cpu_safe_histc_patch()
 
+  parallel_dims = ParallelDims(
+      dp_shard=1,
+      dp_replicate=1,
+      cp=1,
+      tp=world_size,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_tp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=1,
-        dp_replicate=1,
-        cp=1,
-        tp=world_size,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
@@ -77,6 +86,7 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
       model_class=DeepSeekV3Model,
       model_args=_get_deepseek_v3_model_config(),
       parallelism_func=apply_tp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -91,16 +101,17 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
   # Apply histc CPU workaround in worker process. Doesn't propagate from parent.
   use_cpu_safe_histc_patch()
 
+  parallel_dims = ParallelDims(
+      dp_shard=1,
+      dp_replicate=1,
+      cp=1,
+      tp=world_size,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_tp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=1,
-        dp_replicate=1,
-        cp=1,
-        tp=world_size,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
@@ -120,6 +131,7 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
       model_class=DeepSeekV3Model,
       model_args=_get_deepseek_v3_model_config(),
       parallelism_func=apply_tp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -146,16 +158,17 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
   # Apply histc CPU workaround in worker process. Doesn't propagate from parent.
   use_cpu_safe_histc_patch()
 
+  parallel_dims = ParallelDims(
+      dp_shard=world_size,
+      dp_replicate=1,
+      cp=1,
+      tp=1,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_fsdp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=world_size,
-        dp_replicate=1,
-        cp=1,
-        tp=1,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
@@ -175,6 +188,7 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
       model_class=DeepSeekV3Model,
       model_args=_get_deepseek_v3_model_config(),
       parallelism_func=apply_fsdp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.SPLIT_BATCH,
       use_meta_init=True,
   )

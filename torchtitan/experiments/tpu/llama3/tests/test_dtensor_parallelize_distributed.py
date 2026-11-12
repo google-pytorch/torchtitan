@@ -41,7 +41,18 @@ def _get_model_config(model_name: str = "testmodel") -> Llama3Model.Config:
   Defaults to 'testmodel' (which specifies dim=64, n_heads=8, n_layers=1,
   vocab_size=128, max_seq_len=512).
   """
-  return llama3_tpu.llama3_configs[model_name]
+  import copy
+  from torchtitan.models.llama3.sharding import set_llama3_sharding_config
+
+  # Under spmd_types, ``Module.parallelize`` shards from the config's sharding
+  # spec, which the registry entries do not carry; deepcopy so the shared
+  # registry config is not mutated. Sequence parallel is off because the test
+  # feeds an unsharded input tensor and compares against the CPU reference;
+  # with SP the model expects the sequence axis pre-sharded, which only the
+  # trainer's input pipeline does.
+  config = copy.deepcopy(llama3_tpu.llama3_configs[model_name])
+  set_llama3_sharding_config(config, enable_sp=False)
+  return config
 
 
 def _verify_dtensor_llama3_tp_forward_worker(
@@ -50,16 +61,17 @@ def _verify_dtensor_llama3_tp_forward_worker(
   """Verifies numerical equivalence of forward pass of Llama3 model with DTensor TP."""
 
   # Apply TP wrapper
+  parallel_dims = ParallelDims(
+      dp_shard=1,
+      dp_replicate=1,
+      cp=1,
+      tp=world_size,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_tp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=1,
-        dp_replicate=1,
-        cp=1,
-        tp=world_size,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     llama3_dtensor_parallelize.parallelize_llama(
         model,
@@ -80,6 +92,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
       model_class=Llama3Model,
       model_args=config,
       parallelism_func=apply_tp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -98,16 +111,17 @@ def _verify_dtensor_llama3_tp_backward_worker(
   """Worker function to run forward and backward pass on model after apply_tp is called."""
 
   # Apply TP wrapper
+  parallel_dims = ParallelDims(
+      dp_shard=1,
+      dp_replicate=1,
+      cp=1,
+      tp=world_size,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_tp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=1,
-        dp_replicate=1,
-        cp=1,
-        tp=world_size,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     llama3_dtensor_parallelize.parallelize_llama(
         model,
@@ -128,6 +142,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
       model_class=Llama3Model,
       model_args=config,
       parallelism_func=apply_tp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -150,16 +165,17 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
   """Worker function to verify FSDP numerical equivalence on Llama3 model."""
 
   # Apply FSDP wrapper
+  parallel_dims = ParallelDims(
+      dp_shard=world_size,
+      dp_replicate=1,
+      cp=1,
+      tp=1,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_fsdp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=world_size,
-        dp_replicate=1,
-        cp=1,
-        tp=1,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     llama3_dtensor_parallelize.parallelize_llama(
         model,
@@ -180,6 +196,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
       model_class=Llama3Model,
       model_args=config,
       parallelism_func=apply_fsdp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.SPLIT_BATCH,  # FSDP = Split Batch
       use_meta_init=True,
   )

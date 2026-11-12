@@ -192,6 +192,11 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # after decoration, leaving the ``__class__`` cell that zero-arg
     # ``super()`` relies on pointing at a stale class. See bpo-46404.
     super(BaseTPUTrainerConfig, self).__post_init__()
+    # ``loss.global_vocab_size`` (spmd_types loss-parallel CE needs the full
+    # vocab) is filled from the final model config by the trainers right before
+    # ``Trainer.__init__`` (``components.loss.set_global_vocab_size``), not
+    # here: the model vocab can still change after construction
+    # (``train_minimal`` widens it to the tokenizer's).
     if (
         self.model_spec is not None
         and self.parallelism.context_parallel_degree > 1

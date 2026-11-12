@@ -25,30 +25,8 @@ applies the transform to each logits tile in-kernel (see that module's doc).
 import hashlib
 import inspect
 
-# Workaround for https://github.com/openxla/tokamax/issues/240
-import jaxtyping
-
-# 1. Save the real decorator
-_real_jaxtyped = jaxtyping.jaxtyped
-
-
-# 2. Create a dummy pass-through
-def _dummy_jaxtyped(*args, **kwargs):
-  def decorator(f):
-    return f
-
-  if len(args) == 1 and callable(args[0]):
-    return args[0]
-  return decorator
-
-
-# 3. Swap the dummy in, import tokamax, and swap the real one back
-jaxtyping.jaxtyped = _dummy_jaxtyped
-import tokamax  # pylint: disable=g-import-not-at-top
-
-jaxtyping.jaxtyped = _real_jaxtyped
-
-import jax  # pylint: disable=g-import-not-at-top, g-bad-import-order
+import jax
+import tokamax
 import torch
 from torch_tpu._internal.pallas import pallas
 from torchtitan.tools.logging import logger

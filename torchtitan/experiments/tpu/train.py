@@ -7,6 +7,7 @@
 """Trainer compatible with TorchTpu."""
 
 import contextlib
+import dataclasses
 import json
 from typing import Any, cast
 
@@ -29,6 +30,7 @@ import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
+from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
 from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
 
@@ -61,6 +63,16 @@ class TPUTrainer(torchtitan.train.Trainer):
 
       if job_config.model_spec is not None:
         set_global_vocab_size(job_config.loss, job_config.model_spec.model)
+    # Under EP, split optimizer param groups by device mesh; the base trainer
+    # runs this hook before it builds the LR schedulers.
+    model_spec = getattr(job_config, "model_spec", None)
+    if model_spec is not None:
+      job_config.model_spec = dataclasses.replace(
+          model_spec,
+          post_optimizer_build_fn=with_split_optimizers_by_mesh(
+              model_spec.post_optimizer_build_fn
+          ),
+      )
     super().__init__(job_config)
 
     self._compiled_grad_norm: CompiledGradNorm | None = None

@@ -3,11 +3,9 @@ from dataclasses import dataclass, replace
 import torch
 import spmd_types as spmd
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import spmd_mesh_size
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
@@ -256,19 +254,10 @@ class TpuGroupedExperts(GroupedExperts):
         ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
         silu.
         """
-        if isinstance(self.w1_EFD, DTensor):
-            w1_EFD = self.w1_EFD.to_local()
-            w2_EDF = self.w2_EDF.to_local()
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
+        w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
 
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if (
-            get_spmd_backend() == "spmd_types"
-            and spmd.is_type_checking()
-            and spmd_mesh_size("ep") == 1
-        ):
+        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
@@ -305,17 +294,14 @@ class TpuGroupedExperts(GroupedExperts):
             if self.activation == "silu":
                 return super().forward(x_RD, num_tokens_per_expert_E)
             return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
-        def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.to_local() if isinstance(tensor, DTensor) else tensor
-
         if self.use_kernel_native_weight_layout:
-            w1_EKN = local_tensor(self.w1_EDF)
-            w2_EKN = local_tensor(self.w2_EFD)
-            w3_EKN = local_tensor(self.w3_EDF)
+            w1_EKN = self.w1_EDF
+            w2_EKN = self.w2_EFD
+            w3_EKN = self.w3_EDF
         else:
-            w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
-            w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
-            w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
+            w1_EKN = self.w1_EFD.transpose(-2, -1)
+            w2_EKN = self.w2_EDF.transpose(-2, -1)
+            w3_EKN = self.w3_EFD.transpose(-2, -1)
 
         if self._use_transposed_w2_rhs:
             w2_EKN = w2_EKN.transpose(-2, -1)

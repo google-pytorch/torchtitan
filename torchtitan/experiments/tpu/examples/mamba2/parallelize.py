@@ -5,8 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 """Parallelization strategies for Mamba-2 architecture on TPU."""
 
-# pylint: disable=g-import-not-at-top
-
 from torchtitan.config import CompileConfig
 from torchtitan.config import ParallelismConfig
 from torchtitan.config import TORCH_DTYPE_MAP
@@ -15,6 +13,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan.distributed.fsdp import resolve_fsdp_mesh
 from .model import Mamba2LM
 
 
@@ -51,23 +50,7 @@ def parallelize_mamba2(
   if skip_dp:
     return model
 
-  if parallelism.spmd_backend == "spmd_types":
-    # Upstream d771abb0 deleted the `full_dtensor` SPMD backend (#4217) and
-    # moved `resolve_fsdp_mesh` from `torchtitan.distributed.full_dtensor` into
-    # `torchtitan.distributed.fsdp`. `resolve_fsdp_mesh` now asserts
-    # `spmd_backend == "spmd_types"`, so the branch matches upstream
-    # `models/llama3/parallelize.py`.
-    from torchtitan.distributed.fsdp import resolve_fsdp_mesh
-
-    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-  else:
-    names = (
-        ["dp_replicate", "fsdp"]
-        if parallel_dims.dp_replicate_enabled
-        else ["fsdp"]
-    )
-    dp_mesh = parallel_dims.get_mesh(names)
-    dp_mesh_dims = None
+  dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
 
   apply_fsdp_to_decoder(
       model,

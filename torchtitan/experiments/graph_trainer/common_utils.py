@@ -20,7 +20,6 @@ from torch.utils._pytree import register_constant, register_pytree_node, tree_ma
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
@@ -503,15 +502,10 @@ def get_transformer_block_buckets(model) -> list[list[str] | str]:
 def get_simple_fsdp_mesh(parallel_dims: ParallelDims) -> DeviceMesh:
     """Return the flattened DP-shard/CP mesh used by SimpleFSDP.
 
-    Mirrors upstream ``get_simple_fsdp_mesh``: ``spmd_types`` keeps ``dp_shard``
-    and ``cp`` as separate axes, so flatten them (singleton axes included) into
-    an ``fsdp`` axis with the same name and extent as the one ``partial_dtensor``
-    builds into its dense mesh. ``DeviceMesh._flatten`` returns the existing
-    mesh when called again with the same dims and name. The ``partial_dtensor``
-    branch goes away with the next upstream sync.
+    ``dp_shard`` and ``cp`` are separate mesh axes; flatten them (singleton axes
+    included) into one ``fsdp`` axis. ``DeviceMesh._flatten`` returns the
+    existing mesh when called again with the same dims and name.
     """
-    if get_spmd_backend() != "spmd_types":
-        return parallel_dims.get_mesh("fsdp")
     fsdp_mesh = parallel_dims.get_optional_mesh(
         ["dp_shard", "cp"], include_singleton_axes=True
     )
@@ -533,7 +527,6 @@ def apply_simple_fsdp(
 
     A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis.
     """
-    use_spmd_types = get_spmd_backend() == "spmd_types"
     fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
 
     if parallel_dims.dp_replicate_enabled:
@@ -582,9 +575,7 @@ def apply_simple_fsdp(
                 dp_mode,
                 mp_policy=mp_policy,
                 shard_dim=experts_shard_dim,
-                non_dp_mesh=(
-                    parallel_dims.get_optional_mesh("ep") if use_spmd_types else None
-                ),
+                non_dp_mesh=parallel_dims.get_optional_mesh("ep"),
             )
 
     # A submodule carrying `_fsdp_shard_dim` is sharded on that axis instead of
@@ -605,7 +596,7 @@ def apply_simple_fsdp(
         dp_mesh,
         dp_mode,
         mp_policy=mp_policy,
-        non_dp_mesh=(parallel_dims.get_optional_mesh("tp") if use_spmd_types else None),
+        non_dp_mesh=parallel_dims.get_optional_mesh("tp"),
     )
     logger.info(
         "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode

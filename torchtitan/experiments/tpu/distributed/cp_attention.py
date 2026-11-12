@@ -1,10 +1,9 @@
 """Context parallelism (Ulysses and Load-Balanced KV All-Gather) for the TPU lane.
 
 As on GPU, a recipe turns CP on explicitly: it sets
-``parallelism.context_parallel_degree``, ``spmd_backend="spmd_types"`` and the
-load balancer, then applies core ``ContextParallelTransform`` with one of the
-TPU CP inner attentions below (see ``qwen3/config_registry.py``). Two
-strategies are provided:
+``parallelism.context_parallel_degree`` and the load balancer, then applies
+core ``ContextParallelTransform`` with one of the TPU CP inner attentions
+below (see ``qwen3/config_registry.py``). Two strategies are provided:
 
 1. ``all_gather`` (MaxText-style load-balanced KV All-Gather): Inputs
    are reordered into head-tail load-balanced order
@@ -45,7 +44,6 @@ from torchtitan.distributed.context_parallel.api import (
 )
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.distributed.headtail import headtail_chunk_order
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common.attention import (
@@ -114,7 +112,7 @@ def _cache_cp_rank_for_mesh(cp_mesh: DeviceMesh) -> None:
 
 
 def _type_checking() -> bool:
-  return get_spmd_backend() == "spmd_types" and spmd.is_type_checking()
+  return spmd.is_type_checking()
 
 
 def _tracing() -> bool:

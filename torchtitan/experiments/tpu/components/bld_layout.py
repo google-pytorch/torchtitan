@@ -45,7 +45,6 @@ import torch
 import torch.nn.functional as F
 import torch_remat as remat
 from torch import nn
-from torch.distributed.tensor import DTensor
 
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.components.unflatten_shim import UnflattenShim
@@ -63,14 +62,7 @@ from torchtitan.tools.logging import logger
 def _bld_seq_len(x: torch.Tensor) -> int | None:
   """The L of a [T, D] activation's [B, L] split, or None for the [T] path."""
   seq_len = get_unflatten_seq_len()
-  if (
-      x.ndim != 2
-      or seq_len is None
-      or x.shape[0] % seq_len != 0
-      # The partial_dtensor backend runs the fused-QKV split on local tensors
-      # (see `FusedQKVLinear.forward`); leave it on the upstream path.
-      or isinstance(x, DTensor)
-  ):
+  if x.ndim != 2 or seq_len is None or x.shape[0] % seq_len != 0:
     return None
   return seq_len
 

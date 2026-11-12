@@ -424,13 +424,12 @@ def _qwen3_cp(
 ) -> TPUTrainerConfig:
   """Enables TPU context parallelism, following pattern set by upstream torchtitan_recipes/muse_glimmer.py for CUDA.
 
-  Sets the CP degree, the SPMD backend and the load balancer, then applies
+  Sets the CP degree and the load balancer, then applies
   core ContextParallelTransform with the TPU CP inner attention for the
   model's attention backend.
   """
   assert config.model_spec is not None
   config.parallelism.context_parallel_degree = cp_degree
-  config.parallelism.spmd_backend = "spmd_types"
   config.parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(
       strategy
   )
@@ -487,13 +486,12 @@ def _qwen3_cp(
 ) -> TPUTrainerConfig:
   """Enables TPU context parallelism, following pattern set by upstream torchtitan_recipes/muse_glimmer.py for CUDA.
 
-  Sets the CP degree, the SPMD backend and the load balancer, then applies
+  Sets the CP degree and the load balancer, then applies
   core ContextParallelTransform with the TPU CP inner attention for the
   model's attention backend.
   """
   assert config.model_spec is not None
   config.parallelism.context_parallel_degree = cp_degree
-  config.parallelism.spmd_backend = "spmd_types"
   config.parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(
       strategy
   )

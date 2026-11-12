@@ -8,10 +8,10 @@ import torch.nn as nn
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import distributed
-from torchtitan.experiments.tpu import test_utils
-from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import distributed
+from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu.testing.base_distributed_device_test import InputDistribution
 import torchtitan.experiments.tpu.qwen3 as qwen3_tpu
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.experiments.tpu.qwen3.infra import parallelize as qwen3_dtensor_parallelize
@@ -37,7 +37,12 @@ def _get_qwen3_model_config(model_name: str = "testmodel") -> Qwen3Model.Config:
   Defaults to 'testmodel' (which specifies dim=128, head_dim=16, n_layers=3,
   vocab_size=2048, max_seq_len=128).
   """
-  return qwen3_tpu.qwen3_configs[model_name]
+  import copy
+  from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
+
+  config = copy.deepcopy(qwen3_tpu.qwen3_configs[model_name])
+  set_qwen3_sharding_config(config, enable_sp=False, enable_ep=False)
+  return config
 
 
 def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
@@ -45,16 +50,17 @@ def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
 ):
   """Verifies numerical equivalence of forward pass of Qwen3 model with DTensor TP."""
 
+  parallel_dims = ParallelDims(
+      dp_shard=1,
+      dp_replicate=1,
+      cp=1,
+      tp=world_size,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_tp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=1,
-        dp_replicate=1,
-        cp=1,
-        tp=world_size,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
@@ -74,6 +80,7 @@ def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
       model_class=Qwen3Model,
       model_args=_get_qwen3_model_config(),
       parallelism_func=apply_tp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -86,16 +93,17 @@ def _verify_dtensor_qwen3_tp_backward_worker(
 ):
   """Worker function to run forward and backward pass on model after apply_tp is called."""
 
+  parallel_dims = ParallelDims(
+      dp_shard=1,
+      dp_replicate=1,
+      cp=1,
+      tp=world_size,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_tp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=1,
-        dp_replicate=1,
-        cp=1,
-        tp=world_size,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
@@ -115,6 +123,7 @@ def _verify_dtensor_qwen3_tp_backward_worker(
       model_class=Qwen3Model,
       model_args=_get_qwen3_model_config(),
       parallelism_func=apply_tp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
@@ -134,16 +143,17 @@ def _verify_dtensor_qwen3_fsdp_training_loop_worker(
 ):
   """Worker function to call the FSDP numerical equivalence helper on Qwen3 model."""
 
+  parallel_dims = ParallelDims(
+      dp_shard=world_size,
+      dp_replicate=1,
+      cp=1,
+      tp=1,
+      pp=1,
+      ep=1,
+      world_size=world_size,
+  )
+
   def apply_fsdp_wrapper(model):
-    parallel_dims = ParallelDims(
-        dp_shard=world_size,
-        dp_replicate=1,
-        cp=1,
-        tp=1,
-        pp=1,
-        ep=1,
-        world_size=world_size,
-    )
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
@@ -163,6 +173,7 @@ def _verify_dtensor_qwen3_fsdp_training_loop_worker(
       model_class=Qwen3Model,
       model_args=_get_qwen3_model_config(),
       parallelism_func=apply_fsdp_wrapper,
+      parallel_dims=parallel_dims,
       input_distribution=InputDistribution.SPLIT_BATCH,
       use_meta_init=True,
   )

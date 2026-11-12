@@ -17,13 +17,13 @@ from torchtitan.config.override import apply_overrides
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import resolve_save_regions
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer import attention as tpu_attention
 from torchtitan.experiments.tpu.muse_glimmer import config_registry
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import parallelize_muse_glimmer
 from torchtitan.experiments.tpu.overrides import fused_loss
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import attention as common_attention
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.muse_glimmer import model as upstream_model

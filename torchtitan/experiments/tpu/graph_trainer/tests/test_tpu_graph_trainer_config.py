@@ -60,7 +60,7 @@ from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     graph_trainer_gemma4_debugmodel,
     graph_trainer_gemma4_moe_debug,
 )
-from torchtitan.experiments.tpu.layer_loop import (
+from torchtitan.experiments.tpu.components.layer_loop import (
     builds_layer_loop,
     runs_layer_loop,
 )
@@ -75,7 +75,7 @@ from torchtitan.experiments.tpu.llama3.config_registry import (
     llama3_debugmodel,
     sft_llama3_8b_metamath,
 )
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.overrides.bf16_rope import (
     TpuActivationDtypeCosSinRoPE,
 )
@@ -86,7 +86,7 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
-from torchtitan.experiments.tpu.qkv import TpuPackedQKVLinear
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     graph_trainer_qwen3_debugmodel,
@@ -113,7 +113,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
 )

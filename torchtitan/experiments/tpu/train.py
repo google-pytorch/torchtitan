@@ -15,8 +15,8 @@ import torch
 import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
-import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+from torchtitan.experiments.tpu.components.grad_norm import CompiledGradNorm
+import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
@@ -53,11 +53,19 @@ class TPUTrainer(torchtitan.train.Trainer):
   """
 
   def __init__(self, job_config: Configurable.Config):
+    if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
+      # Trainer.__init__ builds `loss_fn` from `job_config.loss` (and, under
+      # pipeline parallelism, binds it into the PP schedule), so fill
+      # `global_vocab_size` from the final model config first.
+      from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+      if job_config.model_spec is not None:
+        set_global_vocab_size(job_config.loss, job_config.model_spec.model)
     super().__init__(job_config)
 
     self._compiled_grad_norm: CompiledGradNorm | None = None
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
-      from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
+      from torchtitan.experiments.tpu.components.loss import build_cross_entropy_loss
       self.loss_fn = build_cross_entropy_loss(job_config)
 
       if not job_config.tpu_config.enable_amp:
@@ -84,7 +92,7 @@ class TPUTrainer(torchtitan.train.Trainer):
       input_dict: dict[str, Any] | list[dict[str, Any]],
       global_valid_tokens: torch.Tensor,
   ) -> torch.Tensor:
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
     from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
 
     config = self.config
@@ -214,7 +222,7 @@ def start_trainer(
   if rank == 0:
     init_logger()
 
-  from torchtitan.experiments.tpu import cloud_distributed_utils  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.distributed import cloud_distributed_utils  # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
 
   workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
@@ -338,7 +346,7 @@ def start_trainer(
               json.dumps(train_config.to_dict(), indent=2),
           )
         # TT-UNFLATTEN-SHIM:
-        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
         # Upstream d771abb0 renamed training.seq_len ->
         # training.max_context_length.
         with set_unflatten_seq_len(train_config.training.max_context_length):

@@ -5,7 +5,7 @@ from unittest import mock
 from absl.testing import absltest
 import torch
 from torch import nn
-from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
+from torchtitan.experiments.tpu.testing.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.compiled_optimizers import separate_graph
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer
 

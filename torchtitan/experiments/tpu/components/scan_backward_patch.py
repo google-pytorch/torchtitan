@@ -73,7 +73,7 @@ def apply_scan_reverse_backward_patch() -> bool:
             "Not patching scan's backward: torch's"
             " ScanAutogradImpl.call_backward no longer reverses with"
             " torch.flip. If the upstream fix has landed, delete"
-            " torchtitan/experiments/tpu/scan_backward_patch.py."
+            " torchtitan/experiments/tpu/components/scan_backward_patch.py."
         )
         return False
     _call_backward_reverse_indexed._torchtitan_patched = True
@@ -109,7 +109,7 @@ def _call_backward_reverse_indexed(self, *grad_fw_outputs):
     if not state.reversed_by_index:
         raise RuntimeError(
             "scan's backward no longer reverses the way"
-            " torchtitan/experiments/tpu/scan_backward_patch.py expects"
+            " torchtitan/experiments/tpu/components/scan_backward_patch.py expects"
             f" (torch {torch.__version__}), so it was not rewritten to reverse"
             " by index and may be reversing by copy instead, which roughly"
             " doubles peak memory. Refresh that file against the new"

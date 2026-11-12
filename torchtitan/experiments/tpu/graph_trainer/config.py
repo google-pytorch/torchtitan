@@ -361,7 +361,8 @@ def apply_tpu_graph_trainer_model_transforms(
   ):
     raise ValueError(
         f"generic offload policy {memory_policy!r} is unsupported with scan; "
-        "use the scan-specific 'full_and_scan_offload' policy"
+        "use 'full_and_scan_offload' or 'tpu_selective_and_offload', which "
+        "offload from inside the scan"
     )
   if compile_config.cpu_offload_budget_gb < 0:
     raise ValueError("CPU-offload budget must be nonnegative")

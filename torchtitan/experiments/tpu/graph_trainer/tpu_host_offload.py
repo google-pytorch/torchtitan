@@ -71,6 +71,9 @@ def _only_read_by(node: Node, scan: Node) -> bool:
     pending, seen = [node], set()
     while pending:
         for user in pending.pop().users:
+            # The graph output has no users but is a real reader.
+            if user.op == "output":
+                return False
             if user is scan or user in seen or not user.users:
                 continue
             seen.add(user)
@@ -202,10 +205,11 @@ def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     Raises if there is none: asking for the offload and silently not getting
     it gives a correct run at the wrong memory.
     """
-    found = 0
+    found = forward_scans = 0
     for node in gm.graph.find_nodes(op="call_function", target=_SCAN_HOP):
         if _is_backward_node(node):
             continue
+        forward_scans += 1
         outs = _outputs(_scan_body(gm, node))
         tagged = [i for i, out in enumerate(outs) if _is_layer_input(out)]
         if len(tagged) > 1:
@@ -213,11 +217,15 @@ def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         for index in tagged:
             _offload_one(gm, node, index)
             found += 1
+    if not forward_scans:
+        raise RuntimeError(
+            "scan offload found no forward scan; it needs "
+            "--compile.use-scan-layers."
+        )
     if not found:
         raise RuntimeError(
-            "scan offload found no saved layer input to offload. It needs "
-            "--compile.use-scan-layers, and a scan body tagged by "
-            "scan_remat_policy."
+            f"scan offload: {forward_scans} forward scans, none saves a tagged "
+            "layer_input (did scan's re-trace drop node meta?)"
         )
     return gm
 

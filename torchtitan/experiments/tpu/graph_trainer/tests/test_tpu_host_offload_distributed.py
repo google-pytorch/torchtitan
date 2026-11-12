@@ -22,6 +22,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.components.remat_regions import (
+    ATTENTION_INNER_ATTENTION,
     LAYER_INPUT,
     REMAT_REGION,
 )
@@ -101,11 +102,23 @@ def _check_offload_engaged(gm):
 
 
 def _check_attention_saved_and_offload_engaged(gm):
-  """As above, and the backward body no longer reruns the splash forward."""
+  """As above, and the splash forward runs once, its output saved by tag."""
   _check_offload_engaged(gm)
-  _, backward = _scans(gm)
-  fwd_ops = [str(n.target) for n in _body(gm, backward[0]).graph.nodes]
-  assert not any("splash_attn_fwd" in t for t in fwd_ops), (
+  forward, backward = _scans(gm)
+  # Without these, a model that lost splash would pass the backward check.
+  fwd_body = _body(gm, forward[0]).graph
+  assert any("splash_attn_fwd" in str(n.target) for n in fwd_body.nodes), (
+      "the forward body has no splash forward"
+  )
+  regions = [
+      (o.meta.get("custom") or {}).get(REMAT_REGION)
+      for o in next(iter(fwd_body.find_nodes(op="output"))).args[0]
+  ]
+  assert ATTENTION_INNER_ATTENTION in regions, (
+      f"no forward scan output is tagged {ATTENTION_INNER_ATTENTION}: {regions}"
+  )
+  bwd_ops = [str(n.target) for n in _body(gm, backward[0]).graph.nodes]
+  assert not any("splash_attn_fwd" in t for t in bwd_ops), (
       "the backward body recomputes the splash forward"
   )
 

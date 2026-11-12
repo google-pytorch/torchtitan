@@ -55,6 +55,7 @@ from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfi
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.models.qwen3_5 import model as qwen3_5_model
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 from transformers import (
     Qwen3_5ForCausalLM,
@@ -1368,6 +1369,174 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         0.01,
         msg="Negative control failed: unpacked positions did not leak",
     )
+
+  def test_model_computes_segment_ids_once(self):
+    """Tests that the model derives the document ids once for all layers.
+
+    ``Qwen35Model.forward`` computes ``segment_ids_from_positions(positions)``
+    for a 1-D token stream and passes the ids to every TPU layer, so the
+    GatedDeltaNet layers no longer derive their own. The logits and every
+    parameter gradient keep their bit patterns compared with the per-layer
+    path.
+    """
+    num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    self.addCleanup(torch.set_num_threads, num_threads)
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    vocab_size = 512
+    config.vocab_size = vocab_size
+    config.tok_embeddings.num_embeddings = vocab_size
+    config.lm_head.out_features = vocab_size
+    config.layers = config.layers[:4]  # 3 GatedDeltaNet + 1 attention layers.
+    torch.manual_seed(0)
+    model = config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
+    if config.enable_weight_tying:
+      model.tok_embeddings.weight = model.lm_head.weight
+
+    rows = ((30, 34, 16), (50, 30))
+    seq_len = 80
+    gen = torch.Generator().manual_seed(7)
+    tokens = torch.randint(0, vocab_size, (len(rows) * seq_len,), generator=gen)
+    positions = torch.cat([_packed_positions(lens) for lens in rows])
+
+    def forward_backward():
+      model.zero_grad()
+      with set_unflatten_seq_len(seq_len):
+        logits = model(tokens, positions=positions)
+      logits.float().square().sum().backward()
+      grads = [
+          param.grad.detach().clone()
+          for param in model.parameters()
+          if param.grad is not None
+      ]
+      return [logits.detach(), *grads]
+
+    with mock.patch.object(
+        qwen3_5_model,
+        "segment_ids_from_positions",
+        wraps=segment_ids_from_positions,
+    ) as in_model, mock.patch.object(
+        gated_delta,
+        "segment_ids_from_positions",
+        wraps=segment_ids_from_positions,
+    ) as in_gdn:
+      once = forward_backward()
+    in_model.assert_called_once()
+    in_gdn.assert_not_called()
+
+    with mock.patch.object(
+        tpu_model.TpuQwen35TransformerBlock, "accepts_segment_ids", False
+    ), mock.patch.object(
+        gated_delta,
+        "segment_ids_from_positions",
+        wraps=segment_ids_from_positions,
+    ) as in_gdn_per_layer:
+      per_layer = forward_backward()
+    # Negative control: without the model's ids, every GatedDeltaNet layer
+    # derives them from `positions` itself.
+    self.assertEqual(in_gdn_per_layer.call_count, 3)
+    self.assertEqual(len(once), len(per_layer))
+    for i, (actual, expected) in enumerate(zip(once, per_layer, strict=True)):
+      self.assertTrue(
+          torch.equal(
+              actual.contiguous().view(torch.uint8),
+              expected.contiguous().view(torch.uint8),
+          ),
+          msg=f"output {i} differs from the per-layer path",
+      )
+
+  def test_gated_delta_net_uses_given_segment_ids(self):
+    """Tests ``TpuInnerGatedDeltaNet`` with ``segment_ids`` from the model.
+
+    Given ``segment_ids``, the layer uses them instead of deriving them from
+    ``positions`` (same output), and it rejects ids that do not cover every
+    token.
+    """
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn = config.layers[0].delta_net.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    seq_len = 32
+    torch.manual_seed(0)
+    x = torch.randn(seq_len, config.dim)
+    positions = _packed_positions((10, 22))
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      from_positions = gdn(x, positions=positions)
+      with mock.patch.object(
+          gated_delta,
+          "segment_ids_from_positions",
+          wraps=segment_ids_from_positions,
+      ) as derive:
+        given = gdn(
+            x,
+            positions=positions,
+            segment_ids=segment_ids_from_positions(positions),
+        )
+      derive.assert_not_called()
+      self.assertTrue(torch.equal(given, from_positions))
+      with self.assertRaisesRegex(ValueError, "one segment id per token"):
+        gdn(
+            x,
+            positions=positions,
+            segment_ids=segment_ids_from_positions(positions)[:-1],
+        )
+
+  def test_gated_delta_net_drops_given_segment_ids_without_document_resets(
+      self,
+  ):
+    """Tests given ``segment_ids`` with ``document_resets.enabled=False``.
+
+    Like ``positions``, they are dropped, so the row runs as one stream.
+    """
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn_cfg = dataclasses.replace(
+        config.layers[0].delta_net,
+        document_resets=gated_delta.GatedDeltaDocumentResets.Config(
+            enabled=False
+        ),
+    )
+    gdn = gdn_cfg.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    seq_len = 32
+    torch.manual_seed(0)
+    x = torch.randn(seq_len, config.dim)
+    positions = _packed_positions((10, 22))
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      stream = gdn(x)
+      given = gdn(
+          x,
+          positions=positions,
+          segment_ids=segment_ids_from_positions(positions),
+      )
+    self.assertTrue(torch.equal(given, stream))
+
+  def test_gated_delta_net_given_segment_ids_go_through_document_ids(self):
+    """Tests given ``segment_ids`` with a kernel that merges documents.
+
+    ``TokamaxGatedDeltaKernel.document_ids`` keeps only the first
+    ``max_num_segments`` documents of a row apart (here on its XLA path on
+    CPU). Ids from the model must be merged in the convolution and the
+    recurrence like the ids the layer derives from ``positions``.
+    """
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128).model
+    gdn_cfg = copy.deepcopy(config.layers[0].delta_net)
+    gdn_cfg.inner_gated_delta_net.kernel = (
+        tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(max_num_segments=2)
+    )
+    gdn = gdn_cfg.build()
+    gdn.init_states(buffer_device=torch.device("cpu"))
+    seq_len = 32
+    torch.manual_seed(0)
+    x = torch.randn(seq_len, config.dim)
+    positions = _packed_positions((6, 5, 7, 6, 8))  # 5 documents, 2 kept apart.
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      from_positions = gdn(x, positions=positions)
+      given = gdn(
+          x,
+          positions=positions,
+          segment_ids=segment_ids_from_positions(positions),
+      )
+    self.assertTrue(torch.equal(given, from_positions))
 
   def test_attention_isolates_packed_documents(self):
     """Tests that TpuQwen35Attention isolates packed documents via positions."""

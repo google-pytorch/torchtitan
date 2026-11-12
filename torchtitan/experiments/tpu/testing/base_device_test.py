@@ -10,9 +10,9 @@ import torch
 from torch import nn
 from torch import optim
 import torchtitan.config
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import test_utils
-from torchtitan.experiments.tpu import numerical_validation
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu.testing import numerical_validation
 
 
 class BaseAcceleratorDeviceTest(parameterized.TestCase):
@@ -175,7 +175,7 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     optimizer_cpu = optim.Adam(model_cpu.parameters(), lr=0.01)
     optimizer_device = optim.Adam(model_device.parameters(), lr=0.01)
 
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     from torchtitan.models.common.decoder import Decoder
 
     is_decoder = isinstance(model_cpu, Decoder)

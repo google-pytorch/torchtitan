@@ -11,48 +11,26 @@ from typing import Optional
 # JAX imports
 import jax
 import jax.numpy as jnp
-# Workaround for https://github.com/openxla/tokamax/issues/240 (same as
-# linear_softmax_cross_entropy_loss.py): tokamax applies @jaxtyping.jaxtyped
-# at import time, and typeguard's AST instrumentation cannot parse jaxtyping
-# shape-string annotations ("*B T H d"). Swap in a pass-through decorator for
-# the duration of the tokamax import.
-import jaxtyping
 import numpy as np
-from torchtitan.experiments.tpu.headtail import (
+import torch
+# torch_tpu Pallas bridge
+from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.components.remat_regions import (
+    ATTENTION_INNER_ATTENTION,
+    annotate_region,
+)
+from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
     slice_cp_mask_info,
 )
 
-_real_jaxtyped = jaxtyping.jaxtyped
-
-
-def _dummy_jaxtyped(*args, **kwargs):
-  def decorator(f):
-    return f
-
-  if len(args) == 1 and callable(args[0]):
-    return args[0]
-  return decorator
-
-
-jaxtyping.jaxtyped = _dummy_jaxtyped
 try:
-  from tokamax._src.ops.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
-  from tokamax._src.ops.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
+  from tokamax._src.ops.splash_attention import splash_attention_kernel  # pylint: disable=g-import-not-at-top
+  from tokamax._src.ops.splash_attention import splash_attention_mask  # pylint: disable=g-import-not-at-top
 except ImportError:
-  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
-  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
-
-jaxtyping.jaxtyped = _real_jaxtyped
-
-import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
-# torch_tpu Pallas bridge
-from torch_tpu._internal import pallas
-from torchtitan.experiments.tpu.remat_regions import (  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
-    ATTENTION_INNER_ATTENTION,
-    annotate_region,
-)
+  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # pylint: disable=g-import-not-at-top
+  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # pylint: disable=g-import-not-at-top
 
 
 # Taken from tokamax._src.ops.splash_attention.base.DEFAULT_MASK_VALUE.

@@ -63,13 +63,15 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_body_remat_window,
 )
-from torchtitan.experiments.tpu.layer_loop import (
+from torchtitan.experiments.tpu.components.layer_loop import (
     model_subclass,
     tpu_model_class,
     runs_layer_loop,
     TpuLayerLoop,
 )
-from torchtitan.experiments.tpu.remat_regions import annotate_moe_expert_counts
+from torchtitan.experiments.tpu.components.remat_regions import (
+    annotate_moe_expert_counts,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.protocols.module import Module
@@ -629,9 +631,11 @@ class LayerStack:
             annotate_moe_expert_counts()
             # Logged because `compile.memory_policy` does not reach the
             # body's nodes; only `save_regions` does. See `scan_remat_policy`.
+            has_moe = any(isinstance(m, MoE) for m in model.layers.modules())
             logger.info(
                 "Decoder layers run as a scan: the body recomputes everything "
-                "but its MoE expert counts and save regions %s",
+                "but %ssave regions %s",
+                "its MoE expert counts and " if has_moe else "",
                 list(save_regions),
             )
         # The container holds the same layer modules, so `self.layers` keeps
@@ -827,7 +831,7 @@ def _apply_stacked_layers(
         # Here because every scanning model comes through here. Without the
         # patch the backward reverses by copy and OOMs some steps later, so
         # fail at build time instead.
-        from torchtitan.experiments.tpu.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
+        from torchtitan.experiments.tpu.components.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
             apply_scan_reverse_backward_patch,
         )
 

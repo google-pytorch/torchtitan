@@ -35,7 +35,10 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     _full_memory_policy_pass,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
-from torchtitan.experiments.tpu.remat_regions import LAYER_INPUT, REMAT_REGION
+from torchtitan.experiments.tpu.components.remat_regions import (
+    LAYER_INPUT,
+    REMAT_REGION,
+)
 from torchtitan.tools.logging import logger
 
 _SCAN_HOP = torch.ops.higher_order.scan

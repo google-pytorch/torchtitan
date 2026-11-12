@@ -20,12 +20,12 @@ import torchtitan.distributed
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu.cp_attention import reorder_sequence
+from torchtitan.experiments.tpu.distributed.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
-import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
@@ -206,6 +206,9 @@ class TrainerMinimal:
     )
     self.model_config = model_config
 
+    # TODO(jerryx99): Consider stop widening model_config.vocab_size to the
+    # tokenizer's here and fail fast instead/always give the debug configs a
+    # vocab that matches the tokenizer they run with (see #158 review)
     if (
         hasattr(self.model_config, "vocab_size")
         and self.model_config.vocab_size is not None
@@ -244,6 +247,11 @@ class TrainerMinimal:
         f"size: {model_param_count:,} total parameters"
     )
 
+    # Fill ``global_vocab_size`` from the final model config (the vocab may
+    # have been widened to the tokenizer's above).
+    from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+    set_global_vocab_size(job_config.loss, self.model_config)
     self.loss_fn = job_config.loss.build(compile_config=job_config.compile)
 
     # Apply TPU-specific patches/workarounds
@@ -294,7 +302,7 @@ class TrainerMinimal:
 
   def train(self):
     """Runs a simple training loop on the specified device."""
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
     from torchtitan.models.common.decoder import Decoder  # pylint: disable=g-import-not-at-top
     from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
 
@@ -537,7 +545,7 @@ def start_trainer(config: JobConfig):
           json.dumps(config.to_dict(), indent=2)
       )
     # TT-UNFLATTEN-SHIM:
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     # Upstream d771abb0 renamed training.seq_len ->
     # training.max_context_length.
     with set_unflatten_seq_len(config.training.max_context_length):

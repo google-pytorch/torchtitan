@@ -455,7 +455,7 @@ class ScaledDotProductInnerAttention(InnerAttention):
         if was_3d:
             seq_len = None
             try:
-                from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
+                from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
                 seq_len = get_unflatten_seq_len()
             except ImportError:
                 pass

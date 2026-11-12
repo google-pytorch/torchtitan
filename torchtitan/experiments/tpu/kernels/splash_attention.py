@@ -22,12 +22,12 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
-from torchtitan.experiments.tpu.headtail import (
+from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
     slice_cp_mask_info,
 )
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     annotate_region,
 )

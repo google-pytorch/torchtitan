@@ -9,7 +9,7 @@ from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
 )
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.models.common.attention import (
     FusedQKVLinear,
     QKVLinear,
@@ -425,8 +425,8 @@ _gemma4_factories = {
             n_heads=8,
             n_kv_heads=8,
             n_global_kv_heads=8,
-            head_dim=32,
-            global_head_dim=64,
+            head_dim=64,
+            global_head_dim=128,
             norm_eps=1e-6,
             max_seq_len=4096,
             sliding_window_size=128,
@@ -452,8 +452,8 @@ _gemma4_factories = {
             n_heads=8,
             n_kv_heads=8,
             n_global_kv_heads=8,
-            head_dim=32,
-            global_head_dim=64,
+            head_dim=64,
+            global_head_dim=128,
             norm_eps=1e-6,
             max_seq_len=4096,
             sliding_window_size=128,

@@ -14,7 +14,7 @@ from torchtitan.config.configs import (
 )
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.datasets import (
+from torchtitan.experiments.tpu.components.datasets import (
     TPUGrainDataLoader,
     c4_test_dataloader,
 )
@@ -26,13 +26,14 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
+from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )
@@ -76,7 +77,7 @@ def _enable_pallas_cross_entropy(
     cfg.override.imports.append(FUSED_LOSS_OVERRIDE)
 
 
-def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
+def _use_tpu_moe_kernels(cfg: TPUTrainerConfig, *, tile_m: int = 256) -> None:
   """Selects the Qwen3-30B-A3B TPU recipe's MoE kernels.
 
   Pallas paired grouped matmuls with kernel-native expert weights, and dScore
@@ -86,6 +87,7 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
 
   Args:
     cfg: The recipe to update in place.
+    tile_m: Forward and dWeight row tile size for the Pallas grouped matmuls.
   """
   assert cfg.model_spec is not None
   experts = list(cfg.model_spec.model.traverse(TpuGroupedExperts.Config))
@@ -100,11 +102,30 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig) -> None:
   for _, experts_config, _, _ in experts:
     experts_config.use_pallas_grouped_mm = True
     experts_config.use_pallas_paired_grouped_mm = True
-    experts_config.pallas_grouped_mm_tile_m = 256
-    experts_config.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    experts_config.pallas_grouped_mm_tile_m = tile_m
+    experts_config.pallas_grouped_mm_tgmm_tiling = (tile_m, 0, 0)
     experts_config.use_kernel_native_weight_layout = True
   for _, dispatcher, _, _ in dispatchers:
     dispatcher.fuse_route_score_backward = True
+
+
+def _no_gated_delta_document_resets(cfg: TPUTrainerConfig) -> None:
+  """Runs every GatedDeltaNet over whole rows, without packed-document resets.
+
+  Pretraining on packed text does not need the causal convolution and the
+  recurrence to restart at each document (upstream does not without
+  `cu_seqlens`), and the Tokamax kernels' restarts lay every document out
+  from a 64-token chunk boundary. Full attention still masks documents.
+
+  Args:
+    cfg: The recipe to update in place.
+  """
+  assert cfg.model_spec is not None
+  delta_nets = list(cfg.model_spec.model.traverse(TpuGatedDeltaNet.Config))
+  if not delta_nets:
+    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model_spec.model")
+  for _, delta_net, _, _ in delta_nets:
+    delta_net.reset_at_documents = False
 
 
 def _use_tokamax_gated_delta(
@@ -371,10 +392,10 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   `--training.dtype=bfloat16` to fit one tpu7x-2x2x1 host): FP32 master
   weights, gradients and AdamW state with bf16 compute, ZeRO-3 with selective
   rematerialization, GraphTrainer with 2 layers per forward and backward
-  executable, Tokamax's Mosaic KDA kernels for the 30 GatedDeltaNet layers,
-  Pallas paired grouped matmuls for the experts, Splash attention, and the
-  Pallas fused linear cross-entropy. 32K tokens per rank (16 sequences of
-  2048).
+  executable, Tokamax's Mosaic KDA kernels for the 30 GatedDeltaNet layers
+  (without packed-document resets), Pallas paired grouped matmuls for the
+  experts, Splash attention, and the Pallas fused linear cross-entropy. 32K
+  tokens per rank (16 sequences of 2048).
   """
   base_cfg = qwen35_moe_35b()
   base_cfg.dataloader = c4_test_dataloader()
@@ -398,6 +419,18 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
       enable_amp=False,
       enable_mfu_benchmark=False,
   )
+  _use_tokamax_gated_delta(base_cfg)
+  _no_gated_delta_document_resets(base_cfg)
+  # One hidden block (H=2048) keeps every x tile resident in the fused LCE
+  # backward; v=640 divides the 248320 vocabulary (388 blocks). Needs bf16
+  # activations: on TPU7x the backward fits the kernel's VMEM limit (90% of 64
+  # MiB) only single-buffered (~51.9 MiB; fp32 hidden states would need ~69.9
+  # MiB), which `linear_softmax_cross_entropy_loss` selects. On one TPU7x
+  # core at 64K tokens (measured with 8 x 8192 tokens/rank): 564 vs 633 ms
+  # forward + backward with (1024, 512, 2048).
+  _enable_pallas_cross_entropy(
+      base_cfg, b_block_size=1024, h_block_size=2048, v_block_size=640
+  )
   # Save each layer's MoE router top-k / sort permutation and the 10 full
   # attention layers' Splash output + LSE (~5.98 GiB logical at 64K tokens/rank)
   # so backward skips re-running router top-k/argsort and Splash forward.
@@ -407,7 +440,12 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
       memory_policy="tpu_selective",
       save_regions=("moe.routing", "attention.inner_attention"),
   )
-  _use_tokamax_gated_delta(cfg)
+  # 512-row expert tiles, measured at EP=1 with 64K tokens per rank (8 x 8192,
+  # ~2K routed rows per expert on average): the routed-expert MLP's forward +
+  # backward takes 22.9 vs 26.8 ms per layer on one TPU7x core with the
+  # Qwen3-30B tiles (256). The 32K-token default and the EP recipes inherit
+  # this tile.
+  _use_tpu_moe_kernels(cfg, tile_m=512)
   # Throughput DVFS operating point (p_state=7) and SparseCore collective
   # offload (async AG, dual-SC RS, latency-hiding scheduler), merged onto
   # qwen35_moe_35b's 65472 KiB scoped VMEM limit.

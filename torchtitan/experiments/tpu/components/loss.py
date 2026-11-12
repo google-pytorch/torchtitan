@@ -175,6 +175,34 @@ def _legacy_pallas_loss_config(
   )
 
 
+def set_global_vocab_size(loss_config, model_config) -> None:
+  """Fill ``loss_config.global_vocab_size`` from the model config if unset.
+
+  spmd_types loss-parallel CE sees only the local vocab shard, so it needs the
+  full vocab size. Call this once the model config is final (right before
+  ``Trainer.__init__`` builds the model and the loss, or after ``train_minimal``
+  widens the vocab to the tokenizer's), the same way upstream's HF backend sets
+  it at model build. An explicit value is kept; configs without the field (e.g.
+  MSE) are left alone; the chunked wrapper's inner ``loss_fn`` is handled.
+  """
+  inner = getattr(loss_config, "loss_fn", None)
+  if inner is not None:
+    set_global_vocab_size(inner, model_config)
+  if not hasattr(loss_config, "global_vocab_size"):
+    return
+  model_vocab_size = getattr(model_config, "vocab_size", None)
+  if model_vocab_size is None:
+    return
+  if loss_config.global_vocab_size is None:
+    loss_config.global_vocab_size = model_vocab_size
+  elif loss_config.global_vocab_size != model_vocab_size:
+    raise ValueError(
+        f"loss.global_vocab_size={loss_config.global_vocab_size} does not match"
+        f" the model's vocab_size={model_vocab_size}. Leave it unset to derive"
+        " it from the model config."
+    )
+
+
 def build_cross_entropy_loss(
     job_config: (
         torchtitan.trainer.Trainer.Config
@@ -188,8 +216,9 @@ def build_cross_entropy_loss(
   ``loss_kernel`` branch preserves older regular-TPU callers during migration;
   all other recipes retain ordinary cross entropy.
   """
-  if isinstance(job_config.loss, PallasCrossEntropyLoss.Config):
-    return job_config.loss.build(compile_config=job_config.compile)
+  loss_config = job_config.loss
+  if isinstance(loss_config, PallasCrossEntropyLoss.Config):
+    return loss_config.build(compile_config=job_config.compile)
 
   # TODO: Remove this backward-compatibility fallback once all TPU recipes
   # select PallasCrossEntropyLoss.Config directly.
@@ -199,4 +228,10 @@ def build_cross_entropy_loss(
     return _legacy_pallas_loss_config(job_config).build(
         compile_config=job_config.compile
     )
-  return components_loss.CrossEntropyLoss(components_loss.CrossEntropyLoss.Config())
+  # A fresh Config is built here, so carry over ``global_vocab_size`` (set from
+  # the model config in ``TPUTrainer.__init__``). Not every loss config has it.
+  return components_loss.CrossEntropyLoss(
+      components_loss.CrossEntropyLoss.Config(
+          global_vocab_size=getattr(loss_config, "global_vocab_size", None)
+      )
+  )

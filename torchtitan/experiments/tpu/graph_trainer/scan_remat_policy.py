@@ -24,7 +24,7 @@ from torch._functorch import partitioners
 from torch._higher_order_ops import partitioner as hop_partitioner
 from torch.utils.checkpoint import CheckpointPolicy
 
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FSDP_GATHER,
     LAYER_INPUT,
@@ -65,12 +65,16 @@ def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
     ``scan`` returns a clone of it that copies this meta, so the tag reaches
     the forward body in the outer graph.
 
-    Nodes that already have a tag keep it: ``scan`` partitions each body twice,
-    and the HOP partitioner pre-tags complex SymInt expressions.
+    ``fsdp.gather`` is always recompute, whatever tag it came with: saving it
+    keeps every layer's whole weight. Other nodes keep a tag they already
+    have, if it is a recompute tag or the one this would set: ``scan``
+    partitions each body twice, and the HOP partitioner pre-tags complex
+    SymInt expressions. Any other save tag raises.
 
-    Raises if the body has a collective or ``save_regions`` but no region
-    meta: then ``scan`` dropped it while re-tracing the body, and the counts
-    and saves would silently be recomputed.
+    Raises if a requested save region tags no forward node, e.g.
+    ``attention.inner_attention`` with SDPA instead of Splash. Raises too if
+    the body has a collective but no region meta: then ``scan`` dropped it
+    while re-tracing the body, and the counts would silently be recomputed.
     """
     if not any(_region(n) for n in graph.nodes if n.op == "call_function"):
         has_collective = any(
@@ -78,9 +82,9 @@ def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
             and n.target.namespace == "_c10d_functional"
             for n in graph.nodes
         )
-        if save_regions or has_collective:
+        if has_collective:
             raise RuntimeError(
-                "the scan body's joint graph has no remat_region meta; is "
+                "the scan body has a collective but no remat_region meta; is "
                 "scan_body_remat_window's re-trace patch still in effect?"
             )
     # The joint graph's inputs are (carry, xs), and the carry is one tensor.
@@ -89,17 +93,38 @@ def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
     custom = carry.meta.get("custom") or {}
     carry.meta["custom"] = {**custom, REMAT_REGION: LAYER_INPUT}
     backward_only = _depends_on_tangents(graph)
+    saved_regions: set[str] = set()
     for node in graph.nodes:
         if node.op != "call_function" or node in backward_only:
             continue
-        if node.meta.get("recompute") is not None:
-            continue
         region = _region(node)
-        save = region != FSDP_GATHER and (
-            region == MOE_EXPERT_COUNTS or region in save_regions
-        )
-        node.meta["recompute"] = (
+        if region == FSDP_GATHER:
+            node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+            continue
+        if region in save_regions:
+            saved_regions.add(region)
+        save = region == MOE_EXPERT_COUNTS or region in save_regions
+        policy = (
             CheckpointPolicy.MUST_SAVE if save else CheckpointPolicy.MUST_RECOMPUTE
+        )
+        existing = node.meta.get("recompute")
+        if existing is None:
+            node.meta["recompute"] = policy
+        elif existing != policy and existing in (
+            CheckpointPolicy.MUST_SAVE,
+            CheckpointPolicy.PREFER_SAVE,
+        ):
+            raise RuntimeError(
+                f"scan body node {node.name} (region {region!r}) came tagged "
+                f"{existing.name}; only save_regions decide what the scan "
+                "body saves"
+            )
+    missing = set(save_regions) - saved_regions
+    if missing:
+        raise ValueError(
+            f"Save region(s) {sorted(missing)} matched no forward nodes in the "
+            "scan body; the model or its tracing no longer exposes them (e.g. "
+            "SDPA instead of Splash for attention.inner_attention)."
         )
 
 

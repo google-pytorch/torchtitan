@@ -11,22 +11,32 @@ import torch.nn.functional as F
 from torchtitan.components.loss import (
     ChunkedLossWrapper,
     CrossEntropyLoss,
+    IGNORE_INDEX,
     cross_entropy_loss,
 )
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
+from torchtitan.experiments.tpu.testing.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
 from torchtitan.experiments.tpu.examples.gemma4 import (
     _build_flavor_config,
+    _build_gemma4_layers,
     gemma4_configs,
 )
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
+from torchtitan.experiments.tpu.examples.gemma4 import config_registry
 from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     gemma4_26b_a4b,
     gemma4_31b,
     gemma4_debugmodel,
+    gemma4_debugmodel_fused_ce,
     gemma4_moe_debug,
+    gemma4_moe_debug_fused_ce,
+    gemma4_moe_debug_pallas,
     gemma4_moe_testmodel,
+)
+from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
+    configure_gemma4_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import (
     Gemma4Attention,
@@ -37,14 +47,24 @@ from torchtitan.experiments.tpu.examples.gemma4.model import (
 from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
     Gemma4StateDictAdapter,
 )
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.overrides.fused_loss import (
+    FusedLossLinearWrapper,
+)
+from torchtitan.experiments.tpu.components.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
+    TpuTokenDispatcherConverter,
+)
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.models.common.attention import (
     QKVLinear,
     ScaledDotProductInnerAttention,
+    segment_ids_from_positions,
 )
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear, RouterGateLinear
@@ -111,15 +131,27 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
   def test_config_registry_valid(self):
     for fn in (
         gemma4_debugmodel,
+        gemma4_debugmodel_fused_ce,
         gemma4_moe_testmodel,
         gemma4_moe_debug,
+        gemma4_moe_debug_fused_ce,
+        gemma4_moe_debug_pallas,
+        config_registry.graph_trainer_gemma4_debugmodel,
+        config_registry.graph_trainer_gemma4_moe_debug,
         gemma4_31b,
         gemma4_26b_a4b,
+        config_registry.gemma4_31b_graph_trainer,
+        config_registry.gemma4_31b_graph_split,
+        config_registry.gemma4_31b_graph_split_offload,
+        config_registry.gemma4_26b_a4b_graph_trainer,
+        config_registry.gemma4_26b_a4b_graph_split,
+        config_registry.gemma4_26b_a4b_graph_split_offload,
     ):
       cfg = fn()
       self.assertEqual(cfg.model_spec.name, "gemma4")
       self.assertIn(cfg.model_spec.flavor, gemma4_configs)
       self.assertFalse(cfg.model_spec.model.enable_weight_tying)
+      self.assertEqual(cfg.optimizer.implementation, "fused")
 
   def test_build_flavor_config_weight_tying(self):
     tied = _build_flavor_config("testmodel")
@@ -454,7 +486,7 @@ class TestGemma4SoftCappedLoss(absltest.TestCase):
       workarounds.use_output_projection_patch(model)
 
 
-class TestGemma4SdpaSlidingWindow(absltest.TestCase):
+class TestGemma4SdpaSlidingWindow(parameterized.TestCase):
   """Sliding layers must apply the HF window on the plain SDPA backend."""
 
   _WINDOW = 4
@@ -533,15 +565,16 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
 
     x = torch.randn(2 * self._SEQ_LEN, self._DIM)
     positions = torch.arange(self._SEQ_LEN).repeat(2)
+    segment_ids = segment_ids_from_positions(positions)
     with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
-      actual = attn(x, attention_masks=None, positions=positions).view(
-          2, self._SEQ_LEN, self._DIM
-      )
+      actual = attn(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
       expected = self._attention_with_mask(attn, hf_mask)(
-          x, attention_masks=None, positions=positions
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
       ).view(2, self._SEQ_LEN, self._DIM)
       full_causal = self._attention_with_mask(attn, causal_mask)(
-          x, attention_masks=None, positions=positions
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
       ).view(2, self._SEQ_LEN, self._DIM)
 
     torch.testing.assert_close(actual, expected)
@@ -564,14 +597,103 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
       model = config.build()
     for layer in model.layers.values():
       inner = layer.attention.inner_attention
+      self.assertIsInstance(inner, SlidingWindowScaledDotProductAttention)
       if layer.attention.is_sliding:
-        self.assertIsInstance(inner, SlidingWindowScaledDotProductAttention)
         self.assertEqual(
             inner.sliding_window_size,
             layer.attention.sliding_window_size - 1,
         )
       else:
-        self.assertIs(type(inner), ScaledDotProductInnerAttention)
+        self.assertIsNone(inner.sliding_window_size)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="sliding", is_sliding=True, window=_WINDOW),
+      dict(testcase_name="global", is_sliding=False, window=None),
+  )
+  def test_packed_document_masking_on_sliding_and_global_layers(
+      self, is_sliding: bool, window: int | None
+  ):
+    """Packed positions (resetting to 0 at doc boundaries) mask cross-doc keys."""
+    head_dim = 8
+    cfg = Gemma4Attention.Config(
+        dim=self._DIM,
+        n_heads=4,
+        n_kv_heads=2,
+        head_dim=head_dim,
+        is_sliding=is_sliding,
+        sliding_window_size=window,
+        qk_norm=RMSNorm.Config(
+            normalized_shape=head_dim, eps=1e-6, param_init=_NORM_INIT
+        ),
+        v_norm=RMSNorm.Config(
+            normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
+        ),
+        qkv_linear=QKVLinear.Config(
+            head_dim=head_dim,
+            wq=Linear.Config(
+                in_features=self._DIM,
+                out_features=32,
+                param_init=_LINEAR_INIT,
+            ),
+            wkv=Linear.Config(
+                in_features=self._DIM,
+                out_features=16,
+                param_init=_LINEAR_INIT,
+            ),
+        ),
+        wo=Linear.Config(
+            in_features=32, out_features=self._DIM, param_init=_LINEAR_INIT
+        ),
+        inner_attention=ScaledDotProductInnerAttention.Config(),
+        rope=Gemma4RoPE.Config(
+            dim=head_dim, max_context_length=self._SEQ_LEN, theta=10000.0
+        ),
+    )
+    torch.manual_seed(0)
+    attn = cfg.build()
+    attn.init_states()
+
+    # Two packed documents of length 6 in a 12-token sequence (doc boundary
+    # at index 6 is inside the 4-token sliding window for tokens 6..8).
+    doc_split = 6
+    positions_1d = torch.cat(
+        [torch.arange(doc_split), torch.arange(self._SEQ_LEN - doc_split)]
+    )
+    positions = positions_1d.repeat(2)
+    segment_ids = segment_ids_from_positions(positions)
+    seg_1d = torch.tensor(
+        [1] * doc_split + [2] * (self._SEQ_LEN - doc_split)
+    )
+    same_doc = seg_1d[:, None] == seg_1d[None, :]
+    dist = (
+        torch.arange(self._SEQ_LEN)[:, None]
+        - torch.arange(self._SEQ_LEN)[None, :]
+    )
+    unpacked_mask = dist >= 0
+    if is_sliding and window is not None:
+      unpacked_mask = unpacked_mask & (dist < window)
+    packed_mask = unpacked_mask & same_doc
+
+    x = torch.randn(2 * self._SEQ_LEN, self._DIM)
+    with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
+      actual = attn(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
+      expected = self._attention_with_mask(attn, packed_mask)(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
+      unpacked = self._attention_with_mask(attn, unpacked_mask)(
+          x, attention_masks=None, positions=positions, segment_ids=segment_ids
+      ).view(2, self._SEQ_LEN, self._DIM)
+
+    torch.testing.assert_close(actual, expected)
+    # Document 1 (rows :doc_split) is identical; document 2 must differ when
+    # cross-document keys are masked out.
+    torch.testing.assert_close(
+        actual[:, :doc_split], unpacked[:, :doc_split]
+    )
+    doc2_diff = (actual[:, doc_split:] - unpacked[:, doc_split:]).abs().amax()
+    self.assertGreater(doc2_diff.item(), 1e-4)
 
 
 class TestGemma4HFReferenceParity(BaseDeviceTest):
@@ -845,6 +967,813 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
       )
       hf_logits = hf_model(input_ids=tokens).logits
     torch.testing.assert_close(tt_logits, hf_logits, atol=5e-2, rtol=1e-2)
+
+
+# Splash / tokamax attention patches vs. SDPA on Gemma 4 attention layers across
+# both debugmodel head dimensions (64 sliding / 128 global) and production
+# 26B-A4B head dimensions (256 sliding / 512 global):
+# - SWA_ROPE (layer 0): sliding-window (LocalMask), full RoPE
+# - GLOBAL_KEQV (layer 5): global causal (CausalMask), K=V, partial RoPE 0.25
+_SPLASH_TEST_CONFIGS = [
+    dict(
+        testcase_name=f"_{kernel}_{layer_name}_{shape_name}",
+        kernel=kernel,
+        layer_id=layer_id,
+        shape_name=shape_name,
+        seq_len=seq_len,
+        sliding_window_size=sliding_window_size,
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
+    )
+    for kernel in ("splash", "splash_batch_native", "tokamax")
+    for shape_name, seq_len, sliding_window_size, head_dim, global_head_dim in (
+        ("debug", 512, 128, 64, 128),
+        ("26b_a4b", 2048, 1024, 256, 512),
+    )
+    for layer_name, layer_id in (("SWA_ROPE", 0), ("GLOBAL_KEQV", 5))
+]
+
+
+class TestGemma4SplashAttentionParity(BaseDeviceTest):
+  """TPU-only checks that Splash and Tokamax patches match Gemma 4 SDPA on packed docs."""
+
+  def setUp(self):
+    super().setUp()
+    # torch_tpu defaults fp32 matmuls to a single bf16 pass ("medium"); run
+    # the non-attention matmuls (wq/wk/wv/wo) at full fp32 so the comparison
+    # isolates the attention kernel numerics.
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous_precision)
+
+  def _check_relative_l2(
+      self,
+      test: torch.Tensor,
+      reference: torch.Tensor,
+      max_rel_error: float,
+      check_name: str,
+  ) -> None:
+    """Checks ``||test - reference|| / ||reference|| <= max_rel_error``."""
+    test_f = test.detach().float().cpu()
+    ref_f = reference.detach().float().cpu()
+    rel_error = (
+        torch.linalg.vector_norm(test_f - ref_f)
+        / torch.linalg.vector_norm(ref_f).clamp_min(1e-12)
+    ).item()
+    self.assertLessEqual(
+        rel_error,
+        max_rel_error,
+        f"{check_name}: relative L2 error {rel_error:.3e} >"
+        f" {max_rel_error:.1e}",
+    )
+
+  @parameterized.parameters(gemma4_31b, gemma4_26b_a4b)
+  def test_production_recipes_enable_splash_attention(self, recipe):
+    cfg = recipe()
+    self.assertTrue(cfg.splash_attention_kernel.use_splash_attention_kernel)
+    self.assertFalse(
+        cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel
+    )
+
+  def test_production_recipes_saturation_token_budgets(self):
+    cfg_31b = gemma4_31b()
+    self.assertEqual(cfg_31b.training.max_context_length, 4096)
+    self.assertEqual(
+        cfg_31b.training.num_tokens_per_microbatch_per_dp_rank, 2 * 4096
+    )
+
+    cfg_26b = gemma4_26b_a4b()
+    self.assertEqual(cfg_26b.training.max_context_length, 4096)
+    self.assertEqual(
+        cfg_26b.training.num_tokens_per_microbatch_per_dp_rank, 6 * 4096
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="splash", kernel="splash"),
+      dict(testcase_name="tokamax", kernel="tokamax"),
+  )
+  def test_patch_replaces_every_layer(self, kernel: str):
+    """Both Splash and Tokamax patches replace/rebind every Gemma 4 layer.
+
+    Verifies that on a meta-device ``debugmodel`` (5 sliding-window layers +
+    1 global K=V layer), the patch takes effect on all 6 layers and preserves
+    per-layer ``sliding_window_size`` (127 on sliding layers, None on global).
+    """
+    with torch.device("meta"):
+      model = gemma4_configs["debugmodel"].build()
+    if kernel == "tokamax":
+      workarounds.use_tokamax_splash_attention_patch(
+          model, SplashAttentionKernelConfig()
+      )
+    else:
+      workarounds.use_splash_attention_patch(
+          model, SplashAttentionKernelConfig()
+      )
+    layers = list(model.layers.values())
+    self.assertLen(layers, 6)
+    for idx, layer in enumerate(layers):
+      inner = layer.attention.inner_attention
+      expected_window = 127 if idx < 5 else None
+      if kernel == "tokamax":
+        self.assertIn("forward", vars(inner))
+        self.assertEqual(inner.sliding_window_size, expected_window)
+      else:
+        self.assertNotIn("ScaledDotProduct", type(inner).__name__)
+        self.assertEqual(inner.inner.local_window_size, expected_window)
+
+  @parameterized.named_parameters(*_SPLASH_TEST_CONFIGS)
+  def test_gemma4_splash_attention_matches_sdpa(
+      self,
+      kernel: str,
+      layer_id: int,
+      shape_name: str,
+      seq_len: int,
+      sliding_window_size: int,
+      head_dim: int,
+      global_head_dim: int,
+  ):
+    """Tests Splash and tokamax attention patches against SDPA on packed docs.
+
+    Exercises ``use_splash_attention_patch`` (both document-aware block
+    skipping and batch-native masking) and
+    ``use_tokamax_splash_attention_patch`` on a ``Gemma4Attention`` layer across
+    both debugmodel shapes (head_dim 64/128, window 128, seq 512) and
+    production 26B-A4B shapes (sliding head_dim 256 with window 1024, global
+    K=V head_dim 512, seq 2048): layer 0 has ``sliding_window_size`` (patched
+    to ``sliding_window_size - 1`` on ``inner_attention``, exercising Splash
+    ``LocalMask``), and layer 5 is global ``K=V`` with partial RoPE 0.25
+    (exercising ``CausalMask``). The input has packed documents with resets
+    inside the window so both windowing and ``segment_ids`` masking are active.
+    """
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("Splash and tokamax attention kernels only run on TPU.")
+
+    batch, dim = 2, 256
+    layers = _build_gemma4_layers(
+        n_layers=6,
+        dim=dim,
+        hidden_dim=dim * 2,
+        n_heads=4,
+        n_kv_heads=2,
+        n_global_kv_heads=2,
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
+        norm_eps=1e-6,
+        max_seq_len=seq_len,
+        sliding_window_size=sliding_window_size,
+    )
+    attention_config = layers[layer_id].attention
+
+    torch.manual_seed(0)
+    attention_cpu = attention_config.build()
+    attention_cpu.init_states(buffer_device=torch.device("cpu"))
+    attention_cpu = attention_cpu.cpu()
+    # Move Q/K norm weights slightly off all-ones so per-channel scaling is
+    # non-trivial in both forward and backward.
+    gen = torch.Generator().manual_seed(1234)
+    with torch.no_grad():
+      for name, param in attention_cpu.named_parameters():
+        if "norm" in name:
+          param.copy_(
+              1.0 + 0.1 * torch.randn(param.shape, generator=gen).to(param)
+          )
+    attention_device = copy.deepcopy(attention_cpu).to(self.accelerator_device)
+
+    # On v5e-1 (16 MiB default scoped VMEM limit), fp32 splash_mha_dkv with
+    # head_dim=512 and 512x512 tiles uses 16.34 MiB (Splash) / 18.62 MiB
+    # (Tokamax); using 256x256 tiles halves fp32 VMEM (~8.5 MiB) and exercises
+    # a 2x2 tile grid at seq_len=512 (8x8 tile grid at seq_len=2048).
+    block_size = 512 if (head_dim, global_head_dim) == (64, 128) else 256
+    sa_config = SplashAttentionKernelConfig(
+        sa_use_document_aware_block_skipping=(kernel == "splash"),
+        sa_block_q=block_size,
+        sa_block_kv=block_size,
+        sa_block_kv_compute=block_size,
+        sa_block_q_dkv=block_size,
+        sa_block_kv_dkv=block_size,
+        sa_block_kv_dkv_compute=block_size,
+    )
+    if kernel == "tokamax":
+      workarounds.use_tokamax_splash_attention_patch(
+          attention_device, sa_config
+      )
+    elif kernel in ("splash", "splash_batch_native"):
+      workarounds.use_splash_attention_patch(attention_device, sa_config)
+    else:
+      self.fail(f"Unknown kernel: {kernel}")
+
+    # Row 0 packs 3 documents with boundaries inside the sliding window of
+    # subsequent queries; row 1 is a single document.
+    if seq_len == 512:
+      doc_lengths_row0 = (150, 200, seq_len - 350)
+    else:
+      doc_lengths_row0 = (600, 800, seq_len - 1400)
+    positions_row0 = torch.cat([torch.arange(n) for n in doc_lengths_row0])
+    positions_row1 = torch.arange(seq_len)
+    positions_cpu = torch.cat([positions_row0, positions_row1]).to(torch.long)
+    positions_device = positions_cpu.to(self.accelerator_device)
+    segment_ids_cpu = segment_ids_from_positions(positions_cpu)
+    segment_ids_device = segment_ids_cpu.to(self.accelerator_device)
+
+    x_cpu, x_device = self._create_input_tensor_cpu_device(
+        size=(batch * seq_len, dim), requires_grad=True
+    )
+
+    with set_unflatten_seq_len(seq_len):
+      y_cpu = attention_cpu(
+          x_cpu,
+          attention_masks=None,
+          positions=positions_cpu,
+          segment_ids=segment_ids_cpu,
+      )
+      y_device = attention_device(
+          x_device,
+          attention_masks=None,
+          positions=positions_device,
+          segment_ids=segment_ids_device,
+      )
+
+    # Splash/tokamax run QK^T and PV in bf16 on the TPU MXU, vs. fp32 SDPA on
+    # CPU. Because Gemma 4 applies unit-RMS qk_norm with scale=1.0, pre-softmax
+    # logits QK^T have std sqrt(head_dim) (8..11.3 at head_dim 64/128 vs.
+    # 16..22.6 at head_dim 256/512), increasing bf16 rounding at head_dim
+    # 256/512.
+    fwd_max_rel_error = (
+        1e-2 if (head_dim, global_head_dim) == (64, 128) else 1.2e-2
+    )
+    bwd_max_rel_error = (
+        2.5e-2 if (head_dim, global_head_dim) == (64, 128) else 4.0e-2
+    )
+
+    self._check_relative_l2(
+        y_device,
+        y_cpu,
+        max_rel_error=fwd_max_rel_error,
+        check_name=f"Gemma4Attention ({kernel} {shape_name}) forward",
+    )
+
+    grad_out_cpu, grad_out_device = self._create_input_tensor_cpu_device(
+        size=y_cpu.shape
+    )
+    y_cpu.backward(grad_out_cpu)
+    y_device.backward(grad_out_device)
+
+    self._check_relative_l2(
+        x_device.grad,
+        x_cpu.grad,
+        max_rel_error=bwd_max_rel_error,
+        check_name=f"Gemma4Attention ({kernel} {shape_name}) input grad",
+    )
+    for (name, p_cpu), (_, p_device) in zip(
+        attention_cpu.named_parameters(), attention_device.named_parameters()
+    ):
+      self._check_relative_l2(
+          p_device.grad,
+          p_cpu.grad,
+          max_rel_error=bwd_max_rel_error,
+          check_name=(
+              f"Gemma4Attention ({kernel} {shape_name}) param grad ({name})"
+          ),
+      )
+
+    # Failure control: if the kernel ignored the sliding window or the
+    # packed-document boundaries (plain full-sequence causal SDPA with the same
+    # RoPE positions), the output would shift by >10% relative L2, well above
+    # the tolerance checked above.
+    unmasked_cpu = copy.deepcopy(attention_cpu)
+    unmasked_cpu.inner_attention = ScaledDotProductInnerAttention.Config().build()
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      y_unmasked = unmasked_cpu(
+          x_cpu,
+          attention_masks=None,
+          positions=positions_cpu,
+          segment_ids=segment_ids_cpu,
+      )
+    unmasked_diff = (
+        torch.linalg.vector_norm(y_device.detach().float().cpu() - y_unmasked)
+        / torch.linalg.vector_norm(y_unmasked)
+    ).item()
+    self.assertGreater(
+        unmasked_diff,
+        0.1,
+        "Unmasked causal attention is too close to the windowed/packed output;"
+        " the tolerance check above would not catch a broken mask.",
+    )
+
+
+class TestGemma4FusedCrossEntropyConfig(parameterized.TestCase):
+  """Config-level checks for Gemma 4 soft-capped fused Pallas cross-entropy."""
+
+  @parameterized.parameters(
+      (gemma4_debugmodel_fused_ce, 256),
+      (gemma4_moe_debug_fused_ce, 256),
+      (gemma4_31b, 384),
+      (gemma4_26b_a4b, 256),
+  )
+  def test_recipe_wires_soft_capped_pallas_cross_entropy(
+      self, recipe, expected_h_block_size
+  ):
+    cfg = recipe()
+    self.assertIsInstance(cfg.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(cfg.loss.soft_cap, 30.0)
+    self.assertEqual(cfg.loss.output_multiplier, 1.0)
+    self.assertEqual(cfg.loss.h_block_size, expected_h_block_size)
+    model_config = cfg.model_spec.model
+    self.assertEqual(
+        model_config.dim % cfg.loss.h_block_size,
+        0,
+        f"h_block_size={cfg.loss.h_block_size} does not divide dim={model_config.dim}",
+    )
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.fused_loss."
+        "fused_loss_soft_capped_lm_head",
+        cfg.override.imports,
+    )
+
+  def test_override_replaces_lm_head_with_fused_loss_linear_wrapper(self):
+    from torchtitan.config import apply_overrides
+
+    cfg = gemma4_debugmodel_fused_ce()
+    apply_overrides(cfg.override, cfg)
+    lm_head_cfg = cfg.model_spec.model.lm_head
+    self.assertIsInstance(lm_head_cfg, FusedLossLinearWrapper.Config)
+    self.assertEqual(lm_head_cfg.soft_cap, 30.0)
+    self.assertEqual(lm_head_cfg.output_multiplier, 1.0)
+
+    with torch.device("meta"):
+      model = cfg.model_spec.model.build()
+    self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
+    self.assertTrue(model.lm_head.returns_loss_operands)
+    self.assertEqual(tuple(model.lm_head.weight.shape), (2048, 256))
+
+
+class TestGemma4FusedCrossEntropyParity(BaseDeviceTest):
+  """TPU parity of PallasCrossEntropyLoss(soft_cap=30.0) vs SoftCappedLinear + CrossEntropyLoss."""
+
+  def setUp(self):
+    super().setUp()
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous_precision)
+
+  def _check_relative_l2(
+      self,
+      test: torch.Tensor,
+      reference: torch.Tensor,
+      max_rel_error: float,
+      check_name: str,
+  ) -> None:
+    test_f = test.detach().float().cpu()
+    ref_f = reference.detach().float().cpu()
+    rel_error = (
+        torch.linalg.vector_norm(test_f - ref_f)
+        / torch.linalg.vector_norm(ref_f).clamp_min(1e-12)
+    ).item()
+    self.assertLessEqual(
+        rel_error,
+        max_rel_error,
+        f"{check_name}: relative L2 error {rel_error:.3e} >"
+        f" {max_rel_error:.1e}",
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="float32_dim256",
+          dtype=torch.float32,
+          dim=256,
+          h_block_size=256,
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          # Pallas Mosaic TPU kernel uses MXU 1-pass bf16-input dot products
+          # internally (measured ~2.9e-3 vs CPU IEEE FP32; negative control with
+          # soft_cap=None diverges by >5e-2).
+          grad_rel_l2=5e-3,
+      ),
+      dict(
+          testcase_name="bfloat16_dim256",
+          dtype=torch.bfloat16,
+          dim=256,
+          h_block_size=256,
+          loss_atol=1.5e-2,
+          loss_rtol=5e-3,
+          grad_rel_l2=1.5e-2,
+      ),
+      dict(
+          testcase_name="bfloat16_dim384",
+          dtype=torch.bfloat16,
+          dim=384,
+          h_block_size=384,
+          loss_atol=1.5e-2,
+          loss_rtol=5e-3,
+          grad_rel_l2=1.5e-2,
+      ),
+  )
+  def test_fused_cross_entropy_matches_eager_soft_capped_linear(
+      self,
+      dtype: torch.dtype,
+      dim: int,
+      h_block_size: int,
+      loss_atol: float,
+      loss_rtol: float,
+      grad_rel_l2: float,
+  ):
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("PallasCrossEntropyLoss Mosaic kernel only runs on TPU.")
+
+    torch.manual_seed(42)
+    num_tokens, vocab_size = 1024, 2048
+    soft_cap = 30.0
+
+    eager_head_cfg = SoftCappedLinear.Config(
+        in_features=dim,
+        out_features=vocab_size,
+        output_soft_cap_temp=soft_cap,
+        param_init={"weight": partial(nn.init.normal_, mean=0.0, std=1.5)},
+    )
+    fused_head_cfg = FusedLossLinearWrapper.Config(
+        in_features=dim,
+        out_features=vocab_size,
+        soft_cap=soft_cap,
+        output_multiplier=1.0,
+        param_init={"weight": partial(nn.init.normal_, mean=0.0, std=1.5)},
+    )
+
+    eager_head = eager_head_cfg.build().to(dtype=dtype)
+    eager_head.init_states()
+    fused_head = fused_head_cfg.build().to(
+        device=self.accelerator_device, dtype=dtype
+    )
+    fused_head.load_state_dict(eager_head.state_dict())
+
+    # Scale hidden states so pre-cap logits (z = x @ w.T) have std ~24 and
+    # exercise the non-linear saturation region of 30 * tanh(z / 30).
+    x_cpu = torch.randn(num_tokens, dim, dtype=dtype, requires_grad=True)
+    x_tpu = x_cpu.detach().to(self.accelerator_device).requires_grad_(True)
+    labels_cpu = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.long)
+    # Include IGNORE_INDEX (-100) positions to verify masked token handling.
+    labels_cpu[::16] = IGNORE_INDEX
+    labels_tpu = labels_cpu.to(self.accelerator_device)
+    valid_tokens_cpu = (labels_cpu != IGNORE_INDEX).sum()
+    valid_tokens_tpu = valid_tokens_cpu.to(self.accelerator_device)
+
+    eager_loss_fn = CrossEntropyLoss.Config().build()
+    fused_loss_fn = PallasCrossEntropyLoss.Config(
+        b_block_size=1024,
+        h_block_size=h_block_size,
+        v_block_size=2048,
+        soft_cap=soft_cap,
+        output_multiplier=1.0,
+    ).build()
+
+    logits_cpu = eager_head(x_cpu)
+    loss_cpu, _ = eager_loss_fn(logits_cpu, labels_cpu, valid_tokens_cpu)
+    loss_cpu.backward()
+
+    operands_tpu = fused_head(x_tpu)
+    loss_tpu, _ = fused_loss_fn(operands_tpu, labels_tpu, valid_tokens_tpu)
+    loss_tpu.backward()
+
+    test_utils.check_equivalence(
+        loss_tpu.detach().float().cpu(),
+        loss_cpu.detach().float().cpu(),
+        atol=loss_atol,
+        rtol=loss_rtol,
+        check_name=f"Fused CE loss ({dtype} dim={dim} h_block={h_block_size})",
+    )
+    self._check_relative_l2(
+        x_tpu.grad,
+        x_cpu.grad,
+        max_rel_error=grad_rel_l2,
+        check_name=f"Fused CE hidden grad ({dtype} dim={dim} h_block={h_block_size})",
+    )
+    self._check_relative_l2(
+        fused_head.weight.grad,
+        eager_head.weight.grad,
+        max_rel_error=grad_rel_l2,
+        check_name=f"Fused CE lm_head.weight grad ({dtype} dim={dim} h_block={h_block_size})",
+    )
+
+    # Negative control: running PallasCrossEntropyLoss without soft_cap (None)
+    # on the same inputs must diverge well beyond the test tolerances.
+    uncapped_loss_fn = PallasCrossEntropyLoss.Config(
+        b_block_size=1024,
+        h_block_size=h_block_size,
+        v_block_size=2048,
+        soft_cap=None,
+        output_multiplier=1.0,
+    ).build()
+    x_uncapped = x_cpu.detach().to(self.accelerator_device).requires_grad_(True)
+    fused_head.zero_grad()
+    loss_uncapped, _ = uncapped_loss_fn(
+        fused_head(x_uncapped), labels_tpu, valid_tokens_tpu
+    )
+    loss_uncapped.backward()
+    loss_diff = (loss_uncapped.detach().float().cpu() - loss_cpu.detach().float()).abs().item()
+    self.assertGreater(
+        loss_diff,
+        0.5,
+        f"Uncapped loss differed by only {loss_diff:.3e}; soft-cap check is not sensitive.",
+    )
+    grad_uncapped_rel = (
+        torch.linalg.vector_norm(x_uncapped.grad.detach().float().cpu() - x_cpu.grad.detach().float())
+        / torch.linalg.vector_norm(x_cpu.grad.detach().float())
+    ).item()
+    self.assertGreater(
+        grad_uncapped_rel,
+        0.1,
+        f"Uncapped grad relative L2 was only {grad_uncapped_rel:.3e}; soft-cap check is not sensitive.",
+    )
+
+
+class TestGemma4MoEPallasKernels(BaseDeviceTest):
+  """Tests MoE Pallas kernels, kernel-native weights, and route-score fusion for Gemma 4."""
+
+  def setUp(self):
+    super().setUp()
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous_precision)
+
+  def _check_relative_l2(
+      self,
+      test: torch.Tensor,
+      reference: torch.Tensor,
+      max_rel_error: float,
+      check_name: str,
+  ) -> None:
+    test_f = test.detach().float().cpu()
+    ref_f = reference.detach().float().cpu()
+    rel_error = (
+        torch.linalg.vector_norm(test_f - ref_f)
+        / torch.linalg.vector_norm(ref_f).clamp_min(1e-12)
+    ).item()
+    self.assertLessEqual(
+        rel_error,
+        max_rel_error,
+        f"{check_name}: relative L2 error {rel_error:.3e} >"
+        f" {max_rel_error:.1e}",
+    )
+
+  @parameterized.parameters(gemma4_moe_debug_pallas, gemma4_26b_a4b)
+  def test_moe_pallas_config_enables_all_five_levers(self, recipe):
+    cfg = recipe()
+    model_cfg = cfg.model_spec.model
+    dispatchers = list(
+        model_cfg.traverse(TpuAllToAllTokenDispatcher.Config)
+    )
+    self.assertNotEmpty(dispatchers)
+    for _, dispatcher, _, _ in dispatchers:
+      self.assertTrue(dispatcher.fuse_route_score_backward)
+
+    experts_list = list(model_cfg.traverse(TpuGroupedExperts.Config))
+    self.assertNotEmpty(experts_list)
+    for _, experts, _, _ in experts_list:
+      self.assertEqual(experts.activation, "gelu_tanh")
+      self.assertTrue(experts.use_pallas_grouped_mm)
+      self.assertTrue(experts.use_pallas_paired_grouped_mm)
+      self.assertEqual(experts.pallas_grouped_mm_tile_m, 256)
+      self.assertEqual(experts.pallas_grouped_mm_tile_k, 0)
+      self.assertEqual(experts.pallas_grouped_mm_tile_n, 0)
+      if model_cfg.dim > 256:
+        self.assertEqual(experts.pallas_grouped_mm_tgmm_tiling, (256, 1408, 0))
+        self.assertEqual(experts.pallas_grouped_mm_w2_tgmm_tiling, (256, 0, 0))
+      else:
+        self.assertEqual(experts.pallas_grouped_mm_tgmm_tiling, (256, 0, 0))
+        self.assertEqual(experts.pallas_grouped_mm_w2_tgmm_tiling, (256, 0, 0))
+      self.assertTrue(experts.use_kernel_native_weight_layout)
+
+  def test_kernel_native_weight_layout_state_dict_adapter_round_trip(self):
+    """Kernel-native expert storage (w1_EDF, w2_EFD, w3_EDF) round-trips through HF state_dict."""
+    torch.manual_seed(0)
+    cfg = _build_flavor_config(
+        "testmodel_moe",
+        converters=[
+            TpuTokenDispatcherConverter.Config(),
+            TpuGroupedExpertsConverter.Config(),
+        ],
+        enable_weight_tying=False,
+    )
+    for _, experts, _, _ in cfg.traverse(TpuGroupedExperts.Config):
+      experts.use_pallas_grouped_mm = True
+      experts.use_pallas_paired_grouped_mm = True
+      experts.pallas_grouped_mm_tile_m = 256
+      experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+      experts.use_kernel_native_weight_layout = True
+
+    model = cfg.build()
+    model.init_states()
+
+    inner = model.layers["0"].moe.routed_experts.inner_experts
+    # Native in-memory parameters are transposed: (E=8, D=128, F=128).
+    self.assertTrue(hasattr(inner, "w1_EDF"))
+    self.assertTrue(hasattr(inner, "w2_EFD"))
+    self.assertTrue(hasattr(inner, "w3_EDF"))
+    self.assertFalse(hasattr(inner, "w1_EFD"))
+
+    # Fill w1_EDF with an asymmetric tensor so a missing transpose is caught even when D == F.
+    for layer in model.layers.values():
+      exp = layer.moe.routed_experts.inner_experts
+      with torch.no_grad():
+        exp.w1_EDF.copy_(torch.randn_like(exp.w1_EDF))
+        exp.w2_EFD.copy_(torch.randn_like(exp.w2_EFD))
+        exp.w3_EDF.copy_(torch.randn_like(exp.w3_EDF))
+
+    expected_w1_edf = inner.w1_EDF.detach().clone()
+    expected_w2_efd = inner.w2_EFD.detach().clone()
+    expected_w3_edf = inner.w3_EDF.detach().clone()
+
+    # state_dict() post-hook must expose canonical keys (w1_EFD, w2_EDF, w3_EFD)
+    # with transposed values.
+    tt_sd = model.state_dict()
+    self.assertIn(
+        "layers.0.moe.routed_experts.inner_experts.w1_EFD", tt_sd
+    )
+    self.assertNotIn(
+        "layers.0.moe.routed_experts.inner_experts.w1_EDF", tt_sd
+    )
+    torch.testing.assert_close(
+        tt_sd["layers.0.moe.routed_experts.inner_experts.w1_EFD"],
+        expected_w1_edf.transpose(-2, -1),
+    )
+
+    adapter = Gemma4StateDictAdapter(cfg, hf_assets_path=None)
+    hf_sd = adapter.to_hf(tt_sd)
+    self.assertIn(
+        "model.language_model.layers.0.experts.gate_up_proj", hf_sd
+    )
+    self.assertIn("model.language_model.layers.0.experts.down_proj", hf_sd)
+
+    # Zero out model weights and reload from converted HF state dict.
+    with torch.no_grad():
+      for p in model.parameters():
+        p.zero_()
+    reloaded_tt_sd = adapter.from_hf(hf_sd)
+    missing, unexpected = model.load_state_dict(reloaded_tt_sd, strict=True)
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    torch.testing.assert_close(inner.w1_EDF, expected_w1_edf)
+    torch.testing.assert_close(inner.w2_EFD, expected_w2_efd)
+    torch.testing.assert_close(inner.w3_EDF, expected_w3_edf)
+
+  def test_configure_simple_fsdp_shard_dims_with_kernel_native_weights(self):
+    """configure_gemma4_simple_fsdp_shard_dims shards uneven experts on dim 1 under native layout."""
+    from types import SimpleNamespace
+
+    cfg = gemma4_moe_debug_pallas().model_spec.model
+    # Set E=8 (not divisible by dp_shard=6), D=192 and F=96 (both divisible by 6).
+    cfg.vocab_size = 192
+    cfg.dim = 192
+    cfg.tok_embeddings.num_embeddings = 192
+    cfg.tok_embeddings.embedding_dim = 192
+    cfg.lm_head.in_features = 192
+    cfg.lm_head.out_features = 192
+    for layer in cfg.layers:
+      experts = layer.moe.routed_experts.inner_experts
+      experts.num_experts = 8
+      experts.dim = 192
+      experts.hidden_dim = 96
+
+    with torch.device("meta"):
+      model = cfg.build()
+    pdims = SimpleNamespace(dp_shard=6, ep_enabled=False)
+    configure_gemma4_simple_fsdp_shard_dims(model, pdims)
+    for layer in model.layers.values():
+      inner = layer.moe.routed_experts.inner_experts
+      self.assertEqual(getattr(inner, "_fsdp_shard_dim", None), 1)
+
+  @parameterized.named_parameters(
+      ("untiled_tgmm", (256, 0, 0), (256, 0, 0)),
+      ("k_tiled_tgmm", (256, 128, 0), (256, 0, 0)),
+  )
+  def test_gemma4_moe_pallas_kernels_match_native_reference(
+      self, tgmm_tiling, w2_tgmm_tiling
+  ):
+    """Full Gemma4MoE with Pallas grouped MM, paired W1/W3, native weights, and fused route-score bwd."""
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("MoE Pallas grouped matmul kernels only run on TPU.")
+
+    use_cpu_safe_histc_patch()
+    torch.manual_seed(123)
+
+    ref_cfg = copy.deepcopy(gemma4_moe_debug().model_spec.model.layers[0].moe)
+    cand_cfg = copy.deepcopy(
+        gemma4_moe_debug_pallas().model_spec.model.layers[0].moe
+    )
+    cand_cfg.routed_experts.inner_experts.pallas_grouped_mm_tgmm_tiling = (
+        tgmm_tiling
+    )
+    cand_cfg.routed_experts.inner_experts.pallas_grouped_mm_w2_tgmm_tiling = (
+        w2_tgmm_tiling
+    )
+
+    ref_moe = ref_cfg.build().to(self.accelerator_device)
+    ref_moe.init_states()
+    # Perturb unit-initialized router and norm scales so scaling bugs are caught.
+    with torch.no_grad():
+      ref_moe.pre_feedforward_layernorm_2.weight.copy_(
+          1.0 + 0.1 * torch.randn_like(ref_moe.pre_feedforward_layernorm_2.weight)
+      )
+      ref_moe.router.scale.copy_(
+          1.0 + 0.1 * torch.randn_like(ref_moe.router.scale)
+      )
+      ref_moe.router.per_expert_scale.copy_(
+          1.0 + 0.1 * torch.randn_like(ref_moe.router.per_expert_scale)
+      )
+
+    cand_moe = cand_cfg.build().to(self.accelerator_device)
+    cand_moe.init_states()
+    missing, unexpected = cand_moe.load_state_dict(
+        ref_moe.state_dict(), strict=True
+    )
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    # 512 tokens * top_k=2 = 1024 routed tokens (4 tiles of tile_m=256).
+    num_tokens, dim = 512, 256
+    x_ref = torch.randn(
+        num_tokens, dim, device=self.accelerator_device, requires_grad=True
+    )
+    x_cand = x_ref.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(num_tokens, dim, device=self.accelerator_device)
+
+    y_ref = ref_moe(x_ref)
+    y_cand = cand_moe(x_cand)
+
+    self._check_relative_l2(
+        y_cand,
+        y_ref,
+        max_rel_error=1e-2,
+        check_name="Gemma4MoE Pallas forward",
+    )
+
+    y_ref.backward(grad_out)
+    y_cand.backward(grad_out)
+
+    self._check_relative_l2(
+        x_cand.grad,
+        x_ref.grad,
+        max_rel_error=2e-2,
+        check_name="Gemma4MoE Pallas input grad",
+    )
+
+    ref_grads = {
+        name: p.grad.detach()
+        for name, p in ref_moe.named_parameters()
+        if p.grad is not None
+    }
+    cand_grads_raw = {
+        name: p.grad.detach()
+        for name, p in cand_moe.named_parameters()
+        if p.grad is not None
+    }
+    # Map kernel-native parameter gradient names/shapes back to canonical layout.
+    native_to_canonical = {
+        "routed_experts.inner_experts.w1_EDF": (
+            "routed_experts.inner_experts.w1_EFD"
+        ),
+        "routed_experts.inner_experts.w2_EFD": (
+            "routed_experts.inner_experts.w2_EDF"
+        ),
+        "routed_experts.inner_experts.w3_EDF": (
+            "routed_experts.inner_experts.w3_EFD"
+        ),
+    }
+    cand_grads = {}
+    for name, g in cand_grads_raw.items():
+      if name in native_to_canonical:
+        cand_grads[native_to_canonical[name]] = g.transpose(-2, -1).contiguous()
+      else:
+        cand_grads[name] = g
+
+    self.assertEqual(set(cand_grads.keys()), set(ref_grads.keys()))
+    for name in sorted(ref_grads.keys()):
+      self._check_relative_l2(
+          cand_grads[name],
+          ref_grads[name],
+          max_rel_error=2.5e-2,
+          check_name=f"Gemma4MoE Pallas param grad ({name})",
+      )
+
+    # Negative control: if the Pallas path ran silu instead of gelu_tanh on the
+    # same weights and inputs, the output would shift by >10% relative L2.
+    silu_cfg = copy.deepcopy(cand_cfg)
+    silu_cfg.routed_experts.inner_experts.activation = "silu"
+    silu_moe = silu_cfg.build().to(self.accelerator_device)
+    silu_moe.init_states()
+    silu_moe.load_state_dict(ref_moe.state_dict(), strict=True)
+    with torch.no_grad():
+      y_silu = silu_moe(x_ref.detach())
+    silu_rel_diff = (
+        torch.linalg.vector_norm((y_silu - y_ref).float())
+        / torch.linalg.vector_norm(y_ref.float())
+    ).item()
+    self.assertGreater(
+        silu_rel_diff,
+        0.1,
+        f"SiLU MoE output differed by only {silu_rel_diff:.3e} from GeLU-tanh;"
+        " the 1e-2 check above would not catch a wrong activation.",
+    )
 
 
 if __name__ == "__main__":

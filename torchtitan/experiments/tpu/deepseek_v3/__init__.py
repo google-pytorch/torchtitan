@@ -4,13 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+
 import torchtitan.models.common as common_models
 import torchtitan.models.deepseek_v3 as deepseek_v3_models
-from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
+from torchtitan.experiments.tpu.deepseek_v3.infra.parallelize import parallelize_deepseekv3
+from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
     "parallelize_deepseekv3",
     "deepseekv3_configs",
+    "model_registry",
 ]
 
 
@@ -151,6 +155,38 @@ def _upstream_flavor(flavor: str, attn_backend: str):
       moe_comm_backend="standard",
       seq_len=max_context_length,
   )
+
+
+def model_registry(
+    flavor: str,
+    *,
+    seq_len: int | None = None,
+    attn_backend: str = "sdpa",
+    converters: list | None = None,
+) -> ModelSpec:
+  """Upstream's DeepSeek-V3 spec, built for TPU.
+
+  Differs from ``torchtitan.models.deepseek_v3.model_registry`` in two ways:
+  attention defaults to ``"sdpa"``, whose ``ScaledDotProductInnerAttention``
+  the Splash / Tokamax patch replaces (TPU has no flex attention lowering),
+  and the parallelizer is the TPU one, which adds the SimpleFSDP path.
+
+  Args:
+    flavor: An upstream flavor (``debugmodel``, ``16B``, ``236B``, ``671B``).
+    seq_len: Context length; defaults to the flavor's maximum.
+    attn_backend: Upstream attention backend name.
+    converters: Model config converters (e.g. the TPU MoE converters).
+
+  Returns:
+    The model spec.
+  """
+  spec = deepseek_v3_models.model_registry(
+      flavor,
+      seq_len=seq_len,
+      attn_backend=attn_backend,
+      converters=converters,
+  )
+  return dataclasses.replace(spec, parallelize_fn=parallelize_deepseekv3)
 
 
 deepseekv3_configs = {

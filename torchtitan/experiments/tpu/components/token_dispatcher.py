@@ -130,10 +130,19 @@ class _StableGroupedReduce(torch.autograd.Function):
   """
 
   @staticmethod
-  def forward(ctx, src_ND, index_N, top_k):
+  def forward(ctx, src_ND, index_N, top_k, slot_major=False):
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(index_N)
     permutation_N = torch.argsort(index_N, stable=True)
+    if slot_major:
+      # Gather in (slot, token) order so the reshape splits the leading row
+      # dim at T, which stays tile-aligned for any top_k (see
+      # stable_grouped_reduce).
+      permutation_N = permutation_N.reshape(-1, top_k).t().reshape(-1)
+      grouped_KTD = torch.index_select(src_ND, 0, permutation_N).reshape(
+          top_k, -1, src_ND.shape[1]
+      )
+      return grouped_KTD.float().sum(dim=0).to(src_ND.dtype)
     grouped_TKD = torch.index_select(src_ND, 0, permutation_N).reshape(
         -1, top_k, src_ND.shape[1]
     )
@@ -145,16 +154,25 @@ class _StableGroupedReduce(torch.autograd.Function):
     grad_src_ND = None
     if grad_output_TD is not None:
       grad_src_ND = torch.index_select(grad_output_TD, 0, index_N)
-    return grad_src_ND, None, None
+    return grad_src_ND, None, None, None
 
 
 def stable_grouped_reduce(
     src_ND: torch.Tensor,
     index_N: torch.Tensor,
     top_k: int,
+    slot_major: bool = False,
 ) -> torch.Tensor:
-  """Reduce fixed-K routes by token with FP32 accumulation."""
-  return _StableGroupedReduce.apply(src_ND, index_N, top_k)
+  """Reduce fixed-K routes by token with FP32 accumulation.
+
+  ``slot_major`` gathers rows as ``[K, T, D]`` and sums dim 0 instead of
+  ``[T, K, D]`` over dim 1. Each token sums the same K values, though XLA may
+  associate the FP32 sum differently (not bitwise identical on TPU). With ``[T, K, D]``, K lands on the second-minor dim, so a K that is
+  not a multiple of the tile height (8 rows f32, 16 bf16) makes XLA
+  materialize a relaid FP32 copy before the sum (DeepSeek's K=6: 3.7 ms per
+  236B layer). With ``[K, T, D]`` the split is at T and the reshape is free.
+  """
+  return _StableGroupedReduce.apply(src_ND, index_N, top_k, slot_major)
 
 
 class _LocalReorder(torch.autograd.Function):
@@ -184,7 +202,7 @@ class _LocalReorder(torch.autograd.Function):
   """
 
   @staticmethod
-  def forward(ctx, x_TD, scores_TK, permutation_N, top_k):
+  def forward(ctx, x_TD, scores_TK, permutation_N, top_k, slot_major=False):
     ctx.set_materialize_grads(False)
     inverse_N = torch.argsort(permutation_N)
     token_indices_N = permutation_N // top_k
@@ -192,6 +210,7 @@ class _LocalReorder(torch.autograd.Function):
     ctx.input_shape = x_TD.shape
     ctx.score_shape = scores_TK.shape
     ctx.top_k = top_k
+    ctx.slot_major = slot_major
     ctx.mark_non_differentiable(token_indices_N)
     return (
         torch.index_select(x_TD, 0, token_indices_N),
@@ -204,19 +223,32 @@ class _LocalReorder(torch.autograd.Function):
     (inverse_N,) = ctx.saved_tensors
     grad_x_TD = None
     if grad_routed_ND is not None:
-      grad_x_TD = torch.index_select(grad_routed_ND, 0, inverse_N)
-      grad_x_TD = (
-          grad_x_TD.float()
-          .reshape(ctx.input_shape[0], ctx.top_k, ctx.input_shape[1])
-          .sum(dim=1)
-          .to(grad_routed_ND.dtype)
-      )
+      if ctx.slot_major:
+        # Same layout reasoning as stable_grouped_reduce(slot_major=True).
+        slot_inverse_N = (
+            inverse_N.reshape(ctx.input_shape[0], ctx.top_k).t().reshape(-1)
+        )
+        grad_x_TD = (
+            torch.index_select(grad_routed_ND, 0, slot_inverse_N)
+            .float()
+            .reshape(ctx.top_k, ctx.input_shape[0], ctx.input_shape[1])
+            .sum(dim=0)
+            .to(grad_routed_ND.dtype)
+        )
+      else:
+        grad_x_TD = torch.index_select(grad_routed_ND, 0, inverse_N)
+        grad_x_TD = (
+            grad_x_TD.float()
+            .reshape(ctx.input_shape[0], ctx.top_k, ctx.input_shape[1])
+            .sum(dim=1)
+            .to(grad_routed_ND.dtype)
+        )
     grad_scores_TK = None
     if grad_scores_N is not None:
       grad_scores_TK = torch.index_select(
           grad_scores_N, 0, inverse_N
       ).reshape(ctx.score_shape)
-    return grad_x_TD, grad_scores_TK, None, None
+    return grad_x_TD, grad_scores_TK, None, None, None
 
 
 def local_reorder(
@@ -224,12 +256,17 @@ def local_reorder(
     scores_TK: torch.Tensor,
     expert_ids_TK: torch.Tensor,
     top_k: int,
+    slot_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Sort routes by expert while keeping all gathers row-indexed."""
+  """Sort routes by expert while keeping all gathers row-indexed.
+
+  ``slot_major`` applies stable_grouped_reduce's layout to the token-gradient
+  sum in backward.
+  """
   # Marked so that a selective memory policy can save the sort order.
   with annotate_region(MOE_ROUTING):
     permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
-  return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
+  return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k, slot_major)
 
 
 class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
@@ -246,10 +283,14 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
   @dataclass(kw_only=True, slots=True)
   class Config(AllToAllTokenDispatcher.Config):
     fuse_route_score_backward: bool = False
+    # Sum the K routes per token as [K, T, D] instead of [T, K, D] (EP=1
+    # combine and its dispatch backward); see stable_grouped_reduce.
+    slot_major_reduce: bool = False
 
   def __init__(self, config: Config):
     super().__init__(config)
     self.fuse_route_score_backward = config.fuse_route_score_backward
+    self.slot_major_reduce = config.slot_major_reduce
 
   def _local_reorder(
       self,
@@ -262,6 +303,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         topk_scores_TK,
         topk_expert_ids_TK,
         self.top_k,
+        self.slot_major_reduce,
     )
 
   def combine(
@@ -288,6 +330,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         routed_output_ND,
         metadata.token_indices_experts_sorted_N,
         self.top_k,
+        self.slot_major_reduce,
     )
 
 
@@ -352,6 +395,7 @@ class TpuRoutedExperts(RoutedExperts):
         routed_output_RD,
         metadata.token_indices_experts_sorted_N,
         self.token_dispatcher.top_k,
+        self.token_dispatcher.slot_major_reduce,
     )
 
 

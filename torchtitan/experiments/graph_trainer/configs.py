@@ -270,10 +270,6 @@ def to_graph_trainer_config(
         target_cls = GraphTrainer.Config
 
     d = {f.name: getattr(base_config, f.name) for f in fields(base_config)}
-    d["parallelism"] = replace(
-        base_config.parallelism,
-        spmd_backend=base_config.parallelism.spmd_backend,
-    )
     flavor = (
         base_config.model_spec.flavor
         if hasattr(base_config, "model_spec") and base_config.model_spec is not None

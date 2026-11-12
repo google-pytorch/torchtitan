@@ -68,20 +68,14 @@ def parallelize_flux(
     if ac_config is not None:
         apply_ac(model, ac_config)
 
-    if parallelism.spmd_backend == "spmd_types":
-        model.parallelize(parallel_dims)
-        annotate_replicated_parameters(model, parallel_dims)
+    model.parallelize(parallel_dims)
+    annotate_replicated_parameters(model, parallel_dims)
 
     if compile_config.enable and "model" in compile_config.components:
         apply_compile(model, compile_config)
 
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh = parallel_dims.get_activated_mesh(["dp_replicate", "fsdp"])
-        dp_mesh_dims = None
-        assert dp_mesh is not None
-        
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+
     use_simple_fsdp = getattr(parallelism, "use_simple_fsdp", False)
     if use_simple_fsdp:
         dp_mode = (
@@ -268,12 +262,7 @@ def parallelize_encoders(
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
     )
 
-    if parallel_dims.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh = parallel_dims.get_activated_mesh(["dp_replicate", "fsdp"])
-        dp_mesh_dims = None
-        assert dp_mesh is not None
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     use_simple_fsdp = getattr(parallelism, "use_simple_fsdp", False)
     if use_simple_fsdp:
         dp_mode = (
@@ -304,8 +293,7 @@ def parallelize_encoders(
         # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
         hf_module = t5_model.hf_module
         assert isinstance(hf_module, nn.Module)
-        if parallel_dims.spmd_backend == "spmd_types":
-            annotate_replicated_parameters(hf_module, parallel_dims)
+        annotate_replicated_parameters(hf_module, parallel_dims)
         # pyrefly: ignore [missing-attribute, not-iterable]
         for block in hf_module.encoder.block:
             fully_shard(block, **fsdp_config)

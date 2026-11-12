@@ -21,7 +21,7 @@ from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Mo
 from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
-from torchtitan.experiments.tpu.mfu_flops import (
+from torchtitan.experiments.tpu.profiling.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
 from torchtitan.experiments.tpu.qwen3_sharding import (

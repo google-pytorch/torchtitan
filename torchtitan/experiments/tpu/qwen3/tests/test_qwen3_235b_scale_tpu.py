@@ -48,11 +48,20 @@ class _FakeParallelDims:
     self.dp_shard_enabled = True
     self.cp_enabled = False
     self.ep_enabled = False
+    self.spmd_backend = "spmd_types"
 
   def get_mesh(self, names):
     return self._mesh
 
-  def get_optional_mesh(self, names):
+  def get_optional_mesh(self, names, *, include_singleton_axes: bool = False):
+    if names == ["dp_shard", "cp"]:
+      # `apply_simple_fsdp` must ask for the singleton `cp` axis too, so the
+      # flattened fsdp mesh covers it; fail loudly if that contract changes.
+      assert include_singleton_axes, (
+          "apply_simple_fsdp must request ['dp_shard', 'cp'] with "
+          "include_singleton_axes=True"
+      )
+      return self._mesh
     return None
 
 

@@ -13,8 +13,8 @@ from absl.testing import parameterized
 import torch
 from torch import nn
 import torchtitan.experiments.tpu.deepseek_v3 as deepseek_v3_tpu
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v3.model import Attention, DeepSeekV3Model, DeepSeekV3TransformerBlock

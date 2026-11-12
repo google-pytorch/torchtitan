@@ -22,7 +22,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
 - **Float8**: `llama3_70b_float8` swaps the model's linears for torchao `Float8Linear`
   layers using the `rowwise` recipe, via `TpuFloat8LinearConverter`
-  ([`float8_converter.py`](../../../../float8_converter.py)). The output projection
+  ([`float8_converter.py`](../../../../components/float8_converter.py)). The output projection
   (`output`/`lm_head`) stays in bf16. `use_fast_accum` is a no-op on TPU; TPU
   matmuls accumulate in float32.
 - **torchao**: the float8 config needs torchao in the image. The TPU

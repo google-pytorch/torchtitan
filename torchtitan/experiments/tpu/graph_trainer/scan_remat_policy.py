@@ -21,7 +21,7 @@ from torch._functorch import partitioners
 from torch._higher_order_ops import partitioner as hop_partitioner
 from torch.utils.checkpoint import CheckpointPolicy
 
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FSDP_GATHER,
     MOE_EXPERT_COUNTS,

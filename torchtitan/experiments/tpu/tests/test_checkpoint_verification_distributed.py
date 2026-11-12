@@ -8,8 +8,8 @@ from absl import logging
 from absl.testing import absltest
 import torch
 import torch.multiprocessing as mp
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 import torchtitan.experiments.tpu.train
 from torchtitan.experiments.tpu.train import TPUTrainer, start_trainer
 

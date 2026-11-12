@@ -550,6 +550,22 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           "use-scan-layers",
       ),
       (
+          "scan_unknown_region",
+          "tpu_selective",
+          ("moe.nope",),
+          {},
+          True,
+          "use-scan-layers",
+      ),
+      (
+          "scan_last_n_layers",
+          "tpu_selective",
+          (),
+          {"attention.inner_attention": 2},
+          True,
+          "no compile.save_last_n_layers",
+      ),
+      (
           "regions_without_policy",
           "full",
           ("moe.routing",),

@@ -631,9 +631,11 @@ class LayerStack:
             annotate_moe_expert_counts()
             # Logged because `compile.memory_policy` does not reach the
             # body's nodes; only `save_regions` does. See `scan_remat_policy`.
+            has_moe = any(isinstance(m, MoE) for m in model.layers.modules())
             logger.info(
                 "Decoder layers run as a scan: the body recomputes everything "
-                "but its MoE expert counts and save regions %s",
+                "but %ssave regions %s",
+                "its MoE expert counts and " if has_moe else "",
                 list(save_regions),
             )
         # The container holds the same layer modules, so `self.layers` keeps

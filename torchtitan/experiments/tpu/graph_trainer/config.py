@@ -246,7 +246,8 @@ def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
       raise ValueError(
           "--compile.use-scan-layers supports only "
           "compile.memory_policy='tpu_selective' with "
-          f"compile.save_regions from {sorted(SCAN_SAVE_REGIONS)}"
+          f"compile.save_regions from {sorted(SCAN_SAVE_REGIONS)}, and no "
+          "compile.save_last_n_layers"
       )
   resolve_save_regions(save_regions, last_n_layers, policy)
 

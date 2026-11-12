@@ -17,7 +17,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.distributed import distributed
-from tests.unit_tests.test_tpu_packed_qkv import _build_fused_and_packed
+from torchtitan.experiments.tpu.tests.test_packed_qkv import _build_fused_and_packed
 
 
 def _full_tensor(tensor):

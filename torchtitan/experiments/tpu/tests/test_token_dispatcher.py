@@ -9,6 +9,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
 )
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
+    TpuRaggedDispatchMetadata,
     TpuRoutedExperts,
     TpuTokenDispatcherConverter,
     scale_route_weights,
@@ -18,6 +19,7 @@ from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
+    LocalDispatchMetadata,
 )
 
 
@@ -435,3 +437,37 @@ def test_scale_before_down_proj_rejects_all_to_all_metadata():
   ):
     with pytest.raises(ValueError, match="EP=1 local dispatch"):
       routed(x, scores, expert_ids, counts)
+
+
+@pytest.mark.parametrize("ep_transport", ["all_to_all", "ragged_all_to_all"])
+def test_ep1_combine_keeps_the_fixed_k_reduction(ep_transport):
+  """Without an EP mesh, either transport uses the local fixed-K reduction."""
+  generator = torch.Generator().manual_seed(11)
+  num_experts, top_k, dim, tokens = 4, 2, 8, 6
+  dispatcher = TpuAllToAllTokenDispatcher.Config(
+      num_experts=num_experts, top_k=top_k, ep_transport=ep_transport
+  ).build()
+  x = torch.randn(tokens, dim, generator=generator)
+  scores = torch.rand(tokens, top_k, generator=generator)
+  expert_ids = torch.randint(0, num_experts, (tokens, top_k), generator=generator)
+  counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
+
+  routed, _, metadata = dispatcher.dispatch(x, scores, expert_ids, counts)
+  assert isinstance(metadata, LocalDispatchMetadata)
+  module = "torchtitan.experiments.tpu.components.token_dispatcher"
+  with mock.patch(
+      f"{module}.stable_grouped_reduce", wraps=stable_grouped_reduce
+  ) as reduce:
+    out = dispatcher.combine(routed * 2, metadata, x)
+  reduce.assert_called_once()
+
+  expected = torch.zeros_like(x)
+  for t in range(tokens):
+    for k in range(top_k):
+      expected[t] += 2 * x[t] * scores[t, k]
+  torch.testing.assert_close(out, expected)
+
+
+def test_ragged_dispatch_metadata_is_not_local_metadata():
+  # EP-1's guard in TpuRoutedExperts relies on this to refuse EP metadata.
+  assert not issubclass(TpuRaggedDispatchMetadata, LocalDispatchMetadata)

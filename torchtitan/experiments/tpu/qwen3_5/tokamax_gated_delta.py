@@ -96,6 +96,14 @@ _MAX_KERNEL_HEAD_DIM = 256
 _MIN_TPU_GENERATION = 6
 _KERNEL_DTYPES = (torch.bfloat16, torch.float32)
 
+# The forward ops whose outputs (out + residuals) `TPUSelectiveAC` saves under
+# `save_kda_residuals` (`components/activation_checkpoint.py` matches them by
+# name, with its own copy of this tuple; a test keeps the two equal).
+KDA_FWD_OPS = (
+    "tt_qwen35::gated_delta_segments_fwd_res",
+    "tt_qwen35::gated_delta_fwd_res",
+)
+
 
 @functools.lru_cache(maxsize=1)
 def _import_kda() -> tuple[Any, Exception | None]:

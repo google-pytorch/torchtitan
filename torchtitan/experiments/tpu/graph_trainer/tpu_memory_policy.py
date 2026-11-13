@@ -451,6 +451,9 @@ def _tpu_selective_memory_policy_pass(
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
     """Full recompute, except the configured save regions."""
+    if config.compile.use_scan_layers:
+        # The regions live in the scan body, which `LayerStack.run` tags.
+        return _full_memory_policy_pass(gm, config=config)
     last_n_layers = config.compile.save_last_n_layers
     regions = resolve_save_regions(config.compile.save_regions, last_n_layers)
     full_remat_with_saves(gm, config, select_saves(gm, regions, last_n_layers))

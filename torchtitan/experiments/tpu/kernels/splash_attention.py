@@ -27,6 +27,10 @@ from torchtitan.experiments.tpu.distributed.headtail import (
     make_headtail_splash_mask,
     slice_cp_mask_info,
 )
+from torchtitan.experiments.tpu.components.remat_regions import (
+    ATTENTION_INNER_ATTENTION,
+    annotate_region,
+)
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.tools.logging import logger
 
@@ -635,7 +639,9 @@ def splash_sdpa(
     # head dimension to be squeezed.
     k = torch.squeeze(k, dim=1)
     v = torch.squeeze(v, dim=1)
-  result, _ = torch_fwd_fn(q, k, v, segment_ids, cp_rank)
+  # The region lets a scan body's memory policy keep the output and LSE.
+  with annotate_region(ATTENTION_INNER_ATTENTION):
+    result, _ = torch_fwd_fn(q, k, v, segment_ids, cp_rank)
   result = typing.cast(torch.Tensor, result)
 
   if result.dtype != input_dtype:

@@ -15,6 +15,10 @@ import numpy as np
 import torch
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.components.remat_regions import (
+    ATTENTION_INNER_ATTENTION,
+    annotate_region,
+)
 from torchtitan.experiments.tpu.distributed.headtail import (
     make_cp_segment_ids,
     make_headtail_splash_mask,
@@ -658,15 +662,17 @@ def splash_sdpa(
 
   local_window_size_val = local_window_size if local_window_size is not None else -1
 
-  out, _ = splash_op(
-      q,
-      k,
-      v,
-      segment_ids,
-      cp_rank,
-      is_causal,
-      local_window_size_val,
-      scale,
-      *_kernel_config_args(),
-  )
+  # The region lets a scan body's memory policy keep the output and LSE.
+  with annotate_region(ATTENTION_INNER_ATTENTION):
+    out, _ = splash_op(
+        q,
+        k,
+        v,
+        segment_ids,
+        cp_rank,
+        is_causal,
+        local_window_size_val,
+        scale,
+        *_kernel_config_args(),
+    )
   return out

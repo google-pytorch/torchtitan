@@ -21,6 +21,9 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
+from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
+    SCAN_SAVE_REGIONS,
+)
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
@@ -237,13 +240,15 @@ def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
       )
     return
   if compile_config.use_scan_layers:
-    # A scan node stands for the whole layer loop and is always saved; the
-    # values these regions select live inside its body, where the policy
-    # cannot see them.
-    raise ValueError(
-        f"compile.memory_policy={policy!r} does not support "
-        "--compile.use-scan-layers"
-    )
+    # One scan body runs every layer, so a region is saved in all or none.
+    unsupported = set(save_regions) - SCAN_SAVE_REGIONS
+    if policy != "tpu_selective" or last_n_layers or unsupported:
+      raise ValueError(
+          "--compile.use-scan-layers supports only "
+          "compile.memory_policy='tpu_selective' with "
+          f"compile.save_regions from {sorted(SCAN_SAVE_REGIONS)}, and no "
+          "compile.save_last_n_layers"
+      )
   resolve_save_regions(save_regions, last_n_layers, policy)
 
 
@@ -386,7 +391,13 @@ def apply_tpu_graph_trainer_model_transforms(
 
   config.model_spec = dataclasses.replace(
       config.model_spec,
-      model=with_tpu_stacked_layers(config.model_spec.model, use_scan=True),
+      model=with_tpu_stacked_layers(
+          config.model_spec.model,
+          use_scan=True,
+          save_regions=tuple(compile_config.save_regions)
+          if memory_policy == "tpu_selective"
+          else (),
+      ),
       parallelize_fn=parallelize_fn_with_shard_dims,
   )
   if not builds_layer_loop(config.model_spec.model):

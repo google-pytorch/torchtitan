@@ -34,6 +34,8 @@ The following files are licensed under the Apache License, Version 2.0:
   torchtitan/experiments/tpu/kernels/linear_softmax_ce_softcap_kernel.py
     (derived from Tokamax, Copyright 2025 DeepMind Technologies Limited)
   torchtitan/experiments/tpu/kernels/linear_softmax_cross_entropy_loss.py
+  torchtitan/experiments/tpu/kernels/ragged_gather_tc.py
+    (derived from MaxText, Copyright 2026 Google LLC)
 
                                  Apache License
                            Version 2.0, January 2004

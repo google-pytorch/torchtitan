@@ -381,6 +381,7 @@ def _configure_graph_trainer_full_ac(
   """Configure unsplit GraphTrainer ZeRO-3 with full activation checkpointing."""
   cfg = _to_gemma4_graph_trainer_config(base_cfg)
   cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.fused_qk_norm_rope = True
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       components=["model"],
@@ -397,6 +398,7 @@ def _configure_graph_split(
   """Configure per-layer GraphTrainer splitting with full or host-offload AC."""
   cfg = _to_gemma4_graph_trainer_config(base_cfg)
   cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.fused_qk_norm_rope = True
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       components=["model"],

@@ -31,6 +31,7 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
     ATTENTION_INNER_ATTENTION,
     FSDP_GATHER,
+    LAYER_INPUT,
     MOE_EXPERT_COUNTS,
     REMAT_REGION,
 )
@@ -382,6 +383,17 @@ class TestScanBodyRematWindow(unittest.TestCase):
         with mock.patch.object(scan_remat_policy, "_keeping_meta", lambda fn: fn):
             with self.assertRaisesRegex(Exception, "no remat_region meta"):
                 _run(scan_body_remat_window)
+
+    def test_tags_the_carry_as_the_layer_input(self):
+        graph = fx.Graph()
+        carry, x = graph.placeholder("carry"), graph.placeholder("x")
+        shared = {"module_fqn": "layers"}
+        carry.meta["custom"] = x.meta["custom"] = shared
+        graph.output(graph.call_function(torch.mul, (carry, x)))
+        tag_scan_body_joint_graph(graph, frozenset())
+        self.assertEqual(carry.meta["custom"][REMAT_REGION], LAYER_INPUT)
+        # Placeholder meta is shared between graphs; the tag must not leak.
+        self.assertNotIn(REMAT_REGION, shared)
 
     def test_refuses_an_unknown_save_region(self):
         with self.assertRaises(ValueError):

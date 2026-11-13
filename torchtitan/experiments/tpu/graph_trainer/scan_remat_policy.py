@@ -9,6 +9,9 @@ traces, ``scan_body_remat_window`` tags each forward node of the body from its
 * ``moe.expert_counts``: save. Redoing the all-reduce is an exposed round trip.
 * a region in ``save_regions``, e.g. ``attention.inner_attention``: save.
 * everything else: recompute.
+
+It also tags the carry (the layer input) ``layer_input``, so the scan offload
+pass can find its saved copy after the split.
 """
 
 import contextlib
@@ -24,6 +27,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FSDP_GATHER,
+    LAYER_INPUT,
     MOE_EXPERT_COUNTS,
     REMAT_REGION,
 )
@@ -57,6 +61,10 @@ def _depends_on_tangents(graph: fx.Graph) -> set[fx.Node]:
 def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
     """Set ``meta["recompute"]`` on every forward node, from its region.
 
+    Also tags the carry placeholder ``layer_input``. When min-cut saves it,
+    ``scan`` returns a clone of it that copies this meta, so the tag reaches
+    the forward body in the outer graph.
+
     ``fsdp.gather`` is always recompute, whatever tag it came with: saving it
     keeps every layer's whole weight. Other nodes keep a tag they already
     have, if it is a recompute tag or the one this would set: ``scan``
@@ -68,7 +76,7 @@ def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
     the body has a collective but no region meta: then ``scan`` dropped it
     while re-tracing the body, and the counts would silently be recomputed.
     """
-    if not any(_region(n) for n in graph.nodes):
+    if not any(_region(n) for n in graph.nodes if n.op == "call_function"):
         has_collective = any(
             isinstance(n.target, torch._ops.OpOverload)
             and n.target.namespace == "_c10d_functional"
@@ -79,6 +87,11 @@ def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
                 "the scan body has a collective but no remat_region meta; is "
                 "scan_body_remat_window's re-trace patch still in effect?"
             )
+    # The joint graph's inputs are (carry, xs), and the carry is one tensor.
+    carry = next(iter(graph.find_nodes(op="placeholder")))
+    # A new dict: min-cut shares placeholder meta between graphs.
+    custom = carry.meta.get("custom") or {}
+    carry.meta["custom"] = {**custom, REMAT_REGION: LAYER_INPUT}
     backward_only = _depends_on_tangents(graph)
     saved_regions: set[str] = set()
     for node in graph.nodes:

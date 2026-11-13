@@ -242,10 +242,11 @@ def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
   if compile_config.use_scan_layers:
     # One scan body runs every layer, so a region is saved in all or none.
     unsupported = set(save_regions) - SCAN_SAVE_REGIONS
-    if policy != "tpu_selective" or last_n_layers or unsupported:
+    if last_n_layers or unsupported:
       raise ValueError(
           "--compile.use-scan-layers supports only "
-          "compile.memory_policy='tpu_selective' with "
+          "compile.memory_policy='tpu_selective' or "
+          "'tpu_selective_and_offload' with "
           f"compile.save_regions from {sorted(SCAN_SAVE_REGIONS)}, and no "
           "compile.save_last_n_layers"
       )
@@ -355,11 +356,13 @@ def apply_tpu_graph_trainer_model_transforms(
   if (
       compile_config.use_scan_layers
       and memory_policy.endswith("_and_offload")
-      and memory_policy != "full_and_scan_offload"
+      and memory_policy
+      not in ("full_and_scan_offload", "tpu_selective_and_offload")
   ):
     raise ValueError(
         f"generic offload policy {memory_policy!r} is unsupported with scan; "
-        "use the scan-specific 'full_and_scan_offload' policy"
+        "use 'full_and_scan_offload' or 'tpu_selective_and_offload', which "
+        "offload from inside the scan"
     )
   if compile_config.cpu_offload_budget_gb < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
@@ -395,7 +398,7 @@ def apply_tpu_graph_trainer_model_transforms(
           config.model_spec.model,
           use_scan=True,
           save_regions=tuple(compile_config.save_regions)
-          if memory_policy == "tpu_selective"
+          if memory_policy in ("tpu_selective", "tpu_selective_and_offload")
           else (),
       ),
       parallelize_fn=parallelize_fn_with_shard_dims,

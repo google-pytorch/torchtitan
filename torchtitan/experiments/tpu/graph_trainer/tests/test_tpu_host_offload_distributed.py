@@ -21,6 +21,11 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
+from torchtitan.experiments.tpu.components.remat_regions import (
+    ATTENTION_INNER_ATTENTION,
+    LAYER_INPUT,
+    REMAT_REGION,
+)
 import torchtitan.experiments.tpu.train
 
 
@@ -75,13 +80,13 @@ def _check_offload_engaged(gm):
       f"the reload is on {reload_node.args[0].target}, not on the slice"
   )
 
-  # The selector has to prefer the layer stack over the loss logits, which are
-  # the larger tensor at this size. Offloading those would ship a tensor the
-  # backward reloads immediately.
-  offload_node = next(n for n in fwd_body.nodes if n.target is _OFFLOAD)
-  assert offload_node.meta["val"].dim() >= 2, (
-      f"offloaded {tuple(offload_node.meta['val'].shape)}, which is not a stack"
-  )
+  # Exactly one value goes to host: the saved copy of the layer input.
+  offloads = [n for n in fwd_body.nodes if n.target is _OFFLOAD]
+  assert len(offloads) == 1, f"{len(offloads)} offloads in the forward body"
+  offload_node = offloads[0]
+  tag = (offload_node.args[0].meta.get("custom") or {}).get(REMAT_REGION)
+  assert tag == LAYER_INPUT, f"offloaded a value tagged {tag!r}"
+  assert _ao_targets(bwd_body).count(_RELOAD) == 1, "expected one reload"
 
   # Around the loop rather than inside it means every row lands on device at
   # once, which costs the stack instead of saving it. The epilogue's read of the
@@ -94,6 +99,28 @@ def _check_offload_engaged(gm):
           f"a reload outside the loop takes {tuple(node.meta['val'].shape)},"
           " which is more than one row"
       )
+
+
+def _check_attention_saved_and_offload_engaged(gm):
+  """As above, and the splash forward runs once, its output saved by tag."""
+  _check_offload_engaged(gm)
+  forward, backward = _scans(gm)
+  # Without these, a model that lost splash would pass the backward check.
+  fwd_body = _body(gm, forward[0]).graph
+  assert any("splash_attn_fwd" in str(n.target) for n in fwd_body.nodes), (
+      "the forward body has no splash forward"
+  )
+  regions = [
+      (o.meta.get("custom") or {}).get(REMAT_REGION)
+      for o in next(iter(fwd_body.find_nodes(op="output"))).args[0]
+  ]
+  assert ATTENTION_INNER_ATTENTION in regions, (
+      f"no forward scan output is tagged {ATTENTION_INNER_ATTENTION}: {regions}"
+  )
+  bwd_ops = [str(n.target) for n in _body(gm, backward[0]).graph.nodes]
+  assert not any("splash_attn_fwd" in t for t in bwd_ops), (
+      "the backward body recomputes the splash forward"
+  )
 
 
 def _train_and_check(config, check):
@@ -126,6 +153,29 @@ def _start_and_expect_offload(config):
   _train_and_check(config, _check_offload_engaged)
 
 
+def _start_and_expect_attention_saved(config):
+  """Trains with attention saved and the layer input offloaded."""
+  _train_and_check(config, _check_attention_saved_and_offload_engaged)
+
+
+_LLAMA3_SCAN = [
+    "--module=torchtitan.experiments.tpu.llama3",
+    "--config=graph_trainer_llama3_debugmodel",
+    "--optimizer.implementation=foreach",
+    "--dataloader.dataset_path=tests/assets/c4_test",
+    "--dataloader.dataset=c4_test",
+    "--hf_assets_path=tests/assets/tokenizer",
+    "--training.max_context_length=128",
+    "--training.steps=1",
+    "--training.mixed_precision_param=float32",
+    "--training.mixed_precision_reduce=float32",
+    "--training.num_tokens_per_microbatch_per_dp_rank=512",
+    "--splash_attention_kernel.use_splash_attention_kernel",
+    "--parallelism.use_simple_fsdp",
+    "--compile.use_scan_layers",
+]
+
+
 class ScanOffloadDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
@@ -136,25 +186,25 @@ class ScanOffloadDistributedTest(
     # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
     self._test_train_distributed(
         config_args=[
-            "--module=torchtitan.experiments.tpu.llama3",
-            "--config=graph_trainer_llama3_debugmodel",
-            "--optimizer.implementation=foreach",
-            "--dataloader.dataset_path=tests/assets/c4_test",
-            "--dataloader.dataset=c4_test",
-            "--hf_assets_path=tests/assets/tokenizer",
-            "--training.max_context_length=128",
-            "--training.steps=1",
-            "--training.mixed_precision_param=float32",
-            "--training.mixed_precision_reduce=float32",
-            "--training.num_tokens_per_microbatch_per_dp_rank=512",
-            "--splash_attention_kernel.use_splash_attention_kernel",
-            "--parallelism.use_simple_fsdp",
-            "--compile.use_scan_layers",
+            *_LLAMA3_SCAN,
             "--compile.memory_policy=full_and_scan_offload",
         ],
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,
         start_trainer=_start_and_expect_offload,  # pyrefly: ignore[bad-argument-type]
+        enable_compile=True,
+    )
+
+  def test_scan_offload_with_attention_saved(self):
+    self._test_train_distributed(
+        config_args=[
+            *_LLAMA3_SCAN,
+            "--compile.memory_policy=tpu_selective_and_offload",
+            "--compile.save_regions=attention.inner_attention",
+        ],
+        data_parallel_shard_degree=-1,
+        tensor_parallel_degree=1,
+        start_trainer=_start_and_expect_attention_saved,  # pyrefly: ignore[bad-argument-type]
         enable_compile=True,
     )
 

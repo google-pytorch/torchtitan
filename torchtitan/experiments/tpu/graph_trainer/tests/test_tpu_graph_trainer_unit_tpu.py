@@ -1,5 +1,7 @@
 """Unit tests for TpuGraphTrainer (tracing, loss override, and config wiring)."""
 
+import contextlib
+import copy
 from types import SimpleNamespace
 import typing
 from unittest import mock
@@ -7,6 +9,7 @@ from unittest import mock
 from absl.testing import absltest
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import make_fx_tracer
 from torchtitan.experiments.graph_trainer.common_utils import (
@@ -51,6 +54,55 @@ def _make_dummy_fwd_bwd_step(loss_fn: nn.Module, model: nn.Module):
     return [loss] + list(grads)
 
   return fwd_bwd_fn
+
+
+def _traced_trainer(model: nn.Module, inputs, labels, global_valid_tokens):
+  """A bare TpuGraphTrainer holding one traced fwd+bwd step for these shapes."""
+
+  def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
+    pred = model(inputs)
+    loss = F.cross_entropy(
+        pred.view(-1, 128), labels.view(-1), reduction="sum"
+    ) / global_valid_tokens
+    params = [
+        p
+        for _, p in model.named_parameters(remove_duplicate=False)
+        if p.requires_grad
+    ]
+    return [loss, *torch.autograd.grad(loss, params)]
+
+  trainer = object.__new__(tpu_graph_trainer.TpuGraphTrainer)
+  trainer._traced_step = make_fx_tracer.minimal_fx_tracer(
+      fwd_bwd, module=model
+  )(inputs, labels, global_valid_tokens, {})
+  trainer.train_context = contextlib.nullcontext
+  trainer._collect_moe_routing_metrics = False
+  return trainer
+
+
+def _eager_grads(model: nn.Module, inputs, labels) -> list[torch.Tensor]:
+  """Eager autograd grads of the full-batch mean loss, on a copy of model."""
+  ref = copy.deepcopy(model)
+  ref.zero_grad(set_to_none=True)
+  loss = F.cross_entropy(
+      ref(inputs).view(-1, 128), labels.view(-1), reduction="sum"
+  )
+  (loss / labels.numel()).backward()
+  return [p.grad for p in ref.parameters()]
+
+
+def _run_grad_accum_step(trainer, model, inputs, labels, num_microbatches):
+  """Runs one training step's fwd+bwd calls, split into microbatches."""
+  params = tuple(
+      p
+      for _, p in model.named_parameters(remove_duplicate=False)
+      if p.requires_grad
+  )
+  tokens = torch.tensor(float(labels.numel()), device=labels.device)
+  for x, y in zip(
+      inputs.chunk(num_microbatches), labels.chunk(num_microbatches)
+  ):
+    trainer._make_fx_forward_backward_step(model, x, y, tokens, params, {})
 
 
 class MfuBenchmarkTest(absltest.TestCase):
@@ -286,6 +338,63 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
     loss = outputs[0]
     self.assertEqual(loss.ndim, 0, "Loss output must be a scalar tensor.")
 
+  def _tied_model(self) -> nn.Module:
+    model = DummyModule(dim=32, vocab_size=128).to(self.accelerator_device)
+    model.lm_head.weight = model.tok_embeddings.weight
+    return model
+
+  def _assert_grads(self, model, expected, msg) -> None:
+    for (name, p), want in zip(model.named_parameters(), expected, strict=True):
+      torch.testing.assert_close(
+          p.grad, want, rtol=1e-5, atol=1e-6, msg=f"{msg} {name}"
+      )
+
+  def test_grad_accumulation_matches_full_batch(self) -> None:
+    """GA=2 at batch 2 matches GA=1 at batch 4, tied weights included."""
+    device = self.accelerator_device
+    model = self._tied_model()
+    inputs = torch.randint(0, 128, (4, 16), device=device)
+    labels = torch.randint(0, 128, (4, 16), device=device)
+    expected = _eager_grads(model, inputs, labels)
+
+    for num_microbatches in (1, 2):
+      model.zero_grad(set_to_none=True)
+      trainer = _traced_trainer(
+          model,
+          inputs.chunk(num_microbatches)[0],
+          labels.chunk(num_microbatches)[0],
+          torch.tensor(float(labels.numel()), device=device),
+      )
+      _run_grad_accum_step(trainer, model, inputs, labels, num_microbatches)
+      self._assert_grads(model, expected, f"GA={num_microbatches}")
+
+  def test_grad_accumulation_resets_between_steps(self) -> None:
+    """Step 2's grads hold only step 2's batch, for both zero_grad modes."""
+    device = self.accelerator_device
+    batches = [
+        (
+            torch.randint(0, 128, (4, 16), device=device),
+            torch.randint(0, 128, (4, 16), device=device),
+        )
+        for _ in range(2)
+    ]
+    # The TPU lane sets grads to None (set_to_none=True); test both modes.
+    for set_to_none in (False, True):
+      model = self._tied_model()
+      trainer = _traced_trainer(
+          model,
+          batches[0][0][:2],
+          batches[0][1][:2],
+          torch.tensor(64.0, device=device),
+      )
+      for step, (inputs, labels) in enumerate(batches, start=1):
+        model.zero_grad(set_to_none=set_to_none)
+        _run_grad_accum_step(trainer, model, inputs, labels, 2)
+        self._assert_grads(
+            model,
+            _eager_grads(model, inputs, labels),
+            f"set_to_none={set_to_none} step {step}",
+        )
 
 
 if __name__ == "__main__":

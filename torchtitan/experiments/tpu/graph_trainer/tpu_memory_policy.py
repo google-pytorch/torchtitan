@@ -493,3 +493,39 @@ def _tpu_selective_and_offload_memory_policy_pass(
     for node in save_nodes:
         _tag_saved(node, CheckpointPolicy.MUST_SAVE)
     return gm
+
+
+# Loop HOPs in this torch build. A joint graph holds while_loop's forward as
+# while_loop_stack_output, and map's as map_impl.
+_LOOP_HOPS = tuple(
+    op
+    for name in ("scan", "while_loop", "while_loop_stack_output", "map_impl")
+    if (op := getattr(torch.ops.higher_order, name, None)) is not None
+)
+
+
+def save_loop_nodes_pass(
+    gm: torch.fx.GraphModule, example_inputs: tuple | None = None
+) -> torch.fx.GraphModule:
+    """Re-tag every forward loop node the memory policy left recomputable.
+
+    Recomputing a loop node reruns the whole loop in backward: the loss stays
+    exact and the saved set shrinks, but the step does twice the forward work.
+    This runs after the policy, so it covers every policy, including ones
+    registered later. Offload tags are kept: offloading is not recomputing.
+    """
+    retagged = 0
+    for node in gm.graph.nodes:
+        if node.target not in _LOOP_HOPS or _is_backward_node(node):
+            continue
+        # The getitems that unpack a loop share its tag, as in tag_sac_policy.
+        for saved in (node, *(u for u in node.users if u.target is operator.getitem)):
+            if saved.meta.get("recompute") in (
+                CheckpointPolicy.PREFER_RECOMPUTE,
+                CheckpointPolicy.MUST_RECOMPUTE,
+            ):
+                saved.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+                retagged += 1
+    if retagged:
+        logger.info(f"Re-tagged {retagged} loop nodes and getitems MUST_SAVE")
+    return gm

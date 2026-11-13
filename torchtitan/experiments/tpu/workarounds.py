@@ -751,12 +751,16 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   # TT-UNFLATTEN-SHIM: run dense blocks on [B, L, ...] views for TPU layouts.
   tpu_config = getattr(job_config, "tpu_config", None)
   if tpu_config is not None and tpu_config.bld_block_layout:
-    from torchtitan.experiments.tpu.components.bld_layout import apply_bld_layout, bld_skip_reason  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.components import bld_layout  # pylint: disable=g-import-not-at-top
 
-    apply_bld_layout(
+    bld_layout.apply_bld_layout(
         model,
-        skip_reason=bld_skip_reason(job_config.parallelism),
+        skip_reason=bld_layout.bld_skip_reason(job_config.parallelism),
     )
+  if tpu_config is not None and tpu_config.fused_qk_norm_rope:
+    from torchtitan.experiments.tpu.components import fused_qk_norm_rope  # pylint: disable=g-import-not-at-top
+
+    fused_qk_norm_rope.apply_fused_qk_norm_rope(model)
 
 
 def raise_dynamo_recompile_limits(model_config) -> None:

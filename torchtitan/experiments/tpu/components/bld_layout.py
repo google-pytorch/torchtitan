@@ -143,6 +143,15 @@ class _BLDGQAttention(GQAttention):
       return cossin_rotate(xq, cos_h, sin_h), cossin_rotate(xk, cos_h, sin_h)
     return self.rope.apply_rotary_emb(xq, xk, cache)
 
+  def _apply_qk_norm_and_rope(self, xq, xk, positions):
+    if self.q_norm is not None or self.k_norm is not None:
+      assert self.q_norm is not None and self.k_norm is not None
+      xq = self.q_norm(xq)
+      xk = self.k_norm(xk)
+    if self.rope is not None:
+      xq, xk = self._bld_rope(xq, xk, positions)
+    return xq, xk
+
   def forward(
       self,
       x_TD: torch.Tensor,
@@ -160,13 +169,7 @@ class _BLDGQAttention(GQAttention):
     )(x_TD)
     remat.recompute_needs_tensor(xq, xk, xv)
 
-    if self.q_norm is not None or self.k_norm is not None:
-      assert self.q_norm is not None and self.k_norm is not None
-      xq = self.q_norm(xq)
-      xk = self.k_norm(xk)
-
-    if self.rope is not None:
-      xq, xk = self._bld_rope(xq, xk, positions)
+    xq, xk = self._apply_qk_norm_and_rope(xq, xk, positions)
 
     # The TT-UNFLATTEN-SHIM passes 4-D q/k/v through (and unflattens the 1-D
     # positions/segment_ids). Other inner attentions take upstream [T, H, K].

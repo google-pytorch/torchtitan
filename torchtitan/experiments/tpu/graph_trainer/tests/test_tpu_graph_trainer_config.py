@@ -770,7 +770,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.training.num_tokens_per_train_step, 1024 * 4096)
     self.assertEqual(config.training.mixed_precision_reduce, reduce_dtype)
     self.assertEqual(config.parallelism, zero3.parallelism)
-    self.assertEqual(config.tpu_config, zero3.tpu_config)
+    self.assertEqual(
+        config.tpu_config,
+        dataclasses.replace(zero3.tpu_config, fused_qk_norm_rope=not bf16_rope),
+    )
     self.assertEqual(
         config.compile,
         dataclasses.replace(zero3.compile, fsdp_barrier_policy="prefetch"),
@@ -1051,6 +1054,46 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             (splash.sa_block_q, splash.sa_block_kv, splash.sa_block_kv_compute),
             (128, 512, 512),
         )
+
+  @parameterized.parameters(
+      qwen3_8b,
+      qwen3_8b_zero3,
+      qwen3_32b,
+      qwen3_32b_4x8x8,
+      qwen3_moe_235b_fsdp_activation_offload_4x4x4,
+      gemma4_26b_a4b_graph_trainer,
+      gemma4_26b_a4b_graph_split,
+      gemma4_26b_a4b_graph_split_offload,
+      gemma4_31b_graph_trainer,
+      gemma4_31b_graph_split,
+      gemma4_31b_graph_split_offload,
+  )
+  def test_recipes_fuse_qk_norm_rope(self, recipe) -> None:
+    self.assertTrue(recipe().tpu_config.fused_qk_norm_rope, recipe.__name__)
+
+  @parameterized.parameters(
+      qwen3_8b_maxtext_parity,
+      qwen3_32b_maxtext_parity,
+      qwen3_moe_235b_fsdp_activation_offload_maxtext,
+      qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
+  )
+  def test_maxtext_bf16_rope_recipes_disable_fused_qk_norm_rope(
+      self, recipe
+  ) -> None:
+    self.assertFalse(recipe().tpu_config.fused_qk_norm_rope, recipe.__name__)
+
+  def test_fused_qk_norm_rope_recipe_patches_every_layer_after_overrides(
+      self,
+  ) -> None:
+    """Verifies Qwen3 recipe overrides keep attention layers patch-eligible."""
+    from torchtitan.experiments.tpu.components import fused_qk_norm_rope  # pylint: disable=g-import-not-at-top
+
+    cfg = qwen3_8b()
+    cfg.model_spec.model.layers = cfg.model_spec.model.layers[:2]
+    apply_tpu_graph_trainer_model_transforms(cfg)
+    with torch.device("meta"):
+      model = cfg.model_spec.model.build()
+    self.assertEqual(fused_qk_norm_rope.apply_fused_qk_norm_rope(model), 2)
 
   def test_235b_4x4x4_reduce_scatter_policy(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()

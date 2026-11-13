@@ -368,6 +368,7 @@ def _configure_graph_trainer_full_ac(
       base_cfg, graph_trainer_model_registry
   )
   cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.fused_qk_norm_rope = True
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       components=["model"],
@@ -386,6 +387,7 @@ def _configure_graph_split(
       base_cfg, graph_trainer_model_registry
   )
   cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.fused_qk_norm_rope = True
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       components=["model"],

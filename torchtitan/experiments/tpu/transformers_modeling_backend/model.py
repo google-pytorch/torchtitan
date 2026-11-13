@@ -49,7 +49,7 @@ from torchtitan.experiments.transformers_modeling_backend.model import (
 )
 from torchtitan.tools.logging import logger
 
-from . import _meta_init, _structure
+from . import _meta_init, _structure, float8
 # Importing ``attention`` registers ``attn_implementation="splash_tpu"`` with
 # HF's AttentionInterface, also for a worker that receives the Config by pickle
 # and imports nothing else from the lane.
@@ -150,6 +150,12 @@ class TPUHFTransformerModel(HFTransformerModel):
       )
       self._titan_injected_model_args["tpu_swiglu_saved_sigmoid"] = bool(
           getattr(config, "esmc_swiglu_saved_sigmoid", False)
+      )
+      self._titan_injected_model_args["tpu_float8_recipe"] = str(
+          getattr(config, "hf_float8_recipe", "") or ""
+      )
+      self._titan_injected_model_args["tpu_float8_modules"] = str(
+          getattr(config, "hf_float8_modules", "") or ""
       )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
@@ -487,6 +493,13 @@ class TPUHFTransformerModel(HFTransformerModel):
         logger.warning(f"Could not size the position table: {e}")
     model = self._build_with_supported_attention(model_cls, config)
     _use_tpu_esmc_attention(model)
+    float8_recipe = getattr(config, "tpu_float8_recipe", "")
+    if float8_recipe:
+      float8.apply_float8_linears(
+          model,
+          float8_recipe,
+          only_modules=getattr(config, "tpu_float8_modules", ""),
+      )
     return model
 
   @staticmethod
@@ -1001,6 +1014,29 @@ class _EsmcTPUAttention(nn.Module):
     attn.register_buffer(
         "rotate_half", _rotate_half_matrix(attn.head_dim), persistent=False
     )
+    cls._size_qk_norms(attn)
+
+  @staticmethod
+  def _size_qk_norms(attn: nn.Module) -> None:
+    """Resizes ``q_norm`` and ``k_norm`` to ``heads * head_dim`` when ``heads * head_dim != hidden_size``."""
+    config = attn.config
+    for name, heads in (
+        ("q_norm", config.num_attention_heads),
+        ("k_norm", config.num_key_value_heads),
+    ):
+      norm = getattr(attn, name, None)
+      width = heads * attn.head_dim
+      if not isinstance(norm, nn.LayerNorm):
+        continue
+      if tuple(norm.normalized_shape) == (width,):
+        continue
+      resized = type(norm)(width, bias=norm.bias is not None)
+      resized.eps = norm.eps
+      setattr(
+          attn,
+          name,
+          resized.to(device=norm.weight.device, dtype=norm.weight.dtype),
+      )
 
   @classmethod
   @functools.cache

@@ -22,6 +22,22 @@ from torchtitan.components.quantization.utils import module_filter_fn
 from torchtitan.tools.logging import logger
 
 
+def tpu_float8_linear_config(
+    recipe_name: str = "rowwise", *, emulate: bool = False
+) -> Float8LinearConfig:
+  """Returns a torchao `Float8LinearConfig` with `use_fast_accum=False` for TPU."""
+  if emulate:
+    torchao_config = Float8LinearConfig(emulate=True)
+  else:
+    torchao_config = Float8LinearConfig.from_recipe_name(recipe_name)
+  return dataclasses.replace(
+      torchao_config,
+      gemm_config_output=dataclasses.replace(
+          torchao_config.gemm_config_output, use_fast_accum=False
+      ),
+  )
+
+
 class TpuFloat8LinearConverter(Float8LinearConverter):
   """Replaces matching `Linear.Config`s with torchao `Float8Linear` on TPU."""
 
@@ -34,24 +50,8 @@ class TpuFloat8LinearConverter(Float8LinearConverter):
   # CUDA/ROCm capability check.
   def __init__(self, config: Config):  # pylint: disable=super-init-not-called
     self.config = config
-    if config.emulate:
-      torchao_config = Float8LinearConfig(emulate=True)
-    else:
-      torchao_config = Float8LinearConfig.from_recipe_name(config.recipe_name)
-    # `use_fast_accum` is a cuBLAS option. Hopper/Ada FP8 tensor cores
-    # accumulate in reduced precision; by default cuBLAS periodically promotes
-    # the partial sums to FP32, and fast accumulation skips that promotion,
-    # trading accuracy for speed. torchao enables it for the forward GEMM
-    # (`gemm_config_output`) and keeps the two gradient GEMMs exact. TPU has no
-    # such mode: its matmuls accumulate in FP32, and TorchTPU's `_scaled_mm`
-    # raises NotImplementedError for `use_fast_accum=True`
-    # (torch_tpu/csrc/ops/scaled_mm). Turning it off costs nothing on TPU and
-    # gives the forward GEMM the same accumulation as the gradient GEMMs.
-    self.torchao_config = dataclasses.replace(
-        torchao_config,
-        gemm_config_output=dataclasses.replace(
-            torchao_config.gemm_config_output, use_fast_accum=False
-        ),
+    self.torchao_config = tpu_float8_linear_config(
+        config.recipe_name, emulate=config.emulate
     )
     if "auto_filter_small_kn" in config.filter_fqns:
       raise ValueError(
@@ -63,4 +63,4 @@ class TpuFloat8LinearConverter(Float8LinearConverter):
     logger.info(f"TPU float8 training active with recipe {config.recipe_name}")
 
 
-__all__ = ["TpuFloat8LinearConverter"]
+__all__ = ["TpuFloat8LinearConverter", "tpu_float8_linear_config"]

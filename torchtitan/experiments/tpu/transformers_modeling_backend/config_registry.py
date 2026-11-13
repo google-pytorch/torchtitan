@@ -12,6 +12,8 @@ lane's existing ones.
 """
 
 
+import json
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -417,6 +419,42 @@ def hf_esmc_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
   return cfg
 
 
+_ESMC_G8_3B_OVERRIDES = {
+    "num_hidden_layers": 54,
+    "hidden_size": 2048,
+    "num_attention_heads": 10,
+    "num_key_value_heads": 10,
+    "head_dim": 256,
+    "intermediate_size": 5632,
+}
+
+_DEFAULT_FUSED_FP8_MODULES = "gate_proj,up_proj,down_proj,q_proj,k_proj,v_proj"
+
+
+def hf_esmc_g8_3b_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
+  """G8-3B (54L, d=2048, 10x256 heads, SwiGLU 5632) MLM config on TPU."""
+  cfg = hf_esmc_mlm_uniref50_graph()
+  cfg.hf_model = "biohub/ESMC-600M"
+  cfg.hf_config_overrides = json.dumps(_ESMC_G8_3B_OVERRIDES)
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 8 * 2048
+  cfg.metrics.log_freq = 10
+  return cfg
+
+
+def _with_fused_fp8(
+    cfg: TPUTransformersBackendConfig,
+) -> TPUTransformersBackendConfig:
+  """Enables fused FP8 Pallas linears on ``_DEFAULT_FUSED_FP8_MODULES``."""
+  cfg.hf_float8_recipe = "fused"
+  cfg.hf_float8_modules = _DEFAULT_FUSED_FP8_MODULES
+  return cfg
+
+
+def hf_esmc_g8_3b_mlm_uniref50_graph_float8() -> TPUTransformersBackendConfig:
+  """``hf_esmc_g8_3b_mlm_uniref50_graph`` with fused FP8 projections."""
+  return _with_fused_fp8(hf_esmc_g8_3b_mlm_uniref50_graph())
+
+
 def hf_esmc600m_mlm_uniref50_tpu7x16() -> TPUTransformersBackendConfig:
   """ESMC-600M at the paper's 4.19M-token step on an 8-chip ``tpu7x-16`` slice.
 
@@ -495,4 +533,6 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   config.tpu_config.optimizer_in_graph = False
   config.esmc_fused_qk_norm_rope = False
   config.esmc_swiglu_saved_sigmoid = False
+  config.hf_float8_recipe = ""
+  config.hf_float8_modules = ""
   return config

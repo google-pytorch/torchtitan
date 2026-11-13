@@ -100,6 +100,7 @@ class QkNormRopeTest(
     self.assertEqual(qk_norm_rope.default_block_s(1536, 18, 64), 512)
     self.assertEqual(qk_norm_rope.default_block_s(2048, 40, 64), 256)
     self.assertEqual(qk_norm_rope.default_block_s(2048, 32, 128), 256)
+    self.assertEqual(qk_norm_rope.default_block_s(2048, 10, 256), 512)
 
   def test_lazy_pallas_registration_signature_eval_str(self):
     # `torch.tpu.pallas.jax_op` calls `inspect.signature(fn, eval_str=True)`.
@@ -221,6 +222,15 @@ class QkNormRopeTest(
           head_dim=128,
           cos_batch=1,
           q_scale=1.0,
+      ),
+      dict(
+          testcase_name="adaptive_default_s2048_esmc_g8_3b_h10_d256",
+          seq=2048,
+          block_s=None,
+          heads=10,
+          head_dim=256,
+          cos_batch=1,
+          q_scale=0.0625,
       ),
   )
   def test_matches_reference_forward_and_backward(

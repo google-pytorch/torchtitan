@@ -38,3 +38,5 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   # (tokens, intermediate_size) per layer). Carried as
   # ``tpu_swiglu_saved_sigmoid``.
   esmc_swiglu_saved_sigmoid: bool = False
+  hf_float8_recipe: str = ""
+  hf_float8_modules: str = ""

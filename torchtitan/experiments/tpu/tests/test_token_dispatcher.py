@@ -15,7 +15,10 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     stable_grouped_reduce,
 )
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.token_dispatcher import (
+    AllToAllDispatchMetadata,
+    AllToAllTokenDispatcher,
+)
 
 
 def test_scale_route_weights_matches_native_autograd():
@@ -365,3 +368,70 @@ def test_scale_before_down_proj_matches_scaling_the_output():
         ),
         scale_before_down_proj=True,
     ).build()
+
+
+def _row_scaled_routed_experts(num_experts=3, top_k=2, dim=4, hidden=6):
+  return TpuRoutedExperts.Config(
+      inner_experts=GroupedExperts.Config(
+          dim=dim, hidden_dim=hidden, num_experts=num_experts
+      ),
+      token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+          num_experts=num_experts, top_k=top_k
+      ),
+      scale_before_down_proj=True,
+  ).build()
+
+
+def _parallel_dims_with_ep(has_ep):
+  parallel_dims = mock.Mock()
+  parallel_dims.get_optional_mesh.side_effect = lambda name: (
+      mock.sentinel.ep_mesh if has_ep and name == "ep" else None
+  )
+  return parallel_dims
+
+
+def test_scale_before_down_proj_refuses_expert_parallelism_at_parallelize():
+  routed = _row_scaled_routed_experts()
+  with mock.patch(
+      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+  ) as parent_parallelize:
+    with pytest.raises(ValueError, match="expert_parallel_degree=1"):
+      routed.parallelize(_parallel_dims_with_ep(has_ep=True))
+  parent_parallelize.assert_not_called()
+
+
+def test_scale_before_down_proj_allows_ep1_parallelize():
+  routed = _row_scaled_routed_experts()
+  with mock.patch(
+      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+  ) as parent_parallelize:
+    routed.parallelize(_parallel_dims_with_ep(has_ep=False))
+  parent_parallelize.assert_called_once()
+
+
+def test_scale_before_down_proj_rejects_all_to_all_metadata():
+  # AllToAllDispatchMetadata subclasses LocalDispatchMetadata. Before the
+  # explicit check, EP metadata passed the EP=1 guard and the forward reduced
+  # the expert outputs locally, skipping the return all-to-all.
+  generator = torch.Generator().manual_seed(97)
+  num_experts, top_k, dim = 3, 2, 4
+  routed = _row_scaled_routed_experts(num_experts, top_k, dim)
+  x = torch.randn(5, dim, generator=generator)
+  scores = torch.rand(5, top_k, generator=generator)
+  expert_ids = torch.randint(0, num_experts, (5, top_k), generator=generator)
+  counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
+  metadata = AllToAllDispatchMetadata(
+      token_indices_experts_sorted_N=torch.arange(10) // top_k,
+      topk_scores_experts_sorted_N=scores.reshape(-1),
+      input_shape=(10, dim),
+      permuted_indices=torch.arange(10),
+      input_splits=[10],
+      output_splits=[10],
+  )
+  with mock.patch.object(
+      routed.token_dispatcher,
+      "dispatch",
+      return_value=(torch.randn(10, dim, generator=generator), counts, metadata),
+  ):
+    with pytest.raises(ValueError, match="EP=1 local dispatch"):
+      routed(x, scores, expert_ids, counts)

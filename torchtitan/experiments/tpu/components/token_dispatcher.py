@@ -321,6 +321,20 @@ class TpuRoutedExperts(RoutedExperts):
           " scale_before_down_proj removes; enable only one"
       )
 
+  def parallelize(self, parallel_dims) -> None:
+    # Under EP > 1 the routing scores stay on the source rank while W2 runs on
+    # the expert's rank after dispatch, so the rows can't be scaled before W2.
+    # Refuse the combination when the model is parallelized, before any step.
+    if (
+        self.scale_before_down_proj
+        and parallel_dims.get_optional_mesh("ep") is not None
+    ):
+      raise ValueError(
+          "scale_before_down_proj requires expert_parallel_degree=1; disable"
+          " it to run expert parallelism"
+      )
+    super().parallelize(parallel_dims)
+
   def forward(
       self,
       x_TD: torch.Tensor,
@@ -340,7 +354,11 @@ class TpuRoutedExperts(RoutedExperts):
             num_local_tokens_per_expert_E,
         )
     )
-    if not isinstance(metadata, LocalDispatchMetadata):
+    # AllToAllDispatchMetadata subclasses LocalDispatchMetadata, so check for
+    # it explicitly: the local reduce below has no return all-to-all.
+    if not isinstance(metadata, LocalDispatchMetadata) or isinstance(
+        metadata, AllToAllDispatchMetadata
+    ):
       raise ValueError("scale_before_down_proj requires EP=1 local dispatch")
     with maybe_set_sparse_mesh():
       routed_output_RD = self.inner_experts(

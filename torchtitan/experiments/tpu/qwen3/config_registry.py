@@ -1115,7 +1115,11 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TpuGraphTrainer.Config:
   vocabulary evenly. Keep local batch 16 and use one microbatch per step.
   """
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
-  _without_splash_saves(cfg)
+  # Keep the Splash output and LSE of only the last 8 layers (~1 GiB each at
+  # the HBM peak). This topology has ~12 GiB free at the peak, versus room for
+  # 36 at world 512. At 8 layers on a 2x2x1 slice, saving every layer cut
+  # step time 1.8% (one attention-forward recompute, ~6.8 ms, per saved layer).
+  cfg.compile.save_last_n_layers = {"attention.inner_attention": 8}
   _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   # This topology's large FSDP reductions benefit from libtpu's hierarchical
   # n-D lowering. Keep the unvalidated HSDP and MaxText-numerics variants on

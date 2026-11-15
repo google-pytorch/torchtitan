@@ -468,7 +468,6 @@ def splash_tbwd_call(
   num_b, num_h, d, s = q_BHDS.shape
   num_kv = k_BNDS.shape[1]
   g = num_h // num_kv
-  num_steps = sched["b"].shape[0]
 
   def q_seq_minor(
       h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
@@ -529,13 +528,9 @@ def splash_tbwd_call(
       pltpu.VMEM((_round_up(g, 8), block), jnp.float32),
       pltpu.VMEM((_round_up(g, 8), block), jnp.float32),
   ]
-  # Static cost estimate, so XLA's latency-hiding scheduler overlaps async
-  # collectives (FSDP reduce-scatters) with this call instead of treating it
-  # as free. With T_max = num_steps (every causal tile, an upper bound on the
-  # active ones):
-  #   flops           = N * T_max * G * 5 matmuls * 2 * block * block * D
-  #   transcendentals = N * T_max * G * block * block   (one exp2 per P entry)
-  #   bytes_accessed  = every operand and output, read / written once
+  # No pl.CostEstimate: on the Qwen3-235B recipe it gave no step-time gain
+  # (4x4x4: 22.237 vs 22.252 s; 8 layers: -0.3%) and, at 8 layers, made XLA
+  # overlap the MoE backward with the activation reloads, +3.5 GiB of HBM.
   operands = (
       q_BHDS,
       do_BHDS,
@@ -546,14 +541,6 @@ def splash_tbwd_call(
       o_BHDS,
       qseg_BSL,
       kvseg_B8S,
-  )
-  tile_heads = num_kv * num_steps * g
-  cost = pl.CostEstimate(
-      flops=tile_heads * 5 * 2 * block * block * d,
-      transcendentals=tile_heads * block * block,
-      bytes_accessed=sum(
-          x.size * x.dtype.itemsize for x in (*operands, *out_shape)
-      ),
   )
   return pl.pallas_call(
       functools.partial(
@@ -574,7 +561,6 @@ def splash_tbwd_call(
           dimension_semantics=("arbitrary", "arbitrary"),
           vmem_limit_bytes=_vmem_limit_bytes(),
       ),
-      cost_estimate=cost,
       name="splash_tbwd",
   )(*(sched[key] for key in _SCHEDULE_KEYS), *operands)
 

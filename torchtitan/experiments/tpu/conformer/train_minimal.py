@@ -273,6 +273,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
 
   metrics_processor = train_config.metrics.build(
       parallel_dims=parallel_dims,
+      device_memory_monitor=metrics.build_device_memory_monitor(),
       dump_folder=train_config.dump_folder,
       pp_schedule=train_config.parallelism.pipeline_parallel_schedule,
       config_dict=train_config.to_dict(),

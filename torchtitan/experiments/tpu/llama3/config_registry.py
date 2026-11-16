@@ -151,7 +151,11 @@ def llama3_debugmodel_checkpoint() -> TPUTrainerConfig:
   config; `--checkpointer.interval/folder` then override it.
   """
   config = llama3_debugmodel()
-  config.checkpointer = CheckpointManager.Config(interval=2)
+  # Full training state on the last step too: the resume runs reload the
+  # dataloader and optimizer from the final save.
+  config.checkpointer = CheckpointManager.Config(
+      interval=2, last_save_model_only=False
+  )
   return config
 
 

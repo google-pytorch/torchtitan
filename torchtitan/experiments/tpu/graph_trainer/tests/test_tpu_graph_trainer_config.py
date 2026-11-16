@@ -328,8 +328,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     config = JaxJobConfig.derive_from(source)
 
+    # Upstream ec953b36: a present generic CompileConfig means enabled.
     self.assertIs(type(config.compile), CompileConfig)
-    self.assertTrue(config.compile.enable)
+    self.assertFalse(hasattr(config.compile, "enable"))
     self.assertEqual(config.compile.components, ["model"])
     self.assertEqual(config.compile.backend, "tpu")
     self.assertFalse(
@@ -340,12 +341,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   @parameterized.named_parameters(
       (
           "generic",
-          CompileConfig(enable=True, components=["model"], backend="tpu"),
+          CompileConfig(components=["model"], backend="tpu"),
       ),
       (
           "graph",
           GraphTrainerCompileConfig(
-              enable=True,
               components=["model"],
               backend="tpu",
               memory_policy="full",
@@ -361,6 +361,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIsInstance(config.compile, TpuGraphTrainerCompileConfig)
+    self.assertTrue(config.compile.enable)
     self.assertEqual(config.compile.components, ["model"])
     self.assertEqual(config.compile.backend, "tpu")
     self.assertEqual(config.compile.pass_pipeline, "tpu")

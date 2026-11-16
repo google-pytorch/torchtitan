@@ -514,6 +514,10 @@ class TpuGraphTrainer(GraphTrainer):
                 values = {
                     name: getattr(source_compile, name) for name in names
                 }
+                if "enable" not in source_fields:
+                    # An upstream compile config has no ``enable``: when it
+                    # is present at all, upstream compiles.
+                    values["enable"] = True
                 # A generic GraphTrainer pipeline cannot lower a TPU graph.
                 values["pass_pipeline"] = "tpu"
                 self.compile = TpuGraphTrainerCompileConfig(**values)

@@ -252,23 +252,39 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # inherit merely because they reuse a TorchTPU recipe. Reconstruct the
     # destination's declared/default type and carry only the generic policy.
     if "compile" in values:
-      compile_factory = dst_fields["compile"].default_factory
-      if compile_factory is dataclasses.MISSING:
-        raise TypeError(f"{cls.__name__}.compile must have a default factory")
-      dst_compile = compile_factory()
+      compile_field = dst_fields["compile"]
+      if compile_field.default_factory is not dataclasses.MISSING:
+        dst_compile = compile_field.default_factory()
+      elif compile_field.default is not dataclasses.MISSING:
+        # Upstream ``Trainer.Config.compile`` is ``CompileConfig | None``
+        # (``None`` means no compilation).
+        dst_compile = compile_field.default
+      else:
+        raise TypeError(f"{cls.__name__}.compile must have a default")
       src_compile = values["compile"]
       if src_compile is None:
-        # Upstream ``Trainer.Config.compile`` is optional (``None`` means no
-        # compilation); the TPU lanes keep a concrete, always-present policy.
+        # The TPU lanes keep a concrete, always-present policy.
         values["compile"] = dst_compile
-      elif type(src_compile) is not type(dst_compile):
-        values["compile"] = type(dst_compile)(
-            # A plain upstream ``CompileConfig`` has no ``enable``: when it
-            # is present at all, upstream compiles.
-            enable=getattr(src_compile, "enable", True),
-            components=list(src_compile.components),
-            backend=src_compile.backend,
+      elif dst_compile is None:
+        # Upstream's optional generic policy: present means enabled.
+        values["compile"] = (
+            torchtitan.config.CompileConfig(
+                components=list(src_compile.components),
+                backend=src_compile.backend,
+            )
+            if getattr(src_compile, "enable", True)
+            else None
         )
+      elif type(src_compile) is not type(dst_compile):
+        kwargs = {
+            "components": list(src_compile.components),
+            "backend": src_compile.backend,
+        }
+        if "enable" in {f.name for f in dataclasses.fields(dst_compile)}:
+          # A plain upstream ``CompileConfig`` has no ``enable``: when it is
+          # present at all, upstream compiles.
+          kwargs["enable"] = getattr(src_compile, "enable", True)
+        values["compile"] = type(dst_compile)(**kwargs)
     return cls(
         **values,
         **overrides,

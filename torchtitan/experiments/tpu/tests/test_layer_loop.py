@@ -97,10 +97,10 @@ class _ScanLikeLoop(TpuLayerLoop):
     super().__init__(layers)
     self.calls = 0
 
-  def forward(self, h, *args):
+  def forward(self, h, *args, **kwargs):
     self.calls += 1
     for name in list(self.keys()):
-      h = self[name](h, *args)
+      h = self[name](h, *args, **kwargs)
     return h
 
 

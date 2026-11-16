@@ -31,6 +31,7 @@ from torchtitan.models.common.config_utils import (
     make_aux_loss_config,
     update_moe_aux_loss_configs,
 )
+from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
     _batch_wise_load_balance_loss,
@@ -497,7 +498,7 @@ def _router_config(aux_loss=None):
     return TokenChoiceTopKRouter.Config(
         num_experts=_E,
         top_k=_K,
-        score_func="softmax",
+        score_func=Softmax.Config(),
         route_norm=True,
         gate=Linear.Config(in_features=_D, out_features=_E, bias=False),
         aux_loss=aux_loss,
@@ -646,7 +647,7 @@ def test_moe_forward_produces_routing_metrics():
 
     metrics = get_moe_load_balancing_metrics([model_part])
 
-    counts_E = moe.tokens_per_expert_E
+    counts_E = moe.router.tokens_per_expert_E
     assert json.loads(metrics["moe/route_counts_json"]) == [
         counts_E.to(torch.int64).tolist()
     ]

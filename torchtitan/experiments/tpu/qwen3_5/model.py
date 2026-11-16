@@ -89,6 +89,8 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
       x_TD: torch.Tensor,
       attention_masks: Qwen35AttentionMaskDict | None,
       positions: torch.Tensor | None = None,
+      *,
+      padding_mask: torch.Tensor | None = None,
   ) -> torch.Tensor:
     layer_mask = (
         attention_masks[self.attn_mask_key]
@@ -102,7 +104,7 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
 
     h_TD = self.ffn_norm(x_TD)
     if self.moe_enabled:
-      x_TD = x_TD + self.moe(h_TD)
+      x_TD = x_TD + self.moe(h_TD, padding_mask_T=padding_mask)
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD

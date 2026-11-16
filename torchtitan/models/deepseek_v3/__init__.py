@@ -716,7 +716,7 @@ def _testmodel(
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         router_top_k=3,
-        router_score_func="sigmoid",
+        router_score_func=Sigmoid.Config(),
         router_route_norm=True,
         aux_loss_coeff=1e-3,
         attn_backend=attn_backend,

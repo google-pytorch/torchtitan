@@ -34,7 +34,9 @@ RUN if [ -n "${TORCH_TPU_VERSION}" ]; then \
 
 # renderers 0.1.11 (upstream's pin) declares Requires-Python <3.14 although it
 # is pure Python and runs on 3.14; upstream relaxes the pin with 0.1.12 later.
-RUN grep -v '^renderers' requirements.txt > requirements-tpu-image.txt \
+# attn-gym ships CUDA/Triton kernels (Qwen3.5 GDN, Kimi K3 KDA) the TPU lane
+# never calls; `experiments/tpu/qwen3_5/attn_gym_stub.py` stands in for it.
+RUN grep -v -e '^renderers' -e '^attn-gym' requirements.txt > requirements-tpu-image.txt \
     && pip install -r requirements-tpu-image.txt \
     && pip install --ignore-requires-python "$(grep '^renderers' requirements.txt | tr -d ' ')" \
     && rm requirements-tpu-image.txt

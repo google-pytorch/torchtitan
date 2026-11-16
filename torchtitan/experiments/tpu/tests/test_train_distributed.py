@@ -682,9 +682,8 @@ class TrainDistributedTest(
       test_tmp_dir = tempfile.mkdtemp()
       self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)
       combined_args.extend([
-          "--checkpoint.enable",
-          "--checkpoint.interval=2",
-          f"--checkpoint.folder={os.path.join(test_tmp_dir, 'checkpoint')}",
+          "--checkpointer.interval=2",
+          f"--checkpointer.folder={os.path.join(test_tmp_dir, 'checkpoint')}",
       ])
 
     self._test_train_distributed(

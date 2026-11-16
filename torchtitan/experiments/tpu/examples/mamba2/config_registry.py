@@ -163,9 +163,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
           steps=10,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=10, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
   )
 
@@ -190,9 +188,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
           steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=1000, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
   )
 
@@ -217,9 +213,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
           steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=1000, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
   )
 
@@ -244,9 +238,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
           steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=1000, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
   )
 
@@ -271,9 +263,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
           steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=1000, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
   )
 
@@ -298,9 +288,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
           steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=1000, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
   )
 
@@ -325,8 +313,6 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
           steps=1000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=100, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.FullAC.Config(),
   )

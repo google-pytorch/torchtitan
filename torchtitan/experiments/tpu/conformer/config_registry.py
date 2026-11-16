@@ -54,7 +54,7 @@ def conformer_test() -> TPUTrainerConfig:
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
       dataloader=c4_test_dataloader(),
       tokenizer=HuggingFaceTokenizer.Config(),
-      validator=Validator.Config(enable=True),
+      validator=Validator.Config(),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=768 * 512,
           max_context_length=512,

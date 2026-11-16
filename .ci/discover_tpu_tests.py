@@ -169,6 +169,9 @@ DESELECTED_TESTS = (
     # Upstream test; the fork passes cache_dir= to load_dataset (copy.bara.sky),
     # so the exact-call assertion fails.
     "tests/unit_tests/cpu/components/data/test_grain_data.py::test_hf_explicit_fields_are_passed_to_load_dataset",
+    # Fork keeps EP-disabled routed experts as replicated DTensors (spmd FSDP
+    # rejects plain tensors); upstream asserts no sharding config there.
+    "tests/unit_tests/cpu/test_moe.py::TestMoE::test_moe_without_ep_keeps_routed_weights_replicated",
 )
 
 

@@ -225,7 +225,10 @@ class GraphTrainingEngine(TrainingEngine):
         ):
             is_last = accumulation_index == self.num_accumulation_steps - 1
             for part in self.model_parts:
-                part.set_requires_all_reduce(is_last)  # pyrefly: ignore[not-callable]
+                # Fork: the TPU scan path shards through ``scan_fsdp`` and
+                # has no ``set_requires_all_reduce`` (see training_engine.py).
+                if hasattr(part, "set_requires_all_reduce"):
+                    part.set_requires_all_reduce(is_last)  # pyrefly: ignore[not-callable]
 
         def compute_forward_backward() -> torch.Tensor:
             assert len(microbatch_group) == 1

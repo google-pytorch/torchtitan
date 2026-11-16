@@ -37,10 +37,10 @@ from torchtitan.experiments.rl.losses import GRPOLoss
 from torchtitan.experiments.rl.types import OptimStepOutput, TrainingMicrobatch
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.logging import init_logger
+from torchtitan.observability.profiler import Profiler
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
-from torchtitan.tools.profiler import Profiler
-from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
 
@@ -395,7 +395,10 @@ class PolicyTrainer(Actor, Configurable):
         with self.train_context():
             with sl.log_trace_span("model_forward"):
                 pred = model(
-                    token_ids, attention_masks=attention_masks, positions=positions
+                    token_ids,
+                    attention_masks=attention_masks,
+                    positions=positions,
+                    padding_mask=padding_mask,
                 )
 
             with sl.log_trace_span("loss_fn"):

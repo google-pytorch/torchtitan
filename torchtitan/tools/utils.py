@@ -6,6 +6,7 @@
 
 import contextlib
 import gc
+import logging
 import os
 import subprocess
 import time
@@ -19,7 +20,9 @@ import torch.distributed as dist
 from torch._utils import _get_available_device_type, _get_device_module
 
 from torchtitan.observability import structured_logger as sl
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def round_up(value: int, multiple: int) -> int:

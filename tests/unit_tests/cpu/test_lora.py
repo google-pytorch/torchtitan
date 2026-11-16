@@ -8,22 +8,36 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from torchtitan.components.lora import _get_lora_cls, LoRAConverter
-from torchtitan.components.quantization import Float8LinearConverter
+from torchtitan.config.transform import (
+    Float8LinearConverter,
+    LinearLoRAHandler,
+    LoRATransform,
+    transform_model_config_,
+)
 from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3 import model_registry
-from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.module import Module
+
+
+LINEAR_LORA_HANDLERS = (LinearLoRAHandler(),)
 
 
 def test_lora_model_builds():
     """LoRA debug model builds, has trainable adapters and frozen base."""
-    model_spec = model_registry(
-        "debugmodel",
-        converters=[
-            LoRAConverter.Config(rank=8, alpha=16.0, target_modules=["wqkv", "wo"]),
+    model_spec = model_registry("debugmodel")
+    model_spec.model = transform_model_config_(
+        model_spec.model,
+        [
+            LoRATransform(
+                handlers=LINEAR_LORA_HANDLERS,
+                rank=8,
+                alpha=16.0,
+                target_modules=["wqkv", "wo"],
+            )
         ],
     )
     model = model_spec.model.build()
@@ -60,10 +74,16 @@ def test_lora_model_builds():
 
 def test_lora_forward():
     """LoRA model forward produces correct output shape."""
-    model_spec = model_registry(
-        "debugmodel",
-        converters=[
-            LoRAConverter.Config(rank=8, alpha=16.0, target_modules=["wqkv", "wo"]),
+    model_spec = model_registry("debugmodel")
+    model_spec.model = transform_model_config_(
+        model_spec.model,
+        [
+            LoRATransform(
+                handlers=LINEAR_LORA_HANDLERS,
+                rank=8,
+                alpha=16.0,
+                target_modules=["wqkv", "wo"],
+            )
         ],
     )
     model = model_spec.model.build()
@@ -82,37 +102,205 @@ def test_lora_forward():
     assert output.shape == (num_tokens, vocab_size)
 
 
-def test_validate_converter_order():
-    """Quantization before LoRA is valid; LoRA before quantization is not."""
-    lora_cfg = LoRAConverter.Config(rank=8, alpha=16.0)
+def test_lora_targets_fused_feed_forward_projection():
+    """The physical w13 projection uses one LoRA adapter."""
+    init = {"weight": torch.nn.init.ones_}
+    config = FeedForward.Config(
+        w13=Linear.Config(in_features=4, out_features=16, param_init=init),
+        w2=Linear.Config(in_features=8, out_features=4, param_init=init),
+    )
+    config = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS,
+        rank=2,
+        alpha=4.0,
+        target_modules=["w13"],
+    ).transform(config)
+    feed_forward = config.build()
+    feed_forward.init_states()
 
-    # Valid order: no error
-    validate_converter_order([lora_cfg])
+    assert set(feed_forward.state_dict()) == {
+        "w1.weight",
+        "w2.weight",
+        "w3.weight",
+        "w13.lora_a.weight",
+        "w13.lora_b.weight",
+    }
+    assert {
+        name
+        for name, parameter in feed_forward.named_parameters()
+        if parameter.requires_grad
+    } == {
+        "w13.lora_a.weight",
+        "w13.lora_b.weight",
+    }
 
-    # Invalid order: quantization after LoRA
-    float8_cfg = Float8LinearConverter.Config(emulate=True)
-    with pytest.raises(ValueError, match="must be applied before"):
-        validate_converter_order([lora_cfg, float8_cfg])
+    with torch.no_grad():
+        for adapter in (feed_forward.w13.lora_a, feed_forward.w13.lora_b):
+            adapter.weight.copy_(torch.randn_like(adapter.weight))
 
-    # Valid order: quantization before LoRA
-    validate_converter_order([float8_cfg, lora_cfg])
+    x = torch.randn(3, 4)
+    gate_up = F.linear(x, feed_forward.w13.weight)
+    gate_up = gate_up + 2 * feed_forward.w13.lora_b(feed_forward.w13.lora_a(x))
+    gate_up = gate_up.unflatten(-1, (8, 2))
+    gate, up = gate_up.unbind(-1)
+    expected = feed_forward.w2(F.silu(gate) * up)
+    torch.testing.assert_close(feed_forward(x), expected)
+
+    reloaded = config.build()
+    reloaded.init_states()
+    reloaded.load_state_dict(feed_forward.state_dict())
+    torch.testing.assert_close(reloaded(x), expected)
 
 
-def test_lora_cls_cache():
+def test_float8_lora_targets_fused_feed_forward_projection():
+    """Quantized w13 uses one LoRA adapter."""
+    pytest.importorskip("torchao")
+    from torchtitan.quantization import Float8Linear
+
+    if Float8Linear is None:
+        pytest.skip("torchao Float8Linear is unavailable")
+
+    init = {"weight": torch.nn.init.ones_}
+    config = FeedForward.Config(
+        w13=Linear.Config(in_features=16, out_features=64, param_init=init),
+        w2=Linear.Config(in_features=32, out_features=16, param_init=init),
+    )
+    config = Float8LinearConverter(
+        Float8LinearConverter.Config(emulate=True, model_compile_enabled=False)
+    ).convert(config)
+    config = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS,
+        rank=4,
+        alpha=8.0,
+        target_modules=["w13"],
+    ).transform(config)
+    feed_forward = config.build()
+    feed_forward.init_states()
+
+    assert isinstance(feed_forward.w13, Float8Linear)
+    assert set(feed_forward.state_dict()) == {
+        "w1.weight",
+        "w2.weight",
+        "w3.weight",
+        "w13.lora_a.weight",
+        "w13.lora_b.weight",
+    }
+    assert not feed_forward.w13.weight.requires_grad
+    assert feed_forward.w13.lora_a.weight.requires_grad
+    assert feed_forward.w13.lora_b.weight.requires_grad
+    assert feed_forward(torch.randn(2, 16)).shape == (2, 16)
+
+
+def test_lora_class_is_reused_for_the_same_parent():
     """Dynamic LoRA class creation is cached per parent class."""
-    cls1 = _get_lora_cls(Linear)
-    cls2 = _get_lora_cls(Linear)
-    assert cls1 is cls2
-    assert cls1.__name__ == "LoRALinear"
-    assert issubclass(cls1, Linear)
+    first = LoRATransform(handlers=LINEAR_LORA_HANDLERS, rank=2, alpha=4.0).transform(
+        Linear.Config(in_features=4, out_features=3)
+    )
+    second = LoRATransform(handlers=LINEAR_LORA_HANDLERS, rank=2, alpha=4.0).transform(
+        Linear.Config(in_features=4, out_features=3)
+    )
+
+    assert type(first) is type(second)
+    assert first._owner is second._owner
+    assert first._owner is not None
+    assert first._owner.__name__ == "LoRALinear"
+    assert issubclass(first._owner, Linear)
+
+
+def test_lora_handler_matches_linear_config_subclass():
+    class AlternateLinear(Linear):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Linear.Config):
+            pass
+
+    config = AlternateLinear.Config(in_features=4, out_features=3)
+    transformed = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS, rank=2, alpha=4.0
+    ).transform(config)
+    model = transformed.build()
+
+    assert isinstance(model, AlternateLinear)
+    assert not model.weight.requires_grad
+    assert model.lora_a.weight.requires_grad
+    assert model.lora_b.weight.requires_grad
+
+
+def test_lora_transform_rejects_duplicate_handler_type():
+    with pytest.raises(ValueError, match="is shadowed by earlier handler"):
+        LoRATransform(
+            handlers=(LinearLoRAHandler(), LinearLoRAHandler()),
+        )
+
+
+def test_lora_transform_requires_handlers():
+    with pytest.raises(TypeError, match="handlers"):
+        LoRATransform()
+
+
+def test_lora_transform_rejects_handler_shadowed_by_superclass():
+    class SpecializedLinear(Linear):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Linear.Config):
+            pass
+
+    class SpecializedLinearHandler:
+        config_type = SpecializedLinear.Config
+
+        def make_config(self, cfg, *, rank, alpha):
+            return cfg
+
+    with pytest.raises(ValueError, match="is shadowed by earlier handler"):
+        LoRATransform(
+            handlers=(LinearLoRAHandler(), SpecializedLinearHandler()),
+        )
+
+
+def test_lora_transform_accepts_specialized_handler_before_superclass():
+    class SpecializedLinear(Linear):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Linear.Config):
+            pass
+
+    class SpecializedLinearHandler:
+        config_type = SpecializedLinear.Config
+
+        def make_config(self, cfg, *, rank, alpha):
+            return cfg
+
+    LoRATransform(
+        handlers=(SpecializedLinearHandler(), LinearLoRAHandler()),
+    )
 
 
 def test_lora_rank_validation():
     """LoRA rank must be positive."""
     with pytest.raises(ValueError, match="rank must be positive"):
-        LoRAConverter(LoRAConverter.Config(rank=0))
+        LoRATransform(handlers=LINEAR_LORA_HANDLERS, rank=0)
     with pytest.raises(ValueError, match="rank must be positive"):
-        LoRAConverter(LoRAConverter.Config(rank=-1))
+        LoRATransform(handlers=LINEAR_LORA_HANDLERS, rank=-1)
+
+
+def test_multiple_lora_transforms_conflict():
+    model_spec = model_registry("debugmodel")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        transform_model_config_(
+            model_spec.model,
+            [
+                LoRATransform(
+                    handlers=LINEAR_LORA_HANDLERS,
+                    rank=2,
+                    alpha=4.0,
+                    target_modules=["wqkv"],
+                ),
+                LoRATransform(
+                    handlers=LINEAR_LORA_HANDLERS,
+                    rank=4,
+                    alpha=8.0,
+                    target_modules=["wo"],
+                ),
+            ],
+        )
 
 
 def test_lora_freezes_direct_params_on_composite_modules():
@@ -146,9 +334,12 @@ def test_lora_freezes_direct_params_on_composite_modules():
         )
     )
 
-    model_config = LoRAConverter(
-        LoRAConverter.Config(rank=2, alpha=4.0, target_modules=["child"])
-    ).convert(model_config)
+    model_config = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS,
+        rank=2,
+        alpha=4.0,
+        target_modules=["child"],
+    ).transform(model_config)
     model = model_config.build()
 
     assert not model.direct.requires_grad
@@ -184,9 +375,12 @@ def test_lora_freezes_direct_params_on_root_module():
         dim=4,
     )
 
-    model_config = LoRAConverter(
-        LoRAConverter.Config(rank=2, alpha=4.0, target_modules=["child"])
-    ).convert(model_config)
+    model_config = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS,
+        rank=2,
+        alpha=4.0,
+        target_modules=["child"],
+    ).transform(model_config)
     model = model_config.build()
 
     assert not model.direct.requires_grad
@@ -221,12 +415,120 @@ def test_lora_preserves_frozen_config_type_checks():
         proj=Linear.Config(in_features=4, out_features=4),
     )
 
-    model_config = LoRAConverter(
-        LoRAConverter.Config(rank=2, alpha=4.0, target_modules=["proj"])
-    ).convert(model_config)
+    model_config = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS,
+        rank=2,
+        alpha=4.0,
+        target_modules=["proj"],
+    ).transform(model_config)
 
     assert isinstance(model_config.inner_attention, FlexInnerAttention.Config)
     model = model_config.build()
     assert not model.proj.weight.requires_grad
     assert model.proj.lora_a.weight.requires_grad
     assert model.proj.lora_b.weight.requires_grad
+
+
+def test_lora_transform_handlers_support_multiple_projection_types():
+    """One transform can adapt projections from unrelated class hierarchies."""
+
+    class HeadwiseProjection(Module):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Module.Config):
+            num_heads: int
+            in_features: int
+            out_features: int
+
+        def __init__(self, config: Config) -> None:
+            super().__init__()
+            self.num_heads = config.num_heads
+            self.out_features = config.out_features
+            self.weight = torch.nn.Parameter(
+                torch.empty(
+                    config.num_heads,
+                    config.out_features,
+                    config.in_features,
+                )
+            )
+
+        def forward(  # pyrefly: ignore [bad-override]
+            self, input: torch.Tensor
+        ) -> torch.Tensor:
+            return torch.einsum("...hi,hoi->...ho", input, self.weight)
+
+    class LoRAHeadwiseProjection(HeadwiseProjection):
+        @dataclass(kw_only=True, slots=True)
+        class Config(HeadwiseProjection.Config):
+            rank: int
+            alpha: float
+
+        def __init__(self, config: Config) -> None:
+            super().__init__(config)
+            self.weight.requires_grad_(False)
+            self.scaling = config.alpha / config.rank
+            self.lora_a = torch.nn.Parameter(
+                torch.randn(config.in_features, config.rank)
+            )
+            self.lora_b = torch.nn.Parameter(
+                torch.zeros(config.num_heads, config.rank, config.out_features)
+            )
+
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            base = super().forward(input)
+            hidden = input @ self.lora_a
+            adapter = torch.einsum("...hr,hro->...ho", hidden, self.lora_b)
+            return base + self.scaling * adapter
+
+    class HeadwiseProjectionLoRAHandler:
+        config_type = HeadwiseProjection.Config
+
+        def make_config(
+            self,
+            cfg: Module.Config,
+            *,
+            rank: int,
+            alpha: float,
+        ) -> Module.Config:
+            assert isinstance(cfg, HeadwiseProjection.Config)
+            return LoRAHeadwiseProjection.Config(
+                num_heads=cfg.num_heads,
+                in_features=cfg.in_features,
+                out_features=cfg.out_features,
+                rank=rank,
+                alpha=alpha,
+            )
+
+    class Root(Module):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Module.Config):
+            projection: HeadwiseProjection.Config
+            linear: Linear.Config
+
+        def __init__(self, config: Config) -> None:
+            super().__init__()
+            self.projection = config.projection.build()
+            self.linear = config.linear.build()
+
+    config = Root.Config(
+        projection=HeadwiseProjection.Config(
+            num_heads=2,
+            in_features=4,
+            out_features=3,
+        ),
+        linear=Linear.Config(in_features=4, out_features=3),
+    )
+    converted = LoRATransform(
+        handlers=(LinearLoRAHandler(), HeadwiseProjectionLoRAHandler()),
+        rank=2,
+        alpha=4.0,
+    ).transform(config)
+    model = converted.build()
+    output = model.projection(torch.randn(5, 2, 4))
+
+    assert output.shape == (5, 2, 3)
+    assert not model.projection.weight.requires_grad
+    assert model.projection.lora_a.requires_grad
+    assert model.projection.lora_b.requires_grad
+    assert not model.linear.weight.requires_grad
+    assert model.linear.lora_a.weight.requires_grad
+    assert model.linear.lora_b.weight.requires_grad

@@ -15,6 +15,8 @@ entry point selects a tagging strategy via ``--compile.memory_policy``.
 
 from __future__ import annotations
 
+import logging
+
 import operator
 from collections import defaultdict
 from collections.abc import Callable
@@ -46,7 +48,7 @@ from torchtitan.experiments.graph_trainer.cpu_offload import (
     tag_all_offloadable_activations,
 )
 from torchtitan.experiments.graph_trainer.fsdp_patterns import (
-    find_fsdp_unshard_save_nodes,
+    find_fsdp_unshard_outputs_by_param,
 )
 from torchtitan.experiments.graph_trainer.log_activation_memory_policy import (
     log_activation_memory_policy,
@@ -55,7 +57,9 @@ from torchtitan.experiments.graph_trainer.registry import (
     MEMORY_POLICY_REGISTRY,
     register_memory_policy,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
@@ -78,10 +82,10 @@ def _make_default_memory_policy(save_ops: set | None = None) -> Callable:
 
 
 def _find_fsdp_unshard_save_nodes(gm: torch.fx.GraphModule) -> set[torch.fx.Node]:
-    save_nodes: set[torch.fx.Node] = set()
-    for node in gm.graph.find_nodes(op="placeholder"):
-        save_nodes.update(find_fsdp_unshard_save_nodes(node))
-    return save_nodes
+    outputs_by_param = find_fsdp_unshard_outputs_by_param(
+        gm.graph.find_nodes(op="placeholder")
+    )
+    return {output for outputs in outputs_by_param.values() for output in outputs}
 
 
 def _resolve_op_target(op_name: str) -> object:

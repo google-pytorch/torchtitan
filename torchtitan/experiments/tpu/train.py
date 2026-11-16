@@ -112,6 +112,11 @@ class TpuTrainingEngine(TrainingEngine):
       from torchtitan.models.qwen3 import Qwen3Model  # pylint: disable=g-import-not-at-top
       from torchtitan.models.qwen3_5.model import Qwen35Model  # pylint: disable=g-import-not-at-top
 
+      # Restore the original parallelize method before dispatching so TPU
+      # wrappers (`parallelize_llama`, `parallelize_qwen3`, `parallelize_qwen3_5`)
+      # that delegate to `model.parallelize(...)` call the upstream method
+      # instead of recursing into `_tpu_parallelize`.
+      self_model.parallelize = orig_parallelize
       if isinstance(self_model, Llama3Model):
         from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama  # pylint: disable=g-import-not-at-top
 
@@ -155,10 +160,15 @@ class TpuTrainingEngine(TrainingEngine):
         hf_assets_path=hf_assets_path,
         create_seed_checkpoint=create_seed_checkpoint,
     )
-    if self._is_tpu_config:
+    from torchtitan.models.flux import FluxModel  # pylint: disable=g-import-not-at-top
+
+    if self._is_tpu_config and not isinstance(
+        self.model_config, FluxModel.Config
+    ):
       # The base engine builds `loss_fn` from `config.loss` (and, under
       # pipeline parallelism, binds it into the PP schedule); the TPU recipes
-      # keep their legacy loss-kernel selection on top of that.
+      # keep their legacy loss-kernel selection on top of that. Flux uses MSE
+      # loss (`config.loss`) rather than cross-entropy.
       from torchtitan.experiments.tpu.components.loss import build_cross_entropy_loss  # pylint: disable=g-import-not-at-top
 
       self.loss_fn = build_cross_entropy_loss(self.config)

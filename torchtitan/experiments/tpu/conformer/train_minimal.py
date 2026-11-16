@@ -319,7 +319,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       train_config.compile.enable and "model" in train_config.compile.components
   )
   if world_size > 1 or model_compile_enabled:
-    from torchtitan.experiments.tpu.conformer.parallelize import parallelize_conformer  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer  # pylint: disable=g-import-not-at-top
 
     compiled_model = parallelize_conformer(
         model, parallel_dims, train_config

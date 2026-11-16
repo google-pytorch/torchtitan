@@ -115,6 +115,7 @@ DISABLED_TESTS = {
     # attn-gym (CUDA/Triton kernels) is left out of the TPU image; these import
     # torchtitan.models.qwen3_5 directly, without the TPU lane's attn_gym_stub.
     "tests.unit_tests.cpu.test_model_td_layout",
+    "tests.unit_tests.cpu.test_skip_dp",
     "tests.unit_tests.cpu.test_triton_offset_rmsnorm_override",
     "tests.unit_tests.rl.test_gdn_graph_metadata",
     # Missing optional dependency torchvision

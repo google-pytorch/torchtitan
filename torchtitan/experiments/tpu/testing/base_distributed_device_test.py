@@ -393,7 +393,7 @@ class DistributedUnitTestRunner:
 
     is_parallel = model is self.parallel_model and self.parallel_dims is not None
     spmd_ctx = (
-        dist_utils.get_spmd_context(parallel_dims=self.parallel_dims)()
+        dist_utils.get_spmd_context(parallel_dims=self.parallel_dims)
         if is_parallel
         else contextlib.nullcontext()
     )

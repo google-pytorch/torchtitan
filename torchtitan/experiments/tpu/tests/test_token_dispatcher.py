@@ -242,12 +242,19 @@ def test_ep_combine_delegates_to_standard_dispatcher():
     dispatcher = TpuAllToAllTokenDispatcher.Config(
         num_experts=2, top_k=2
     ).build()
-    dispatcher.ep_mesh = object()
     expected = torch.tensor([1.0])
 
-    with mock.patch.object(
-        AllToAllTokenDispatcher, "combine", return_value=expected
-    ) as combine:
+    with (
+        mock.patch.object(
+            TpuAllToAllTokenDispatcher,
+            "ep_mesh",
+            new_callable=mock.PropertyMock,
+            return_value=object(),
+        ),
+        mock.patch.object(
+            AllToAllTokenDispatcher, "combine", return_value=expected
+        ) as combine,
+    ):
         actual = dispatcher.combine(
             torch.empty(0), mock.sentinel.metadata, torch.empty(0)
         )

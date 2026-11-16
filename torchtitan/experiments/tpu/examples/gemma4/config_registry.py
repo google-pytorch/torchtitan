@@ -4,7 +4,7 @@ from typing import cast
 from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator

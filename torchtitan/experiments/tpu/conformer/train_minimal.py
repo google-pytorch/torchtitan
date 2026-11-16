@@ -34,7 +34,7 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
 from torchtitan.tools import utils
 import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 ParallelDims = torchtitan.distributed.ParallelDims

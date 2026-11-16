@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torchtitan.config import derive
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.attention import BaseQKVLinear, FusedQKVLinear
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform import ModelConfigConverter
 
 
 class _PackedQKVInit:

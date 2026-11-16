@@ -21,8 +21,10 @@ from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import (
@@ -555,7 +557,7 @@ def _build_flavor_config(
     )
 
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
     return config

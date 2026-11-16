@@ -45,6 +45,11 @@ TpuTrainerOptimizerCompileMode = Literal["eager", "separate_graph"]
 class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
   """Generic compile policy plus regular-Trainer TorchTPU controls."""
 
+  # Upstream ec953b36 dropped ``CompileConfig.enable`` in favour of
+  # ``Trainer.Config.compile`` being ``None``. The TPU compile config also
+  # carries execution controls that apply when torch.compile is off, so it is
+  # always present and keeps the explicit switch.
+  enable: bool = False
   # TPU model families support different subsets: Llama/Qwen use
   # layer/fullgraph, Conformer uses layer/whole, and redacted uses block/whole.
   mode: TpuTrainerCompileMode = "layer"
@@ -58,6 +63,14 @@ class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
   optimizer_compile: TpuTrainerOptimizerCompileMode = "eager"
   # Compile the DTensor-aware global gradient norm as a separate static graph.
   compile_grad_norm: bool = False
+
+  def __post_init__(self) -> None:
+    super(TpuTrainerCompileConfig, self).__post_init__()
+    if not self.enable:
+      # Upstream consumers read "compile is not None and <component> in
+      # components" (model parallelize fns, config validation, loss build);
+      # keep the fork's explicit switch and upstream's view consistent.
+      self.components = []
 
 
 @dataclasses.dataclass
@@ -244,9 +257,15 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
         raise TypeError(f"{cls.__name__}.compile must have a default factory")
       dst_compile = compile_factory()
       src_compile = values["compile"]
-      if type(src_compile) is not type(dst_compile):
+      if src_compile is None:
+        # Upstream ``Trainer.Config.compile`` is optional (``None`` means no
+        # compilation); the TPU lanes keep a concrete, always-present policy.
+        values["compile"] = dst_compile
+      elif type(src_compile) is not type(dst_compile):
         values["compile"] = type(dst_compile)(
-            enable=src_compile.enable,
+            # A plain upstream ``CompileConfig`` has no ``enable``: when it
+            # is present at all, upstream compiles.
+            enable=getattr(src_compile, "enable", True),
             components=list(src_compile.components),
             backend=src_compile.backend,
         )
@@ -265,11 +284,15 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
-    if type(self.compile) is torchtitan.config.CompileConfig:
+    if self.compile is None:
+      # Upstream ``Trainer.Config.compile`` is optional; the TPU lane always
+      # carries its concrete policy (``enable`` defaults to False).
+      self.compile = TpuTrainerCompileConfig()
+    elif type(self.compile) is torchtitan.config.CompileConfig:
       # ``derive_from`` may receive an upstream Trainer.Config. Preserve its
       # generic compile policy while restoring the TPU-specific config type.
       self.compile = TpuTrainerCompileConfig(
-          enable=self.compile.enable,
+          enable=getattr(self.compile, "enable", True),
           components=list(self.compile.components),
           backend=self.compile.backend,
       )

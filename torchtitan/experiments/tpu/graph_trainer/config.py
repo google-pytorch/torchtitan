@@ -129,6 +129,10 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   ``"loss"`` unless a separately compiled loss is intentional.
   """
 
+  # Fork: the TPU compile config carries knobs that apply even when
+  # torch.compile is off; upstream removed ``CompileConfig.enable`` in
+  # ec953b36 and uses ``compile is None`` instead.
+  enable: bool = False
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"
@@ -175,6 +179,13 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+
+  def __post_init__(self) -> None:
+    super(TpuGraphTrainerCompileConfig, self).__post_init__()
+    if not self.enable:
+      # Upstream consumers read "compile is not None and <component> in
+      # components"; keep the fork's explicit switch consistent with that.
+      self.components = []
 
 
 def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:

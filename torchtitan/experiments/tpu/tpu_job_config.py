@@ -200,6 +200,20 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # graph to capture in this lane, so opt out before the check runs. Must
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
     self.training.disable_cuda_graphs = True
+    if (
+        self.model_spec is not None
+        and self.parallelism.context_parallel_degree > 1
+    ):
+      # CP recipes apply core ContextParallelTransform with a TPU CP inner
+      # attention; core validates the CP backend, this adds the TPU rules.
+      # Runs before ``super()`` so the strategy-specific sequence-length error
+      # surfaces instead of upstream's generic ring-CP (``2 * cp``) token check.
+      validate_tpu_context_parallel(
+          self.model_spec.model,
+          self.parallelism,
+          training=self.training,
+          splash_attention_kernel=self.splash_attention_kernel,
+      )
     # NOTE: explicit ``super(...)`` (rather than zero-arg ``super()``) is
     # required because ``@dataclass(slots=True)`` replaces the class object
     # after decoration, leaving the ``__class__`` cell that zero-arg
@@ -210,18 +224,6 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # ``Trainer.__init__`` (``components.loss.set_global_vocab_size``), not
     # here: the model vocab can still change after construction
     # (``train_minimal`` widens it to the tokenizer's).
-    if (
-        self.model_spec is not None
-        and self.parallelism.context_parallel_degree > 1
-    ):
-      # CP recipes apply core ContextParallelTransform with a TPU CP inner
-      # attention; core validates the CP backend, this adds the TPU rules.
-      validate_tpu_context_parallel(
-          self.model_spec.model,
-          self.parallelism,
-          training=self.training,
-          splash_attention_kernel=self.splash_attention_kernel,
-      )
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed
     # that is crashing when running on TAP.

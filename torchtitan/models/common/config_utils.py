@@ -68,8 +68,20 @@ class _FusedLinearInit:
         self.up_init = up_init
 
     def __call__(self, t: torch.Tensor) -> None:
-        self.gate_init(t[0])
-        self.up_init(t[1])
+        if not isinstance(t, DTensor):
+            self.gate_init(t[0])
+            self.up_init(t[1])
+            return
+        # ``t[0]`` on a DTensor whose dim 0 is sharded is a redistributed copy,
+        # not a view, so in-place init would never reach the parameter (the
+        # TPU scan stacks present ``w13`` that way). Init replicated, then
+        # ``copy_`` scatters into ``t``'s placements, as ``_FusedQKVInit`` does.
+        gate = t.new_empty(t.shape[1:])
+        up = t.new_empty(t.shape[1:])
+        self.gate_init(gate)
+        self.up_init(up)
+        with torch.no_grad():
+            t.copy_(torch.stack([gate, up]))
 
 
 def _make_fused_linear_init(gate_init: Callable, up_init: Callable) -> Callable:

@@ -91,6 +91,7 @@ DISABLED_TESTS = {
     # Missing optional dependency monarch
     "tests.unit_tests.rl.test_shutdown",
     "tests.unit_tests.rl.test_inter_generator_router",
+    "tests.unit_tests.rl.test_trainer",
     "tests.unit_tests.rl.test_intra_generator_router",
     # Missing optional dependency vllm
     "tests.unit_tests.rl.test_generator",
@@ -115,6 +116,7 @@ DISABLED_TESTS = {
     # torchtitan.models.qwen3_5 directly, without the TPU lane's attn_gym_stub.
     "tests.unit_tests.cpu.test_model_td_layout",
     "tests.unit_tests.cpu.test_triton_offset_rmsnorm_override",
+    "tests.unit_tests.rl.test_gdn_graph_metadata",
     # Missing optional dependency torchvision
     "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
     "tests.unit_tests.cpu.components.data.test_qwen_multimodal_data",

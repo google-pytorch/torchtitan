@@ -40,7 +40,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("context parallel", parallel_dims.cp_enabled),
         )
@@ -60,7 +59,7 @@ def parallelize_kimi_k3(
     annotate_replicated_parameters(model, parallel_dims)
 
     # model_registry's moe_comm_backend picks the dispatcher: standard
-    # (default), deepep and minimal_async_ep run on this model; hybridep
+    # (default) and deepep run on this model; hybridep
     # needs GB200-class hardware.
     model.parallelize(parallel_dims)
 
@@ -107,7 +106,7 @@ def parallelize_kimi_k3(
         edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
 
     return model

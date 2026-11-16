@@ -816,8 +816,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             base.compile,
             fsdp_barrier_policy="interleave",
             fsdp_allreduce_slice_parameter_patterns=(
-                "layers.*.feed_forward.w1.weight",
-                "layers.*.feed_forward.w3.weight",
+                "layers.*.feed_forward.w13.weight",
             ),
             fsdp_allreduce_slice_max_input_bytes=25600 * 5120 * 4,
         ),
@@ -1778,8 +1777,8 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   def test_scan_is_refused_at_model_build(self) -> None:
     """Gemma 4's sliding and global layers cannot share a stack.
 
-    Layer 0 is sliding (``FusedQKVLinear``) while layer 5 is global ``K=V``
-    (``FusedQKVLinearKeqV`` with a larger ``head_dim``), so
+    Layer 0 is sliding (``QKVLinear``) while layer 5 is global ``K=V``
+    (``QKVLinearKeqV`` with a larger ``head_dim``), so
     ``check_layers_are_stackable`` refuses the model when ``build()`` constructs the scan stack.
     """
     graph_config = graph_trainer_gemma4_debugmodel()

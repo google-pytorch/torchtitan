@@ -5,18 +5,36 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Callable
+from dataclasses import replace
 from functools import partial
 
 import torch
 import torch.nn as nn
 
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.models.common import Conv1d, Embedding, Linear, RouterGateLinear
+from torchtitan.components.optimizer import register_moe_quantile_balancing_hook
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
+from torchtitan.models.common import (
+    Conv1d,
+    Embedding,
+    FeedForward,
+    Linear,
+    RouterGateLinear,
+    Sigmoid,
+    SiTUGLU,
+)
 from torchtitan.models.common.config_utils import (
     get_attention_config,
+    make_ffn_config,
     make_token_dispatcher_config,
 )
-from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.moe import (
+    GroupedExperts,
+    QuantileBalancedTopKRouter,
+    RoutedExperts,
+)
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
 from torchtitan.models.common.vision_encoder import (
     VisionAttention,
@@ -24,13 +42,11 @@ from torchtitan.models.common.vision_encoder import (
     VisionTransformerBlock,
 )
 from torchtitan.models.kimi_k2_7.vision_encoder import VisionRotaryEmbedding2D
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .kda import InnerKDA, KDA, KDAKernel, KimiRMSNormGated
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
-from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
+from .moe import KimiLatentMoE
 from .parallelize import parallelize_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 from .vision_encoder import KimiK3VisionEncoder, KimiK3VisionProjector
@@ -120,13 +136,15 @@ def _feed_forward_config(
     *,
     dim: int,
     hidden_dim: int,
-) -> KimiFeedForward.Config:
-    return KimiFeedForward.Config(
-        w1=_linear(dim, hidden_dim),
-        w2=_linear(hidden_dim, dim),
-        w3=_linear(dim, hidden_dim),
-        beta=4.0,
-        linear_beta=25.0,
+) -> FeedForward.Config:
+    return replace(
+        make_ffn_config(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            w1_param_init=_LINEAR_INIT,
+            w2w3_param_init=_LINEAR_INIT,
+        ),
+        activation_fn=SiTUGLU.Config(beta=4.0, linear_beta=25.0),
     )
 
 
@@ -228,7 +246,7 @@ def _latent_moe_config(
 ) -> KimiLatentMoE.Config:
     return KimiLatentMoE.Config(
         num_experts=num_experts,
-        router=TokenChoiceTopKRouter.Config(
+        router=QuantileBalancedTopKRouter.Config(
             num_experts=num_experts,
             top_k=top_k,
             gate=RouterGateLinear.Config(
@@ -237,26 +255,26 @@ def _latent_moe_config(
                 bias=False,
                 param_init=_LINEAR_INIT,
             ),
-            score_func="sigmoid",
+            score_func=Sigmoid.Config(),
             route_norm=True,
             route_scale=1.0,
+            num_bins=1000,
         ),
         routed_down=_linear(dim, latent_dim),
         routed_experts=RoutedExperts.Config(
-            inner_experts=KimiGroupedExperts.Config(
+            inner_experts=GroupedExperts.Config(
                 dim=latent_dim,
                 hidden_dim=expert_hidden_dim,
                 num_experts=num_experts,
-                beta=4.0,
-                linear_beta=25.0,
+                activation_fn=SiTUGLU.Config(beta=4.0, linear_beta=25.0),
                 param_init={
                     "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
                     "w2_EDF": partial(nn.init.trunc_normal_, std=0.02),
                     "w3_EFD": partial(nn.init.trunc_normal_, std=0.02),
                 },
             ),
-            # core's dispatcher factory: standard / deepep / hybridep /
-            # minimal_async_ep per spec, as deepseek_v3; falls back to local
+            # core's dispatcher factory: standard / deepep / hybridep per spec,
+            # as deepseek_v3; falls back to local
             # dispatch when the ep mesh is None.
             token_dispatcher=make_token_dispatcher_config(
                 num_experts=num_experts,
@@ -273,7 +291,7 @@ def _latent_moe_config(
             dim=dim,
             hidden_dim=num_shared_experts * expert_hidden_dim,
         ),
-        load_balance_coeff=1e-3,
+        load_balance_coeff=None,
     )
 
 
@@ -570,7 +588,7 @@ def model_registry(
         )
     config = get_config(attn_backend=attn_backend, moe_comm_backend=moe_comm_backend)
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for converter in converters:
             config = converter.build().convert(config)
     return ModelSpec(
@@ -580,6 +598,6 @@ def model_registry(
         max_context_length=context_len,
         parallelize_fn=parallelize_kimi_k3,
         pipelining_fn=None,
-        post_optimizer_build_fn=register_moe_load_balancing_hook,
+        post_optimizer_build_fn=register_moe_quantile_balancing_hook,
         state_dict_adapter=KimiK3StateDictAdapter,
     )

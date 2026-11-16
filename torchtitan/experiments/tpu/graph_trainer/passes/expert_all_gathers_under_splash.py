@@ -31,6 +31,7 @@ configuration error.
 
 from __future__ import annotations
 
+import logging
 import operator
 from collections import defaultdict
 
@@ -52,7 +53,8 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     _is_splash_forward_op,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _is_gathered_expert_weight(node: torch.fx.Node) -> bool:

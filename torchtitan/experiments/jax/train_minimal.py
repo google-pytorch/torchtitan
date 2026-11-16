@@ -11,23 +11,24 @@ python -m torchtitan.experiments.jax.train_minimal \
 ```
 """
 
+import logging
 import sys
 import typing
 from typing import Any
 
 from absl import app, flags
 import jax
+import torchtitan.observability.logging
 import torchtitan.config
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import trainer as jax_trainer
 from torchtitan.experiments.jax import utils as jax_utils
-import torchtitan.tools.logging
 
 
 P = jax.sharding.PartitionSpec
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 
 def _maybe_init_jax_distributed():
@@ -63,7 +64,7 @@ def _maybe_init_jax_distributed():
 
 
 def main_train_loop(job_config: Any):
-  torchtitan.tools.logging.init_logger()
+  torchtitan.observability.logging.init_logger()
 
   # Must apply XLA and libtpu flags before the JAX backend is initialized.
   tpu_flags.apply_init_flags(job_config)

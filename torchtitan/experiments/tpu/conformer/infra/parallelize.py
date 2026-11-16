@@ -1,6 +1,7 @@
 """Parallelization utilities for Conformer on TPU."""
 
 import enum
+import logging
 import torch
 from torch.distributed import fsdp
 from torch.distributed._composable import replicate
@@ -13,7 +14,8 @@ from torchtitan.experiments.graph_trainer import simple_fsdp
 from torchtitan.experiments.graph_trainer.common_utils import get_simple_fsdp_mesh
 from torchtitan.experiments.tpu import tpu_job_config
 import torchtitan.experiments.tpu.utils as tpu_utils
-from torchtitan.tools import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ParallelStrategy(enum.Enum):
@@ -71,7 +73,7 @@ def parallelize_conformer(
     apply_ac(model)
 
   strategy = _determine_parallel_strategy(parallel_dims, train_config)
-  logging.logger.info(f"Using parallel strategy: {strategy}")
+  logger.info(f"Using parallel strategy: {strategy}")
 
   if strategy == ParallelStrategy.NONE:
     return model
@@ -140,7 +142,7 @@ def parallelize_conformer(
     model = apply_compile(model, train_config)
 
   if strategy == ParallelStrategy.DDP:
-    logging.logger.info("Applying Native DDP (replicate) to the model")
+    logger.info("Applying Native DDP (replicate) to the model")
     replicate.replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
     return model
 
@@ -164,7 +166,7 @@ def parallelize_conformer(
         mode=dp_mode,
         mp_policy=mp_policy,
     )
-    logging.logger.info(f"Applied Simple FSDP (dp mode={dp_mode}) to the model")
+    logger.info(f"Applied Simple FSDP (dp mode={dp_mode}) to the model")
     return model
 
   # Shard each individual Conformer layer (only if not compiling whole model)
@@ -177,11 +179,11 @@ def parallelize_conformer(
       layers = None
 
     if layers is not None:
-      logging.logger.info(f"Sharding Conformer layers (FSDP, mode={dp_mode}).")
+      logger.info(f"Sharding Conformer layers (FSDP, mode={dp_mode}).")
       for layer in layers.children():
         fsdp.fully_shard(layer, **fsdp_config, reshard_after_forward=reshard)
     else:
-      logging.logger.warning("No layers found to shard.")
+      logger.warning("No layers found to shard.")
 
     # Shard the full model (if it's a separate module)
     if encoder is not model:
@@ -190,7 +192,7 @@ def parallelize_conformer(
   # Shard the outer wrapper (which is the compiled model if whole compiled)
   fsdp.fully_shard(model, **fsdp_config)
 
-  logging.logger.info("Applied FSDP to the model")
+  logger.info("Applied FSDP to the model")
 
   return model
 
@@ -217,7 +219,7 @@ def apply_compile(
 
   if compile_mode == "whole":
     if hasattr(model, "model"):
-      logging.logger.info("Applying torch.compile to Whole Model (via model.model).")
+      logger.info("Applying torch.compile to Whole Model (via model.model).")
       model.model = torch.compile(
           encoder,
           backend=train_config.compile.backend,
@@ -226,7 +228,7 @@ def apply_compile(
       )
       return model
     else:
-      logging.logger.info("Applying torch.compile to Whole Model.")
+      logger.info("Applying torch.compile to Whole Model.")
       return torch.compile(
           model,
           backend=train_config.compile.backend,
@@ -234,7 +236,7 @@ def apply_compile(
           dynamic=False,
       )
   elif compile_mode == "layer" and layers is not None:
-    logging.logger.info("Applying torch.compile to Conformer layers.")
+    logger.info("Applying torch.compile to Conformer layers.")
     for layer_id, layer in layers.named_children():
       compiled = torch.compile(
           layer,
@@ -245,7 +247,7 @@ def apply_compile(
       layers.register_module(layer_id, compiled)
     return model
   else:
-    logging.logger.warning(
+    logger.warning(
         f"Compile mode {compile_mode} not supported or no layers found."
     )
     return model
@@ -253,7 +255,7 @@ def apply_compile(
 
 def apply_ac(model: nn.Module) -> None:
   """Apply activation checkpointing."""
-  logging.logger.info("Applying activation checkpointing to Conformer layers.")
+  logger.info("Applying activation checkpointing to Conformer layers.")
 
   if hasattr(model, "model"):
     encoder = model.model
@@ -274,4 +276,4 @@ def apply_ac(model: nn.Module) -> None:
       )
       layers.register_module(layer_id, wrapped_layer)
   else:
-    logging.logger.warning("No layers found to apply AC.")
+    logger.warning("No layers found to apply AC.")

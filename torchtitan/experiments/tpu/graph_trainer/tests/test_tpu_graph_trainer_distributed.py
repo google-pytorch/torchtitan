@@ -10,7 +10,7 @@ from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
-from torchtitan.components import metrics
+from torchtitan.observability import metrics
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 import torchtitan.experiments.tpu.train
@@ -160,7 +160,7 @@ class TpuGraphTrainerDistributedTest(
       # 128-token sliding window, so the sliding layers actually mask; the
       # token budget keeps 4 sequences per rank. Plain SDPA: Splash/tokamax
       # parity on Gemma 4 is its own PR. No scan case: the sliding (head_dim
-      # 32, FusedQKVLinear) and global (head_dim 64, FusedQKVLinearKeqV)
+      # 32, QKVLinear) and global (head_dim 64, QKVLinearKeqV)
       # layers cannot be stacked. No TP case: the wrapper is SimpleFSDP/HSDP
       # only.
       dict(

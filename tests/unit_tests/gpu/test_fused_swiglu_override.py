@@ -15,9 +15,6 @@ import spmd_types as spmd
 
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.models.deepseek_v3.config_registry import (
-    deepseek_v3_debugmodel_minimal_async_ep,
-)
 from torchtitan.overrides.fused_swiglu import (
     fused_grouped_experts,
     FusedGroupedExperts,
@@ -45,14 +42,6 @@ def _build_fused_grouped_experts() -> FusedGroupedExperts:
 
 
 class TestFusedSwiGLUOverride(unittest.TestCase):
-    def test_minimal_async_ep_config_imports_override(self):
-        config = deepseek_v3_debugmodel_minimal_async_ep(seq_len=2048)
-
-        self.assertIn(
-            "torchtitan.overrides.fused_swiglu.fused_grouped_experts",
-            config.override.imports,
-        )
-
     def test_grouped_experts_config_is_replaced(self):
         cfg = GroupedExperts.Config(
             dim=16,
@@ -281,3 +270,46 @@ class TestFusedSwiGLUOverrideKernels(unittest.TestCase):
         assert up.grad is not None
         torch.testing.assert_close(grad_gate[:2], gate.grad[:2])
         torch.testing.assert_close(grad_up[:2], up.grad[:2])
+
+    def test_silu_and_mul_uses_int64_row_stride_arithmetic(self):
+        row = 262_144
+        row_stride = 8192
+        storage_numel = row * row_stride + 2
+        required_bytes = storage_numel * 2 + 512 * 1024**2
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < required_bytes:
+            self.skipTest(
+                f"need at least {required_bytes} free CUDA bytes, got {free_bytes}"
+            )
+
+        storage = torch.empty(storage_numel, device="cuda", dtype=torch.bfloat16)
+        gate = torch.as_strided(storage, (row + 1, 1), (row_stride, 2))
+        up = torch.as_strided(storage, (row + 1, 1), (row_stride, 2), 1)
+        gate[row] = 1.0
+        up[row] = 2.0
+        offsets = torch.tensor([row + 1], device="cuda", dtype=torch.int32)
+
+        out = silu_and_mul_forward_kernel(gate, up, offsets)
+        grad_out = torch.zeros_like(out)
+        grad_out[row] = 3.0
+        grad_gate, grad_up = silu_and_mul_backward_kernel(
+            grad_out,
+            gate,
+            up,
+            offsets,
+        )
+        torch.cuda.synchronize()
+
+        ref_gate = torch.tensor(
+            [1.0], device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        ref_up = torch.tensor(
+            [2.0], device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        expected = torch.nn.functional.silu(ref_gate) * ref_up
+        expected.backward(torch.tensor([3.0], device="cuda", dtype=torch.bfloat16))
+        assert ref_gate.grad is not None
+        assert ref_up.grad is not None
+        torch.testing.assert_close(out[row], expected.detach())
+        torch.testing.assert_close(grad_gate[row], ref_gate.grad)
+        torch.testing.assert_close(grad_up[row], ref_up.grad)

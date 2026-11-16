@@ -22,6 +22,7 @@ from torchtitan.components.optimizer import (
     register_moe_load_balancing_hook,
 )
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.deepseek_v3.moe import DeepSeekV3Router
 
 
 def _expert_weights(experts):
@@ -50,8 +51,9 @@ def _moe_buffer(moe, prefix):
     ``tokens_per_expert_E``, ``expert_bias_E``), so match by prefix instead of
     hardcoding the exact name.
     """
-    for name, buf in moe.named_buffers(recurse=False):
-        if name == prefix or name.startswith(prefix + "_"):
+    for name, buf in moe.named_buffers():
+        leaf_name = name.rsplit(".", 1)[-1]
+        if leaf_name == prefix or leaf_name.startswith(prefix + "_"):
             return buf
     raise AttributeError(f"{type(moe).__name__} has no buffer matching '{prefix}*'")
 
@@ -241,6 +243,7 @@ class TestPrepareNativeMoeConfigs(unittest.TestCase):
         _prepare_layers(model)
 
         from torchtitan.experiments.transformers_modeling_backend.moe_replacement import (
+            _build_moe_config,
             _probe_hf_moe_block,
         )
 
@@ -253,6 +256,9 @@ class TestPrepareNativeMoeConfigs(unittest.TestCase):
         self.assertEqual(params["num_limited_groups"], 1)
         self.assertIsNotNone(params["shared_expert_info"])
         self.assertFalse(params["shared_expert_info"]["has_sigmoid_gate"])
+
+        moe_config = _build_moe_config(params, config)
+        self.assertIsInstance(moe_config.router, DeepSeekV3Router.Config)
 
     def test_moe_config_build(self):
         """MoE.Config is built correctly from probed params."""

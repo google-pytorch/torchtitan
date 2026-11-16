@@ -72,8 +72,10 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     local_reorder,
     stable_grouped_reduce,
 )
+from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.deepseek_v3.moe import DeepSeekV3Router
 
 _TOKENS = 8
 _DIM = 8
@@ -214,15 +216,23 @@ def _router(num_expert_groups: int | None) -> TokenChoiceTopKRouter:
     """Upstream's router: softmax top-2 of 4 experts, optionally in 2 groups.
 
     With groups, the router keeps the best of 2 groups and then takes the
-    top-2 of its experts, so it runs three top-ks in all.
+    top-2 of its experts, so it runs three top-ks in all. Upstream aa41c3de
+    moved node-limited routing to ``DeepSeekV3Router``.
     """
-    return TokenChoiceTopKRouter.Config(
+    if num_expert_groups is None:
+        return TokenChoiceTopKRouter.Config(
+            num_experts=_EXPERTS,
+            gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
+            top_k=_TOP_K,
+            score_func=Softmax.Config(),
+        ).build()
+    return DeepSeekV3Router.Config(
         num_experts=_EXPERTS,
         gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
         num_expert_groups=num_expert_groups,
-        num_limited_groups=None if num_expert_groups is None else 1,
+        num_limited_groups=1,
         top_k=_TOP_K,
-        score_func="softmax",
+        score_func=Softmax.Config(),
     ).build()
 
 

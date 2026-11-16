@@ -15,13 +15,14 @@
 """Utilities for configuring torch_tpu on Cloud."""
 
 import functools
+import logging
 import os
 import re
 
 import frozendict
 from torchtitan.experiments.tpu.distributed import local_tpu_device
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 # Trailing "-<job-index>-<pod-index>" of a JobSet pod name; see
 # get_slice_id_from_worker_hostnames.

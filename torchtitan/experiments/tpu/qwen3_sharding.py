@@ -6,6 +6,7 @@
 
 """Qwen3 sharding helpers shared by regular Trainer and GraphTrainer."""
 
+import logging
 import torch.nn as nn
 
 import torchtitan.distributed
@@ -13,7 +14,8 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def configure_qwen_simple_fsdp_shard_dims(

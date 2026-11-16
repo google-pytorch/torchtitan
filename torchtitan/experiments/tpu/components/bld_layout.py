@@ -14,7 +14,7 @@ unflatten sequence length:
 * ``Llama3TransformerBlock`` / ``Qwen3TransformerBlock`` (dense or MoE): view
   the input as [B, L, D], run the block's own ``forward``, view back. The
   block's external [T, D] contract is unchanged.
-* ``GQAttention`` with ``FusedQKVLinear`` or ``TpuPackedQKVLinear``: accept
+* ``GQAttention`` with ``QKVLinear`` or ``TpuPackedQKVLinear``: accept
   [B, L, D]; q/k/v are [B, L, H, K], the RoPE cache is fetched by the
   configured RoPE module and viewed as [B, L, 1, W], and the rotation is that module's own ``apply_rotary_emb`` --
   so ``real_rope`` and ``bf16_rope`` keep working. Exact ``CosSinRoPE`` uses a
@@ -40,6 +40,7 @@ heuristics. Investigate if we can control or update these heuristics and
 re-measure (bld_block_layout on vs off) before deleting.
 """
 
+import logging
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
@@ -49,12 +50,13 @@ from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.components.unflatten_shim import UnflattenShim
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common import CosSinRoPE
-from torchtitan.models.common import FusedQKVLinear
+from torchtitan.models.common import QKVLinear
 from torchtitan.models.common import GQAttention
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _bld_seq_len(x: torch.Tensor) -> int | None:
@@ -107,8 +109,8 @@ class _BLDGQAttention(GQAttention):
           F.linear(x, w, bias).view(b, l, -1, hd)
           for w, bias in zip(weights, biases)
       )
-    assert isinstance(qkv, FusedQKVLinear), type(qkv)
-    # Same split as `FusedQKVLinear.forward`, with [B, L] leading dims:
+    assert isinstance(qkv, QKVLinear), type(qkv)
+    # Same split as `QKVLinear.forward`, with [B, L] leading dims:
     # [B, L, n_kv_heads * R * hd] -> [B, L, n_kv_heads, R, hd] -> q/k/v.
     fused = qkv.wqkv(x).view(b, l, -1, qkv.r_dim, hd)
     xq, xk, xv = torch.split(fused, [qkv.heads_per_kv, 1, 1], dim=-2)
@@ -185,16 +187,19 @@ class _BLDGQAttention(GQAttention):
 class _BLDBlock(nn.Module):
   """Mixin: compute a [T, D]-in/[T, D]-out block on a [B, L, D] view."""
 
-  def forward(self, x, attention_masks, positions=None, segment_ids=None):
+  def forward(
+      self, x, attention_masks, positions=None, segment_ids=None, **kwargs
+  ):
     seq_len = _bld_seq_len(x)
     if seq_len is None:
-      return super().forward(x, attention_masks, positions, segment_ids)
+      return super().forward(x, attention_masks, positions, segment_ids, **kwargs)
     num_tokens, dim = x.shape
     out = super().forward(
         x.view(num_tokens // seq_len, seq_len, dim),
         attention_masks,
         positions,
         segment_ids,
+        **kwargs,
     )
     return out.reshape(num_tokens, dim)
 
@@ -212,7 +217,7 @@ class _BLDMoE(nn.Module):
 
 _BLOCK_FORWARDS = (Llama3TransformerBlock.forward, Qwen3TransformerBlock.forward)
 _QKV_FORWARDS = (
-    FusedQKVLinear.forward,
+    QKVLinear.forward,
     TpuPackedQKVLinear.forward,
 )
 _SUBCLASSES: dict[tuple[type, type], type] = {}

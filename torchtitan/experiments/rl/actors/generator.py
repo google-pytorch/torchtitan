@@ -56,10 +56,10 @@ from torchtitan.experiments.rl.routing.intra_generator_router import (
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.logging import init_logger
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.tools.logging import init_logger
 from torchtitan.tools.utils import has_cuda_capability
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
@@ -1340,7 +1340,7 @@ class VLLMGenerator(Actor, Configurable):
         model_sd = model.model.state_dict()
         await self._get_spmd_state_dict(model_sd, model=model)
         # state_dict() returns hook-produced copies for fused modules (e.g.
-        # FusedQKVLinear's wqkv -> wq/wk/wv), so the in-place fill above never
+        # QKVLinear's wqkv -> wq/wk/wv), so the in-place fill above never
         # reaches the real param. Re-apply via load_state_dict to run the merge hook.
         # Non-fused params share storage with model_sd, so reloading them is a
         # harmless self-copy; only the fused wqkv is actually rebuilt.

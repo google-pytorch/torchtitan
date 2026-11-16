@@ -20,6 +20,7 @@ validate the resulting numerical trajectory.
 from __future__ import annotations
 
 import fnmatch
+import logging
 
 import torch
 import torch.distributed as dist
@@ -27,8 +28,8 @@ import torch.distributed as dist
 from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,
 )
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 _ALL_REDUCE = torch.ops._c10d_functional.all_reduce.default
 _REDUCE_SCATTER = torch.ops._c10d_functional.reduce_scatter_tensor.default

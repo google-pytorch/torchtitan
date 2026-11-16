@@ -8,10 +8,10 @@
 Shared configuration dataclasses for torchtitan.
 
 Some configs live near their owner instead of here:
-  - Profiler.Config                 (in tools/profiler.py)
+  - Profiler.Config                 (in observability/profiler.py)
   - OptimizersContainer.Config      (in components/optimizer/optimizer.py)
   - LRSchedulersContainer.Config    (in components/optimizer/lr_scheduler.py)
-  - MetricsProcessor.Config         (in components/metrics.py)
+  - MetricsProcessor.Config         (in observability/metrics.py)
   - CheckpointManager.Config        (in components/checkpointer/dcp.py)
 
 Configs without a clear single owner (or with circular-import constraints)
@@ -27,9 +27,14 @@ The command-line surface is frozen either way, so annotate a new field with
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Annotated, get_args, Literal, TypeAlias
 
 import torch
+import tyro
+
+
+FSDPSymmMemScope: TypeAlias = Literal["all", "dense", None]
+_FSDP_SYMM_MEM_SCOPES = get_args(FSDPSymmMemScope)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -79,8 +84,8 @@ class TrainingConfig:
     Disable CUDA graph capture and replay for the forward+backward step. CUDA
     graphs require fixed-shape inputs and no CPU<->GPU synchronization during
     the captured region. Expert parallelism is supported only with HybridEP
-    when ``non_blocking_capacity_factor`` is set, or with MinimalAsyncEP. Other
-    EP backends synchronize with the host during dispatch. Pipeline parallelism
+    when ``non_blocking_capacity_factor`` is set. Other EP backends synchronize
+    with the host during dispatch. Pipeline parallelism
     is supported with single-stage schedules such as GPipe and 1F1B. CUDA graphs
     are independent of ``torch.compile(mode="reduce-overhead")``, which performs
     its own CUDA graph capture.
@@ -184,10 +189,12 @@ class ParallelismConfig:
     - "never" will disable `reshard_after_forward` for all forward passes.
     """
 
-    enable_fsdp_symm_mem: bool = False
+    fsdp_symm_mem_scope: Annotated[FSDPSymmMemScope, tyro.conf.Suppress] = None
     """
-    Whether to enable FSDP2 symmetric-memory communication optimizations for
-    all FSDP modules after `fully_shard` has been applied.
+    Which FSDP modules use symmetric-memory communication. None disables it.
+    "dense" skips any module with routed experts. An MoE transformer block is
+    one FSDP module, so its attention parameters are skipped along with its
+    experts.
     """
 
     tensor_parallel_degree: int = 1
@@ -288,7 +295,13 @@ class ParallelismConfig:
                 f"None, 'headtail', 'ptrr' "
                 f"(got {self.context_parallel_load_balancer!r})"
             )
-        if self.enable_fsdp_symm_mem and (
+        if self.fsdp_symm_mem_scope not in _FSDP_SYMM_MEM_SCOPES:
+            raise ValueError(
+                "parallelism.fsdp_symm_mem_scope must be one of: "
+                f"{list(_FSDP_SYMM_MEM_SCOPES)} "
+                f"(got {self.fsdp_symm_mem_scope!r})"
+            )
+        if self.fsdp_symm_mem_scope is not None and (
             not torch.cuda.is_available()
             or (
                 torch.version.hip is None
@@ -296,7 +309,7 @@ class ParallelismConfig:
             )
         ):
             raise ValueError(
-                "For NVIDIA GPUs, parallelism.enable_fsdp_symm_mem is only supported "
+                "For NVIDIA GPUs, parallelism.fsdp_symm_mem_scope is only supported "
                 "for compute capability 9.0 or newer."
             )
         # Import lazily so loading configs.py does not pull in pipelining.

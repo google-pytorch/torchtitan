@@ -60,8 +60,9 @@ def get_maxtext_decoder_nparams_and_flops(
             feed_forward = layer.feed_forward
             if not isinstance(feed_forward, FeedForward.Config):
                 raise ValueError("MaxText decoder FLOPs require a SwiGLU FFN")
-            # SwiGLU has two input projections and one output projection.
-            forward_weight_flops += 6 * dim * feed_forward.w1.out_features
+            # SwiGLU has two input projections (fused in w13) and one output
+            # projection.
+            forward_weight_flops += 3 * dim * feed_forward.w13.out_features
             continue
 
         if not isinstance(moe, MoE.Config) or moe.shared_experts is not None:

@@ -8,6 +8,8 @@
 # various training techniques (e.g. activation checkpointing and compile) to the
 # Muse Glimmer model.
 
+import logging
+
 from torchtitan.config import (
     CompileConfig,
     ParallelismConfig,
@@ -22,9 +24,11 @@ from torchtitan.distributed.fsdp import (
     apply_fsdp_to_vision_encoder,
     resolve_fsdp_mesh,
 )
-from torchtitan.tools.logging import logger
 
 from .model import MuseGlimmerModel
+
+
+logger = logging.getLogger(__name__)
 
 
 def parallelize_muse_glimmer(
@@ -121,7 +125,7 @@ def parallelize_muse_glimmer(
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         dp_mesh_dims=dp_mesh_dims,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
 
     logger.info("Applied fully_shard to the model")

@@ -489,12 +489,12 @@ def load_weights_on_driver(vllm_model, state_dict_data: dict) -> None:
     if tok_key and not lm_key:
         state_dict[tok_key.replace("tok_embeddings", "lm_head")] = state_dict[tok_key]
 
-    # Merge QKV weights for FusedQKVLinear modules
-    from torchtitan.models.common.attention import FusedQKVLinear
+    # Merge QKV weights for QKVLinear modules
+    from torchtitan.models.common.attention import QKVLinear
     for name, module in vllm_model.model.named_modules():
-        if isinstance(module, FusedQKVLinear):
+        if isinstance(module, QKVLinear):
             prefix = name + "." if name else ""
-            FusedQKVLinear._merge_qkv_on_load(module, state_dict, prefix)
+            QKVLinear._merge_qkv_on_load(module, state_dict, prefix)
 
     target_sd = dict(vllm_model.named_parameters())
     

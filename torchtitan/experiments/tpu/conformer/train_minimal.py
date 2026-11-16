@@ -21,6 +21,7 @@ from jax import profiler as jax_profiler
 import torch
 import torch.nn.functional as F
 import torchtitan.observability.logging
+from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.observability import metrics
 import torchtitan.components.tokenizer
 import torchtitan.config
@@ -204,7 +205,9 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   batch_degree, batch_rank = 1, 0
   if world_size > 1:
     if parallel_dims.dp_enabled:
-      batch_mesh = parallel_dims.get_mesh("batch")
+      # Upstream ec953b36 removed the "batch" mesh; "dp" folds
+      # dp_replicate and dp_shard the same way.
+      batch_mesh = parallel_dims.get_mesh("dp")
       batch_degree, batch_rank = (
           batch_mesh.size(),
           batch_mesh.get_local_rank(),
@@ -251,13 +254,13 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     # and replaced training.local_batch_size with the token-based
     # training.num_tokens_per_microbatch_per_dp_rank; the dataloader is now
     # components.data.GrainDataLoader, which takes max_context_length /
-    # num_tokens_per_batch instead of seq_len / local_batch_size.
+    # num_tokens_per_microbatch instead of seq_len / local_batch_size.
     dataloader = train_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=tokenizer,
         max_context_length=train_config.training.max_context_length,
-        num_tokens_per_batch=(
+        num_tokens_per_microbatch=(
             train_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
 
@@ -425,6 +428,9 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
 
       t0 = time.perf_counter()
       batch = next(data_iterator)
+      if isinstance(batch, TrainingMicrobatch):
+        # Upstream ec953b36: dataloaders yield TrainingMicrobatch objects.
+        batch = (batch.as_input_dict(), batch.labels)
       metrics_processor.data_loading_times.append(time.perf_counter() - t0)
 
       if parallel_dims.fsdp_enabled or (

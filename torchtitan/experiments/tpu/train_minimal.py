@@ -19,6 +19,7 @@ import torchtitan.observability.logging
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
+from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
@@ -127,7 +128,9 @@ class TrainerMinimal:
     self.loss_mesh = None
     if world_size > 1:
       if self.parallel_dims.dp_enabled:
-        self.batch_mesh = self.parallel_dims.get_mesh("batch")
+        # Upstream ec953b36 removed the "batch" mesh; "dp" folds
+        # dp_replicate and dp_shard the same way.
+        self.batch_mesh = self.parallel_dims.get_mesh("dp")
         batch_degree, batch_rank = (
             self.batch_mesh.size(), self.batch_mesh.get_local_rank())
       else:
@@ -169,13 +172,13 @@ class TrainerMinimal:
     # and replaced training.local_batch_size with the token-based
     # training.num_tokens_per_microbatch_per_dp_rank; the dataloader is now
     # components.data.GrainDataLoader, which takes max_context_length /
-    # num_tokens_per_batch instead of seq_len / local_batch_size.
+    # num_tokens_per_microbatch instead of seq_len / local_batch_size.
     self.dataloader = job_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=self.tokenizer,
         max_context_length=job_config.training.max_context_length,
-        num_tokens_per_batch=(
+        num_tokens_per_microbatch=(
             job_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
 
@@ -314,7 +317,11 @@ class TrainerMinimal:
       def get_batch():
         """One microbatch as ``(tokens, labels, forward_kwargs)``."""
         batch = next(data_iterator)
-        if isinstance(batch, tuple):
+        if isinstance(batch, TrainingMicrobatch):
+          # Upstream ec953b36: dataloaders yield TrainingMicrobatch objects.
+          input_dict = batch.as_input_dict()
+          labels_raw = batch.labels
+        elif isinstance(batch, tuple):
           input_dict, labels_raw = batch
         else:
           input_dict = batch

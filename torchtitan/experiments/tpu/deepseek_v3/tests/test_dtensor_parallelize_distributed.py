@@ -5,7 +5,8 @@ from absl.testing import absltest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.distributed import distributed
@@ -71,7 +72,7 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
         ac_config=SelectiveAC.Config(),
-        compile_config=CompileConfig(),
+        compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
@@ -116,7 +117,7 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
         ac_config=SelectiveAC.Config(),
-        compile_config=CompileConfig(),
+        compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
@@ -173,7 +174,7 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
         ac_config=SelectiveAC.Config(),
-        compile_config=CompileConfig(),
+        compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(data_parallel_shard_degree=world_size),

@@ -8,7 +8,8 @@ import functools
 
 import torch
 from torch.distributed.tensor import DTensor
-from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
@@ -81,7 +82,7 @@ def _tp_wrapper(
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
         ac_config=SelectiveAC.Config(),
-        compile_config=CompileConfig(),
+        compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(
@@ -161,7 +162,7 @@ def _verify_fsdp_training_loop_worker(
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
         ac_config=SelectiveAC.Config(),
-        compile_config=CompileConfig(),
+        compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(data_parallel_shard_degree=world_size),
@@ -211,7 +212,7 @@ def _verify_simple_fsdp_training_loop_worker(
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
         ac_config=SelectiveAC.Config(),
-        compile_config=CompileConfig(),
+        compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(

@@ -13,12 +13,13 @@ from torchtitan.protocols.model_spec import ModelSpec
 # `TPUTrainerConfig().<field>.__class__`. Upstream d771abb0 made
 # `model_spec` a required field, so the no-arg `TPUTrainerConfig()` that
 # idiom relied on now raises.
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.tpu.tpu_job_config import (
     ConformerConfig,
     SplashAttentionKernelConfig,
     TPUConfig,
     TPUTrainerConfig,
+    TpuTrainerCompileConfig,
 )
 import torchtitan.experiments.tpu.conformer as tpu_conformer
 from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer
@@ -67,7 +68,7 @@ def conformer_test() -> TPUTrainerConfig:
           data_parallel_replicate_degree=1,
       ),
       activation_checkpoint=FullAC.Config(),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=False,
           backend="tpu",
           components=["model"],

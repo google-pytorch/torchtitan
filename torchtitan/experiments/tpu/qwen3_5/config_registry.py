@@ -7,7 +7,6 @@ from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.config.configs import (
     CommConfig,
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -246,7 +245,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
       ),
       checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(preserve_rng_state=False),
-      compile=CompileConfig(enable=False, backend="tpu"),
+      compile=TpuTrainerCompileConfig(enable=False, backend="tpu"),
       validator=None,
       tpu_config=TPUConfig(enable_amp=False),
   )

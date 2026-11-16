@@ -21,7 +21,7 @@ from jax import profiler as jax_profiler
 import torch
 import torch.nn.functional as F
 import torchtitan.observability.logging
-from torchtitan.components import metrics
+from torchtitan.observability import metrics
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed

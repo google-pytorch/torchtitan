@@ -604,15 +604,7 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm_epsilon = config.route_norm_epsilon
         self.route_scale = config.route_scale
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
-        # MoELoadBalanceAuxLoss's batch-wise form counts the top-k ids itself;
-        # other aux losses consume the map.
-        aux_loss_needs_map = self.aux_loss is not None and not (
-            isinstance(self.aux_loss, MoELoadBalanceAuxLoss)
-            and self.aux_loss.type == "batch_wise"
-        )
-        self.build_routing_map = (
-            config.token_count_impl == "routing_map" or aux_loss_needs_map
-        )
+        self.token_count_impl = config.token_count_impl
         self._debug_force_load_balance = config._debug_force_load_balance
         # tokens_per_expert_E will be used to track expert usage and to update the expert bias for load balancing
         self.register_buffer(
@@ -620,6 +612,21 @@ class TokenChoiceTopKRouter(Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
         )
+
+    @property
+    def build_routing_map(self) -> bool:
+        """Whether forward materializes the ``[T, E]`` routing map.
+
+        ``token_count_impl="histc"`` skips it, unless an aux loss needs it:
+        MoELoadBalanceAuxLoss's batch-wise form counts the top-k ids itself;
+        other aux losses consume the map. Evaluated per forward so an
+        ``aux_loss`` assigned after construction is honored.
+        """
+        aux_loss_needs_map = self.aux_loss is not None and not (
+            isinstance(self.aux_loss, MoELoadBalanceAuxLoss)
+            and self.aux_loss.type == "batch_wise"
+        )
+        return self.token_count_impl == "routing_map" or aux_loss_needs_map
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is None:

@@ -170,7 +170,9 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
         self.assertEqual(trained[: len(answer)], answer)
 
   def test_chat_options_warn_for_text_datasets(self) -> None:
-    with self.assertLogs(logger, level="WARNING") as logs:
+    with self.assertLogs(
+        "torchtitan.experiments.tpu.components.datasets", level="WARNING"
+    ) as logs:
       self._build(dataset="c4_test", prompt_field="question")
     self.assertIn("only apply to chat datasets", "\n".join(logs.output))
 

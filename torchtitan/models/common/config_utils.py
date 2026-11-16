@@ -56,14 +56,25 @@ from torchtitan.protocols.module import Module
 DEFAULT_DEBUG_MODEL_SEQ_LEN = 2048
 
 
+class _FusedLinearInit:
+    """Initializer for a stacked ``[2, F, D]`` gate/up linear weight.
+
+    A top-level class instead of a closure so that model configs carrying it
+    can be pickled (as `_FusedQKVInit`).
+    """
+
+    def __init__(self, gate_init: Callable, up_init: Callable) -> None:
+        self.gate_init = gate_init
+        self.up_init = up_init
+
+    def __call__(self, t: torch.Tensor) -> None:
+        self.gate_init(t[0])
+        self.up_init(t[1])
+
+
 def _make_fused_linear_init(gate_init: Callable, up_init: Callable) -> Callable:
     """Build an initializer for a stacked gate/up linear weight."""
-
-    def _init(t: torch.Tensor) -> None:
-        gate_init(t[0])
-        up_init(t[1])
-
-    return _init
+    return _FusedLinearInit(gate_init, up_init)
 
 
 def decoder_vocab_size(model_spec: ModelSpec) -> int:

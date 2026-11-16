@@ -187,16 +187,19 @@ class _BLDGQAttention(GQAttention):
 class _BLDBlock(nn.Module):
   """Mixin: compute a [T, D]-in/[T, D]-out block on a [B, L, D] view."""
 
-  def forward(self, x, attention_masks, positions=None, segment_ids=None):
+  def forward(
+      self, x, attention_masks, positions=None, segment_ids=None, **kwargs
+  ):
     seq_len = _bld_seq_len(x)
     if seq_len is None:
-      return super().forward(x, attention_masks, positions, segment_ids)
+      return super().forward(x, attention_masks, positions, segment_ids, **kwargs)
     num_tokens, dim = x.shape
     out = super().forward(
         x.view(num_tokens // seq_len, seq_len, dim),
         attention_masks,
         positions,
         segment_ids,
+        **kwargs,
     )
     return out.reshape(num_tokens, dim)
 

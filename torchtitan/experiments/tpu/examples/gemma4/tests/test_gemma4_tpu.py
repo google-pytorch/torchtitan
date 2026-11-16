@@ -39,7 +39,7 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     configure_gemma4_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import (
-    FusedQKVLinearKeqV,
+    QKVLinearKeqV,
     fused_qk_param_init,
     Gemma4Attention,
     Gemma4Model,
@@ -63,8 +63,9 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
 )
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
+from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.attention import (
-    FusedQKVLinear,
+    QKVLinear,
     ScaledDotProductInnerAttention,
     segment_ids_from_positions,
 )
@@ -407,8 +408,8 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     """
     config = _build_flavor_config("testmodel", enable_weight_tying=False)
     qkv_types = [type(layer.attention.qkv_linear) for layer in config.layers]
-    self.assertIn(FusedQKVLinear.Config, qkv_types)
-    self.assertIn(FusedQKVLinearKeqV.Config, qkv_types)
+    self.assertIn(QKVLinear.Config, qkv_types)
+    self.assertIn(QKVLinearKeqV.Config, qkv_types)
 
     torch.manual_seed(0)
     model = config.build()
@@ -492,8 +493,8 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
   _HEAD_DIM = 8
   _OUT = (_N_HEADS + _N_KV_HEADS) * _HEAD_DIM  # 48
 
-  def _build(self, with_bias: bool = False) -> FusedQKVLinearKeqV:
-    module = FusedQKVLinearKeqV.Config(
+  def _build(self, with_bias: bool = False) -> QKVLinearKeqV:
+    module = QKVLinearKeqV.Config(
         head_dim=self._HEAD_DIM,
         n_heads=self._N_HEADS,
         n_kv_heads=self._N_KV_HEADS,
@@ -508,7 +509,7 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
 
   def test_rejects_wrong_out_features(self):
     with self.assertRaisesRegex(ValueError, "n_heads \\+ n_kv_heads"):
-      FusedQKVLinearKeqV.Config(
+      QKVLinearKeqV.Config(
           head_dim=self._HEAD_DIM,
           n_heads=self._N_HEADS,
           n_kv_heads=self._N_KV_HEADS,
@@ -603,12 +604,12 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
 
     config = _build_flavor_config("testmodel")
     sliding, global_kv = config.layers[0], config.layers[1]
-    self.assertIs(type(sliding.attention.qkv_linear), FusedQKVLinear.Config)
+    self.assertIs(type(sliding.attention.qkv_linear), QKVLinear.Config)
     self.assertIsInstance(
         sliding.attention.qkv_linear.wqkv.param_init["weight"], _FusedQKVInit
     )
     self.assertIs(
-        type(global_kv.attention.qkv_linear), FusedQKVLinearKeqV.Config
+        type(global_kv.attention.qkv_linear), QKVLinearKeqV.Config
     )
     self.assertIsInstance(
         global_kv.attention.qkv_linear.wqkv.param_init["weight"], _FusedQKInit
@@ -731,7 +732,7 @@ class TestGemma4SdpaSlidingWindow(parameterized.TestCase):
         v_norm=RMSNorm.Config(
             normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
         ),
-        qkv_linear=FusedQKVLinear.Config(
+        qkv_linear=QKVLinear.Config(
             head_dim=head_dim,
             n_heads=4,
             n_kv_heads=2,
@@ -824,7 +825,7 @@ class TestGemma4SdpaSlidingWindow(parameterized.TestCase):
         v_norm=RMSNorm.Config(
             normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
         ),
-        qkv_linear=FusedQKVLinear.Config(
+        qkv_linear=QKVLinear.Config(
             head_dim=head_dim,
             n_heads=4,
             n_kv_heads=2,
@@ -1063,9 +1064,12 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
     hf_grads_in_tt_keys = adapter.from_hf(raw_hf_grads)
     # HF has separate q/k/v grads; fold them into the fused wqkv layout with
     # the same merge the load hook applies to weights (wq/wk only on K=V).
+    # Likewise gate/up grads into the fused w13 layout.
     for name, module in tt_model.named_modules():
-      if isinstance(module, FusedQKVLinear):
+      if isinstance(module, QKVLinear):
         module._merge_qkv_on_load(module, hf_grads_in_tt_keys, f"{name}.")
+      elif isinstance(module, FeedForward):
+        module._merge_w13_on_load(module, hf_grads_in_tt_keys, f"{name}.")
     # When weights are tied, both models accumulate the embedding + lm_head
     # gradient into the single shared parameter (tok_embeddings.weight in TT).
     if tt_config.enable_weight_tying:

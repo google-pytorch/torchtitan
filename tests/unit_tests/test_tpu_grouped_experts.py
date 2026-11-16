@@ -24,7 +24,6 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.models.common.moe_sharding import expert_param_placement_dense
 from torchtitan.protocols.sharding import ShardingConfig
 
 
@@ -472,12 +471,25 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
         torch.testing.assert_close(grad, expected_param.grad, rtol=0.01, atol=1e-6)
 
 
+def _dense_tp_placement(tp_placement):
+    # Upstream 610bb6f6 deprecated pure TP on routed experts and dropped
+    # `expert_param_placement_dense`; the layout transpose is still exercised
+    # on a TP-sharded placement here.
+    return spmd.SpmdType(
+        {
+            MeshAxisName.DP: spmd.R,
+            MeshAxisName.CP: spmd.R,
+            MeshAxisName.TP: tp_placement,
+        }
+    )
+
+
 def test_kernel_native_layout_transposes_tp_sharding_axes():
     config = ShardingConfig(
         state_shardings={
-            "w1_EFD": expert_param_placement_dense(tp_placement=spmd.S(1)),
-            "w2_EDF": expert_param_placement_dense(tp_placement=spmd.S(2)),
-            "w3_EFD": expert_param_placement_dense(tp_placement=spmd.S(1)),
+            "w1_EFD": _dense_tp_placement(spmd.S(1)),
+            "w2_EDF": _dense_tp_placement(spmd.S(2)),
+            "w3_EFD": _dense_tp_placement(spmd.S(1)),
         }
     )
     native = _native_weight_sharding(config)

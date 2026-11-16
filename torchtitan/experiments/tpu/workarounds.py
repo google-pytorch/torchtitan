@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn.attention import sdpa_kernel
 import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
+from torchtitan.models.common.linear import Linear
 
 logger = logging.getLogger(__name__)
 
@@ -522,13 +523,19 @@ def _check_lm_head_is_plain_projection(lm_head: nn.Linear) -> None:
   """
   if getattr(lm_head, "returns_loss_operands", False):
     return  # E.g. FusedLossLinearWrapper: already returns (x, weight.T).
-  if type(lm_head).forward is not nn.Linear.forward:
-    raise ValueError(
-        "--loss_kernel.use_loss_kernel cannot be used with"
-        f" {type(lm_head).__name__} as lm_head: it overrides forward (e.g. an"
-        " output multiplier or logit soft-cap), which the fused Pallas loss"
-        " would silently skip. Disable the loss kernel for this model."
-    )
+  forward = type(lm_head).forward
+  if forward is nn.Linear.forward:
+    return
+  # Upstream's ``Linear.forward`` only flattens/unflattens stacked weights
+  # (``num_linears > 1``); a single projection is a plain ``F.linear``.
+  if forward is Linear.forward and getattr(lm_head, "num_linears", 1) == 1:
+    return
+  raise ValueError(
+      "--loss_kernel.use_loss_kernel cannot be used with"
+      f" {type(lm_head).__name__} as lm_head: it overrides forward (e.g. an"
+      " output multiplier or logit soft-cap), which the fused Pallas loss"
+      " would silently skip. Disable the loss kernel for this model."
+  )
 
 
 def use_output_projection_patch(

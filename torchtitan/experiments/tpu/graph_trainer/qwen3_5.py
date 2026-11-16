@@ -1,6 +1,7 @@
 """TPU GraphTrainer integration for Qwen3.5 (text-only Dense and MoE)."""
 
 import dataclasses
+from dataclasses import dataclass
 
 import torch.nn as nn
 from torchtitan.config import ParallelismConfig, TrainingConfig
@@ -13,11 +14,50 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.model import GraphTrainerModel
 from torchtitan.experiments.tpu import qwen3_5 as tpu_qwen3_5
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 from torchtitan.models.qwen3_5.model import Qwen35Model
-from torchtitan.protocols.model_spec import ModelSpec
+
+
+class TpuGraphTrainerQwen35Model(GraphTrainerModel, Qwen35Model):
+  """GraphTrainer Qwen3.5 model with TPU SimpleFSDP and compile hooks."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Qwen35Model.Config):
+    pass
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+
+  def parallelize(
+      self,
+      *,
+      parallel_dims: ParallelDims,
+      training: TrainingConfig,
+      parallelism: ParallelismConfig,
+      compile_config: GraphTrainerCompileConfig,
+      ac_config: ActivationCheckpointingConfig | None = None,
+      dump_folder: str,
+      skip_dp: bool = False,
+  ) -> nn.Module:
+    if skip_dp:
+      raise ValueError("GraphTrainer models do not support skip_dp=True.")
+    return parallelize_qwen3_5(
+        self,
+        parallel_dims=parallel_dims,
+        training=training,
+        parallelism=parallelism,
+        compile_config=compile_config,
+        ac_config=ac_config,  # type: ignore[arg-type]
+        dump_folder=dump_folder,
+    )
+
+  def pipeline(self, **kwargs):
+    raise NotImplementedError(
+        "TPU GraphTrainer Qwen3.5 does not support TP, CP, PP or EP."
+    )
 
 
 def parallelize_qwen3_5(
@@ -34,7 +74,7 @@ def parallelize_qwen3_5(
   del ac_config
   # Upstream's eager parallelize_qwen3_5 rejects CP too (the GatedDeltaNet
   # needs the whole sequence); TP is untested on TPU, the TPU model_registry
-  # has no pipelining_fn, and EP requires mesh-split optimizer support.
+  # has no pipelining, and EP requires mesh-split optimizer support.
   if (
       parallel_dims.tp_enabled
       or parallel_dims.cp_enabled
@@ -49,7 +89,7 @@ def parallelize_qwen3_5(
     annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
-  model.parallelize(parallel_dims)
+  model._parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
   configure_simple_fsdp_shard_dims(model, parallel_dims)
@@ -67,10 +107,15 @@ def parallelize_qwen3_5(
   return model
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str) -> TpuGraphTrainerQwen35Model.Config:
   """GraphTrainer model registry for TPU text-only Qwen3.5 flavors."""
-  return dataclasses.replace(
-      tpu_qwen3_5.model_registry(flavor),
-      parallelize_fn=parallelize_qwen3_5,
-      pipelining_fn=None,
+  base = tpu_qwen3_5.model_registry(flavor)
+  return TpuGraphTrainerQwen35Model.Config(
+      **{
+          field.name: getattr(base, field.name)
+          for field in dataclasses.fields(base)
+      }
   )
+
+
+model_registry._model_config_cls = TpuGraphTrainerQwen35Model.Config  # type: ignore[attr-defined]

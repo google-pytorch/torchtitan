@@ -59,7 +59,7 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   wrapper only hands ``(hidden, weight.T)`` to the loss and the transform is
   applied inside the fused kernel.
   """
-  lm_head = config.model_spec.model.lm_head
+  lm_head = config.model.lm_head
   config.loss = PallasCrossEntropyLoss.Config(
       soft_cap=lm_head.output_soft_cap_temp,
       output_multiplier=lm_head.output_multiplier,
@@ -87,11 +87,11 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
   # module at the end.
   from torchtitan.experiments.tpu.muse_glimmer import model_registry  # pylint: disable=g-import-not-at-top
 
-  model_spec = model_registry("debugmodel", seq_len=_DEBUGMODEL_CONTEXT_LENGTH)
+  model = model_registry("debugmodel", seq_len=_DEBUGMODEL_CONTEXT_LENGTH)
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model,
       optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -147,13 +147,13 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
   """
   from torchtitan.experiments.tpu.muse_glimmer import model_registry  # pylint: disable=g-import-not-at-top
 
-  model_spec = model_registry("30B", seq_len=_30B_CONTEXT_LENGTH)
+  model = model_registry("30B", seq_len=_30B_CONTEXT_LENGTH)
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       # Test tokenizer, like the other TPU recipes; pass the Muse Glimmer
       # tokenizer via --hf_assets_path for meaningful loss values.
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model,
       optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
       training=TrainingConfig(

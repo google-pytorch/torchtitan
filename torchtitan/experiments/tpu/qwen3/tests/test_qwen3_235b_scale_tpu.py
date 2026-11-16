@@ -70,9 +70,9 @@ def _placed_235b(world: int):
   dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=world)
   try:
     mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("fsdp",))
-    spec = config_registry.qwen3_moe_235b_scan().model_spec
+    model_cfg = config_registry.qwen3_moe_235b_scan().model
     with torch.device("meta"):
-      model = with_tpu_stacked_layers(spec.model, use_scan=True).build()
+      model = with_tpu_stacked_layers(model_cfg, use_scan=True).build()
     configure_qwen_simple_fsdp_shard_dims(model, _FakeParallelDims(mesh, world))
     yield apply_simple_fsdp(
         model,

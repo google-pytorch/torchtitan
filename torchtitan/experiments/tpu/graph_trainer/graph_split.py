@@ -328,7 +328,7 @@ class GraphSplitter:
     return cls(
         enabled=enabled,
         config=split_config,
-        n_layers=len(config.model_spec.model.layers) if enabled else 0,
+        n_layers=len(config.model.layers) if enabled else 0,
     )
 
   def split_and_compile(self, traced: "TracedResult") -> torch.fx.GraphModule:

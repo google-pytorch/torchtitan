@@ -729,7 +729,7 @@ class CPValidationTest(parameterized.TestCase):
     config = self._config(strategy)
     config.parallelism.pipeline_parallel_degree = 2
     with self.assertRaisesRegex(NotImplementedError, "pipeline parallelism"):
-      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+      validate_tpu_context_parallel(config.model, config.parallelism)
 
   @parameterized.named_parameters(
       (
@@ -816,12 +816,12 @@ class CPValidationTest(parameterized.TestCase):
 
   def test_rejects_non_causal_kv_all_gather(self):
     config = self._config("all_gather")
-    for layer in config.model_spec.model.layers:
+    for layer in config.model.layers:
       layer.attention.inner_attention = (
           KVAllGatherCPVarlenInnerAttention.Config(window_size=(-1, -1))
       )
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
-      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+      validate_tpu_context_parallel(config.model, config.parallelism)
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
       KVAllGatherCPVarlenInnerAttention(
           KVAllGatherCPVarlenInnerAttention.Config(window_size=(4, 2))

@@ -30,6 +30,7 @@ def _testmodel_moe(
     n_layers = 3
     vocab_size = 2048
     return Qwen3Model.Config(
+        max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),

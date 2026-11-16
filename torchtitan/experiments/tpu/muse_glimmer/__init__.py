@@ -18,9 +18,7 @@ import dataclasses
 
 import torchtitan.models.muse_glimmer as upstream_muse_glimmer
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
-from torchtitan.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
 from torchtitan.config.transform import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
 
 from .attention import SlidingWindowScaledDotProductInnerAttention
 from .attention import TpuMuseGlimmerAttention
@@ -116,18 +114,8 @@ def model_registry(
     *,
     seq_len: int | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> ModelSpec:
-  """Returns a TPU ``ModelSpec`` for a text-only Muse Glimmer flavor.
-
-  Args:
-    flavor: ``testmodel`` or one of the upstream text flavors.
-    seq_len: Context length; defaults to the flavor's maximum.
-    converters: Optional model-config converters (applied before the TPU
-      attention swap).
-
-  Returns:
-    The model spec, using ``parallelize_muse_glimmer``.
-  """
+) -> MuseGlimmerModel.Config:
+  """Returns a TPU ``MuseGlimmerModel.Config`` for a text-only Muse Glimmer flavor."""
   if flavor == "testmodel":
     if converters:
       raise ValueError("converters are not supported for testmodel")
@@ -136,33 +124,22 @@ def model_registry(
           f"Requested seq_len {seq_len} exceeds max context length "
           f"{TESTMODEL_MAX_CONTEXT_LENGTH} for flavor {flavor}"
       )
-    return ModelSpec(
-        name="muse_glimmer",
-        flavor=flavor,
-        model=_testmodel(),
-        max_context_length=seq_len or TESTMODEL_MAX_CONTEXT_LENGTH,
-        parallelize_fn=parallelize_muse_glimmer,
-        pipelining_fn=None,
-        post_optimizer_build_fn=None,
-        state_dict_adapter=MuseGlimmerStateDictAdapter,
-    )
+    config = _testmodel()
+    config.max_context_length = seq_len or TESTMODEL_MAX_CONTEXT_LENGTH
+    return config
 
   if flavor not in _UPSTREAM_TEXT_FLAVORS:
     raise ValueError(
         f"Unsupported Muse Glimmer flavor on TPU: {flavor!r}. Supported:"
         f" {('testmodel',) + _UPSTREAM_TEXT_FLAVORS}"
     )
-  model_spec = upstream_muse_glimmer.model_registry(
+  config = upstream_muse_glimmer.model_registry(
       flavor,
       seq_len=seq_len,
       attn_backend="sdpa",
       converters=converters,
   )
-  use_tpu_attention(model_spec.model)
-  model_spec.parallelize_fn = parallelize_muse_glimmer
-  # PP is not supported on TPU yet; parallelize_muse_glimmer rejects it.
-  model_spec.pipelining_fn = None
-  return model_spec
+  return use_tpu_attention(config)
 
 
 from .config_registry import *  # pylint: disable=wildcard-import,g-import-not-at-top,g-bad-import-order

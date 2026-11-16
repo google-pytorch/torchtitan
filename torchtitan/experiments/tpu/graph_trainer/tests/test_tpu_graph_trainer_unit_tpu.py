@@ -120,9 +120,9 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         tpu_graph_trainer.TpuGraphTrainer.Config,
         "from_tpu_trainer_config must produce TpuGraphTrainer.Config.",
     )
-    assert self.config.model_spec is not None
-    assert gt_cfg.model_spec is not None
-    self.assertEqual(gt_cfg.model_spec.name, self.config.model_spec.name)
+    assert self.config.model is not None
+    assert gt_cfg.model is not None
+    self.assertEqual(gt_cfg.model.dim, self.config.model.dim)
 
   def test_pallas_ce_loss_override(self) -> None:
     """Verifies build_cross_entropy_loss returns PallasCrossEntropyLoss when use_loss_kernel=True."""

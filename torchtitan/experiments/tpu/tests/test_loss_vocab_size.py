@@ -84,7 +84,7 @@ class JobConfigVocabSizeTest(absltest.TestCase):
     # loss-parallel CE reject the (now larger) local shard; filling from the
     # final model config does not.
     config = config_registry.llama3_debugmodel()
-    model_config = config.model_spec.model
+    model_config = config.model
     old_vocab = model_config.vocab_size
     model_config.vocab_size = 2 * old_vocab  # what the widening does
     tp = 2
@@ -106,9 +106,9 @@ class JobConfigVocabSizeTest(absltest.TestCase):
     # A recipe derived from another that changes `vocab_size` after the base
     # config was constructed.
     config = config_registry.llama3_debugmodel()
-    config.model_spec.model.vocab_size = 4096
+    config.model.vocab_size = 4096
     config.parallelism.tensor_parallel_degree = 2
-    set_global_vocab_size(config.loss, config.model_spec.model)
+    set_global_vocab_size(config.loss, config.model)
     self.assertEqual(config.loss.global_vocab_size, 4096)
 
 
@@ -141,7 +141,7 @@ class TrainerFillsBeforeBaseInitTest(absltest.TestCase):
     self.assertIsNone(config.loss.global_vocab_size)
     self.assertEqual(
         self._captured_vocab(tpu_train.TPUTrainer, torchtitan.trainer.Trainer, config),
-        config.model_spec.model.vocab_size,
+        config.model.vocab_size,
     )
 
   def test_tpu_graph_trainer_fills_before_graph_trainer_init(self):
@@ -152,7 +152,7 @@ class TrainerFillsBeforeBaseInitTest(absltest.TestCase):
     self.assertIsNone(config.loss.global_vocab_size)
     self.assertEqual(
         self._captured_vocab(tpu_graph_trainer.TpuGraphTrainer, GraphTrainer, config),
-        config.model_spec.model.vocab_size,
+        config.model.vocab_size,
     )
 
 

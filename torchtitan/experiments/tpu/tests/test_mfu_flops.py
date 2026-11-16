@@ -53,7 +53,7 @@ class MaxTextQwen3FlopsTest(absltest.TestCase):
 class FlopsConventionTest(absltest.TestCase):
 
   def test_qwen3_model_config_reports_torchtitan_flops(self) -> None:
-    model_config = tpu_qwen3_model_registry("30B-A3B").model
+    model_config = tpu_qwen3_model_registry("30B-A3B")
     self.assertEqual(
         model_config.get_nparams_and_flops(
             _build(model_config), seq_len=2048
@@ -86,7 +86,7 @@ class FlopsConventionTest(absltest.TestCase):
       with self.subTest(recipe=name):
         self.assertEqual(
             isinstance(
-                recipe().model_spec.model,
+                recipe().model,
                 (MaxTextQwen3Config, MaxTextTpuGraphTrainerQwen3Model.Config),
             ),
             "maxtext" in name,

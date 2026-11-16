@@ -79,10 +79,8 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       with self.subTest(parallelism=parallelism), self.assertRaisesRegex(
           ValueError, message
       ):
-        # Upstream d771abb0 made `model_spec` required; the topology checks
-        # under test do not look at it.
         TPUTrainerConfig(
-            model_spec=model_registry("debugmodel", attn_backend="sdpa"),
+            model=model_registry("debugmodel", attn_backend="sdpa"),
             parallelism=ParallelismConfig(**parallelism),
             compile=TpuTrainerCompileConfig(compile_grad_norm=True),
         )

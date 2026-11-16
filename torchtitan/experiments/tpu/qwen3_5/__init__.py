@@ -45,7 +45,6 @@ from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
 from torchtitan.config.transform import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
     "model_registry",
@@ -102,37 +101,20 @@ def model_registry(
     seq_len: int | None = None,
     attn_backend: str = "sdpa",
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> ModelSpec:
-  """Returns a TPU ``ModelSpec`` for a text-only Qwen3.5 flavor.
-
-  Args:
-    flavor: An upstream Qwen3.5 flavor (e.g. ``debugmodel``, ``debugmodel_moe``,
-      ``35B-A3B``).
-    seq_len: Context length; defaults to the flavor's maximum.
-    attn_backend: Only ``"sdpa"``, the document-masked SDPA that the Splash and
-      Tokamax attention patches replace.
-    converters: Optional model-config converters.
-
-  Returns:
-    The model spec, using ``parallelize_qwen3_5``.
-  """
+) -> Qwen35Model.Config:
+  """Returns a TPU ``Qwen35Model.Config`` for a text-only Qwen3.5 flavor."""
   if attn_backend != "sdpa":
     raise ValueError(
         "Qwen3.5 on TPU supports only attn_backend='sdpa', got "
         f"{attn_backend!r}"
     )
-  model_spec = upstream_qwen3_5.model_registry(
+  config = upstream_qwen3_5.model_registry(
       flavor,
       seq_len=seq_len,
       attn_backend="sdpa",
       converters=converters,
   )
-  return dataclasses.replace(
-      model_spec,
-      model=use_tpu_modules(model_spec.model),
-      parallelize_fn=parallelize_qwen3_5,
-      pipelining_fn=None,
-  )
+  return use_tpu_modules(config)
 
 
 from .config_registry import *  # pylint: disable=wildcard-import,g-import-not-at-top,g-bad-import-order

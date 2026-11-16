@@ -75,7 +75,7 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
     )
     with torch.device("meta"):
         model = convert(
-            model_registry("debugmodel", attn_backend="sdpa").model
+            model_registry("debugmodel", attn_backend="sdpa")
         ).build()
     model = apply_simple_fsdp(
         model,

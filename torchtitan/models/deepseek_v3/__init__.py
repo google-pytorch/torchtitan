@@ -732,6 +732,7 @@ def _testmodel(
     )
     return DeepSeekV3Model.Config(
         vocab_size=vocab_size,
+        max_context_length=seq_len,
         dim=dim,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT

@@ -11,11 +11,6 @@ the 128-expert banks switch to a divisible hidden axis when the FSDP degree
 does not divide dim 0), applies SimpleFSDP, and hands the model to
 GraphTrainer's ``apply_compile``.
 
-There is no ``GraphTrainerGemma4Model``: upstream's GraphTrainer models wrap
-``init_states`` in ``disable_active_parametrization()``, but every Gemma 4
-module initializes through ``param_init`` / ``named_parameters()``, which
-bypasses SimpleFSDP's parametrization.
-
 Only SimpleFSDP / HSDP is supported here.
 
 Scan (``--compile.use_scan_layers``) is not supported without
@@ -26,6 +21,7 @@ Graph split is the large-size path for Gemma 4.
 """
 
 import dataclasses
+from dataclasses import dataclass
 
 from torch import nn
 
@@ -46,8 +42,45 @@ from torchtitan.experiments.tpu.examples import gemma4 as tpu_gemma4
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     configure_gemma4_simple_fsdp_shard_dims,
 )
+from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
 from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
-from torchtitan.protocols.model_spec import ModelSpec
+
+
+class TpuGraphTrainerGemma4Model(Gemma4Model):
+  """Gemma 4 model subclass owning the TPU GraphTrainer ``parallelize`` path."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Gemma4Model.Config):
+    pass
+
+  def parallelize(
+      self,
+      *,
+      parallel_dims: ParallelDims,
+      training: TrainingConfig,
+      parallelism: ParallelismConfig,
+      compile_config: GraphTrainerCompileConfig,
+      ac_config: ActivationCheckpointingConfig | None = None,
+      dump_folder: str,
+      skip_dp: bool = False,
+  ) -> nn.Module:
+    if skip_dp:
+      raise ValueError("GraphTrainer models do not support skip_dp=True.")
+    return parallelize_gemma4(
+        self,
+        parallel_dims=parallel_dims,
+        training=training,
+        parallelism=parallelism,
+        compile_config=compile_config,
+        ac_config=ac_config,  # type: ignore[arg-type]
+        dump_folder=dump_folder,
+    )
+
+  def pipeline(self, **kwargs):
+    raise NotImplementedError(
+        "TPU GraphTrainer Gemma 4 supports SimpleFSDP/HSDP only; "
+        "pipeline parallelism is not supported."
+    )
 
 
 def parallelize_gemma4(
@@ -62,7 +95,7 @@ def parallelize_gemma4(
 ) -> nn.Module:
   """Applies SimpleFSDP (TPU uneven-dim policy) and graph capture to Gemma 4.
 
-  ``ac_config`` is accepted for the ``parallelize_fn`` protocol but unused: the
+  ``ac_config`` is accepted for the ``parallelize`` protocol but unused: the
   graph trainer rematerializes its joint graph with ``compile.memory_policy``
   instead of eager AC wrappers.
   """
@@ -80,7 +113,7 @@ def parallelize_gemma4(
   if unsupported:
     raise NotImplementedError(
         "TPU GraphTrainer Gemma 4 supports SimpleFSDP/HSDP only; "
-        f"{", ".join(unsupported)} parallelism is not supported."
+        f"{', '.join(unsupported)} parallelism is not supported."
     )
   # SimpleFSDP wraps tok_embeddings with a read-only `weight` property, which
   # is incompatible with Decoder.init_states re-tying tok_embeddings.weight
@@ -93,7 +126,7 @@ def parallelize_gemma4(
 
   annotate_module_fqns(model)
 
-  model.parallelize(parallel_dims)
+  model._parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
 
@@ -112,30 +145,22 @@ def parallelize_gemma4(
   )
 
 
-def model_registry(flavor: str) -> ModelSpec:
-  """Returns the GraphTrainer ``ModelSpec`` for a TPU Gemma 4 flavor.
-
-  ``to_graph_trainer_config`` only takes the model class, ``parallelize_fn``
-  and ``pipelining_fn`` from this spec; the field values (weight tying,
-  converters, sharding) come from the recipe's own model config.
-
-  Args:
-    flavor: a flavor of ``experiments.tpu.examples.gemma4.model_registry``
-      (``testmodel``, ``testmodel_moe``, ``debugmodel``, ``debugmodel_moe``,
-      ``31B``, ``26B-A4B``).
-
-  Returns:
-    The TPU Gemma 4 spec with the graph-trainer ``parallelize_gemma4`` and no
-    ``pipelining_fn``.
-  """
-  return dataclasses.replace(
-      tpu_gemma4.model_registry(flavor, enable_weight_tying=False),
-      parallelize_fn=parallelize_gemma4,
-      pipelining_fn=None,
+def model_registry(flavor: str) -> TpuGraphTrainerGemma4Model.Config:
+  """Returns the GraphTrainer model config for a TPU Gemma 4 flavor."""
+  base = tpu_gemma4.model_registry(flavor, enable_weight_tying=False)
+  return TpuGraphTrainerGemma4Model.Config(
+      **{
+          field.name: getattr(base, field.name)
+          for field in dataclasses.fields(base)
+      }
   )
 
 
+model_registry._model_config_cls = TpuGraphTrainerGemma4Model.Config  # type: ignore[attr-defined]
+
+
 __all__ = [
+    "TpuGraphTrainerGemma4Model",
     "model_registry",
     "parallelize_gemma4",
 ]

@@ -196,7 +196,9 @@ class FluxModel(BaseModel):
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
         skip_dp: bool = False,
+        **kwargs: Any,
     ) -> Self:
+        del kwargs
         """Apply Flux's AC-before-SPMD parallelization lifecycle."""
         from torchtitan.distributed.utils import get_spmd_context
 

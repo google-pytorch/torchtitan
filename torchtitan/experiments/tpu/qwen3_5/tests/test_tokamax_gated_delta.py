@@ -546,7 +546,7 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
 
     torch.manual_seed(0)
     dev = self.accelerator_device
-    base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=256).model
+    base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=256)
     xla_cfg = copy.deepcopy(base_cfg.layers[0].delta_net)
     tok_cfg = copy.deepcopy(xla_cfg)
     tok_cfg.inner_gated_delta_net.kernel = (
@@ -697,7 +697,7 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     batch, seq_len = 2, 2048
     torch.manual_seed(0)
     dev = self.accelerator_device
-    base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=seq_len).model
+    base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=seq_len)
     xla_cfg = copy.deepcopy(base_cfg.layers[0].delta_net)
     tok_cfg = copy.deepcopy(xla_cfg)
     tok_cfg.inner_gated_delta_net.kernel = (
@@ -835,7 +835,7 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     min_log_decay = tokamax_gated_delta.DEFAULT_MIN_LOG_DECAY
     batch, seq_len, steps, vocab_size = 4, 512, 10, 1024
     dev = self.accelerator_device
-    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=seq_len).model
+    config = qwen3_5_tpu.model_registry("debugmodel", seq_len=seq_len)
     config.vocab_size = vocab_size
     config.tok_embeddings.num_embeddings = vocab_size
     config.lm_head.out_features = vocab_size

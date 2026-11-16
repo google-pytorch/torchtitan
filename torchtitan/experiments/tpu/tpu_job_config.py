@@ -201,7 +201,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
     self.training.disable_cuda_graphs = True
     if (
-        self.model_spec is not None
+        self.model is not None
         and self.parallelism.context_parallel_degree > 1
     ):
       # CP recipes apply core ContextParallelTransform with a TPU CP inner
@@ -209,7 +209,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
       # Runs before ``super()`` so the strategy-specific sequence-length error
       # surfaces instead of upstream's generic ring-CP (``2 * cp``) token check.
       validate_tpu_context_parallel(
-          self.model_spec.model,
+          self.model,
           self.parallelism,
           training=self.training,
           splash_attention_kernel=self.splash_attention_kernel,

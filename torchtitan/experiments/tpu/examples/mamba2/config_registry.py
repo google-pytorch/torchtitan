@@ -21,7 +21,6 @@ from torchtitan.config import configs
 from torchtitan.distributed import activation_checkpoint
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
-from torchtitan.protocols import model_spec
 from . import model
 from . import parallelize
 
@@ -128,19 +127,9 @@ def model_registry(
     ssm_backend: str = "pallas",
     seq_len: int | None = None,
     **kwargs,
-) -> model_spec.ModelSpec:
-  config = mamba2_configs[flavor](ssm_backend=ssm_backend, **kwargs)
-  # Upstream d771abb0 made ModelSpec.max_context_length required.
-  return model_spec.ModelSpec(
-      name="mamba2",
-      flavor=flavor,
-      model=config,
-      max_context_length=seq_len or _DEFAULT_MAX_CONTEXT_LENGTH,
-      parallelize_fn=parallelize.parallelize_mamba2,
-      pipelining_fn=None,
-      post_optimizer_build_fn=None,
-      state_dict_adapter=None,
-  )
+) -> model.Mamba2Config:
+  del seq_len
+  return mamba2_configs[flavor](ssm_backend=ssm_backend, **kwargs)
 
 
 def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
@@ -148,7 +137,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("debugmodel"),
+      model=model_registry("debugmodel"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -173,7 +162,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("130M"),
+      model=model_registry("130M"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -198,7 +187,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("370M"),
+      model=model_registry("370M"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=6e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -223,7 +212,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("780M"),
+      model=model_registry("780M"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=5e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -248,7 +237,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("1.3B"),
+      model=model_registry("1.3B"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=4e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -273,7 +262,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("2.7B"),
+      model=model_registry("2.7B"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -298,7 +287,7 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("2.7B"),
+      model=model_registry("2.7B"),
       dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(

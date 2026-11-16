@@ -32,8 +32,8 @@ from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
-from torchtitan.experiments.graph_trainer.llama3 import (
-    model_registry as graph_trainer_model_registry,
+from torchtitan.experiments.graph_trainer.llama3.model import (
+    GraphTrainerLlama3Model,
 )
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
@@ -41,7 +41,6 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama as tpu_parallelize_llama
 from torchtitan.models.llama3.config_registry import model_registry
 
 
@@ -88,7 +87,7 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   layer's input live and 405B does not compile.
   """
   graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
-      config, graph_trainer_model_registry
+      config, GraphTrainerLlama3Model.Config
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
@@ -112,12 +111,10 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
 
 def llama3_debugmodel() -> TPUTrainerConfig:
   """Llama3 debug model configuration for TPU."""
-  model_spec = model_registry("debugmodel", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_llama
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_registry("debugmodel", attn_backend="sdpa"),
       optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -162,7 +159,7 @@ def llama3_debugmodel_checkpoint() -> TPUTrainerConfig:
 def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
   """Llama3 debug model using TPU GraphTrainer."""
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
-      llama3_debugmodel(), graph_trainer_model_registry
+      llama3_debugmodel(), GraphTrainerLlama3Model.Config
   )
   config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
@@ -173,12 +170,10 @@ def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
 
 def llama3_1b() -> TPUTrainerConfig:
   """Llama3 1B model configuration for TPU."""
-  model_spec = model_registry("1B", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_llama
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_registry("1B", attn_backend="sdpa"),
       optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -206,12 +201,10 @@ def llama3_1b() -> TPUTrainerConfig:
 
 def llama3_8b() -> TPUTrainerConfig:
   """Llama3 8B model configuration for TPU."""
-  model_spec = model_registry("8B", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_llama
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
-      model_spec=model_spec,
+      model=model_registry("8B", attn_backend="sdpa"),
       optimizer=default_adamw(lr=3e-4, eps=1e-8),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=200,
@@ -262,12 +255,10 @@ def llama3_8b() -> TPUTrainerConfig:
 
 def llama3_70b() -> TPUTrainerConfig:
   """Llama3 70B model configuration for TPU."""
-  model_spec = model_registry("70B", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_llama
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_registry("70B", attn_backend="sdpa"),
       optimizer=default_adamw(lr=1.5e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=200,
@@ -318,12 +309,10 @@ def llama3_70b() -> TPUTrainerConfig:
 
 def llama3_405b() -> TPUTrainerConfig:
   """Llama3 405B model configuration for TPU."""
-  model_spec = model_registry("405B", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_llama
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_registry("405B", attn_backend="sdpa"),
       optimizer=default_adamw(lr=8e-5),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
@@ -385,12 +374,10 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
         {"role": "assistant", "content": sample["response"]},
     ]
 
-  model_spec = model_registry("8B", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_llama
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
-      model_spec=model_spec,
+      model=model_registry("8B", attn_backend="sdpa"),
       optimizer=default_adamw(lr=2e-5),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=25,
@@ -488,7 +475,7 @@ def _with_float8(
   # Imported here so that only float8 configs require torchao.
   from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
 
-  model_spec = model_registry(
+  config.model = model_registry(
       flavor,
       attn_backend="sdpa",
       converters=[
@@ -498,9 +485,6 @@ def _with_float8(
           )
       ],
   )
-  # model_registry installs the GPU parallelize_fn; restore the TPU one.
-  model_spec.parallelize_fn = config.model_spec.parallelize_fn
-  config.model_spec = model_spec
   return config
 
 

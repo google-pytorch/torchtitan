@@ -268,6 +268,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         )
         self._initialize_forward_backward()
 
+    def _build_model(self) -> BaseModel:
+        return self.model_config.build()
+
     def _initialize_model(
         self,
         *,
@@ -291,7 +294,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[self.config.training.dtype]),
         ):
-            model = self.model_config.build()
+            model = self._build_model()
         self.model_cls = type(model)
         adapter_cls = type(model).state_dict_adapter_cls
         self.state_dict_adapter = (

@@ -59,7 +59,7 @@ class FusedLossLinearWrapper(Linear):
     # name argument: an override is now identified by the decorated factory's
     # import path, which is what `override.imports` lists.
     target=Linear.Config,
-    fqns=["model_spec.model.lm_head"],
+    fqns=["model.lm_head"],
     exact=True,
     description="Defer the Qwen LM-head projection to TPU fused cross entropy.",
 )
@@ -69,7 +69,7 @@ def fused_loss_lm_head(cfg: Linear.Config) -> FusedLossLinearWrapper.Config:
 
 @override(
     target=SoftCappedLinear.Config,
-    fqns=["model_spec.model.lm_head"],
+    fqns=["model.lm_head"],
     exact=True,
     description=(
         "Defer the Muse Glimmer soft-capped LM-head projection to TPU fused"

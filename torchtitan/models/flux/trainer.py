@@ -44,7 +44,12 @@ _LOCAL_TOKENIZER_PATH = "tests/assets/tokenizer"
 logger = logging.getLogger(__name__)
 
 
+from torchtitan.experiments.tpu.train import TpuTrainingEngine
+
+
 class FluxTrainer(Trainer):
+    engine_cls = TpuTrainingEngine
+
     @dataclass(kw_only=True, slots=True)
     class Config(TPUTrainerConfig):
         # Overwrite parent class tokenizer

@@ -31,9 +31,11 @@ import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
+import types
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability.logging import init_logger
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.protocols.model import BaseModel
 import torchtitan.train
 import torchtitan.trainer
 from torchtitan.training_engine import TrainingEngine
@@ -93,16 +95,64 @@ class TpuTrainingEngine(TrainingEngine):
           and not self.parallel_dims.pp_enabled
       )
 
+  def _build_model(self) -> BaseModel:
+    model = super()._build_model()
+    from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
+
+    workarounds.apply_patches(model, self.config)
+    if not self._is_tpu_config:
+      return model
+
+    tpu_compile_mode = self.config.compile.mode
+    orig_parallelize = model.parallelize
+
+    def _tpu_parallelize(self_model, **kwargs):
+      from torchtitan.models.llama3 import Llama3Model  # pylint: disable=g-import-not-at-top
+      from torchtitan.models.muse_glimmer import MuseGlimmerModel  # pylint: disable=g-import-not-at-top
+      from torchtitan.models.qwen3 import Qwen3Model  # pylint: disable=g-import-not-at-top
+      from torchtitan.models.qwen3_5.model import Qwen35Model  # pylint: disable=g-import-not-at-top
+
+      if isinstance(self_model, Llama3Model):
+        from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama  # pylint: disable=g-import-not-at-top
+
+        return parallelize_llama(
+            self_model, tpu_compile_mode=tpu_compile_mode, **kwargs
+        )
+      if isinstance(self_model, Qwen3Model):
+        from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3  # pylint: disable=g-import-not-at-top
+
+        return parallelize_qwen3(
+            self_model, tpu_compile_mode=tpu_compile_mode, **kwargs
+        )
+      if isinstance(self_model, Qwen35Model):
+        from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5  # pylint: disable=g-import-not-at-top
+
+        return parallelize_qwen3_5(
+            self_model, tpu_compile_mode=tpu_compile_mode, **kwargs
+        )
+      if isinstance(self_model, MuseGlimmerModel):
+        from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import parallelize_muse_glimmer  # pylint: disable=g-import-not-at-top
+
+        return parallelize_muse_glimmer(
+            self_model, tpu_compile_mode=tpu_compile_mode, **kwargs
+        )
+      if type(self_model).__name__ in ("Gemma4Model", "TPUHFTransformerModel"):
+        return orig_parallelize(tpu_compile_mode=tpu_compile_mode, **kwargs)
+      return orig_parallelize(**kwargs)
+
+    model.parallelize = types.MethodType(_tpu_parallelize, model)
+    return model
+
   def _initialize_model(
       self,
-      model_spec: ModelSpec,
       *,
       compile_config: Any,
+      hf_assets_path: str,
       create_seed_checkpoint: bool = False,
   ) -> None:
     super()._initialize_model(
-        model_spec,
         compile_config=compile_config,
+        hf_assets_path=hf_assets_path,
         create_seed_checkpoint=create_seed_checkpoint,
     )
     if self._is_tpu_config:
@@ -113,8 +163,8 @@ class TpuTrainingEngine(TrainingEngine):
 
       self.loss_fn = build_cross_entropy_loss(self.config)
 
-  def _initialize_optimizer(self, model_spec: ModelSpec) -> None:
-    super()._initialize_optimizer(model_spec)
+  def _initialize_optimizer(self) -> None:
+    super()._initialize_optimizer()
     if (
         self._is_tpu_config
         and self.config.compile.optimizer_compile == "separate_graph"
@@ -171,7 +221,10 @@ class TpuTrainingEngine(TrainingEngine):
     from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
 
     assert len(self.model_parts) == 1
-    with self.train_context():
+    with dist_utils.get_spmd_context(
+        parallel_dims=self.parallel_dims,
+        spmd_typechecking=self.config.debug.spmd_typechecking,
+    ):
       pred = self.model_parts[0](inputs, **model_kwargs)
       loss, self.loss_metrics = self.loss_fn(
           pred,
@@ -208,8 +261,8 @@ class TPUTrainer(torchtitan.trainer.Trainer):
       # `global_vocab_size` from the final model config first.
       from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
 
-      if job_config.model_spec is not None:
-        set_global_vocab_size(job_config.loss, job_config.model_spec.model)
+      if job_config.model is not None:
+        set_global_vocab_size(job_config.loss, job_config.model)
     super().__init__(job_config)
 
 
@@ -290,7 +343,7 @@ def start_trainer(
   from torchtitan.experiments.tpu.distributed import cloud_distributed_utils  # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
 
-  workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
+  workarounds.raise_dynamo_recompile_limits(train_config.model)
   profiler_workaround.init(train_config)
 
   # Reject a replicate degree that would straddle DCN, before ParallelDims is
@@ -303,15 +356,17 @@ def start_trainer(
     workarounds.disable_pinned_host_memory()
 
   trainer: torchtitan.trainer.Trainer | None = None
-  model_spec = train_config.model_spec
-  assert model_spec is not None
-  model_name = model_spec.name
-  if model_name != "flux":
+  model_cfg = train_config.model
+  assert model_cfg is not None
+  from torchtitan.models.flux import FluxModel  # pylint: disable=g-import-not-at-top
+
+  is_flux = isinstance(model_cfg, FluxModel.Config)
+  if not is_flux:
     _fit_rope_to_context(
-        model_spec.model, train_config.training.max_context_length
+        model_cfg, train_config.training.max_context_length
     )
   is_graph_trainer = isinstance(train_config, TpuGraphTrainer.Config)
-  if model_name == "flux":
+  if is_flux:
     # FluxTrainer owns a separate train_step and bypasses the TPU integration.
     if train_config.compile.compile_grad_norm:
       raise ValueError("compile.compile_grad_norm does not support FluxTrainer")
@@ -347,28 +402,6 @@ def start_trainer(
     logger.info(
         f"Setting default seed {train_config.debug.seed} to avoid hang on TPU"
     )
-
-  # Apply TPU-specific workarounds before model parallelization
-  # Moved from deprecated args.py files
-  orig_parallelize = model_spec.parallelize_fn
-
-  def patched_parallelize(model, *args, **kwargs):
-    from torchtitan.experiments.tpu import workarounds
-
-    workarounds.apply_patches(model, train_config)
-    if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if model_spec.name in (
-          "llama3",
-          "muse_glimmer",
-          "qwen3",
-          "qwen3_5",
-          "gemma4",
-      ):
-        kwargs["tpu_compile_mode"] = train_config.compile.mode
-    return orig_parallelize(model, *args, **kwargs)
-
-  if not is_graph_trainer:
-    model_spec.parallelize_fn = patched_parallelize
 
   try:
     with contextlib.ExitStack() as stack:

@@ -211,7 +211,7 @@ class TpuGroupedExperts(GroupedExperts):
             self._native_sharding_applied = True
         super()._distribute_states(parallel_dims)
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallel_dims) -> None:
         # The paired GEMM can consume expert-major rows after EP dispatch, but
         # EP produces a ragged row count that is not generally tile-aligned.
         # Supporting it requires masked or padded tail rows, removing any
@@ -221,7 +221,9 @@ class TpuGroupedExperts(GroupedExperts):
             and parallel_dims.get_optional_mesh("ep") is not None
         ):
             raise ValueError("Paired grouped matmul requires EP=1 exact-row dispatch")
-        super().parallelize(parallel_dims)
+        super()._parallelize(parallel_dims)
+
+    parallelize = _parallelize
 
     @staticmethod
     def _canonical_weights_on_save(module, state_dict, prefix, local_metadata) -> None:

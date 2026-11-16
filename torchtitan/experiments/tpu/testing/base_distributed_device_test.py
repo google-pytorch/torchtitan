@@ -665,6 +665,9 @@ def _run_cpu_verification(
   cpu_config.parallelism.data_parallel_replicate_degree = 1
   cpu_config.parallelism.context_parallel_degree = 1
   cpu_config.compile.enable = False
+  # Upstream reads ``"model" in compile.components`` (see
+  # ``TpuTrainerCompileConfig.__post_init__``).
+  cpu_config.compile.components = []
   if (
       isinstance(cpu_config, tpu_job_config_module.BaseTPUTrainerConfig)
       and cpu_config.model_spec is not None

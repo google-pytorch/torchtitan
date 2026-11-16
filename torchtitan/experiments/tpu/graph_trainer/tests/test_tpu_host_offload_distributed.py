@@ -116,7 +116,7 @@ def _train_and_check(config, check):
     TpuGraphTrainer.train = original
 
   assert captured, "the graph trainer never ran"
-  check(captured[0]._traced_step.gm)  # pylint: disable=protected-access
+  check(captured[0].engine._traced_step.gm)  # pylint: disable=protected-access
 
 
 # Module level, not closures: the workers are spawned, so whatever is passed as

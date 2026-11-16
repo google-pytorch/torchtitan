@@ -13,7 +13,10 @@ def fake_dataloader(size, seqlen, batch_size):
 def torch_loader_to_jax(train_loader, seq_len=None):
     """Wrap a torchtitan dataloader to yield numpy arrays."""
     for batch in train_loader:
-        if isinstance(batch, dict):
+        if hasattr(batch, 'as_input_dict'):
+            # Upstream ec953b36: dataloaders yield TrainingMicrobatch objects.
+            inputs, labels = batch.as_input_dict()['input'], batch.labels
+        elif isinstance(batch, dict):
             inputs, labels = batch['input'], batch['labels']
         else:
             inputs, labels = batch[0]['input'], batch[1]

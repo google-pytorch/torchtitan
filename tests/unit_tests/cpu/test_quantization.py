@@ -322,8 +322,8 @@ def test_qwen3_recipes_resolve(monkeypatch, recipe):
         assert isinstance(dataset, SingleDatasetConfig)
         assert isinstance(dataset.source, HuggingFaceRandomAccessSource.Config)
         assert dataset.source.path == "openai/gsm8k"
-        assert config.checkpoint.initial_load_in_hf
-        assert config.compile.enable
+        assert config.checkpointer.initial_load_in_hf
+        assert config.compile is not None
         assert "model" in config.compile.components
 
 
@@ -502,6 +502,18 @@ def test_mxfp8_linear_validates_config_and_installs_weight_wrapper():
             out_features=128,
             input_activation_format_for_backward="missing",
         )
+    with pytest.raises(ValueError, match="out_features divisible by 32"):
+        MXFP8Linear.Config(
+            in_features=128,
+            out_features=127,
+            num_linears=2,
+        )
+
+    local_stacked_weight = _LinearShardedTensorWithMXFP8Compute(
+        torch.empty(3, 16, 128, dtype=torch.bfloat16)
+    )
+    with pytest.raises(ValueError, match="local matrix out_features divisible by 32"):
+        local_stacked_weight._build_operands(local_stacked_weight._tensor)
 
     for sharding_config in (colwise_config(), rowwise_config()):
         linear = MXFP8Linear.Config(
@@ -575,7 +587,7 @@ def test_mxfp8_converter_applies_mxfp8_saved_input_fqns(monkeypatch):
     )
     converted = converter.convert(
         FeedForward.Config(
-            w13=Linear.Config(in_features=128, out_features=256),
+            w13=Linear.Config(in_features=128, out_features=128, num_linears=2),
             w2=Linear.Config(in_features=128, out_features=128),
         )
     )
@@ -595,7 +607,7 @@ def test_mxfp8_converter_rejects_unmatched_saved_input_fqns(monkeypatch):
         )
     )
     model_config = FeedForward.Config(
-        w13=Linear.Config(in_features=128, out_features=256),
+        w13=Linear.Config(in_features=128, out_features=128, num_linears=2),
         w2=Linear.Config(in_features=128, out_features=128),
     )
 
@@ -665,7 +677,6 @@ def test_builtin_mxfp8_configs_assign_input_activation_format_for_backward(
         fqn: config.input_activation_format_for_backward
         for fqn, config, _parent, _attr in model_config.traverse(MXFP8Linear.Config)
     }
-
     assert assignments
     assert "bf16" in assignments.values()
     assert "mxfp8" in assignments.values()

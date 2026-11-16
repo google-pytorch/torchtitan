@@ -679,12 +679,14 @@ class TrainDistributedTest(
     combined_args = default_args + args
 
     if checkpoint_enabled:
+      # `<config>_checkpoint` carries a non-None checkpointer; upstream keeps a
+      # `None` default off the CLI, so the recipe has to turn it on.
       test_tmp_dir = tempfile.mkdtemp()
       self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)
       combined_args.extend([
-          "--checkpoint.enable",
-          "--checkpoint.interval=2",
-          f"--checkpoint.folder={os.path.join(test_tmp_dir, 'checkpoint')}",
+          f"--config={config}_checkpoint",
+          "--checkpointer.interval=2",
+          f"--checkpointer.folder={os.path.join(test_tmp_dir, 'checkpoint')}",
       ])
 
     self._test_train_distributed(

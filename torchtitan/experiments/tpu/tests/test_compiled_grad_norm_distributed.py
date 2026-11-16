@@ -29,7 +29,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
   qwen3_moe_30b_fsdp_only_full_ac_benchmark,
   reg_trainer_qwen3_8b,
 )
-from torchtitan.experiments.tpu.train import TPUTrainer
+from torchtitan.experiments.tpu.train import TpuTrainingEngine
 from torchtitan.experiments.tpu.tpu_job_config import (
   TPUTrainerConfig,
   TpuTrainerCompileConfig,
@@ -38,20 +38,23 @@ from torchtitan.models.llama3.config_registry import model_registry
 
 
 class CompiledGradNormUnitTest(absltest.TestCase):
-  def test_both_tpu_trainers_use_shared_compiled_norm(self) -> None:
+  def test_both_tpu_engines_use_shared_compiled_norm(self) -> None:
     model = torch.nn.Linear(2, 1, bias=False)
     expected = torch.tensor(2.0)
-    for trainer_cls in (TPUTrainer, tpu_graph_trainer.TpuGraphTrainer):
-      with self.subTest(trainer=trainer_cls.__name__):
+    for engine_cls in (
+        TpuTrainingEngine,
+        tpu_graph_trainer.TpuGraphTrainingEngine,
+    ):
+      with self.subTest(engine=engine_cls.__name__):
         compiled_norm = mock.Mock()
         compiled_norm.clip_grad_norm_.return_value = expected
-        trainer = SimpleNamespace(
+        engine = SimpleNamespace(
             _compiled_grad_norm=compiled_norm,
             model_parts=[model],
             config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
         )
 
-        actual = trainer_cls._clip_grad_norm(trainer)
+        actual = engine_cls._clip_grad_norm(engine)
 
         self.assertIs(actual, expected)
         compiled_norm.clip_grad_norm_.assert_called_once_with(

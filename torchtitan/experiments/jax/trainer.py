@@ -143,7 +143,7 @@ class JaxTrainer:
     # config). Upstream d771abb0 also dropped
     # ``HuggingFaceTextDataLoader`` in favour of
     # ``torchtitan.components.data.GrainDataLoader``, whose build kwargs
-    # are ``max_context_length`` / ``num_tokens_per_batch`` rather than
+    # are ``max_context_length`` / ``num_tokens_per_microbatch`` rather than
     # ``seq_len`` / ``local_batch_size``; both are still build kwargs so we
     # don't need to mutate ``job_config.training``.
     tokenizer = job_config.tokenizer.build(
@@ -154,7 +154,7 @@ class JaxTrainer:
         dp_rank=0,
         tokenizer=tokenizer,
         max_context_length=seq_len,
-        num_tokens_per_batch=expected_global_batch_size * seq_len,
+        num_tokens_per_microbatch=expected_global_batch_size * seq_len,
     )
     return data_utils.torch_loader_to_jax(torch_loader, seq_len=seq_len)
 

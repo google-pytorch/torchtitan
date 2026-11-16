@@ -20,7 +20,12 @@ from torchtitan.experiments.tpu.rl_nc_ray.padding_packing_utils import (
 
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.distributed.tensor import DTensor
-from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+# TODO(jerryx99): upstream ec953b36 replaced PolicyTrainer with
+# torchtitan.rl.trainer.Trainer, built on torchtitan.training_engine; the
+# overrides below (_build_model, _load_initial_hf_weights, optim_step) target
+# the old class and must be re-ported by the rl_nc_ray owners before use. This
+# module is not exercised in CI (needs a multi-host Ray TPU cluster).
+from torchtitan.rl.trainer import Trainer as PolicyTrainer
 from torchtitan.observability.profiler import Profiler
 from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.distributed import utils as dist_utils

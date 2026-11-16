@@ -51,10 +51,7 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           expert_parallel_degree=1,
       ),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(),
   )
 

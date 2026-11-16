@@ -104,9 +104,9 @@ class TrainCheckpointVerificationTest(
     logging.info("Running Checkpointed Save")
     save_args = base_args + [
         "--training.steps=2",
-        "--checkpoint.enable",
-        "--checkpoint.interval=2",
-        f"--checkpoint.folder={checkpoint_dir}",
+        "--config=llama3_debugmodel_checkpoint",
+        "--checkpointer.interval=2",
+        f"--checkpointer.folder={checkpoint_dir}",
     ]
 
     self._test_train_distributed(
@@ -120,9 +120,9 @@ class TrainCheckpointVerificationTest(
     logging.info("Running Checkpointed Load & Resume")
     load_args = base_args + [
         "--training.steps=5",
-        "--checkpoint.enable",
-        "--checkpoint.interval=2",
-        f"--checkpoint.folder={checkpoint_dir}",
+        "--config=llama3_debugmodel_checkpoint",
+        "--checkpointer.interval=2",
+        f"--checkpointer.folder={checkpoint_dir}",
     ]
     self._test_train_distributed(
         config_args=load_args,

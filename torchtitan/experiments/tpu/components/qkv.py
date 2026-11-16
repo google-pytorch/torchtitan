@@ -80,7 +80,7 @@ class TpuPackedQKVLinear(Module):
   The physical parameter stores ``[all Q rows; all K rows; all V rows]``.
   This removes the fused projection's interleaved output materialization while
   preserving a single FSDP all-gather and gradient reduce-scatter. Model
-  checkpoints continue to expose canonical ``wq``/``wk``/``wv`` keys.
+  checkpoints expose ``QKVLinear``'s native interleaved ``wqkv`` key.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -166,6 +166,13 @@ class TpuPackedQKVLinear(Module):
 
   @staticmethod
   def _split_qkv_on_save(module, state_dict, prefix, _local_metadata) -> None:
+    """Expose the packed parameter in ``QKVLinear``'s native ``wqkv`` layout.
+
+    Upstream keeps the physical, per-KV-group interleaved ``wqkv`` in native
+    state dicts and converts to logical Q/K/V only in the HF adapters
+    (1e4b1f68). Re-interleaving here keeps packed and fused checkpoints
+    interchangeable and lets the adapters' ``wqkv`` split apply unchanged.
+    """
     q_end = module.q_rows
     k_end = q_end + module.kv_rows
     for param in ("weight", "bias"):
@@ -178,22 +185,42 @@ class TpuPackedQKVLinear(Module):
             tensor.device_mesh,
             [Replicate()] * tensor.device_mesh.ndim,
         )
-      state_dict[f"{prefix}wq.{param}"] = tensor[:q_end].contiguous()
-      state_dict[f"{prefix}wk.{param}"] = tensor[q_end:k_end].contiguous()
-      state_dict[f"{prefix}wv.{param}"] = tensor[k_end:].contiguous()
+      tail = tensor.shape[1:]
+      q = tensor[:q_end].reshape(module.n_kv_heads, module.heads_per_kv, module.head_dim, *tail)
+      k = tensor[q_end:k_end].reshape(module.n_kv_heads, 1, module.head_dim, *tail)
+      v = tensor[k_end:].reshape(module.n_kv_heads, 1, module.head_dim, *tail)
+      state_dict[f"{prefix}wqkv.{param}"] = (
+          torch.cat((q, k, v), dim=1).reshape(-1, *tail).contiguous()
+      )
 
   @staticmethod
   def _merge_qkv_on_load(module, state_dict, prefix, *_args) -> None:
+    """Accept ``wqkv`` (interleaved) or logical ``wq``/``wk``/``wv`` keys."""
     for param in ("weight", "bias"):
-      keys = [f"{prefix}{name}.{param}" for name in ("wq", "wk", "wv")]
-      if not all(key in state_dict for key in keys):
+      fused_key = f"{prefix}wqkv.{param}"
+      logical_keys = [f"{prefix}{name}.{param}" for name in ("wq", "wk", "wv")]
+      if fused_key in state_dict:
+        tensor = state_dict.pop(fused_key)
+        if isinstance(tensor, DTensor):
+          tensor = tensor.redistribute(
+              tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
+          )
+        tail = tensor.shape[1:]
+        grouped = tensor.reshape(
+            module.n_kv_heads, module.r_dim, module.head_dim, *tail
+        )
+        q = grouped[:, : module.heads_per_kv].reshape(-1, *tail)
+        k = grouped[:, module.heads_per_kv].reshape(-1, *tail)
+        v = grouped[:, module.heads_per_kv + 1].reshape(-1, *tail)
+      elif all(key in state_dict for key in logical_keys):
+        q, k, v = (state_dict.pop(key) for key in logical_keys)
+        if isinstance(q, DTensor):
+          placements = [Replicate()] * q.device_mesh.ndim
+          q = q.redistribute(q.device_mesh, placements)
+          k = k.redistribute(k.device_mesh, placements)
+          v = v.redistribute(v.device_mesh, placements)
+      else:
         continue
-      q, k, v = (state_dict.pop(key) for key in keys)
-      if isinstance(q, DTensor):
-        placements = [Replicate()] * q.device_mesh.ndim
-        q = q.redistribute(q.device_mesh, placements)
-        k = k.redistribute(k.device_mesh, placements)
-        v = v.redistribute(v.device_mesh, placements)
       state_dict[f"{prefix}wqkv_packed.{param}"] = torch.cat((q, k, v), dim=0)
 
 

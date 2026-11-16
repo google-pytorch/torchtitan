@@ -305,7 +305,13 @@ class BaseLoss(ABC, Configurable):
         ...
 
     def _maybe_compile(self, compile_config: CompileConfig | None) -> None:
-        if compile_config is not None and "loss" in compile_config.components:
+        # Fork: the TPU compile configs keep an ``enable`` switch (they carry
+        # knobs that apply even when torch.compile is off).
+        if (
+            compile_config is not None
+            and getattr(compile_config, "enable", True)
+            and "loss" in compile_config.components
+        ):
             logger.info("Compiling the loss function with torch.compile")
             self.fn = torch.compile(self.fn, backend=compile_config.backend)
 

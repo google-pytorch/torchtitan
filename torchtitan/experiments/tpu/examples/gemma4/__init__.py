@@ -10,11 +10,9 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
 )
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
-from torchtitan.models.common.attention import (
-    FusedQKVLinear,
-    QKVLinear,
-)
+from torchtitan.models.common.attention import FusedQKVLinear
 from torchtitan.models.common.config_utils import (
+    _fused_qkv_param_init,
     get_attention_config,
     make_token_dispatcher_config,
 )
@@ -28,6 +26,8 @@ from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import (
+    FusedQKVLinearKeqV,
+    fused_qk_param_init,
     Gemma4Attention,
     Gemma4Embedding,
     Gemma4FeedForward,
@@ -36,12 +36,12 @@ from .model import (
     Gemma4RoPE,
     Gemma4Router,
     Gemma4TransformerBlock,
-    QKVLinearKeqV,
 )
 from .sharding import set_gemma4_sharding_config
 from .state_dict_adapter import Gemma4StateDictAdapter
 
 __all__ = [
+    "FusedQKVLinearKeqV",
     "Gemma4Attention",
     "Gemma4Embedding",
     "Gemma4FeedForward",
@@ -51,7 +51,6 @@ __all__ = [
     "Gemma4Router",
     "Gemma4StateDictAdapter",
     "Gemma4TransformerBlock",
-    "QKVLinearKeqV",
     "parallelize_gemma4",
     "gemma4_configs",
     "model_registry",
@@ -186,7 +185,6 @@ def _build_gemma4_layers(
     load_balance_coeff: float | None = None,
     aux_loss_coeff: float = 0.0,
     attn_backend: str = "sdpa",
-    use_fused_qkv: bool = False,
     comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
 ) -> list[Gemma4TransformerBlock.Config]:
@@ -204,46 +202,33 @@ def _build_gemma4_layers(
             global_partial_rotary_factor if is_global else 1.0
         )
 
+        # Fused QKV: one wqkv Linear per layer, split along R in forward.
+        # Global K=V layers project only Q and K (R = heads_per_kv + 1); all
+        # other layers project Q, K and V (R = heads_per_kv + 2). The fused
+        # weight is initialized slice-wise, so it matches separate wq/wk/wv.
         if layer_use_k_eq_v:
-            qkv_linear_cfg = QKVLinearKeqV.Config(
-                head_dim=layer_head_dim,
-                wq=Linear.Config(
-                    in_features=dim,
-                    out_features=n_heads * layer_head_dim,
-                    param_init=p["linear_in"],
-                ),
-                wkv=Linear.Config(
-                    in_features=dim,
-                    out_features=layer_n_kv_heads * layer_head_dim,
-                    param_init=p["linear_in"],
-                ),
-            )
-        elif use_fused_qkv:
-            r_dim = n_heads // layer_n_kv_heads + 2
-            qkv_linear_cfg = FusedQKVLinear.Config(
-                n_heads=n_heads,
-                n_kv_heads=layer_n_kv_heads,
-                head_dim=layer_head_dim,
-                wqkv=Linear.Config(
-                    in_features=dim,
-                    out_features=layer_n_kv_heads * r_dim * layer_head_dim,
-                    param_init=p["linear_in"],
-                ),
-            )
+            qkv_linear_cls = FusedQKVLinearKeqV
+            qkv_out_features = (n_heads + layer_n_kv_heads) * layer_head_dim
+            qkv_param_init = fused_qk_param_init
         else:
-            qkv_linear_cfg = QKVLinear.Config(
-                head_dim=layer_head_dim,
-                wq=Linear.Config(
-                    in_features=dim,
-                    out_features=n_heads * layer_head_dim,
-                    param_init=p["linear_in"],
+            qkv_linear_cls = FusedQKVLinear
+            qkv_out_features = (n_heads + 2 * layer_n_kv_heads) * layer_head_dim
+            qkv_param_init = _fused_qkv_param_init
+        qkv_linear_cfg = qkv_linear_cls.Config(
+            n_heads=n_heads,
+            n_kv_heads=layer_n_kv_heads,
+            head_dim=layer_head_dim,
+            wqkv=Linear.Config(
+                in_features=dim,
+                out_features=qkv_out_features,
+                param_init=qkv_param_init(
+                    p["linear_in"],
+                    n_heads=n_heads,
+                    n_kv_heads=layer_n_kv_heads,
+                    head_dim=layer_head_dim,
                 ),
-                wkv=Linear.Config(
-                    in_features=dim,
-                    out_features=layer_n_kv_heads * layer_head_dim,
-                    param_init=p["linear_in"],
-                ),
-            )
+            ),
+        )
 
         norm_cfg = _gemma4_norm(dim, eps=norm_eps)
         layers.append(
@@ -540,7 +525,6 @@ def _set_weight_tying(config: Gemma4Model.Config, enable: bool) -> None:
 def _build_flavor_config(
     flavor: str,
     attn_backend: str = "sdpa",
-    use_fused_qkv: bool = False,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     enable_sp: bool = True,
@@ -557,10 +541,7 @@ def _build_flavor_config(
     else:
         factory = _gemma4_factories[flavor]
         layers_partial = factory.keywords["layers"]
-        extra_kw: dict = {
-            "attn_backend": attn_backend,
-            "use_fused_qkv": use_fused_qkv,
-        }
+        extra_kw: dict = {"attn_backend": attn_backend}
         if layers_partial.keywords.get("moe_enabled", False):
             extra_kw["comm_backend"] = moe_comm_backend
             extra_kw["non_blocking_capacity_factor"] = (
@@ -593,7 +574,6 @@ gemma4_configs = {
 def model_registry(
     flavor: str,
     attn_backend: str = "sdpa",
-    use_fused_qkv: bool = False,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     enable_sp: bool = True,
@@ -604,7 +584,6 @@ def model_registry(
     config = _build_flavor_config(
         flavor,
         attn_backend=attn_backend,
-        use_fused_qkv=use_fused_qkv,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         enable_sp=enable_sp,

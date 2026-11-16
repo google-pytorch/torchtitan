@@ -7,7 +7,6 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
-from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -186,18 +185,12 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
       ),
-      validator=Validator.Config(
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
 
 
@@ -307,11 +300,7 @@ def gemma4_31b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
           data_parallel_shard_degree=-1,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # Qwen3 and Muse Glimmer recipes.
@@ -323,11 +312,7 @@ def gemma4_31b() -> TPUTrainerConfig:
           backend="tpu",
           components=["model"],
       ),
-      validator=Validator.Config(
-          enable=False,
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
       ),

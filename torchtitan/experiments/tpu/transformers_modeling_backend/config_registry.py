@@ -258,10 +258,7 @@ def _tpu_hf_config(
       ),
       dataloader=_c4_test_loader(),
       metrics=MetricsProcessor.Config(log_freq=1),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       # ``save_attention`` swaps in the policy that also keeps the Pallas
       # attention output, as upstream's default set already does for every
       # attention implementation it knows about (SDPA variants, flex).
@@ -354,7 +351,6 @@ def hf_sft_full_max() -> TPUTransformersBackendConfig:
   config.tokenizer = HFBackendTokenizer.Config()
   config.dataloader = TPUGrainDataLoader.Config(dataset="gsm8k")
   config.validator = Validator.Config(
-      enable=True,
       freq=25,
       steps=10,
       dataloader=TPUGrainDataLoader.Config(dataset="gsm8k", dataset_split="test"),
@@ -364,8 +360,7 @@ def hf_sft_full_max() -> TPUTransformersBackendConfig:
       warmup_steps=10, decay_ratio=0.9, decay_type="cosine", min_lr_factor=0.1
   )
   config.training.steps = 100
-  config.checkpoint = CheckpointManager.Config(
-      enable=True,
+  config.checkpointer = CheckpointManager.Config(
       initial_load_in_hf=True,
       interval=1_000_000,
       last_save_model_only=True,

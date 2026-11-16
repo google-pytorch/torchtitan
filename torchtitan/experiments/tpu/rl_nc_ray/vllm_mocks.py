@@ -80,7 +80,7 @@ try:
     # temporarily mock dist.get_world_size() to return 1 if tp=1.
     # ---------------------------------------------------------------------------
     try:
-        import torchtitan.experiments.rl.models.vllm_wrapper as vllm_wrapper
+        import torchtitan.rl.model.vllm_wrapper as vllm_wrapper
         original_create_config = vllm_wrapper.create_torchtitan_config_from_vllm_config
 
         def patched_create_config(vllm_config):

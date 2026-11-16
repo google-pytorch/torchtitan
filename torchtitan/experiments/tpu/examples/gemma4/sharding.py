@@ -27,13 +27,6 @@ if TYPE_CHECKING:
     )
 
 
-_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "w1_EFD": spmd.S(1),
-    "w2_EDF": spmd.S(2),
-    "w3_EFD": spmd.S(1),
-}
-
-
 def set_gemma4_sharding_config(
     config: "Gemma4Model.Config",
     *,
@@ -115,7 +108,6 @@ def _set_gemma4_layer_sharding(
             layer_cfg.moe,
             enable_ep=enable_ep,
             enable_sp=enable_sp,
-            expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
         )
         moe_in_layout = (
             (
@@ -145,9 +137,13 @@ def _set_gemma4_layer_sharding(
             in_src_shardings={"input": moe_in_layout},
             out_src_shardings=moe_in_layout,
         )
-        router.sharding_config = ShardingConfig(
-            state_shardings={
-                "scale": dense_param_placement(tp=moe_norm_weight_tp),
-                "per_expert_scale": dense_param_placement(tp=spmd.R),
-            },
-        )
+        # Extend the router config set_moe_sharding_config filled in (it
+        # carries the tokens_per_expert_E buffer and padding-mask layouts) with
+        # Gemma4Router's own parameters.
+        router_config = router.sharding_config or ShardingConfig()
+        router_config.state_shardings = {
+            **(router_config.state_shardings or {}),
+            "scale": dense_param_placement(tp=moe_norm_weight_tp),
+            "per_expert_scale": dense_param_placement(tp=spmd.R),
+        }
+        router.sharding_config = router_config

@@ -37,7 +37,7 @@ def parallelize_muse_glimmer(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     skip_dp: bool = False,
@@ -59,7 +59,7 @@ def parallelize_muse_glimmer(
 
     model.parallelize(parallel_dims)
     model_compile_enabled = (
-        compile_config.enable and "model" in compile_config.components
+        compile_config is not None and "model" in compile_config.components
     )
 
     if ac_config is not None:
@@ -79,20 +79,18 @@ def parallelize_muse_glimmer(
             parallel_dims=parallel_dims,
         )
         if has_vision:
+            # apply_compile walks ``layers`` (TransformerBlock stack). The
+            # adapter is a 2-layer MLP with no ``layers`` attribute, so it is
+            # left uncompiled -- matching the AC skip above.
             apply_compile(
                 model.vision_encoder,  # pyrefly: ignore [bad-argument-type]
-                compile_config=compile_config,
-                parallel_dims=parallel_dims,
-            )
-            apply_compile(
-                model.vision_adapter,  # pyrefly: ignore [bad-argument-type]
                 compile_config=compile_config,
                 parallel_dims=parallel_dims,
             )
 
     # Skip FSDP wrapper for inference. FSDP's forward hooks
     # are incompatible with torch.inference_mode() used by vLLM.
-    # AC and compile are disabled via config (mode="none", enable=False).
+    # AC and compile are disabled via config (AC mode="none", compile is None).
     if skip_dp:
         return model
 

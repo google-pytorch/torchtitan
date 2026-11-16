@@ -57,12 +57,11 @@ DEFAULT_DEBUG_MODEL_SEQ_LEN = 2048
 
 
 def _make_fused_linear_init(gate_init: Callable, up_init: Callable) -> Callable:
-    """Build an initializer for an interleaved 2D gate/up linear weight."""
+    """Build an initializer for a stacked gate/up linear weight."""
 
     def _init(t: torch.Tensor) -> None:
-        gate_up = t.unflatten(0, (-1, 2))
-        gate_init(gate_up[:, 0])
-        up_init(gate_up[:, 1])
+        gate_init(t[0])
+        up_init(t[1])
 
     return _init
 
@@ -181,7 +180,7 @@ def fused_qkv_param_init(
     ``R = heads_per_kv + 2``. This preserves logical initialization order and
     matches the packing used when loading separate checkpoint tensors.
 
-    Parallelism-agnostic RNG: at init ``t`` is the (possibly sharded) param --
+    Parallelism-agnostic RNG: at init ``t`` is the (possibly sharded) matrix --
     e.g. a ``Shard(0)`` DTensor for the colwise wqkv. ``t.new_empty(...)``
     returns ``Replicate`` DTensors, so each ``base_init`` runs on the full tensor
     and draws the same values on every rank (the weights do not depend on the
@@ -303,7 +302,8 @@ def make_ffn_config(
     return FeedForward.Config(
         w13=w13_cls.Config(
             in_features=dim,
-            out_features=2 * hidden_dim,
+            out_features=hidden_dim,
+            num_linears=2,
             param_init=fused_gate_up_param_init(w1_param_init, w2w3_param_init),
         ),
         w2=w2_cls.Config(
@@ -383,7 +383,7 @@ def make_token_dispatcher_config(
     hidden_dim: int,
     non_blocking_capacity_factor: float | None = None,
     num_max_tokens_per_rank: int | None = None,
-    cudagraphable: bool = False,
+    cuda_graph_compatible: bool = False,
 ) -> LocalTokenDispatcher.Config:
     """Build the appropriate token dispatcher config.
 
@@ -400,21 +400,21 @@ def make_token_dispatcher_config(
     - HYBRIDEP_NUM_SMS_DISPATCH (default: 16)
     - HYBRIDEP_NUM_SMS_COMBINE (default: 16)
     """
-    # TODO(unify-ep-dispatch-knobs): unify the per-backend static-shape/cudagraph knobs --
-    # HybridEP non_blocking_capacity_factor vs DeepEP cudagraphable + num_max_tokens_per_rank.
+    # TODO(unify-ep-dispatch-knobs): unify the per-backend static-shape/CUDA graph knobs --
+    # HybridEP non_blocking_capacity_factor vs DeepEP cuda_graph_compatible + num_max_tokens_per_rank.
     if comm_backend == "deepep":
         # DeepEP v2: a single ElasticBuffer handles training and inference. ``hidden_dim``
-        # (model dim) sizes the buffer; wire_meshes creates it eagerly. ``cudagraphable``
+        # (model dim) sizes the buffer; wire_meshes creates it eagerly. ``cuda_graph_compatible``
         # selects the static no-host-sync expand layout (set on the generator by the
         # deepep_override). ``num_max_tokens_per_rank`` is the hard per-rank input-token
         # bound. Runtime config derives it from the fixed training shape or inference
-        # scheduler/cudagraph limits before the dispatcher is built.
+        # scheduler/CUDA graph limits before the dispatcher is built.
         return DeepEPTokenDispatcher.Config(
             num_experts=num_experts,
             top_k=top_k,
             hidden_dim=hidden_dim,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
-            cudagraphable=cudagraphable,
+            cuda_graph_compatible=cuda_graph_compatible,
         )
     elif comm_backend == "hybridep":
         return HybridEPTokenDispatcher.Config(
@@ -446,7 +446,7 @@ def make_routed_experts_config(
     comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
     num_max_tokens_per_rank: int | None = None,
-    cudagraphable: bool = False,
+    cuda_graph_compatible: bool = False,
 ) -> RoutedExperts.Config:
     """Build a fully-specified RoutedExperts.Config (inner_experts + token_dispatcher)."""
     return RoutedExperts.Config(
@@ -463,7 +463,7 @@ def make_routed_experts_config(
             non_blocking_capacity_factor=non_blocking_capacity_factor,
             hidden_dim=dim,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
-            cudagraphable=cudagraphable,
+            cuda_graph_compatible=cuda_graph_compatible,
         ),
     )
 

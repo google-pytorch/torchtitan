@@ -9,7 +9,6 @@ from typing import cast
 
 from torch.distributed.tensor import Shard
 
-from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
     GrainDataLoader,
@@ -78,7 +77,7 @@ def _kimi_multimodal_dataloader(
     return GrainDataLoader.Config(
         dataset=replace(dataset, processor=processor),
         collator=MultiModalCollator.Config(
-            max_images_per_batch=128,
+            max_images_per_microbatch=128,
             patch_size=processor.patch_size,
             temporal_patch_size=processor.temporal_patch_size,
             spatial_merge_size=processor.spatial_merge_size,
@@ -123,10 +122,7 @@ def kimi_k2_5_debugmodel(
             disable_cuda_graphs=True,
         ),
         parallelism=parallelism,
-        checkpoint=CheckpointManager.Config(
-            interval=10,
-            last_save_model_only=False,
-        ),
+        checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )
 
@@ -169,7 +165,7 @@ def moonlight_16b_a3b(seq_len: int | None = None) -> Trainer.Config:
             disable_cuda_graphs=True,
         ),
         parallelism=parallelism,
-        checkpoint=CheckpointManager.Config(interval=500),
+        checkpointer=None,
         activation_checkpoint=FullAC.Config(),
     )
 
@@ -215,14 +211,14 @@ def kimi_vl_a3b(seq_len: int | None = None) -> Trainer.Config:
             disable_cuda_graphs=True,
         ),
         parallelism=parallelism,
-        checkpoint=CheckpointManager.Config(interval=500),
+        checkpointer=None,
         activation_checkpoint=FullAC.Config(),
     )
 
 
 def kimi_k2_5(seq_len: int | None = None) -> Trainer.Config:
     """Full Kimi K2.5 (~1T-total / ~32B-active)."""
-    compile_config = CompileConfig(enable=True, components=["loss"])
+    compile_config = CompileConfig(components=["loss"])
     # The report uses BF16 compute; its FP8 path only compresses saved activations.
     model_spec = model_registry("Kimi-K2.5", seq_len=seq_len, attn_backend="flex")
     parallelism = ParallelismConfig(
@@ -259,7 +255,7 @@ def kimi_k2_5(seq_len: int | None = None) -> Trainer.Config:
             disable_cuda_graphs=True,
         ),
         parallelism=parallelism,
-        checkpoint=CheckpointManager.Config(interval=500),
+        checkpointer=None,
         activation_checkpoint=FullAC.Config(),
         compile=compile_config,
     )
@@ -337,6 +333,12 @@ def _dist_muon_optimizer(
         "wkv_b": per_key_value_head,
         "wo": owned,
     }
+    feed_forward_shardings = {
+        "w13": ComputeLayout(
+            shardings_by_mesh_axis={MeshAxisName.DP_SHARD.value: Shard(0)},
+        ),
+        "w2": owned,
+    }
     num_layers = len(model_config.layers)
     muon_kwargs = {
         "lr": muon_lr,
@@ -366,8 +368,8 @@ def _dist_muon_optimizer(
         if not layer_id:
             shardings.update(
                 {
-                    f"{prefix}.feed_forward.{projection}.weight": owned
-                    for projection in ("w13", "w2")
+                    f"{prefix}.feed_forward.{projection}.weight": compute_sharding
+                    for projection, compute_sharding in feed_forward_shardings.items()
                 }
             )
         else:
@@ -380,8 +382,8 @@ def _dist_muon_optimizer(
             shardings[f"{prefix}.moe.router.gate.weight"] = owned
             shardings.update(
                 {
-                    f"{prefix}.moe.shared_experts.{projection}.weight": owned
-                    for projection in ("w13", "w2")
+                    f"{prefix}.moe.shared_experts.{projection}.weight": compute_sharding
+                    for projection, compute_sharding in feed_forward_shardings.items()
                 }
             )
         return shardings
@@ -421,11 +423,11 @@ def _dist_muon_optimizer(
         r"(?:"
         rf"attention\.(?:{'|'.join(attention_shardings)})\.weight|"
         rf"routed_experts\.inner_experts\.(?:{'|'.join(expert_projections)})|"
-        r"feed_forward\.w[123]\.weight|"
+        r"feed_forward\.(?:w13|w2)\.weight|"
         # Keep the 2D router gate on Muon: Moonlight Figure 4 reports its
         # SVD-entropy gain over AdamW is larger than for other matrix groups.
         r"moe\.router\.gate\.weight|"
-        r"moe\.shared_experts\.w[123]\.weight"
+        r"moe\.shared_experts\.(?:w13|w2)\.weight"
         r")$"
     )
     return OptimizersContainer.Config(

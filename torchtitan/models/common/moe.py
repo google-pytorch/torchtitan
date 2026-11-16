@@ -395,7 +395,7 @@ def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
     # TODO: the meshes are wired by hand, assuming TP splits router tokens only
     # under EP. Upstream's global batch-wise loss (pytorch/torchtitan#4772)
     # infers this from spmd_types placements; switch when it lands.
-    dp_mesh = parallel_dims.get_optional_mesh("batch")
+    dp_mesh = parallel_dims.get_optional_mesh("dp")
     cp_mesh = parallel_dims.get_optional_mesh("cp")
     tp_mesh = (
         parallel_dims.get_optional_mesh("tp") if parallel_dims.ep_enabled else None

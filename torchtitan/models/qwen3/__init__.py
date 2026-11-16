@@ -10,12 +10,10 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config.transform import (
     ModelConfigConverter,
     validate_converter_compatibility,
 )
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     CosSinRoPE,
     Embedding,
@@ -36,14 +34,9 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import skip_param_init
 
-from torchtitan.protocols.model_spec import ModelSpec
-
 from .model import Qwen3Model, Qwen3TransformerBlock
-from .parallelize import parallelize_qwen3
-from .state_dict_adapter import Qwen3StateDictAdapter
 
 __all__ = [
-    "parallelize_qwen3",
     "Qwen3Model",
     "qwen3_configs",
 ]
@@ -210,6 +203,7 @@ def _debugmodel(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 8
     vocab_size = 2048
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -247,6 +241,7 @@ def _0_6b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 28
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -284,6 +279,7 @@ def _1_7b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 28
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -321,6 +317,7 @@ def _4b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 36
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -358,6 +355,7 @@ def _8b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 36
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -392,6 +390,7 @@ def _14b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 40
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -426,6 +425,7 @@ def _32b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     n_layers = 64
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -468,6 +468,7 @@ def _debugmodel_moe(
     n_layers = 8
     vocab_size = 2048
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -512,6 +513,7 @@ def _30b_a3b(
     n_layers = 48
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -571,6 +573,7 @@ def _235b_a22b(
     n_layers = 94
     vocab_size = 151936
     return Qwen3Model.Config(
+        max_context_length=seq_len,
         vocab_size=vocab_size,
         dim=dim,
         norm=_qwen3_norm(dim),
@@ -660,7 +663,7 @@ def model_registry(
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> ModelSpec:
+) -> Qwen3Model.Config:
     get_config, max_context_len = qwen3_configs[flavor]
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
@@ -679,13 +682,4 @@ def model_registry(
         validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
-    return ModelSpec(
-        name="qwen3",
-        flavor=flavor,
-        model=config,
-        max_context_length=context_len,
-        parallelize_fn=parallelize_qwen3,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=Qwen3StateDictAdapter,
-    )
+    return config

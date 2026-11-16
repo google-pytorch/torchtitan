@@ -14,10 +14,9 @@ unflatten sequence length:
 * ``Llama3TransformerBlock`` / ``Qwen3TransformerBlock`` (dense or MoE): view
   the input as [B, L, D], run the block's own ``forward``, view back. The
   block's external [T, D] contract is unchanged.
-* ``GQAttention`` with ``QKVLinear``, ``FusedQKVLinear`` or
-  ``TpuPackedQKVLinear``: accept [B, L, D]; q/k/v are [B, L, H, K],
-  the RoPE cache is fetched by the configured RoPE module and viewed as
-  [B, L, 1, W], and the rotation is that module's own ``apply_rotary_emb`` --
+* ``GQAttention`` with ``FusedQKVLinear`` or ``TpuPackedQKVLinear``: accept
+  [B, L, D]; q/k/v are [B, L, H, K], the RoPE cache is fetched by the
+  configured RoPE module and viewed as [B, L, 1, W], and the rotation is that module's own ``apply_rotary_emb`` --
   so ``real_rope`` and ``bf16_rope`` keep working. Exact ``CosSinRoPE`` uses a
   rotate-half that does not concatenate the FP32 q/k halves (same FP32
   products and sums; bit-exact on CPU).
@@ -52,7 +51,6 @@ from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_s
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common import FusedQKVLinear
 from torchtitan.models.common import GQAttention
-from torchtitan.models.common import QKVLinear
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
@@ -95,10 +93,6 @@ class _BLDGQAttention(GQAttention):
     # isinstance, not `type(...) is`: SimpleFSDP later swaps parametrized
     # modules to generated subclasses (e.g. `SimpleFSDPQKVLinear_7`).
     # `_attention_eligible` already checked each one keeps the upstream forward.
-    if isinstance(qkv, QKVLinear):
-      return tuple(
-          proj(x).view(b, l, -1, hd) for proj in (qkv.wq, qkv.wk, qkv.wv)
-      )
     if isinstance(qkv, TpuPackedQKVLinear):
       # Same single-split projection as `TpuPackedQKVLinear.forward`.
       packed = qkv.wqkv_packed
@@ -218,7 +212,6 @@ class _BLDMoE(nn.Module):
 
 _BLOCK_FORWARDS = (Llama3TransformerBlock.forward, Qwen3TransformerBlock.forward)
 _QKV_FORWARDS = (
-    QKVLinear.forward,
     FusedQKVLinear.forward,
     TpuPackedQKVLinear.forward,
 )

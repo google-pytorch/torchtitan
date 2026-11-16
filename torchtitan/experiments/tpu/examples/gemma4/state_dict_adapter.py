@@ -7,7 +7,6 @@ from typing import Any
 import torch
 
 from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
-from torchtitan.models.common.attention import FusedQKVLinear
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 # Non-text towers of the multimodal checkpoint, with any leading "model." removed.
@@ -57,13 +56,12 @@ class Gemma4StateDictAdapter(StateDictAdapter):
         self, model_config: Gemma4Model.Config, hf_assets_path: str | None
     ) -> None:
         super().__init__(model_config, hf_assets_path)
-        for idx, layer in enumerate(model_config.layers):
-            if isinstance(layer.attention.qkv_linear, FusedQKVLinear.Config):
-                raise NotImplementedError(
-                    f"Gemma4StateDictAdapter does not support FusedQKVLinear "
-                    f"(layer {idx} has use_fused_qkv=True)."
-                )
 
+        # The fused QKV modules (FusedQKVLinear / FusedQKVLinearKeqV) expose
+        # logical ``qkv_linear.wq`` / ``wk`` / ``wv`` keys through state_dict
+        # hooks, so the maps below are written against those; K=V layers have
+        # no ``wv`` key, matching the missing ``v_proj`` in the HF checkpoint.
+        #
         # ``to_hf`` builds the placeholder that ``dcp.load`` fills from disk, and
         # DCP is strict: every placeholder key must exist in the checkpoint. Two
         # things about Gemma 4 HF checkpoints therefore have to be known up

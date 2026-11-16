@@ -856,7 +856,7 @@ class UlyssesCPScaledDotProductInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(ScaledDotProductInnerAttention.Config):
+  class Config(CPInnerAttention.Config, ScaledDotProductInnerAttention.Config):
     pass
 
 
@@ -865,7 +865,7 @@ class UlyssesCPVarlenInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(VarlenInnerAttention.Config):
+  class Config(CPInnerAttention.Config, VarlenInnerAttention.Config):
     pass
 
 
@@ -874,7 +874,7 @@ class KVAllGatherCPScaledDotProductInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(ScaledDotProductInnerAttention.Config):
+  class Config(CPInnerAttention.Config, ScaledDotProductInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_reference_attention: bool = False
     """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""
@@ -885,7 +885,7 @@ class KVAllGatherCPVarlenInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(VarlenInnerAttention.Config):
+  class Config(CPInnerAttention.Config, VarlenInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_reference_attention: bool = False
     """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""

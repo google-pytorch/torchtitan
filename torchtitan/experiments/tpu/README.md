@@ -98,6 +98,8 @@ python3.14 -m venv venv; source venv/bin/activate
 
     The TPU and TorchTitan dependencies are installed in separate commands because `tokamax` and `tyro` declare conflicting `typeguard` versions. pip warns about the conflict but completes the install.
 
+    `attn-gym` in `requirements.txt` is CUDA/Triton-only and unused on TPU; the TPU image leaves it out, and you can too (`grep -v attn-gym requirements.txt`).
+
     > [!NOTE]
     > PyTorch 2.15.0 is on the PyTorch test (release candidate) index until its final release. After the release, use `--extra-index-url https://download.pytorch.org/whl/cpu`.
 

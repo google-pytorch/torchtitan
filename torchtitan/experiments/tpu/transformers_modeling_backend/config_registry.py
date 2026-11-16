@@ -421,4 +421,5 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
     model_config.fused_loss = False
     config.loss = CrossEntropyLoss.Config()
   config.compile.enable = False
+  config.compile.components = []  # upstream reads components, see TpuTrainerCompileConfig
   return config

@@ -235,12 +235,15 @@ class FluxRandomDataloaderTest(absltest.TestCase):
           dp_rank=0,
           tokenizer=trainer_self.tokenizer,
           max_context_length=cfg.training.max_context_length,
-          num_tokens_per_batch=(
+          num_tokens_per_microbatch=(
               cfg.training.num_tokens_per_microbatch_per_dp_rank
           ),
       )
-      trainer_self.parallel_dims = mock.MagicMock(dp_shard_enabled=False)
-      trainer_self.device = "cpu"
+      # Upstream ec953b36: the device/mesh state lives on the engine.
+      trainer_self.engine = mock.MagicMock(
+          parallel_dims=mock.MagicMock(dp_shard_enabled=False),
+          device="cpu",
+      )
 
     with (
         mock.patch.object(Trainer, "__init__", _fake_super_init),

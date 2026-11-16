@@ -1,6 +1,7 @@
 from collections.abc import Callable
 import dataclasses
 from dataclasses import dataclass
+from typing import ClassVar
 
 import spmd_types as spmd
 import torch
@@ -162,7 +163,7 @@ class FusedQKVLinearKeqV(FusedQKVLinear):
 
     @dataclass(kw_only=True, slots=True)
     class Config(FusedQKVLinear.Config):
-        pass
+        k_eq_v: ClassVar[bool] = True
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -790,7 +791,9 @@ class Gemma4Model(Decoder):
                 n_kv_heads = attention.n_kv_heads or n_heads
                 head_dim = attention.head_dim or dim // n_heads
 
-                if isinstance(attention.qkv_linear, FusedQKVLinearKeqV.Config):
+                if isinstance(attention.qkv_linear, FusedQKVLinearKeqV.Config) or getattr(
+                    attention.qkv_linear, "k_eq_v", False
+                ):
                     # Global K=V layers have only Q, K, and O projections (no V projection).
                     qkv_out = (n_heads + n_kv_heads) * head_dim
                 else:

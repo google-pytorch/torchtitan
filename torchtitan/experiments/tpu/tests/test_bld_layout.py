@@ -15,8 +15,13 @@ from torchtitan.experiments.tpu.overrides.bf16_rope import tpu_activation_dtype_
 from torchtitan.experiments.tpu.overrides.real_rope import tpu_real_arithmetic_complex_rope
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.examples.gemma4.model import (
+    FusedQKVLinearKeqV,
+    fused_qk_param_init,
+)
 from torchtitan.models.common import ComplexRoPE
 from torchtitan.models.common import CosSinRoPE
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3 import _build_llama3_layers
 from torchtitan.models.qwen3 import _build_qwen3_layers
 
@@ -67,9 +72,32 @@ def _packed_qwen3_block():
   return TpuPackedQKVConverter.Config().build().convert(_qwen3_block())
 
 
+def _packed_qwen3_keqv_block():
+  block = _qwen3_block()
+  qkv = block.attention.qkv_linear
+  block.attention.qkv_linear = FusedQKVLinearKeqV.Config(
+      n_heads=qkv.n_heads,
+      n_kv_heads=qkv.n_kv_heads,
+      head_dim=qkv.head_dim,
+      wqkv=Linear.Config(
+          in_features=_DIM,
+          out_features=(qkv.n_heads + qkv.n_kv_heads) * qkv.head_dim,
+          bias=True,
+          param_init=fused_qk_param_init(
+              {"weight": torch.nn.init.normal_, "bias": torch.nn.init.zeros_},
+              n_heads=qkv.n_heads,
+              n_kv_heads=qkv.n_kv_heads,
+              head_dim=qkv.head_dim,
+          ),
+      ),
+  )
+  return TpuPackedQKVConverter.Config().build().convert(block)
+
+
 _BLOCKS = {
     "qwen3_fused": _qwen3_block,
     "qwen3_packed": _packed_qwen3_block,
+    "qwen3_packed_keqv": _packed_qwen3_keqv_block,
     "qwen3_bf16_rope": lambda: _qwen3_block(
         tpu_activation_dtype_cossin_rope(_cossin_rope())
     ),

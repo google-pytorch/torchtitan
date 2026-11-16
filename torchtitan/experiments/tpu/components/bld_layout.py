@@ -96,21 +96,30 @@ class _BLDGQAttention(GQAttention):
     if isinstance(qkv, TpuPackedQKVLinear):
       # Same single-split projection as `TpuPackedQKVLinear.forward`.
       packed = qkv.wqkv_packed
-      sizes = (qkv.q_rows, qkv.kv_rows, qkv.kv_rows)
+      sizes = (
+          (qkv.q_rows, qkv.kv_rows)
+          if qkv.k_eq_v
+          else (qkv.q_rows, qkv.kv_rows, qkv.kv_rows)
+      )
       weights = torch.split(packed.weight, sizes, dim=0)
       biases = (
-          (None,) * 3
+          (None,) * len(sizes)
           if packed.bias is None
           else torch.split(packed.bias, sizes, dim=0)
       )
-      return tuple(
+      projs = tuple(
           F.linear(x, w, bias).view(b, l, -1, hd)
           for w, bias in zip(weights, biases)
       )
+      return (projs[0], projs[1], projs[1]) if qkv.k_eq_v else projs
     assert isinstance(qkv, FusedQKVLinear), type(qkv)
     # Same split as `FusedQKVLinear.forward`, with [B, L] leading dims:
     # [B, L, n_kv_heads * R * hd] -> [B, L, n_kv_heads, R, hd] -> q/k/v.
     fused = qkv.wqkv(x).view(b, l, -1, qkv.r_dim, hd)
+    if getattr(qkv.Config, "k_eq_v", False):
+      xq, xk = torch.split(fused, [qkv.heads_per_kv, 1], dim=-2)
+      xk = xk.reshape(b, l, -1, hd)
+      return xq.reshape(b, l, -1, hd), xk, xk
     xq, xk, xv = torch.split(fused, [qkv.heads_per_kv, 1, 1], dim=-2)
     return (
         xq.reshape(b, l, -1, hd),

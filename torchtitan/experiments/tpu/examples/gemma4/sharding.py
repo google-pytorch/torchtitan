@@ -27,13 +27,6 @@ if TYPE_CHECKING:
     )
 
 
-_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "w1_EFD": spmd.S(1),
-    "w2_EDF": spmd.S(2),
-    "w3_EFD": spmd.S(1),
-}
-
-
 def set_gemma4_sharding_config(
     config: "Gemma4Model.Config",
     *,
@@ -115,7 +108,6 @@ def _set_gemma4_layer_sharding(
             layer_cfg.moe,
             enable_ep=enable_ep,
             enable_sp=enable_sp,
-            expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
         )
         moe_in_layout = (
             (

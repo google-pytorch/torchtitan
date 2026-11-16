@@ -273,7 +273,8 @@ def _build_gemma4_layers(
                 feed_forward=Gemma4FeedForward.Config(
                     w13=Linear.Config(
                         in_features=dim,
-                        out_features=2 * hidden_dim,
+                        out_features=hidden_dim,
+                        num_linears=2,
                         # Gate (w1) and up (w3) slices keep their separate
                         # initializers inside the fused parameter.
                         param_init=fused_gate_up_param_init(

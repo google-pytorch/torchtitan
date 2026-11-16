@@ -137,9 +137,13 @@ def _set_gemma4_layer_sharding(
             in_src_shardings={"input": moe_in_layout},
             out_src_shardings=moe_in_layout,
         )
-        router.sharding_config = ShardingConfig(
-            state_shardings={
-                "scale": dense_param_placement(tp=moe_norm_weight_tp),
-                "per_expert_scale": dense_param_placement(tp=spmd.R),
-            },
-        )
+        # Extend the router config set_moe_sharding_config filled in (it
+        # carries the tokens_per_expert_E buffer and padding-mask layouts) with
+        # Gemma4Router's own parameters.
+        router_config = router.sharding_config or ShardingConfig()
+        router_config.state_shardings = {
+            **(router_config.state_shardings or {}),
+            "scale": dense_param_placement(tp=moe_norm_weight_tp),
+            "per_expert_scale": dense_param_placement(tp=spmd.R),
+        }
+        router.sharding_config = router_config

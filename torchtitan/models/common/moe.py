@@ -323,11 +323,7 @@ class MoELoadBalanceAuxLoss(AuxLoss):
             scores_TE = scores_TE * ~padding_mask_T.unsqueeze(-1)
         local_counts_E = None
         if routing_map_TE is None:
-            ids_TK = (
-                expert_ids_TK
-                if padding_mask_T is None
-                else expert_ids_TK[~padding_mask_T]
-            )
+            ids_TK = _mask_padded_expert_ids(expert_ids_TK, padding_mask_T)
             local_counts_E = _tokens_per_expert(ids_TK, num_experts)
         # This rank's share of the global batch, B / global_batch_size, counted
         # in tokens so the batch-wise loss never regroups tokens into sequences.
@@ -436,6 +432,19 @@ def _tokens_per_expert(
         min=0,
         max=num_experts,
     ).to(torch.int64)
+
+
+def _mask_padded_expert_ids(
+    topk_expert_ids_TK: torch.Tensor, padding_mask_T: torch.Tensor | None
+) -> torch.Tensor:
+    """Send padded tokens' ids to -1, which ``_tokens_per_expert`` ignores.
+
+    Keeps the shape static (no boolean indexing / ``nonzero``), so the count
+    compiles on TPU/XLA.
+    """
+    if padding_mask_T is None:
+        return topk_expert_ids_TK
+    return topk_expert_ids_TK.masked_fill(padding_mask_T.unsqueeze(-1), -1)
 
 
 class GroupedExperts(Module):
@@ -758,11 +767,7 @@ class TokenChoiceTopKRouter(Module):
         if self.training:
             if routing_map_TE is None:
                 masked_routing_map_TE = None
-                ids_TK = (
-                    topk_expert_ids_TK
-                    if padding_mask_T is None
-                    else topk_expert_ids_TK[~padding_mask_T]
-                )
+                ids_TK = _mask_padded_expert_ids(topk_expert_ids_TK, padding_mask_T)
                 masked_counts_E = _tokens_per_expert(ids_TK, self.num_experts)
             else:
                 masked_routing_map_TE = (

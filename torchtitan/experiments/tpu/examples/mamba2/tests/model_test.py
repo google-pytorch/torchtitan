@@ -111,15 +111,14 @@ class Mamba2ModelTest(absltest.TestCase):
     )
 
   def test_model_registry_and_configs(self):
-    spec = mamba2.model_registry("debugmodel")
-    self.assertEqual(spec.name, "mamba2")
-    self.assertEqual(spec.flavor, "debugmodel")
+    cfg = mamba2.model_registry("debugmodel")
+    self.assertIsInstance(cfg, model.Mamba2Config)
 
     debug_trainer_cfg = mamba2.mamba2_debug()
-    self.assertEqual(debug_trainer_cfg.model_spec.name, "mamba2")
+    self.assertIsInstance(debug_trainer_cfg.model, model.Mamba2Config)
 
     cfg_130m = mamba2.mamba2_130m()
-    self.assertEqual(cfg_130m.model_spec.flavor, "130M")
+    self.assertIsInstance(cfg_130m.model, model.Mamba2Config)
 
 
 if __name__ == "__main__":

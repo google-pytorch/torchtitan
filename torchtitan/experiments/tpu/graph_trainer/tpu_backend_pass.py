@@ -601,7 +601,7 @@ def construct_tpu_transform_passes(
     passes.append(apply_combine_barrier_pass)
 
     if fsdp_barrier_policy != "none":
-        model_config = config.model_spec.model
+        model_config = config.model
         n_layers = len(model_config.layers)
         # TransformerBlock.Config exposes ``moe`` independently of the concrete
         # expert implementation, including TPU-converted GroupedExperts.

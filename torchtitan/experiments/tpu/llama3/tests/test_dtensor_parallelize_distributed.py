@@ -19,7 +19,6 @@ from torchtitan.experiments.tpu.distributed import distributed
 from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu.testing.base_distributed_device_test import InputDistribution
 import torchtitan.experiments.tpu.llama3 as llama3_tpu
-from torchtitan.models.llama3 import parallelize as llama3_dtensor_parallelize
 from torchtitan.models.llama3.model import Llama3Model
 
 
@@ -74,8 +73,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
 
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
-    llama3_dtensor_parallelize.parallelize_llama(
-        model,
+    model.parallelize(
         ac_config=SelectiveAC.Config(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
@@ -124,8 +122,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
 
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
-    llama3_dtensor_parallelize.parallelize_llama(
-        model,
+    model.parallelize(
         ac_config=SelectiveAC.Config(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
@@ -178,8 +175,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
 
   def apply_fsdp_wrapper(model):
     # pytype: disable=wrong-arg-types
-    llama3_dtensor_parallelize.parallelize_llama(
-        model,
+    model.parallelize(
         ac_config=SelectiveAC.Config(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",

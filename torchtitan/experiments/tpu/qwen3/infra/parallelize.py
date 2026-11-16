@@ -5,7 +5,6 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
@@ -58,16 +57,15 @@ def parallelize_qwen3(
 
   if parallelism.use_simple_fsdp:
     # Apply all other parallelisms but skip data parallelism
-    dtensor_parallelize.parallelize_qwen3(
-          model,  # pyrefly: ignore[bad-argument-type]
-          ac_config=ac_config,
-          compile_config=effective_compile_config,
-          dump_folder=dump_folder,
-          parallel_dims=parallel_dims,
-          parallelism=parallelism,
-          skip_dp=True,
-          training=training,
-      )
+    model.parallelize(
+        ac_config=ac_config,
+        compile_config=effective_compile_config,
+        dump_folder=dump_folder,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        skip_dp=True,
+        training=training,
+    )
 
     # Configure expert sharding after upstream parallelization has installed
     # any wrappers, but before SimpleFSDP selects parameter shard dimensions.
@@ -83,16 +81,15 @@ def parallelize_qwen3(
         holder.build_split_meshes()
     install_tpu_replicate_computation(model)
   else:
-    dtensor_parallelize.parallelize_qwen3(
-          model,  # pyrefly: ignore[bad-argument-type]
-          ac_config=ac_config,
-          compile_config=effective_compile_config,
-          dump_folder=dump_folder,
-          parallel_dims=parallel_dims,
-          parallelism=parallelism,
-          skip_dp=skip_dp,
-          training=training,
-      )
+    model.parallelize(
+        ac_config=ac_config,
+        compile_config=effective_compile_config,
+        dump_folder=dump_folder,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        skip_dp=skip_dp,
+        training=training,
+    )
   if compile_mode == "fullgraph":
     apply_spmd_safe(model)
     model = torch.compile(model, fullgraph=True, backend="tpu")

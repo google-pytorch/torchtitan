@@ -153,9 +153,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
         config_registry.gemma4_26b_a4b_graph_split_offload,
     ):
       cfg = fn()
-      self.assertEqual(cfg.model_spec.name, "gemma4")
-      self.assertIn(cfg.model_spec.flavor, gemma4_configs)
-      self.assertFalse(cfg.model_spec.model.enable_weight_tying)
+      self.assertFalse(cfg.model.enable_weight_tying)
       self.assertEqual(cfg.optimizer.implementation, "fused")
 
   def test_build_flavor_config_weight_tying(self):
@@ -250,10 +248,10 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     with self.assertRaisesRegex(
         NotImplementedError, "Context parallelism is not supported"
     ):
-      cfg.model_spec.model.update_from_config(config=cfg)
+      cfg.model.update_from_config(config=cfg)
 
     with torch.device("meta"):
-      model = gemma4_debugmodel().model_spec.model.build()
+      model = gemma4_debugmodel().model.build()
     pdims = SimpleNamespace(cp_enabled=True, cp=2, dp_shard=1)
     with self.assertRaisesRegex(
         NotImplementedError, "Context parallelism is not supported"
@@ -281,7 +279,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
 
     for ep_enabled, expected_calls in ((False, 2), (True, 0)):
       with torch.device("meta"):
-        model = cfg.model_spec.model.build()
+        model = cfg.model.build()
       pdims = SimpleNamespace(
           cp_enabled=False,
           ep_enabled=ep_enabled,
@@ -1496,7 +1494,7 @@ class TestGemma4FusedCrossEntropyConfig(parameterized.TestCase):
     self.assertEqual(cfg.loss.soft_cap, 30.0)
     self.assertEqual(cfg.loss.output_multiplier, 1.0)
     self.assertEqual(cfg.loss.h_block_size, expected_h_block_size)
-    model_config = cfg.model_spec.model
+    model_config = cfg.model
     self.assertEqual(
         model_config.dim % cfg.loss.h_block_size,
         0,
@@ -1513,13 +1511,13 @@ class TestGemma4FusedCrossEntropyConfig(parameterized.TestCase):
 
     cfg = gemma4_debugmodel_fused_ce()
     apply_overrides(cfg.override, cfg)
-    lm_head_cfg = cfg.model_spec.model.lm_head
+    lm_head_cfg = cfg.model.lm_head
     self.assertIsInstance(lm_head_cfg, FusedLossLinearWrapper.Config)
     self.assertEqual(lm_head_cfg.soft_cap, 30.0)
     self.assertEqual(lm_head_cfg.output_multiplier, 1.0)
 
     with torch.device("meta"):
-      model = cfg.model_spec.model.build()
+      model = cfg.model.build()
     self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
     self.assertTrue(model.lm_head.returns_loss_operands)
     self.assertEqual(tuple(model.lm_head.weight.shape), (2048, 256))
@@ -1735,7 +1733,7 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
   @parameterized.parameters(gemma4_moe_debug_pallas, gemma4_26b_a4b)
   def test_moe_pallas_config_enables_all_five_levers(self, recipe):
     cfg = recipe()
-    model_cfg = cfg.model_spec.model
+    model_cfg = cfg.model
     dispatchers = list(
         model_cfg.traverse(TpuAllToAllTokenDispatcher.Config)
     )
@@ -1838,7 +1836,7 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
     """configure_gemma4_simple_fsdp_shard_dims shards uneven experts on dim 1 under native layout."""
     from types import SimpleNamespace
 
-    cfg = gemma4_moe_debug_pallas().model_spec.model
+    cfg = gemma4_moe_debug_pallas().model
     # Set E=8 (not divisible by dp_shard=6), D=192 and F=96 (both divisible by 6).
     cfg.vocab_size = 192
     cfg.dim = 192
@@ -1874,9 +1872,9 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
     use_cpu_safe_histc_patch()
     torch.manual_seed(123)
 
-    ref_cfg = copy.deepcopy(gemma4_moe_debug().model_spec.model.layers[0].moe)
+    ref_cfg = copy.deepcopy(gemma4_moe_debug().model.layers[0].moe)
     cand_cfg = copy.deepcopy(
-        gemma4_moe_debug_pallas().model_spec.model.layers[0].moe
+        gemma4_moe_debug_pallas().model.layers[0].moe
     )
     cand_cfg.routed_experts.inner_experts.pallas_grouped_mm_tgmm_tiling = (
         tgmm_tiling

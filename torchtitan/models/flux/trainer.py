@@ -6,18 +6,29 @@
 
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Annotated
+from typing import Annotated, Any
 
 import torch
+import torch.nn as nn
 import tyro
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.fsdp import (
+    disable_fsdp_gradient_division,
+    enable_fsdp_symm_mem,
+    resolve_fsdp_mesh,
+)
+from torchtitan.distributed.spmd_types import annotate_replicated_parameters
 from torchtitan.models.flux.configs import FluxEncoderConfig, Inference
 from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.model import FluxModel
 import os as os
-from torchtitan.models.flux.parallelize import parallelize_encoders
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel as simple_fsdp_data_parallel,
+    MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
+)
 from torchtitan.models.flux.precomputed_loader import PrecomputedDataloader
 from torchtitan.models.flux.random_loader import RandomDataloader
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
@@ -33,7 +44,12 @@ _LOCAL_TOKENIZER_PATH = "tests/assets/tokenizer"
 logger = logging.getLogger(__name__)
 
 
+from torchtitan.experiments.tpu.train import TpuTrainingEngine
+
+
 class FluxTrainer(Trainer):
+    engine_cls = TpuTrainingEngine
+
     @dataclass(kw_only=True, slots=True)
     class Config(TPUTrainerConfig):
         # Overwrite parent class tokenizer
@@ -48,8 +64,7 @@ class FluxTrainer(Trainer):
         inference: Inference = field(default_factory=Inference)
 
     def __init__(self, config: Config):
-        assert config.model_spec is not None
-        model_args = config.model_spec.model
+        model_args = config.model
         assert isinstance(model_args, FluxModel.Config)
 
         # If precomputed_dataset_path or random_dataset is provided in
@@ -171,13 +186,13 @@ class FluxTrainer(Trainer):
 
             # 2. Apply FSDP to the T5 model / CLIP model.
             # pyrefly: ignore [bad-assignment]
-            self.t5_encoder, self.clip_encoder = parallelize_encoders(
+            self.t5_encoder, self.clip_encoder = self._parallelize_encoders(
                 t5_model=self.t5_encoder,
                 clip_model=self.clip_encoder,
                 parallel_dims=self.engine.parallel_dims,
                 training=config.training,
-                symm_mem_scope=config.parallelism.fsdp_symm_mem_scope,
                 parallelism=config.parallelism,
+                symm_mem_scope=config.parallelism.fsdp_symm_mem_scope,
             )
 
             # 3. Materialize on device.
@@ -210,3 +225,53 @@ class FluxTrainer(Trainer):
                 clip_encoder=self.clip_encoder,
                 dump_folder=config.dump_folder,
             )
+
+    def _parallelize_encoders(
+        self,
+        *,
+        t5_model,
+        clip_model,
+        parallel_dims,
+        training,
+        parallelism=None,
+        symm_mem_scope=None,
+    ):
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        if getattr(parallelism, "use_simple_fsdp", False):
+            dp_mode = (
+                "hybrid_shard"
+                if parallel_dims.dp_replicate_enabled
+                else "fully_shard"
+            )
+            mp_policy = SimpleFSDPMixedPrecisionPolicy(
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            )
+            t5_model = simple_fsdp_data_parallel(
+                t5_model,
+                dp_mesh,
+                mode=dp_mode,
+                mp_policy=mp_policy,
+            )
+            logger.info(f"Applied SimpleFSDP ({dp_mode}) to the T5 encoder model")
+            return t5_model, clip_model
+
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        )
+        fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
+        if dp_mesh_dims is not None:
+            fsdp_config["dp_mesh_dims"] = dp_mesh_dims
+        if training.enable_cpu_offload:
+            fsdp_config["offload_policy"] = CPUOffloadPolicy()
+
+        hf_module = t5_model.hf_module
+        assert isinstance(hf_module, nn.Module)
+        annotate_replicated_parameters(hf_module, parallel_dims)
+        for block in hf_module.encoder.block:  # pyrefly: ignore [missing-attribute]
+            fully_shard(block, **fsdp_config)
+        fully_shard(hf_module, **fsdp_config)
+        enable_fsdp_symm_mem(hf_module, symm_mem_scope)
+        disable_fsdp_gradient_division(hf_module)
+        return t5_model, clip_model

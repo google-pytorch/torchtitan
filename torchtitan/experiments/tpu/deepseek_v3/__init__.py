@@ -6,7 +6,8 @@
 
 import torchtitan.models.common as common_models
 import torchtitan.models.deepseek_v3 as deepseek_v3_models
-from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
+def parallelize_deepseekv3(model, **kwargs):
+  return model.parallelize(**kwargs)
 
 __all__ = [
     "parallelize_deepseekv3",
@@ -55,6 +56,7 @@ def _testmodel(
   )
   # pytype: enable=wrong-keyword-args
   return deepseek_v3_models.DeepSeekV3Model.Config(
+      max_context_length=128,
       vocab_size=vocab_size,
       dim=dim,
       tok_embeddings=common_models.Embedding.Config(
@@ -115,6 +117,7 @@ def _testmodel_moe(
   )
   # pytype: enable=wrong-keyword-args
   return deepseek_v3_models.DeepSeekV3Model.Config(
+      max_context_length=128,
       vocab_size=vocab_size,
       dim=dim,
       tok_embeddings=common_models.Embedding.Config(

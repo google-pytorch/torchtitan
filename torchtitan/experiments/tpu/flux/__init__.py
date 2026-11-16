@@ -20,7 +20,7 @@ def _upstream_flavor(flavor: str):
   bare callable into a `(builder, max_context_length)` pair. Flux builders take
   no arguments, so only the unpack changes here.
   """
-  build_config, _ = native_flux_models.flux_configs[flavor]
+  build_config = native_flux_models.flux_configs[flavor]
   return build_config()
 
 

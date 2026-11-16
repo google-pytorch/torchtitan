@@ -201,6 +201,14 @@ class Mamba2LM(model_protocol.BaseModel):
     """Verify module protocol compatibility."""
     pass
 
+  def _apply_fsdp(self, *, parallel_dims, training, parallelism) -> None:
+    del parallel_dims, training, parallelism
+
+  def parallelize(self, **kwargs):
+    from .parallelize import parallelize_mamba2
+
+    return parallelize_mamba2(self, **kwargs)
+
   def init_weights(self, buffer_device=None, **kwargs) -> None:
     """Initialize model weights with DTensor support."""
     if self.enable_weight_tying:

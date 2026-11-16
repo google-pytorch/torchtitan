@@ -62,16 +62,16 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
       ).build()
 
   def test_converts_all_linears_except_filtered(self):
-    spec = model_registry(
+    model_cfg = model_registry(
         "debugmodel",
         attn_backend="sdpa",
         converters=[TpuFloat8LinearConverter.Config(filter_fqns=["lm_head"])],
     )
 
-    fp8, plain = _converted(spec.model)
+    fp8, plain = _converted(model_cfg)
     self.assertEqual(plain, ["lm_head"])
     self.assertNotEmpty(fp8)
-    model = spec.model.build()
+    model = model_cfg.build()
     for fqn in fp8:
       module = model.get_submodule(fqn)
       self.assertIsInstance(module, Float8Linear)
@@ -99,11 +99,10 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
   def test_llama3_70b_float8_config(self):
     config = config_registry.llama3_70b_float8()
 
-    fp8, plain = _converted(config.model_spec.model)
+    fp8, plain = _converted(config.model)
     self.assertEqual(plain, ["lm_head"])
     # wqkv, wo, w13 and w2 in each of the 80 layers.
     self.assertLen(fp8, 4 * 80)
-    self.assertIs(config.model_spec.parallelize_fn, parallelize_llama)
 
 
 if __name__ == "__main__":

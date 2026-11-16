@@ -219,7 +219,7 @@ class FluxRandomDataloaderTest(absltest.TestCase):
     from torchtitan.trainer import Trainer
 
     config = flux_dev()
-    config.model_spec = model_registry("flux-test")
+    config.model = model_registry("flux-test")
     config.flux.random_dataset = True
     config.flux.img_size = 1024
     config.training.num_tokens_per_microbatch_per_dp_rank = 9216

@@ -4,7 +4,6 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 import torchtitan.trainer
-from torchtitan.models.flux.parallelize import parallelize_flux as native_parallelize_flux
 
 
 def parallelize_flux(
@@ -24,8 +23,7 @@ def parallelize_flux(
   """
   # For now, we delegate to the native implementation.
   # If TPU-specific optimizations are needed, we can implement them here.
-  return native_parallelize_flux(
-      model,
+  return model.parallelize(
       ac_config=job_config.activation_checkpoint,
       compile_config=job_config.compile,
       dump_folder="",

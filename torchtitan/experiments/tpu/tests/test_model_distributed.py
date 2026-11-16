@@ -48,9 +48,8 @@ def _run_model_distributed(
     )
   setup_logger()
 
-  assert train_config.model_spec is not None
-  model_spec = train_config.model_spec
-  model_args = model_spec.model
+  assert train_config.model is not None
+  model_args = train_config.model
   model_args.update_from_config(config=train_config)
 
   parallelism_config = train_config.parallelism
@@ -74,8 +73,11 @@ def _run_model_distributed(
   ):
     model = model_args.build()
   logging.info("Parallelizing model")
-  model = model_spec.parallelize_fn(
-      model,
+  from torchtitan.models.flux import FluxModel  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.llama3 import Llama3Model  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.qwen3 import Qwen3Model  # pylint: disable=g-import-not-at-top
+
+  parallelize_kwargs = dict(
       parallel_dims=parallel_dims,
       training=train_config.training,
       parallelism=train_config.parallelism,
@@ -83,6 +85,16 @@ def _run_model_distributed(
       ac_config=train_config.activation_checkpoint,
       dump_folder=train_config.dump_folder,
   )
+  if isinstance(model, Llama3Model):
+    from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama  # pylint: disable=g-import-not-at-top
+
+    model = parallelize_llama(model, **parallelize_kwargs)
+  elif isinstance(model, Qwen3Model):
+    from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3  # pylint: disable=g-import-not-at-top
+
+    model = parallelize_qwen3(model, **parallelize_kwargs)
+  else:
+    model = model.parallelize(**parallelize_kwargs)
   logging.info("Calling model.to_empty()")
   model.to_empty(device=device)
   with torch.no_grad():
@@ -100,7 +112,7 @@ def _run_model_distributed(
     loss_fn.set_lm_head(model.lm_head)
     model._skip_lm_head = True
 
-  train_context = dist_utils.get_spmd_context(
+  train_context = lambda: dist_utils.get_spmd_context(
       parallel_dims=parallel_dims, spmd_typechecking=False
   )
 
@@ -114,7 +126,7 @@ def _run_model_distributed(
   for step in range(n_steps):
     logging.info("Step %s / %s", step, n_steps)
     # Generate new inputs for each step
-    if model_spec.name == "flux":
+    if isinstance(model_args, FluxModel.Config):
       # Use batch_size=1 to avoid OOM issues in tests.
       batch_size = 1
       img = torch.randn(

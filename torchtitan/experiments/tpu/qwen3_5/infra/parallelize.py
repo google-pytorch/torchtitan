@@ -13,7 +13,6 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import MoE
-from torchtitan.models.qwen3_5 import parallelize as dtensor_parallelize
 
 
 def parallelize_qwen3_5(
@@ -66,8 +65,7 @@ def parallelize_qwen3_5(
     # TPU: whole-model compile modes replace upstream's per-block compile.
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
-  dtensor_parallelize.parallelize_qwen3_5(
-      model,  # pyrefly: ignore[bad-argument-type]
+  model.parallelize(
       ac_config=ac_config,  # pyrefly: ignore[bad-argument-type]
       compile_config=effective_compile_config,
       dump_folder=dump_folder,

@@ -402,6 +402,32 @@ class TPUHFTransformerModel(HFTransformerModel):
             "config (hf_full_max_plain_ce)."
         )
 
+  def parallelize(
+      self,
+      *,
+      parallel_dims,
+      training,
+      parallelism,
+      compile_config,
+      ac_config,
+      dump_folder: str,
+      skip_dp: bool = False,
+      tpu_compile_mode: str = "layer",
+  ):
+    from .parallelize import parallelize_hf_transformers_tpu  # pylint: disable=g-import-not-at-top
+
+    return parallelize_hf_transformers_tpu(
+        self,
+        parallel_dims=parallel_dims,
+        training=training,
+        parallelism=parallelism,
+        compile_config=compile_config,
+        ac_config=ac_config,
+        dump_folder=dump_folder,
+        tpu_compile_mode=tpu_compile_mode,
+        skip_dp=skip_dp,
+    )
+
   # Post-head logit transforms in HF causal-LM heads, as config fields, with the
   # value that makes each one a no-op: Gemma-2/3/4 soft-cap, Cohere's scale,
   # Granite's divisor, Falcon-H1's multiplier.

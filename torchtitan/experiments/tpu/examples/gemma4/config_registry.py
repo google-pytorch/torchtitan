@@ -92,8 +92,8 @@ def _enable_pallas_cross_entropy(
     v_block_size: int = 2048,
 ) -> None:
   """Select the soft-capped fused Pallas loss and its LM-head override."""
-  assert config.model_spec is not None
-  model_config = cast(Gemma4Model.Config, config.model_spec.model)
+  assert config.model is not None
+  model_config = cast(Gemma4Model.Config, config.model)
   lm_head = cast(SoftCappedLinear.Config, model_config.lm_head)
   if h_block_size is None:
     h_block_size = _default_h_block_size(model_config.dim)
@@ -110,8 +110,8 @@ def _enable_pallas_cross_entropy(
 
 def _enable_moe_pallas_kernels(config: TPUTrainerConfig) -> None:
   """Enable Pallas grouped MM, paired W1/W3, native weight layout, and fused route-score bwd."""
-  assert config.model_spec is not None
-  model_config = cast(Gemma4Model.Config, config.model_spec.model)
+  assert config.model is not None
+  model_config = cast(Gemma4Model.Config, config.model)
   dispatchers = list(
       model_config.traverse(TpuAllToAllTokenDispatcher.Config)
   )
@@ -150,10 +150,9 @@ def _enable_moe_pallas_kernels(config: TPUTrainerConfig) -> None:
 
 def gemma4_debugmodel() -> TPUTrainerConfig:
   """Gemma4 dense debug model configuration for TPU."""
-  model_spec = model_registry(
+  model_config = model_registry(
       "debugmodel", attn_backend="sdpa", enable_weight_tying=False
   )
-  model_config = cast(Gemma4Model.Config, model_spec.model)
   # _EMBEDDING_INIT uses std=0.02 so that Gemma4Embedding's sqrt(dim) scaling
   # stays O(1) on large models (31B dim=5376, 26B-A4B dim=2816) for convergence.
   # In the backward pass, layers[0].attention_norm (RMSNorm) divides by
@@ -167,7 +166,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_config,
       optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -219,7 +218,7 @@ def gemma4_debugmodel_fused_ce() -> TPUTrainerConfig:
 def gemma4_moe_testmodel() -> TPUTrainerConfig:
   """Gemma4 MoE test model configuration for TPU."""
   cfg = gemma4_debugmodel()
-  cfg.model_spec = model_registry(
+  cfg.model = model_registry(
       "testmodel_moe",
       attn_backend="sdpa",
       enable_weight_tying=False,
@@ -232,7 +231,7 @@ def gemma4_moe_testmodel() -> TPUTrainerConfig:
 def gemma4_moe_debug() -> TPUTrainerConfig:
   """Gemma4 MoE debug model configuration for TPU."""
   cfg = gemma4_debugmodel()
-  cfg.model_spec = model_registry(
+  cfg.model = model_registry(
       "debugmodel_moe",
       attn_backend="sdpa",
       converters=[
@@ -287,13 +286,13 @@ def graph_trainer_gemma4_moe_debug() -> TpuGraphTrainer.Config:
 
 def gemma4_31b() -> TPUTrainerConfig:
   """Gemma4 31B dense model configuration for TPU."""
-  model_spec = model_registry(
+  model = model_registry(
       "31B", attn_backend="sdpa", enable_weight_tying=False
   )
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
-      model_spec=model_spec,
+      model=model,
       optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=200,
@@ -340,7 +339,7 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
   """Gemma4 26B-A4B MoE model configuration for TPU."""
   cfg = gemma4_31b()
   cfg.hf_assets_path = "./assets/hf/gemma-4-26B-A4B"
-  cfg.model_spec = model_registry(
+  cfg.model = model_registry(
       "26B-A4B",
       attn_backend="sdpa",
       converters=[

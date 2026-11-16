@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 import torch
+import torch._functorch._activation_offloading.offload_ops  # noqa: F401
 import torch.fx as fx
 from torch._functorch.compile_utils import raise_getitems
 from torch._functorch.partitioners import (

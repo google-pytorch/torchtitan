@@ -87,10 +87,10 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig, *, tile_m: int = 256) -> None:
     cfg: The recipe to update in place.
     tile_m: Forward and dWeight row tile size for the Pallas grouped matmuls.
   """
-  assert cfg.model_spec is not None
-  experts = list(cfg.model_spec.model.traverse(TpuGroupedExperts.Config))
+  assert cfg.model is not None
+  experts = list(cfg.model.traverse(TpuGroupedExperts.Config))
   dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+      cfg.model.traverse(TpuAllToAllTokenDispatcher.Config)
   )
   if not experts or not dispatchers:
     raise ValueError(
@@ -118,10 +118,10 @@ def _no_gated_delta_document_resets(cfg: TPUTrainerConfig) -> None:
   Args:
     cfg: The recipe to update in place.
   """
-  assert cfg.model_spec is not None
-  delta_nets = list(cfg.model_spec.model.traverse(TpuGatedDeltaNet.Config))
+  assert cfg.model is not None
+  delta_nets = list(cfg.model.traverse(TpuGatedDeltaNet.Config))
   if not delta_nets:
-    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model_spec.model")
+    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model")
   for _, delta_net, _, _ in delta_nets:
     delta_net.reset_at_documents = False
 
@@ -226,7 +226,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("debugmodel", seq_len=256),
+      model=model_registry("debugmodel", seq_len=256),
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -254,7 +254,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
 def qwen35_moe_debugmodel() -> TPUTrainerConfig:
   """Debug config for 4-layer hybrid Qwen3.5 MoE on TPU."""
   cfg = qwen35_debugmodel()
-  cfg.model_spec = model_registry(
+  cfg.model = model_registry(
       "debugmodel_moe", seq_len=256, converters=_TPU_MOE_CONVERTERS
   )
   return cfg
@@ -318,7 +318,7 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       # Logging syncs the host on the loss; every 5 steps lets the host
       # dispatch the next step while the current one runs.
       metrics=MetricsProcessor.Config(log_freq=5),
-      model_spec=model_registry("35B-A3B", converters=_TPU_MOE_CONVERTERS),
+      model=model_registry("35B-A3B", converters=_TPU_MOE_CONVERTERS),
       optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       # A 2-step warmup to the peak LR diverged the randomly initialized
       # 40-layer model (loss 12.77 -> 6.45 -> 8.48 -> NaN at step 4 on

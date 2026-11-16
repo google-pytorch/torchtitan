@@ -393,7 +393,7 @@ class DistributedUnitTestRunner:
 
     is_parallel = model is self.parallel_model and self.parallel_dims is not None
     spmd_ctx = (
-        dist_utils.get_spmd_context(parallel_dims=self.parallel_dims)()
+        dist_utils.get_spmd_context(parallel_dims=self.parallel_dims)
         if is_parallel
         else contextlib.nullcontext()
     )
@@ -670,11 +670,11 @@ def _run_cpu_verification(
   cpu_config.compile.components = []
   if (
       isinstance(cpu_config, tpu_job_config_module.BaseTPUTrainerConfig)
-      and cpu_config.model_spec is not None
+      and cpu_config.model is not None
   ):
     # A CP recipe's attention is a CP inner attention; the single-device
     # reference needs the plain one.
-    revert_tpu_context_parallel(cpu_config.model_spec.model)
+    revert_tpu_context_parallel(cpu_config.model)
 
   # Disable splash attention patch on CPU to avoid ValueError, while recording
   # whether the device run used Splash/Tokamax so the CPU reference applies the

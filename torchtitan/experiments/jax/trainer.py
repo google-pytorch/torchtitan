@@ -164,18 +164,22 @@ class JaxTrainer:
 
   def setup_model(self, job_config):
     """Instantiate and shard the Flax NNX model."""
-    model_name = job_config.model_spec.name  # e.g. 'llama3'
-    model_flavor = job_config.model_spec.flavor  # e.g. '8B'
     jax_config = job_config.jax_config
     use_scan = jax_config.use_scan
 
-    if model_name == 'llama3':
+    model_cfg = getattr(job_config, 'model', None)
+    if isinstance(model_cfg, jax_llama3.ModelArgs):
       jax_model_mod = jax_llama3
       layer_attr = 'n_layers'
+      model_args = model_cfg
     else:
-      raise ValueError(f'Unsupported model: {model_name}')
-
-    model_args = jax_model_mod.args[model_flavor]
+      model_spec = getattr(job_config, 'model_spec', None)
+      if model_spec is not None and model_spec.name == 'llama3':
+        jax_model_mod = jax_llama3
+        layer_attr = 'n_layers'
+        model_args = jax_model_mod.args[model_spec.flavor]
+      else:
+        raise ValueError(f'Unsupported model: {model_cfg}')
     # ``max_seq_len`` is a JAX-side dataclass field; only the job config
     # side was renamed (``training.seq_len`` -> ``training.
     # max_context_length``) by upstream d771abb0.

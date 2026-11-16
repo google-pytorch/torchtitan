@@ -566,7 +566,7 @@ class WorkaroundsTest(parameterized.TestCase):
     config = config_registry.qwen3_debugmodel_ulysses_cp2()
     self.assertEqual(config.parallelism.context_parallel_degree, 2)
     self.assertIsNone(config.parallelism.context_parallel_load_balancer)
-    for layer in config.model_spec.model.layers:
+    for layer in config.model.layers:
       self.assertIsInstance(
           layer.attention.inner_attention,
           UlyssesCPScaledDotProductInnerAttention.Config,
@@ -574,26 +574,26 @@ class WorkaroundsTest(parameterized.TestCase):
 
     # Allow n_kv_heads < cp when cp % n_kv_heads == 0 (e.g. Qwen3.5-397B n_kv_heads=2, cp=4).
     config.parallelism.context_parallel_degree = 4
-    for layer in config.model_spec.model.layers:
+    for layer in config.model.layers:
       layer.attention.n_heads = 32
       layer.attention.n_kv_heads = 2
-    validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+    validate_tpu_context_parallel(config.model, config.parallelism)
 
     # Reject n_kv_heads indivisible with cp.
-    for layer in config.model_spec.model.layers:
+    for layer in config.model.layers:
       layer.attention.n_kv_heads = 3
     with self.assertRaisesRegex(ValueError, r"n_kv_heads \(3\)"):
-      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
-    for layer in config.model_spec.model.layers:
+      validate_tpu_context_parallel(config.model, config.parallelism)
+    for layer in config.model.layers:
       layer.attention.n_kv_heads = 2
 
     # Ulysses attends over the full sequence, so it rejects a load balancer.
     config.parallelism.context_parallel_load_balancer = "headtail"
     with self.assertRaisesRegex(ValueError, "context_parallel_load_balancer"):
-      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+      validate_tpu_context_parallel(config.model, config.parallelism)
 
-    revert_tpu_context_parallel(config.model_spec.model)
-    for layer in config.model_spec.model.layers:
+    revert_tpu_context_parallel(config.model)
+    for layer in config.model.layers:
       self.assertIs(
           type(layer.attention.inner_attention),
           ScaledDotProductInnerAttention.Config,
@@ -792,7 +792,7 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertEqual(
         config.parallelism.context_parallel_load_balancer, "headtail"
     )
-    for layer in config.model_spec.model.layers:
+    for layer in config.model.layers:
       self.assertIsInstance(
           layer.attention.inner_attention,
           KVAllGatherCPScaledDotProductInnerAttention.Config,
@@ -802,13 +802,13 @@ class WorkaroundsTest(parameterized.TestCase):
       self.assertTrue(layer.attention.inner_attention.allow_reference_attention)
     # KV All-Gather does not shard heads across CP, so arbitrary n_kv_heads works.
     config.parallelism.context_parallel_degree = 4
-    for layer in config.model_spec.model.layers:
+    for layer in config.model.layers:
       layer.attention.n_heads = 32
       layer.attention.n_kv_heads = 3
-    validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+    validate_tpu_context_parallel(config.model, config.parallelism)
 
-    revert_tpu_context_parallel(config.model_spec.model)
-    for layer in config.model_spec.model.layers:
+    revert_tpu_context_parallel(config.model)
+    for layer in config.model.layers:
       self.assertIs(
           type(layer.attention.inner_attention),
           ScaledDotProductInnerAttention.Config,
@@ -1036,7 +1036,7 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.experiments.tpu.qwen3 import config_registry
 
     config = config_registry.qwen3_debugmodel_allgather_cp2()
-    model, parallelism = config.model_spec.model, config.parallelism
+    model, parallelism = config.model, config.parallelism
     for layer in model.layers:
       layer.attention.n_heads = 8
       layer.attention.n_kv_heads = 2

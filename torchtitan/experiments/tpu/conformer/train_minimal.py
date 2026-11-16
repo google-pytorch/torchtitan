@@ -234,9 +234,8 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   )
   log_freq = train_config.metrics.log_freq
 
-  assert train_config.model_spec is not None
-  model_spec = train_config.model_spec
-  model_args = model_spec.model
+  assert train_config.model is not None
+  model_args = train_config.model
   model_args.update_from_config(train_config=train_config)
 
   tokenizer = typing.cast(
@@ -265,9 +264,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     )
 
   logger.info(
-      "Building %s %s with %s",
-      model_spec.name,
-      model_spec.flavor,
+      "Building conformer with %s",
       model_args,
   )
 
@@ -291,9 +288,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       model, train_config.training.max_context_length
   )
   logger.info(
-      "Model %s %s size: %d total parameters",
-      model_spec.name,
-      model_spec.flavor,
+      "Model conformer size: %d total parameters",
       model_param_count,
   )
 
@@ -324,14 +319,13 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       train_config.compile.enable and "model" in train_config.compile.components
   )
   if world_size > 1 or model_compile_enabled:
-    if model_spec.parallelize_fn is not None:
-      compiled_model = model_spec.parallelize_fn(
-          model, parallel_dims, train_config
-      )
-      if compiled_model is not None:
-        model = compiled_model
-    else:
-      logger.warning("No parallelize_fn provided in ModelSpec.")
+    from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer  # pylint: disable=g-import-not-at-top
+
+    compiled_model = parallelize_conformer(
+        model, parallel_dims, train_config
+    )
+    if compiled_model is not None:
+      model = compiled_model
 
   if not use_simple_fsdp:
     # For FSDP2 and other strategies, we prefer to parallelize (and optionally
@@ -414,7 +408,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   ntokens_seen = 0
   # Same as Trainer / experiments/tpu/train_minimal.py: sets the process-wide
   # SPMD mesh the spmd_types collectives read around forward/backward.
-  train_context = dist_utils.get_spmd_context(parallel_dims=parallel_dims)
+  train_context = lambda: dist_utils.get_spmd_context(parallel_dims=parallel_dims)
   with torchtitan_profiler.Profiler(
       train_config.profiler,
       global_step=0,

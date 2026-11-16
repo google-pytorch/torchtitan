@@ -267,8 +267,8 @@ def maybe_use_maxtext_flops(
   GraphTrainer rebuilds the model config in its own class from the field
   values, which drops that class; this re-applies it.
   """
-  model_spec = train_config.model_spec
-  if model_spec is None or model_spec.name != "qwen3":
+  model_cfg = getattr(train_config, "model", None)
+  if model_cfg is None:
     return
   # Imported here: importing the Qwen3 package also imports its recipes.
   # pylint: disable=g-import-not-at-top
@@ -276,11 +276,8 @@ def maybe_use_maxtext_flops(
   from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
   # pylint: enable=g-import-not-at-top
 
-  if isinstance(model_spec.model, MaxTextQwen3Config):
-    graph_config.model_spec = dataclasses.replace(
-        graph_config.model_spec,
-        model=with_maxtext_flops(graph_config.model_spec.model),
-    )
+  if isinstance(model_cfg, MaxTextQwen3Config):
+    graph_config.model = with_maxtext_flops(graph_config.model)  # type: ignore[arg-type]
 
 
 def apply_tpu_graph_trainer_model_transforms(
@@ -381,26 +378,9 @@ def apply_tpu_graph_trainer_model_transforms(
         "--parallelism.expert-parallel-degree > 1 "
         "(https://github.com/google-pytorch/torchtitan/issues/25)."
     )
-  assert config.model_spec is not None
-  orig_parallelize_fn = config.model_spec.parallelize_fn
-  assert orig_parallelize_fn is not None
-
-  def parallelize_fn_with_shard_dims(
-      model: nn.Module, **kwargs: Any
-  ) -> nn.Module:
-    configure_simple_fsdp_shard_dims(model, kwargs.get("parallel_dims"))
-    model = orig_parallelize_fn(model, **kwargs)
-    for holder in model.modules():
-      if hasattr(holder, "build_split_meshes"):
-        holder.build_split_meshes()
-    return model
-
-  config.model_spec = dataclasses.replace(
-      config.model_spec,
-      model=with_tpu_stacked_layers(config.model_spec.model, use_scan=True),
-      parallelize_fn=parallelize_fn_with_shard_dims,
-  )
-  if not builds_layer_loop(config.model_spec.model):
+  assert config.model is not None
+  config.model = with_tpu_stacked_layers(config.model, use_scan=True)  # type: ignore[arg-type]
+  if not builds_layer_loop(config.model):  # type: ignore[arg-type]
     raise AssertionError("--compile.use-scan-layers did not produce a scan")
 
 

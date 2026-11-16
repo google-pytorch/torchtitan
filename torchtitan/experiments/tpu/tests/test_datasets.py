@@ -142,7 +142,7 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
         dp_rank=0,
         tokenizer=HuggingFaceTokenizer(tokenizer_path=self._TOKENIZER_PATH),
         max_context_length=128,
-        num_tokens_per_batch=128,
+        num_tokens_per_microbatch=128,
     )
 
   def test_chat_json_trains_on_the_response_only(self) -> None:
@@ -162,7 +162,7 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
             response_field="answer",
             shuffle=False,
         )
-        labels = next(iter(loader))["labels"].flatten().tolist()
+        labels = next(iter(loader)).labels.flatten().tolist()
         # The first document's prompt is masked, so its answer is the first
         # supervised span.
         self.assertEqual(labels[0], IGNORE_INDEX)
@@ -197,7 +197,7 @@ class FluxRandomDataloaderTest(absltest.TestCase):
         dp_rank=0,
         tokenizer=None,
         max_context_length=320,
-        num_tokens_per_batch=640,
+        num_tokens_per_microbatch=640,
     )
     self.assertIsInstance(loader, RandomDataloader)
     self.assertEqual(loader.state_dict(), {})

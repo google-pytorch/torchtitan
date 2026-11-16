@@ -143,6 +143,18 @@ def llama3_debugmodel() -> TPUTrainerConfig:
   return config
 
 
+def llama3_debugmodel_checkpoint() -> TPUTrainerConfig:
+  """`llama3_debugmodel` with checkpointing on, for the checkpoint tests.
+
+  Upstream's `checkpointer` is `None` when off and `tyro.conf.AvoidSubcommands`
+  keeps a `None` default off the CLI, so a saving recipe has to carry the
+  config; `--checkpointer.interval/folder` then override it.
+  """
+  config = llama3_debugmodel()
+  config.checkpointer = CheckpointManager.Config(interval=2)
+  return config
+
+
 def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
   """Llama3 debug model using TPU GraphTrainer."""
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(

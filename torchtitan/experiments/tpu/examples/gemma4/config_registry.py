@@ -194,6 +194,17 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
   )
 
 
+def gemma4_debugmodel_checkpoint() -> TPUTrainerConfig:
+  """`gemma4_debugmodel` with checkpointing on, for the checkpoint tests.
+
+  See `llama3_debugmodel_checkpoint`: a `None` checkpointer cannot be enabled
+  from the CLI.
+  """
+  config = gemma4_debugmodel()
+  config.checkpointer = CheckpointManager.Config(interval=2)
+  return config
+
+
 def gemma4_debugmodel_fused_ce() -> TPUTrainerConfig:
   """Gemma4 dense debug model with fused Pallas cross-entropy and soft-cap."""
   cfg = gemma4_debugmodel()

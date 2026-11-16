@@ -154,6 +154,18 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           "graph_trainer_deepseek_v3_debugmodel",
       ),
       (
+          "torchtitan.experiments.tpu.deepseek_v3",
+          "graph_trainer_deepseek_v3_debugmodel_tokamax",
+      ),
+      (
+          "torchtitan.experiments.tpu.deepseek_v3",
+          "deepseek_v3_236b_fsdp_activation_offload_4x4x4",
+      ),
+      (
+          "torchtitan.experiments.tpu.deepseek_v3",
+          "deepseek_v3_236b_fsdp_smoke",
+      ),
+      (
           "torchtitan.experiments.tpu.muse_glimmer",
           "graph_trainer_muse_glimmer_debugmodel",
       ),

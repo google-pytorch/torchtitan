@@ -194,6 +194,20 @@ class TpuGraphTrainerDistributedTest(
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
+      # DeepSeek-V3 on the TPU stack: TPU MoE modules, Tokamax Splash with
+      # MLA's q/k 192 / v 128 head dims, and (from the recipe) the 236B
+      # recipe's graph split with layer-boundary offload.
+      dict(
+          testcase_name="deepseek_v3_tokamax_graph_split_offload",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="graph_trainer_deepseek_v3_debugmodel_tokamax",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
       dict(
           testcase_name="gemma4_graph_split_offload",
           module="torchtitan.experiments.tpu.examples.gemma4",

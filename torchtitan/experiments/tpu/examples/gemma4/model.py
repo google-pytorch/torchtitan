@@ -1,5 +1,6 @@
 from collections.abc import Callable
 import dataclasses
+import logging
 from dataclasses import dataclass
 
 import spmd_types as spmd
@@ -31,7 +32,8 @@ from torchtitan.models.common.moe import (
 )
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class Gemma4Embedding(Embedding):

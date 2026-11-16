@@ -12,6 +12,7 @@ keeps that spelling (and the `--dataloader.dataset` /
 """
 
 import dataclasses
+import logging
 import os
 from typing import Any
 
@@ -26,7 +27,8 @@ from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.hf_datasets.text_datasets import DATASETS
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CHAT_DATASETS",

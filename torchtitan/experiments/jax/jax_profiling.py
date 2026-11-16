@@ -13,15 +13,15 @@ Usage in the training loop::
 """
 
 import contextlib
+import logging
 import os
 
 import jax
 
-import torchtitan.tools.logging
 import torchtitan.tools.profiler
 
 ProfilingConfig = torchtitan.tools.profiler.Profiler.Config
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager

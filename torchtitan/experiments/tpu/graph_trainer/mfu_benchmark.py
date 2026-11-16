@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 
 @dataclass

@@ -40,6 +40,7 @@ heuristics. Investigate if we can control or update these heuristics and
 re-measure (bld_block_layout on vs off) before deleting.
 """
 
+import logging
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
@@ -54,7 +55,8 @@ from torchtitan.models.common import GQAttention
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _bld_seq_len(x: torch.Tensor) -> int | None:

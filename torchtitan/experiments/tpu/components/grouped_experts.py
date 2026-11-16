@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, replace
 
 import torch
@@ -16,8 +17,8 @@ from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.sharding import ShardingConfig
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 _CANONICAL_TO_NATIVE_WEIGHT = {
     "w1_EFD": "w1_EDF",

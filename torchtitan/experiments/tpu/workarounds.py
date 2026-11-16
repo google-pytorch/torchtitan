@@ -6,8 +6,8 @@ from torch import nn
 from torch.nn.attention import sdpa_kernel
 import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 SPLASH_KEYS = {
     "block_q", "block_kv", "block_dkv", "block_kv_compute",

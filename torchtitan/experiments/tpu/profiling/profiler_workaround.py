@@ -1,11 +1,13 @@
 # pylint: disable=protected-access
+import logging
 from typing import Any, Optional
 
 import torch
 
 
-import torchtitan.tools.logging as torchtitan_logging
 import torchtitan.tools.profiler as torchtitan_profiler
+
+logger = logging.getLogger(__name__)
 
 _global_job_config = None
 
@@ -60,7 +62,7 @@ def custom_enter(self: torchtitan_profiler.Profiler) -> torchtitan_profiler.Prof
       if jax_profiler and jax_profiler.jax:
         patched_profiler = jax_profiler.JaxProfiler(self)
       else:
-        torchtitan_logging.logger.warning(
+        logger.warning(
             "JAX profiler requested, but JAX is not available."
         )
 
@@ -75,7 +77,7 @@ def custom_enter(self: torchtitan_profiler.Profiler) -> torchtitan_profiler.Prof
           base_folder=self._base_folder,
           leaf_folder=self._leaf_folder,
       )
-      torchtitan_logging.logger.info(
+      logger.info(
           "Custom TPU Profiler active (type: %s).",
           type(self._patched_profiler).__name__,
       )

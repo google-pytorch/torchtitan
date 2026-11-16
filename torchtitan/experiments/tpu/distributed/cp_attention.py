@@ -22,6 +22,7 @@ below (see ``qwen3/config_registry.py``). Two strategies are provided:
 Tensor suffixes: ``T`` tokens, ``H`` heads, ``K`` qk head dim, ``V`` v head dim.
 """
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 import math
@@ -53,7 +54,8 @@ from torchtitan.models.common.attention import (
     segment_ids_from_positions,
 )
 from torchtitan.models.common.cp_attention import CPInnerAttention
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "UlyssesCPInnerAttention",

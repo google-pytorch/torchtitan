@@ -44,6 +44,7 @@ rounding moves those three gradients further (65% / 55% / 12%, cosine 0.85 /
 4e-4 of the XLA losses (``test_debug_model_losses_match_xla``).
 """
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 import functools
@@ -57,7 +58,8 @@ from torch_tpu._internal import pallas
 from torchtitan.config.override import derive, override
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import per_row_segment_ids
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 # The minimum Tokamax release with the Kimi Delta Attention op (pinned in
 # `torchtitan/experiments/tpu/requirements.txt`).

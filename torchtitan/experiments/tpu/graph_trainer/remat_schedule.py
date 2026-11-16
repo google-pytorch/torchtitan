@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import operator
 from collections import defaultdict
 
@@ -27,8 +28,8 @@ from torchtitan.experiments.graph_trainer.fsdp_patterns import (
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     _collect_bucketed_fsdp_comms,
 )
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 _TPU_REMAT_BARRIER_KIND_META = "tpu_remat_barrier_kind"
 _TPU_REMAT_REGION_ID_META = "tpu_remat_region_id"

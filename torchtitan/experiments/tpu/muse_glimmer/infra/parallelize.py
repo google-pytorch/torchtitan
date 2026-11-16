@@ -11,6 +11,7 @@ Scope: text-only flavors with FSDP/HSDP and TP. CP, PP and the multimodal
 """
 
 import dataclasses
+import logging
 
 import torch
 from torch import nn
@@ -24,7 +25,8 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 # Muse Glimmer's ``tok_embeddings`` is an ``EmbeddingWithNorm``; its weight
 # lives on ``tok_embeddings.embedding``, which the generic

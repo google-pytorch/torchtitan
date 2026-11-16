@@ -45,6 +45,7 @@ which is always before FSDP shards anything.
 
 import contextlib
 import functools
+import logging
 from collections.abc import Iterator
 
 import torch
@@ -72,8 +73,8 @@ from torchtitan.experiments.tpu.components.layer_loop import (
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.protocols.module import Module
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "check_layers_are_stackable",

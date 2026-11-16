@@ -39,6 +39,8 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     configure_gemma4_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import (
+    FusedQKVLinearKeqV,
+    fused_qk_param_init,
     Gemma4Attention,
     Gemma4Model,
     Gemma4RoPE,
@@ -62,7 +64,7 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.models.common.attention import (
-    QKVLinear,
+    FusedQKVLinear,
     ScaledDotProductInnerAttention,
     segment_ids_from_positions,
 )
@@ -395,12 +397,61 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     for k in tt_sd:
       torch.testing.assert_close(roundtrip_sd[k], tt_sd[k])
 
-  def test_fused_qkv_rejected(self):
-    config = _build_flavor_config("debugmodel", use_fused_qkv=True)
-    with self.assertRaisesRegex(
-        NotImplementedError, "does not support FusedQKVLinear"
+  def test_fused_qkv_hf_roundtrip_restores_model(self):
+    """to_hf -> from_hf -> load_state_dict reproduces the fused wqkv weights.
+
+    Exercises the real path: the fused modules' state_dict hooks split
+    ``wqkv`` into logical ``wq``/``wk``/``wv`` (``wq``/``wk`` on the K=V
+    layer), the adapter maps those to HF ``q_proj``/``k_proj``/``v_proj``,
+    and the load hook merges them back into ``wqkv``.
+    """
+    config = _build_flavor_config("testmodel", enable_weight_tying=False)
+    qkv_types = [type(layer.attention.qkv_linear) for layer in config.layers]
+    self.assertIn(FusedQKVLinear.Config, qkv_types)
+    self.assertIn(FusedQKVLinearKeqV.Config, qkv_types)
+
+    torch.manual_seed(0)
+    model = config.build()
+    model.init_states()
+    adapter = Gemma4StateDictAdapter(config, hf_assets_path=None)
+    hf_sd = adapter.to_hf(model.state_dict())
+    self.assertIn(
+        "model.language_model.layers.0.self_attn.v_proj.weight", hf_sd
+    )
+    self.assertNotIn(
+        "model.language_model.layers.1.self_attn.v_proj.weight", hf_sd
+    )
+    # HF q_proj is the plain [n_heads * head_dim, dim] matrix, i.e. rows of
+    # the fused weight with the K (and V) rows removed.
+    qkv0 = model.layers["0"].attention.qkv_linear
+    w0 = qkv0.wqkv.weight.detach().view(
+        -1, qkv0.r_dim, qkv0.head_dim, config.dim
+    )
+    torch.testing.assert_close(
+        hf_sd["model.language_model.layers.0.self_attn.q_proj.weight"],
+        w0[:, : qkv0.heads_per_kv].reshape(-1, config.dim),
+    )
+    torch.testing.assert_close(
+        hf_sd["model.language_model.layers.0.self_attn.k_proj.weight"],
+        w0[:, qkv0.heads_per_kv].reshape(-1, config.dim),
+    )
+    torch.testing.assert_close(
+        hf_sd["model.language_model.layers.0.self_attn.v_proj.weight"],
+        w0[:, qkv0.heads_per_kv + 1].reshape(-1, config.dim),
+    )
+
+    torch.manual_seed(1)
+    restored = config.build()
+    restored.init_states()
+    missing, unexpected = restored.load_state_dict(
+        adapter.from_hf(hf_sd), strict=False
+    )
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+    for (name, p_ref), (_, p_new) in zip(
+        model.named_parameters(), restored.named_parameters()
     ):
-      Gemma4StateDictAdapter(config, hf_assets_path=None)
+      torch.testing.assert_close(p_new, p_ref, msg=name)
 
   def test_tied_hf_checkpoint_loads_into_untied_recipe(self):
     """Tied Gemma 4 HF checkpoints (no lm_head.weight) load into untied recipes."""
@@ -430,6 +481,152 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     # The real on-disk flow (to_hf placeholder -> dcp.load -> from_hf) is
     # covered by TestGemma4HFReferenceParity.
     # test_tied_hf_safetensors_load_into_untied_recipe.
+
+
+class TestFusedQKVLinearKeqV(absltest.TestCase):
+  """Fused Q/K projection of the global K=V layers."""
+
+  _DIM = 16
+  _N_HEADS = 4
+  _N_KV_HEADS = 2
+  _HEAD_DIM = 8
+  _OUT = (_N_HEADS + _N_KV_HEADS) * _HEAD_DIM  # 48
+
+  def _build(self, with_bias: bool = False) -> FusedQKVLinearKeqV:
+    module = FusedQKVLinearKeqV.Config(
+        head_dim=self._HEAD_DIM,
+        n_heads=self._N_HEADS,
+        n_kv_heads=self._N_KV_HEADS,
+        wqkv=Linear.Config(
+            in_features=self._DIM, out_features=self._OUT, bias=with_bias
+        ),
+    ).build()
+    with torch.no_grad():
+      for p in module.parameters():
+        p.copy_(torch.randn_like(p))
+    return module
+
+  def test_rejects_wrong_out_features(self):
+    with self.assertRaisesRegex(ValueError, "n_heads \\+ n_kv_heads"):
+      FusedQKVLinearKeqV.Config(
+          head_dim=self._HEAD_DIM,
+          n_heads=self._N_HEADS,
+          n_kv_heads=self._N_KV_HEADS,
+          wqkv=Linear.Config(
+              in_features=self._DIM,
+              out_features=(self._N_HEADS + 2 * self._N_KV_HEADS)
+              * self._HEAD_DIM,
+          ),
+      ).build()
+
+  def test_state_dict_exposes_only_wq_wk_and_roundtrips(self):
+    for with_bias in (False, True):
+      module = self._build(with_bias=with_bias)
+      sd = module.state_dict()
+      expected = {"wq.weight", "wk.weight"}
+      if with_bias:
+        expected |= {"wq.bias", "wk.bias"}
+      self.assertEqual(set(sd), expected)
+      self.assertEqual(
+          sd["wq.weight"].shape, (self._N_HEADS * self._HEAD_DIM, self._DIM)
+      )
+      self.assertEqual(
+          sd["wk.weight"].shape,
+          (self._N_KV_HEADS * self._HEAD_DIM, self._DIM),
+      )
+      # The fused buffer interleaves per KV group: [hpk Q heads, K head].
+      w = module.wqkv.weight.detach().view(
+          self._N_KV_HEADS, module.r_dim, self._HEAD_DIM, self._DIM
+      )
+      torch.testing.assert_close(
+          sd["wq.weight"], w[:, : module.heads_per_kv].reshape(-1, self._DIM)
+      )
+      torch.testing.assert_close(
+          sd["wk.weight"], w[:, module.heads_per_kv].reshape(-1, self._DIM)
+      )
+
+      restored = self._build(with_bias=with_bias)
+      restored.load_state_dict(sd)
+      for (name, p_ref), (_, p_new) in zip(
+          module.named_parameters(), restored.named_parameters()
+      ):
+        torch.testing.assert_close(p_new, p_ref, msg=name)
+
+  def test_forward_matches_separate_q_k_projections(self):
+    torch.manual_seed(0)
+    module = self._build(with_bias=True)
+    sd = module.state_dict()
+    num_tokens = 6
+    x = torch.randn(num_tokens, self._DIM)
+
+    xq, xk, xv = module(x)
+
+    ref_q = F.linear(x, sd["wq.weight"], sd["wq.bias"]).view(
+        num_tokens, self._N_HEADS, self._HEAD_DIM
+    )
+    ref_k = F.linear(x, sd["wk.weight"], sd["wk.bias"]).view(
+        num_tokens, self._N_KV_HEADS, self._HEAD_DIM
+    )
+    torch.testing.assert_close(xq, ref_q)
+    torch.testing.assert_close(xk, ref_k)
+    self.assertIs(xv, xk)
+    self.assertTrue(xq.is_contiguous() and xk.is_contiguous())
+
+  def test_param_init_matches_separate_q_k_init(self):
+    """The fused init is slice-wise identical to initializing wq then wk."""
+    init = partial(nn.init.trunc_normal_, std=0.02)
+    param_init = fused_qk_param_init(
+        {"weight": init},
+        n_heads=self._N_HEADS,
+        n_kv_heads=self._N_KV_HEADS,
+        head_dim=self._HEAD_DIM,
+    )
+    self.assertEqual(set(param_init), {"weight"})
+    fused = torch.empty(self._OUT, self._DIM)
+    torch.manual_seed(0)
+    param_init["weight"](fused)
+
+    torch.manual_seed(0)
+    wq = init(torch.empty(self._N_HEADS * self._HEAD_DIM, self._DIM))
+    wk = init(torch.empty(self._N_KV_HEADS * self._HEAD_DIM, self._DIM))
+
+    module = self._build()
+    with torch.no_grad():
+      module.wqkv.weight.copy_(fused)
+    sd = module.state_dict()
+    torch.testing.assert_close(sd["wq.weight"], wq)
+    torch.testing.assert_close(sd["wk.weight"], wk)
+
+  def test_flavor_layers_use_slice_wise_fused_init(self):
+    from torchtitan.models.common.config_utils import _FusedQKVInit
+    from torchtitan.experiments.tpu.examples.gemma4.model import _FusedQKInit
+
+    config = _build_flavor_config("testmodel")
+    sliding, global_kv = config.layers[0], config.layers[1]
+    self.assertIs(type(sliding.attention.qkv_linear), FusedQKVLinear.Config)
+    self.assertIsInstance(
+        sliding.attention.qkv_linear.wqkv.param_init["weight"], _FusedQKVInit
+    )
+    self.assertIs(
+        type(global_kv.attention.qkv_linear), FusedQKVLinearKeqV.Config
+    )
+    self.assertIsInstance(
+        global_kv.attention.qkv_linear.wqkv.param_init["weight"], _FusedQKInit
+    )
+    # Both are colwise TP-sharded through set_qkv_linear_sharding.
+    for layer in (sliding, global_kv):
+      self.assertIsNotNone(layer.attention.qkv_linear.wqkv.sharding_config)
+
+    # FLOPs accounting: the K=V layer has no V rows.
+    with torch.device("meta"):
+      model = config.build()
+    nparams, _ = config.get_nparams_and_flops(model, seq_len=16)
+    self.assertEqual(nparams, sum(p.numel() for p in model.parameters()))
+    self.assertEqual(
+        global_kv.attention.qkv_linear.wqkv.out_features,
+        (global_kv.attention.n_heads + global_kv.attention.n_kv_heads)
+        * global_kv.attention.head_dim,
+    )
 
 
 class TestGemma4SoftCappedLoss(absltest.TestCase):
@@ -534,13 +731,12 @@ class TestGemma4SdpaSlidingWindow(parameterized.TestCase):
         v_norm=RMSNorm.Config(
             normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
         ),
-        qkv_linear=QKVLinear.Config(
+        qkv_linear=FusedQKVLinear.Config(
             head_dim=head_dim,
-            wq=Linear.Config(
-                in_features=self._DIM, out_features=32, param_init=_LINEAR_INIT
-            ),
-            wkv=Linear.Config(
-                in_features=self._DIM, out_features=16, param_init=_LINEAR_INIT
+            n_heads=4,
+            n_kv_heads=2,
+            wqkv=Linear.Config(
+                in_features=self._DIM, out_features=64, param_init=_LINEAR_INIT
             ),
         ),
         wo=Linear.Config(
@@ -628,17 +824,12 @@ class TestGemma4SdpaSlidingWindow(parameterized.TestCase):
         v_norm=RMSNorm.Config(
             normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
         ),
-        qkv_linear=QKVLinear.Config(
+        qkv_linear=FusedQKVLinear.Config(
             head_dim=head_dim,
-            wq=Linear.Config(
-                in_features=self._DIM,
-                out_features=32,
-                param_init=_LINEAR_INIT,
-            ),
-            wkv=Linear.Config(
-                in_features=self._DIM,
-                out_features=16,
-                param_init=_LINEAR_INIT,
+            n_heads=4,
+            n_kv_heads=2,
+            wqkv=Linear.Config(
+                in_features=self._DIM, out_features=64, param_init=_LINEAR_INIT
             ),
         ),
         wo=Linear.Config(
@@ -870,6 +1061,11 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
         if param.grad is not None
     }
     hf_grads_in_tt_keys = adapter.from_hf(raw_hf_grads)
+    # HF has separate q/k/v grads; fold them into the fused wqkv layout with
+    # the same merge the load hook applies to weights (wq/wk only on K=V).
+    for name, module in tt_model.named_modules():
+      if isinstance(module, FusedQKVLinear):
+        module._merge_qkv_on_load(module, hf_grads_in_tt_keys, f"{name}.")
     # When weights are tied, both models accumulate the embedding + lm_head
     # gradient into the single shared parameter (tok_embeddings.weight in TT).
     if tt_config.enable_weight_tying:

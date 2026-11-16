@@ -565,7 +565,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     config = config_registry.qwen3_debugmodel_ulysses_cp2()
     self.assertEqual(config.parallelism.context_parallel_degree, 2)
-    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
     self.assertIsNone(config.parallelism.context_parallel_load_balancer)
     for layer in config.model_spec.model.layers:
       self.assertIsInstance(
@@ -665,7 +664,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     config = config_registry.qwen3_debugmodel()
     config.parallelism.context_parallel_degree = 2
-    config.parallelism.spmd_backend = "spmd_types"
     with self.assertRaisesRegex(ValueError, "CPInnerAttention"):
       config.__post_init__()
 
@@ -791,7 +789,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     # 1. Verify the all_gather CP recipe and reverting it for cp=1.
     config = config_registry.qwen3_debugmodel_allgather_cp2()
-    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
     self.assertEqual(
         config.parallelism.context_parallel_load_balancer, "headtail"
     )

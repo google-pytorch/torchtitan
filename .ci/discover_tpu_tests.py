@@ -118,12 +118,9 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_mm_dataset_preprocessing",
     "tests.unit_tests.cpu.test_debug_config_defaults",
     "tests.unit_tests.cpu.test_no_new_cli_options",
-    # Upstream test assumes spmd_backend defaults to "spmd_types"; this fork
-    # pins "partial_dtensor" (copy.bara.sky), so the CP backend gate fires first.
-    "tests.unit_tests.cpu.test_context_parallel_validation",
     # TPUGrainDataLoader.Config overrides `dataset` as a plain str.
     "tests.unit_tests.cpu.test_dataset_flux",
-    # set_gqa_inner_attention_local_map also registers the SDPA q_BLHK/k_BLHK/
+    # set_gqa_inner_attention_local_spmd also registers the SDPA q_BLHK/k_BLHK/
     # v_BLHV keys; the test asserts the exact varlen key set.
     "tests.unit_tests.cpu.test_varlen_attention",
     # Image torch rejects 'reorder_for_locality' in nested compile-region options.
@@ -142,15 +139,14 @@ GPU_ONLY_DIRS = ("tests/unit_tests/gpu",)
 # to `pytest --deselect`. Use this instead of DISABLED_TESTS when the rest of
 # the file passes.
 DESELECTED_TESTS = (
+    # Upstream test; iterates every shipped CP recipe, including the multimodal
+    # ones that import the optional torchvision dependency.
+    "tests/unit_tests/cpu/test_context_parallel_validation.py::TestShippedCpRecipes::test_every_cp_recipe_passes_the_gate",
     # Upstream tests; MXFP8 needs torchao's 32x32 swizzled cast kernels, which
     # are not in any torchao release the image installs.
     "tests/unit_tests/cpu/test_quantization.py::test_mxfp8_converter_replaces_a_root_linear_config",
     "tests/unit_tests/cpu/test_quantization.py::test_mxfp8_converter_applies_mxfp8_saved_input_fqns",
     "tests/unit_tests/cpu/test_quantization.py::test_mxfp8_converter_rejects_unmatched_saved_input_fqns",
-    # Upstream tests assume spmd_backend defaults to "spmd_types"; this fork
-    # pins "partial_dtensor" (copy.bara.sky).
-    "tests/unit_tests/cpu/test_config_manager.py::TestConfigManager::test_suppressed_model_spec_is_opaque_to_tyro",
-    "tests/unit_tests/cpu/test_router_gate_linear.py::TestRouterGateLinearSPMD::test_autograd_function_propagates_router_types",
     # Upstream test; the fork's Qwen3 Config.update_from_config reads
     # config.training, which the test's SimpleNamespace config lacks.
     "tests/unit_tests/cpu/test_expert_parallel.py::TestExpertParallelConfigValidation::test_all_moe_layers_divisible",

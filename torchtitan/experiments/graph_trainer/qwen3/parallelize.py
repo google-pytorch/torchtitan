@@ -64,12 +64,7 @@ def parallelize_qwen3(
 
     annotate_qwen3(model)
 
-    if (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.tp_enabled
-        or parallel_dims.ep_enabled
-    ):
-        model.parallelize(parallel_dims)
+    model.parallelize(parallel_dims)
 
     configure_moe_aux_loss_reduction(model, parallel_dims)
 

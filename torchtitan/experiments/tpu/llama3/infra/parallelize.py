@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 def parallelize_llama(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: torchtitan.config.CompileConfig,
@@ -47,6 +48,9 @@ def parallelize_llama(
     skip_dp: Whether to skip data parallelism wrapping.
     tpu_compile_mode: TPU compile mode ('layer' or 'fullgraph').
   """
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   # TODO b/499075866: re-enable CPU offload for TPU torchtitan run.
   if training.enable_cpu_offload:
     logger.warning(

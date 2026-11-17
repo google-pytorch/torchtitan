@@ -152,6 +152,7 @@ def _upstream_flavor(flavor: str, attn_backend: str):
   return build_config(
       attn_backend=attn_backend,
       moe_comm_backend="standard",
+      enable_sp=True,
       seq_len=max_context_length,
   )
 

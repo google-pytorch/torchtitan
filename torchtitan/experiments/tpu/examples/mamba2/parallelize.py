@@ -20,7 +20,8 @@ from .model import Mamba2LM
 def parallelize_mamba2(
     model: Mamba2LM,
     *,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelDims | None = None,
+    parallelism_context: ParallelDims | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
@@ -29,6 +30,9 @@ def parallelize_mamba2(
     skip_dp: bool = False,
 ):
   """Applies FSDP, compilation, and activation checkpointing to Mamba-2."""
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   if parallel_dims.tp_enabled:
     raise NotImplementedError(
         "Tensor parallelism is not yet supported for Mamba-2."

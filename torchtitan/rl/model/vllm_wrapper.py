@@ -28,11 +28,10 @@ from torchtitan.config import (
     apply_overrides,
     CompileConfig,
     OverrideConfig,
-    ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed import utils as dist_utils
-from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.distributed.spmd_types import (
     current_spmd_mesh,
     dtensor_to_plain_tensor_state_dict,
@@ -41,6 +40,7 @@ from torchtitan.distributed.spmd_types import (
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols.module import Module
+from torchtitan.protocols.sharding import resolve_placements
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from vllm.compilation.decorators import support_torch_compile
@@ -125,11 +125,11 @@ class PlainToDTensorStateDictAdapter(BaseStateDictAdapter):
         self,
         adapter: BaseStateDictAdapter,
         state_dict_layouts: dict[str, SpmdType],
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
     ) -> None:
         self.adapter = adapter
         self.state_dict_layouts = state_dict_layouts
-        self.parallel_dims = parallel_dims
+        self.parallelism_context = parallelism_context
         self.fqn_to_index_mapping = adapter.fqn_to_index_mapping
         self.hf_assets_path = adapter.hf_assets_path
 
@@ -138,12 +138,24 @@ class PlainToDTensorStateDictAdapter(BaseStateDictAdapter):
             plain_tensor_to_dtensor_state_dict(
                 state_dict,
                 state_dict_layouts=self.state_dict_layouts,
-                parallel_dims=self.parallel_dims,
+                parallelism_context=self.parallelism_context,
             )
         )
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        return dtensor_to_plain_tensor_state_dict(self.adapter.from_hf(hf_state_dict))
+        state_dict = self.adapter.from_hf(hf_state_dict)
+        # TODO(@andrewor14): Wrap the generator model with FSDP and revisit this
+        # explicit layout restoration once weights load into DTensor parameters.
+        for name, value in state_dict.items():
+            if isinstance(value, DTensor):
+                # Format conversions can reshard tensors, e.g. fused QKV splits.
+                # Restore the model's layout before discarding DTensor metadata.
+                state_dict[name] = value.redistribute(
+                    placements=resolve_placements(
+                        self.state_dict_layouts[name], value.device_mesh
+                    )
+                )
+        return dtensor_to_plain_tensor_state_dict(state_dict)
 
     def get_hf_storage_reader(
         self,
@@ -302,13 +314,13 @@ class VLLMModelWrapper(Module):
         logger.debug(f"Creating model with config: {self.config.to_dict()}")
 
         # Translate the inference parallelism into torchtitan's full
-        # ParallelismConfig that ParallelDims and model.parallelize consume.
+        # ParallelismConfig that ParallelismContext and model.parallelize consume.
         training_parallelism = parallelism.to_training()
 
-        # Build ParallelDims from the translated ParallelismConfig so TP/EP
+        # Build ParallelismContext from the translated ParallelismConfig so TP/EP
         # sharding sees the same mesh shape as vLLM. data_parallel_shard_degree
         # carries vLLM's pure DP here (skip_dp=True below), not TorchTitan FSDP.
-        self.parallel_dims = ParallelDims(
+        self.parallelism_context = ParallelismContext(
             dp_replicate=training_parallelism.data_parallel_replicate_degree,
             dp_shard=training_parallelism.data_parallel_shard_degree,
             cp=training_parallelism.context_parallel_degree,
@@ -316,6 +328,7 @@ class VLLMModelWrapper(Module):
             pp=training_parallelism.pipeline_parallel_degree,
             ep=training_parallelism.expert_parallel_degree,
             world_size=dist.get_world_size(),
+            enable_sequence_parallel=training_parallelism.enable_sequence_parallel,
         )
 
         # Fill sharding configs on the config BEFORE build so every sub-module
@@ -356,7 +369,7 @@ class VLLMModelWrapper(Module):
             self.model = self.config.build()
 
         self.model = self.model.parallelize(
-            parallel_dims=self.parallel_dims,
+            parallelism_context=self.parallelism_context,
             training=TrainingConfig(),
             parallelism=training_parallelism,
             compile_config=compile_config,
@@ -385,7 +398,7 @@ class VLLMModelWrapper(Module):
             # TODO: Consider an init_non_persistent_buffers contract on the
             # Decoder / Model class so buffer-only init does not need this
             # spmd context.
-            with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+            with self.parallelism_context.activate_spmd():
                 self.model.init_weights(buffer_device=None)
         self._maybe_initial_load_weights()
 
@@ -396,7 +409,7 @@ class VLLMModelWrapper(Module):
 
         # Route the TP all-reduce through vLLM's custom AR (off under
         # batch-invariant mode, where its size-dependent algorithm breaks).
-        if self.parallel_dims.tp_enabled and not is_in_batch_invariant_mode():
+        if self.parallelism_context.tp_enabled and not is_in_batch_invariant_mode():
             _patch_vllm_all_reduce()
 
     # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
@@ -419,7 +432,7 @@ class VLLMModelWrapper(Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """vLLM required API.
         Convert input token IDs to embeddings."""
-        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+        with self.parallelism_context.activate_spmd():
             return self.model.tok_embeddings(input_ids)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -453,7 +466,7 @@ class VLLMModelWrapper(Module):
         if input_ids is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
-        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+        with self.parallelism_context.activate_spmd():
             # Get embeddings
             h = self.model.tok_embeddings(input_ids)
 
@@ -477,12 +490,12 @@ class VLLMModelWrapper(Module):
         """vLLM required API.
         Compute logits from hidden states."""
 
-        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+        with self.parallelism_context.activate_spmd():
             logits = self.model.lm_head(hidden_states)
 
             # lm_head returns vocab-sharded logits under TP; gather to the
             # full local logits tensor that vLLM expects.
-            if self.parallel_dims.tp_enabled:
+            if self.parallelism_context.tp_enabled:
                 mesh = current_spmd_mesh()
                 assert mesh is not None
                 logits = spmd.redistribute(
@@ -515,7 +528,7 @@ class VLLMModelWrapper(Module):
             sd_adapter = PlainToDTensorStateDictAdapter(
                 sd_adapter,
                 self.get_state_dict_layouts(),
-                self.parallel_dims,
+                self.parallelism_context,
             )
 
         # Model-only CheckpointManager: initial_load_model_only=True (default)
@@ -526,6 +539,7 @@ class VLLMModelWrapper(Module):
             model_parts=[self.model],
             optimizers=None,
             lr_schedulers=None,
+            ema=None,
             states={},
             sd_adapter=sd_adapter,
         )
@@ -546,13 +560,6 @@ class VLLMModelWrapper(Module):
             if sharding_config is not None:
                 for state_name, layout in sharding_config.state_shardings.items():
                     layouts[f"{module_prefix}{state_name}"] = layout
-
-                # Fused grouped experts expose split gate/up state-dict keys
-                # while the layout is declared on the fused w13 parameter.
-                w13_layout = sharding_config.state_shardings.get("w13")
-                if w13_layout is not None:
-                    for state_name in ("w1_EFD", "w3_EFD"):
-                        layouts[f"{module_prefix}{state_name}"] = w13_layout
 
             if module_fqn.rsplit(".", 1)[-1] == "vllm_attn":
                 for buffer_name, _ in module.named_buffers(recurse=False):

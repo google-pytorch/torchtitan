@@ -40,9 +40,13 @@ class TpuGraphTrainerMuseGlimmerModel(GraphTrainerMuseGlimmerModel):
       self,
       *,
       training: TrainingConfig,
-      parallel_dims: ParallelDims,
+      parallel_dims: ParallelDims | None = None,
+      parallelism_context: ParallelDims | None = None,
       **kwargs,
   ) -> nn.Module:
+    if parallel_dims is None:
+      parallel_dims = parallelism_context
+    assert parallel_dims is not None
     return parallelize_muse_glimmer(
         self,
         training=training,
@@ -61,10 +65,14 @@ def parallelize_muse_glimmer(
     model: GraphTrainerMuseGlimmerModel,
     *,
     training: TrainingConfig,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelDims | None = None,
+    parallelism_context: ParallelDims | None = None,
     **kwargs,
 ) -> nn.Module:
   """Applies the TPU uneven-vocab FSDP policy, then upstream's setup."""
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   # Upstream's GraphTrainerMuseGlimmerModel.parallelize already rejects CP, and
   # the TPU model_registry only accepts text-only flavors. Upstream applies TP
   # through Module._parallelize (spmd_types), which this fork does not use and

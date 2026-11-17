@@ -184,7 +184,9 @@ class Gemma4StateDictAdapter(StateDictAdapter):
             _split_qk_linear(
                 state_dict, prefix=prefix, head_dim=head_dim, heads_per_kv=heads_per_kv
             )
-        state_dict = self._native_fused_linears_to_hf(state_dict)
+        state_dict = self._native_fused_linears_to_hf(
+            state_dict, split_routed_experts=True
+        )
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
         hf_state_dict: dict[str, Any] = {}
         pending_w1: dict[str, torch.Tensor] = {}
@@ -198,9 +200,9 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                 layer_num = match.group(0)
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
 
-                if (
-                    abstract_key
-                    == "layers.{}.moe.routed_experts.inner_experts.w1_EFD"
+                if abstract_key in (
+                    "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
+                    "layers.{}.moe.routed_experts.w1_EFD",
                 ):
                     pending_w1[layer_num] = value
                     if layer_num in pending_w3:
@@ -211,9 +213,9 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                         )
                     continue
 
-                if (
-                    abstract_key
-                    == "layers.{}.moe.routed_experts.inner_experts.w3_EFD"
+                if abstract_key in (
+                    "layers.{}.moe.routed_experts.inner_experts.w3_EFD",
+                    "layers.{}.moe.routed_experts.w3_EFD",
                 ):
                     pending_w3[layer_num] = value
                     if layer_num in pending_w1:
@@ -222,6 +224,12 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                             [pending_w1.pop(layer_num), pending_w3.pop(layer_num)],
                             dim=1,
                         )
+                    continue
+
+                if abstract_key == "layers.{}.moe.routed_experts.w2.weight":
+                    hf_state_dict[
+                        f"model.language_model.layers.{layer_num}.experts.down_proj"
+                    ] = value
                     continue
 
                 if abstract_key in to_hf_map:

@@ -41,9 +41,13 @@ class TpuGraphTrainerQwen3Model(GraphTrainerQwen3Model):
         self,
         *,
         training: TrainingConfig,
-        parallel_dims: ParallelDims,
+        parallel_dims: ParallelDims | None = None,
+        parallelism_context: ParallelDims | None = None,
         **kwargs,
     ) -> nn.Module:
+        if parallel_dims is None:
+            parallel_dims = parallelism_context
+        assert parallel_dims is not None
         return parallelize_qwen3(
             self,
             training=training,
@@ -85,10 +89,14 @@ def parallelize_qwen3(
     model: GraphTrainerQwen3Model,
     *,
     training: TrainingConfig,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelDims | None = None,
+    parallelism_context: ParallelDims | None = None,
     **kwargs,
 ) -> nn.Module:
     """Apply the TPU uneven-FSDP policy before setup."""
+    if parallel_dims is None:
+        parallel_dims = parallelism_context
+    assert parallel_dims is not None
     configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
     model = graph_trainer_parallelize_qwen3(
         model,

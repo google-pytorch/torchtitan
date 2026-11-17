@@ -405,7 +405,8 @@ class TPUHFTransformerModel(HFTransformerModel):
   def parallelize(
       self,
       *,
-      parallel_dims,
+      parallel_dims=None,
+      parallelism_context=None,
       training,
       parallelism,
       compile_config,
@@ -416,6 +417,8 @@ class TPUHFTransformerModel(HFTransformerModel):
   ):
     from .parallelize import parallelize_hf_transformers_tpu  # pylint: disable=g-import-not-at-top
 
+    if parallel_dims is None:
+      parallel_dims = parallelism_context
     return parallelize_hf_transformers_tpu(
         self,
         parallel_dims=parallel_dims,

@@ -859,7 +859,8 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
                 configure_simple_fsdp_shard_dims,
             )
 
-            configure_simple_fsdp_shard_dims(self, kwargs.get("parallel_dims"))
+            pdims = kwargs.get("parallel_dims") or kwargs.get("parallelism_context")
+            configure_simple_fsdp_shard_dims(self, pdims)
         model = base.parallelize(self, **kwargs)
         if use_scan:
             for holder in model.modules():

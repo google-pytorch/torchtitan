@@ -812,6 +812,8 @@ class Gemma4Model(Decoder):
                         raise ValueError("Expected MoE.Config")
                     experts_hidden_dim = (
                         moe.routed_experts.inner_experts.hidden_dim
+                        if moe.routed_experts.inner_experts is not None
+                        else moe.routed_experts.w13.out_features
                     )
                     forward_weight_flops += (
                         2 * dim * moe.num_experts

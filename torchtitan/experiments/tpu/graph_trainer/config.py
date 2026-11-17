@@ -133,6 +133,7 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # torch.compile is off; upstream removed ``CompileConfig.enable`` in
   # ec953b36 and uses ``compile is None`` instead.
   enable: bool = False
+  mode: str = "aot_fx_trace"
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"

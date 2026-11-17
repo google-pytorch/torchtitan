@@ -42,7 +42,7 @@ The pipeline has three layers.
 
 **1. Experiment logic.** A `Rollouter` composes training/validation data, a `MessageEnv`, a rubric, and a function to run rollouts. It should be flexible enough to express most custom patterns.
 
-**2. Controller and dataflow.** Independent loops load data, produce rollouts, pack batches, and update the policy. `RolloutGroupWorkBuffer` connects them and bounds policy lag. Set `max_offpolicy_steps=0` for synchronous execution.
+**2. Controller and dataflow.** Independent loops load data, produce rollouts, pack batches, and update the policy. `RolloutGroupWorkBuffer` connects them: `target_offpolicy_steps` sets its depth and so the mean policy age, `windowed_fifo_batches` bounds how far one slow group may exceed it (`None`, the default, leaves it unbounded; `1` is FIFO by batch; see [docs/windowed_fifo.md](docs/windowed_fifo.md)). Set `target_offpolicy_steps=0` for synchronous execution.
 
 **3. Distributed execution.** A router sends requests to one or more vLLM generator replicas. `Trainer` runs on a separately configured TorchTitan mesh, and TorchStore publishes new weights back to the generators. Training and generation can be scaled independently for the workload.
 
@@ -117,7 +117,7 @@ That's it. Wire the rollouter into a config registry function:
 # my_project/my_experiment/config_registry.py
 def my_experiment() -> Controller.Config:
     return Controller.Config(
-        model_spec=...,
+        model=...,
         rollouter=rollouter,
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         trainer=Trainer.Config(loss=..., ...),

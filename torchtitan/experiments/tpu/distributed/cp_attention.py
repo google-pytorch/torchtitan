@@ -39,8 +39,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import fsdp as fsdp_mod
-from torchtitan.distributed.context_parallel.api import (
+from torchtitan.distributed.context_parallel import (
     _cp_shard_dims,
+    HeadTailCPLoadBalancer,
     prepare_context_parallel_input,
 )
 from torchtitan.distributed.parallel_dims import MeshAxisName
@@ -304,6 +305,13 @@ class _TPUCPInnerAttention(CPInnerAttention):
   """Shared base for TPU CP inner attentions with pluggable local attention."""
 
   _local_attn_override: Callable[..., torch.Tensor] | None = None
+
+  @staticmethod
+  def prepare_cp_metadata(
+      attention_metadata: Any, *, permutation: torch.Tensor | None
+  ) -> Any:
+    del permutation
+    return attention_metadata
 
   # TODO: Replace set_local_attention (runtime kernel injection) with
   # first-class Splash/Tokamax InnerAttention configs with a CP counterparts
@@ -1106,7 +1114,10 @@ def validate_tpu_context_parallel(
       expected_lb = None
     else:
       continue
-    if parallelism.context_parallel_load_balancer != expected_lb:
+    actual_lb = parallelism.context_parallel_load_balancer
+    if isinstance(actual_lb, HeadTailCPLoadBalancer.Config):
+      actual_lb = "headtail"
+    if actual_lb != expected_lb:
       raise ValueError(
           f"{fqn}.inner_attention uses {owner.__qualname__}, so"
           f" context_parallel_load_balancer must be {expected_lb!r}, got"

@@ -31,9 +31,16 @@ from .attention import (
 )
 from .decoder import Decoder, TransformerBlock
 from .embedding import Embedding
-from .feed_forward import compute_ffn_hidden_dim, FeedForward, SigmoidGatedFeedForward
-from .linear import CastLinear, Linear, PartialBiasRowwiseLinear, RouterGateLinear
-from .moe import MicrobatchWiseLoadBalanceLoss, MoE, MoELoadBalanceAuxLoss
+from .feed_forward import compute_ffn_hidden_dim, FeedForward
+from .linear import (
+    CastLinear,
+    ColumnParallelLinear,
+    GroupedLinear,
+    Linear,
+    RouterGateLinear,
+    RowParallelLinear,
+)
+from .moe import GroupedExperts, MicrobatchWiseLoadBalanceLoss, MoE, MoELoadBalanceAuxLoss
 from .multimodal import MultimodalModel
 from .nn_modules import (
     Conv1d,
@@ -52,13 +59,13 @@ __all__ = [
     "Conv2d",
     "ComplexRoPE",
     "CastLinear",
+    "ColumnParallelLinear",
     "CosSinRoPE",
     "create_attention_mask",
     "create_varlen_metadata_for_document",
     "Decoder",
     "Embedding",
     "FeedForward",
-    "SigmoidGatedFeedForward",
     "FlexInnerAttention",
     "QKVLinear",
     "GELU",
@@ -69,6 +76,8 @@ __all__ = [
     "get_sliding_window_mask_mod",
     "GQAttention",
     "GroupNorm",
+    "GroupedExperts",
+    "GroupedLinear",
     "Identity",
     "InnerAttention",
     "LayerNorm",
@@ -77,9 +86,9 @@ __all__ = [
     "MicrobatchWiseLoadBalanceLoss",
     "MoELoadBalanceAuxLoss",
     "MultimodalModel",
-    "PartialBiasRowwiseLinear",
     "RMSNorm",
     "RoPE",
+    "RowParallelLinear",
     "RouterGateLinear",
     "ScaledDotProductInnerAttention",
     "Sigmoid",

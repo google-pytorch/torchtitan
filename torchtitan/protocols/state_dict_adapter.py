@@ -285,14 +285,25 @@ class StateDictAdapter(BaseStateDictAdapter):
                 fused = fused.redistribute(mesh, placements)
             state_dict[fused_key] = fused
 
-    def _native_fused_linears_to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def _native_fused_linears_to_hf(
+        self,
+        state_dict: dict[str, Any],
+        *,
+        split_routed_experts: bool = False,
+    ) -> dict[str, Any]:
         """Convert native fused linear parameters to logical HF-facing keys.
 
         Model-specific adapters subsequently rename the logical keys to their
         corresponding HF keys.
+
+        Args:
+            state_dict: Native model state.
+            split_routed_experts: Split routed W13 weights into logical W1/W3
+                tensors for HF schemas that store experts independently.
         """
         from torchtitan.models.common.attention import QKVLinear
         from torchtitan.models.common.feed_forward import FeedForward
+        from torchtitan.models.common.moe import RoutedExperts
 
         result = dict(state_dict)
         for fqn, _config, _parent, _ in self.model_config.traverse(FeedForward.Config):
@@ -317,14 +328,59 @@ class StateDictAdapter(BaseStateDictAdapter):
                 heads_per_kv=config.n_heads // config.n_kv_heads,
             )
 
+        for fqn, _config, _parent, _ in self.model_config.traverse(
+            RoutedExperts.Config
+        ):
+            prefix = f"{fqn}." if fqn else ""
+            if _config.inner_experts is not None:
+                if split_routed_experts:
+                    for src_suffix, dst_suffix in (
+                        ("inner_experts.w1_EFD", "w1_EFD"),
+                        ("inner_experts.w3_EFD", "w3_EFD"),
+                        ("inner_experts.w2_EDF", "w2.weight"),
+                    ):
+                        src_key = f"{prefix}{src_suffix}"
+                        if src_key in result:
+                            result[f"{prefix}{dst_suffix}"] = result.pop(src_key)
+                else:
+                    w1_key = f"{prefix}inner_experts.w1_EFD"
+                    w3_key = f"{prefix}inner_experts.w3_EFD"
+                    w2_key = f"{prefix}inner_experts.w2_EDF"
+                    if w1_key in result and w3_key in result:
+                        result[f"{prefix}w13.weight"] = torch.stack(
+                            [result.pop(w1_key), result.pop(w3_key)], dim=1
+                        )
+                    if w2_key in result:
+                        result[f"{prefix}w2.weight"] = result.pop(w2_key)
+            elif split_routed_experts:
+                self._split_stacked_linear(
+                    result,
+                    fused_key=f"{prefix}w13.weight",
+                    logical_keys=(
+                        f"{prefix}w1_EFD",
+                        f"{prefix}w3_EFD",
+                    ),
+                    dim=1,
+                )
+
         return result
 
     def _native_fused_linears_from_hf(
-        self, state_dict: dict[str, Any]
+        self,
+        state_dict: dict[str, Any],
+        *,
+        fuse_routed_experts: bool = False,
     ) -> dict[str, Any]:
-        """Convert logical HF-facing keys to native fused linear parameters."""
+        """Convert logical HF-facing keys to native fused linear parameters.
+
+        Args:
+            state_dict: Logical HF-facing model state.
+            fuse_routed_experts: Fuse logical routed W1/W3 tensors into W13 for
+                HF schemas that store experts independently.
+        """
         from torchtitan.models.common.attention import QKVLinear
         from torchtitan.models.common.feed_forward import FeedForward
+        from torchtitan.models.common.moe import RoutedExperts
 
         result = dict(state_dict)
         for fqn, _config, _parent, _ in self.model_config.traverse(FeedForward.Config):
@@ -348,6 +404,40 @@ class StateDictAdapter(BaseStateDictAdapter):
                 head_dim=config.head_dim,
                 heads_per_kv=config.n_heads // config.n_kv_heads,
             )
+
+        for fqn, _config, _parent, _ in self.model_config.traverse(
+            RoutedExperts.Config
+        ):
+            prefix = f"{fqn}." if fqn else ""
+            if _config.inner_experts is not None:
+                if fuse_routed_experts:
+                    for src_suffix, dst_suffix in (
+                        ("w1_EFD", "inner_experts.w1_EFD"),
+                        ("w3_EFD", "inner_experts.w3_EFD"),
+                        ("w2.weight", "inner_experts.w2_EDF"),
+                    ):
+                        src_key = f"{prefix}{src_suffix}"
+                        if src_key in result:
+                            result[f"{prefix}{dst_suffix}"] = result.pop(src_key)
+                else:
+                    w13_key = f"{prefix}w13.weight"
+                    w2_key = f"{prefix}w2.weight"
+                    if w13_key in result:
+                        w1_EFD, w3_EFD = result.pop(w13_key).unbind(1)
+                        result[f"{prefix}inner_experts.w1_EFD"] = w1_EFD.contiguous()
+                        result[f"{prefix}inner_experts.w3_EFD"] = w3_EFD.contiguous()
+                    if w2_key in result:
+                        result[f"{prefix}inner_experts.w2_EDF"] = result.pop(w2_key)
+            elif fuse_routed_experts:
+                self._stack_logical_linears(
+                    result,
+                    fused_key=f"{prefix}w13.weight",
+                    logical_keys=(
+                        f"{prefix}w1_EFD",
+                        f"{prefix}w3_EFD",
+                    ),
+                    dim=1,
+                )
 
         return result
 

@@ -34,7 +34,8 @@ class TpuGraphTrainerQwen35Model(GraphTrainerModel, Qwen35Model):
   def parallelize(
       self,
       *,
-      parallel_dims: ParallelDims,
+      parallel_dims: ParallelDims | None = None,
+      parallelism_context: ParallelDims | None = None,
       training: TrainingConfig,
       parallelism: ParallelismConfig,
       compile_config: GraphTrainerCompileConfig,
@@ -44,6 +45,9 @@ class TpuGraphTrainerQwen35Model(GraphTrainerModel, Qwen35Model):
   ) -> nn.Module:
     if skip_dp:
       raise ValueError("GraphTrainer models do not support skip_dp=True.")
+    if parallel_dims is None:
+      parallel_dims = parallelism_context
+    assert parallel_dims is not None
     return parallelize_qwen3_5(
         self,
         parallel_dims=parallel_dims,
@@ -63,7 +67,8 @@ class TpuGraphTrainerQwen35Model(GraphTrainerModel, Qwen35Model):
 def parallelize_qwen3_5(
     model: Qwen35Model,
     *,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelDims | None = None,
+    parallelism_context: ParallelDims | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
@@ -72,6 +77,9 @@ def parallelize_qwen3_5(
 ) -> nn.Module:
   """Applies FQN annotation, SimpleFSDP, and GraphTrainer compile to Qwen3.5."""
   del ac_config
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   # Upstream's eager parallelize_qwen3_5 rejects CP too (the GatedDeltaNet
   # needs the whole sequence); TP is untested on TPU, the TPU model_registry
   # has no pipelining, and EP requires mesh-split optimizer support.

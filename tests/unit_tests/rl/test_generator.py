@@ -21,12 +21,14 @@ import math
 import os as os
 import shutil as shutil
 import tempfile
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
+from torchtitan.components.optimizer import AdamW
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC
@@ -43,7 +45,10 @@ from torchtitan.rl.generator import (
     VLLMGenerator,
 )
 from torchtitan.rl.model.vllm_registry import register_to_vllm
-from torchtitan.rl.model.vllm_worker import TorchTitanGPUModelRunner
+from torchtitan.rl.model.vllm_worker import (
+    TorchTitanGPUModelRunner,
+    TorchTitanGPUWorker,
+)
 from torchtitan.rl.observability import metrics as m
 from vllm import SamplingParams
 from vllm.sampling_params import RequestOutputKind
@@ -347,9 +352,11 @@ def test_qwen36_27b_config_applies_offset_rmsnorm_to_both_actors():
     assert config.trainer.parallelism.data_parallel_shard_degree == 2
     assert config.trainer.parallelism.tensor_parallel_degree == 2
     assert config.generator.parallelism.tensor_parallel_degree == 4
-    assert config.trainer.optimizer.implementation == "fused_opt_states_bf16"
+    optimizer = config.trainer.optimizer.optimizers[0]
+    assert isinstance(optimizer, AdamW.Config)
+    assert optimizer.moment_dtype == "bfloat16"
     assert isinstance(config.trainer.activation_checkpoint, FullAC.Config)
-    assert config.generator.cuda_graph.mode == "FULL_AND_PIECEWISE"
+    assert config.generator.cuda_graph.mode == "FULL"
 
 
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---
@@ -441,6 +448,23 @@ def test_sequence_parallel_padding_rounds_runner_tokens(
         TorchTitanGPUModelRunner._pad_for_sequence_parallelism(model_runner, 5)
         == expected_num_tokens
     )
+
+
+def test_only_weights_use_cumem_allocator(monkeypatch):
+    base_worker_cls = TorchTitanGPUWorker.__mro__[1]
+    monkeypatch.setattr(
+        base_worker_cls,
+        "_maybe_get_memory_pool_context",
+        lambda self, tag: nullcontext(tag),
+    )
+    worker = object.__new__(TorchTitanGPUWorker)
+
+    with worker._maybe_get_memory_pool_context("kv_cache") as value:
+        assert value is None
+    with worker._maybe_get_memory_pool_context("weights") as value:
+        assert value == "weights"
+    with worker._maybe_get_memory_pool_context("other") as value:
+        assert value is None
 
 
 def test_cuda_graph_default_mode_is_full():

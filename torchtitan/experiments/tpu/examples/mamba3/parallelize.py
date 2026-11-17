@@ -16,7 +16,8 @@ from .model import Mamba3LM
 def parallelize_mamba3(
     model: Mamba3LM,
     *,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelDims | None = None,
+    parallelism_context: ParallelDims | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
@@ -25,6 +26,9 @@ def parallelize_mamba3(
     skip_dp: bool = False,
 ):
   """Applies FSDP, compilation, and activation checkpointing to Mamba-3."""
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   if parallel_dims.tp_enabled:
     raise NotImplementedError(
         "Tensor parallelism is not yet supported for Mamba-3."

@@ -1,31 +1,195 @@
-# TorchTitan on TPU
+<div align="center">
 
-Google's distribution of [TorchTitan](https://github.com/pytorch/torchtitan), adding training on
-Cloud TPU through [TorchTPU](https://github.com/google-pytorch/torch_tpu). Upstream TorchTitan
-works as documented; TPU support lives in `torchtitan/experiments/tpu` and adds TPU recipes, Pallas
-kernels, and TPU-specific trainer and parallelism paths.
+# torchtitan
 
-## Start here
+#### A PyTorch native platform for training generative AI models
 
-* **Train on TPU**: [`torchtitan/experiments/tpu/README.md`](torchtitan/experiments/tpu/README.md)
-  covers the environment, building the TorchTPU wheel, a single-host TPU VM run, and multi-host
-  training on GKE.
-* **Pick a recipe**: [`torchtitan/experiments/tpu/recipes`](torchtitan/experiments/tpu/recipes) has
-  per-model, per-topology configs, each with its launch block.
-* **Tune a model**: the
-  [TorchTPU optimization guide](torchtitan/experiments/tpu/docs/torch-tpu-optimization-guide.md).
-* **Everything else**: upstream's
-  [README](https://github.com/pytorch/torchtitan/blob/main/README.md) and
-  [docs](https://github.com/pytorch/torchtitan/tree/main/docs) apply unchanged.
+[![arXiv](https://img.shields.io/badge/arXiv-2410.06511-b31b1b.svg)](https://arxiv.org/abs/2410.06511)
+[![ICLR](https://img.shields.io/badge/ICLR-2025-violet.svg)](https://iclr.cc/virtual/2025/poster/29620)
+[![devlogs](https://img.shields.io/badge/PyTorch-DevLog-DE3412.svg)](https://docs.pytorch.org/devlogs/)
+[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](./LICENSE)
+[![pip](https://img.shields.io/pypi/v/torchtitan?color=blue)](https://pypi.org/project/torchtitan/)
+[![conda](https://img.shields.io/conda/vn/conda-forge/torchtitan?color=green)](https://anaconda.org/conda-forge/torchtitan)
 
-## Issues and contributing
 
-File TPU bugs and feature requests in
-[this repository's issue tracker](https://github.com/google-pytorch/torchtitan/issues), and send
-TPU changes here, under `torchtitan/experiments/tpu`. Anything in shared TorchTitan code goes
-upstream to [pytorch/torchtitan](https://github.com/pytorch/torchtitan), because we keep this
-repository in sync with it. See [CONTRIBUTING.md](CONTRIBUTING.md) for the details.
+</div>
+
+`torchtitan` is under extensive development. To use the latest features of `torchtitan`, we recommend using the most recent PyTorch nightly.
+
+
+## Latest News
+- [2026/08] [TitanRL](torchtitan/rl) is a hackable RL stack for scaling and debugging. It reuses TorchTitan model definitions and kernels across training and vLLM generation and supports batch-invariant mode.
+- [2025/11] AMD released an [optimized fork](https://github.com/AMD-AGI/torchtitan-amd/tree/main) of `torchtitan` for AMD GPUs.
+- [2025/10] We released `torchtitan` [v0.2.0](https://github.com/pytorch/torchtitan/releases).
+- [2025/10] SkyPilot now supports `torchtitan`! See the tutorial [here](https://docs.skypilot.co/en/latest/examples/training/torchtitan.html).
+- [2025/07] We published [instructions](/torchtitan/models/README.md) on how to add a model to `torchtitan`.
+- [2025/04] Our paper was accepted by [ICLR 2025](https://iclr.cc/virtual/2025/poster/29620).
+- [2024/12] GPU MODE [lecture](https://www.youtube.com/watch?v=VYWRjcUqW6w) on torchtitan.
+- [2024/07] [Presentation](https://pytorch2024.sched.com/event/1fHn3) at PyTorch Conference 2024.
+
+
+## Overview
+
+`torchtitan` is a PyTorch native platform designed for **rapid experimentation and large-scale training** of generative AI models. As a minimal clean-room implementation of PyTorch native scaling techniques, `torchtitan` provides a flexible foundation for developers to build upon. With `torchtitan` [extension points](docs/extension.md), one can easily create custom extensions tailored to specific needs.
+
+Our mission is to accelerate innovation in the field of generative AI by empowering researchers and developers to explore new modeling architectures and infrastructure techniques.
+
+The Guiding Principles when building `torchtitan`
+* Designed to be easy to understand, use and extend for different training purposes.
+* Minimal changes to the model code when applying multi-dimensional parallelism.
+* Bias towards a clean, minimal codebase while providing basic reusable / swappable components.
+
+`torchtitan` showcases PyTorch's latest distributed training features across multiple model families. Core models include Llama 3, Qwen3 / 3.5 / 3.8, DeepSeek V3 / V4, GPT-OSS, Kimi K2.7 / K3, Muse Glimmer, and Flux.
+
+## Contributing
+
+We look forward to your contributions!
+
+* To accelerate contributions to and innovations around torchtitan, we host an [`experiments`](torchtitan/experiments) folder. New ideas should start there. To contribute, follow the [`experiments guidelines`](torchtitan/experiments/README.md).
+* For fixes and contributions to core, follow these [`guidelines`](CONTRIBUTING.md).
+
+## Test status
+
+| Hardware | Integration Tests | Unit Tests |
+| --- | --- | --- |
+| CPU | - | [![CPU Unit Test](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_cpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_cpu.yaml?query=branch%3Amain) |
+| NVIDIA GPU | [![Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test.yaml?query=branch%3Amain) [![H100 Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_h100.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_h100.yaml?query=branch%3Amain) [![B200 Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_b200.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_b200.yaml?query=branch%3Amain) | [![GPU Unit Tests](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_gpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_gpu.yaml?query=branch%3Amain) |
+| AMD GPU (ROCm) | [![Integration Tests (ROCm)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_rocm.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_rocm.yaml?query=branch%3Amain) | - |
+
+## Llama 3.1 training
+
+### Key features available
+
+1. Multi-dimensional composable parallelisms
+   - [FSDP2](docs/fsdp.md) with per-parameter sharding
+   - [Tensor Parallel](https://pytorch.org/docs/stable/distributed.tensor.parallel.html) (including [async TP](https://discuss.pytorch.org/t/distributed-w-torchtitan-introducing-async-tensor-parallelism-in-pytorch/209487))
+   - [Pipeline Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-training-with-zero-bubble-pipeline-parallelism/214420)
+   - [Context Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-breaking-barriers-training-long-context-llms-with-1m-sequence-length-in-pytorch-using-context-parallel/215082)
+2. [Meta device](https://pytorch.org/docs/stable/meta.html) initialization
+3. Per-op selective and full activation checkpointing
+4. [Distributed checkpointing](https://discuss.pytorch.org/t/distributed-w-torchtitan-optimizing-checkpointing-efficiency-with-pytorch-dcp/211250) (including async checkpointing)
+   - [Interoperable checkpoints](docs/checkpoint.md) which can be loaded directly into [`torchtune`](https://github.com/pytorch/torchtune) for fine-tuning
+5. `torch.compile` support
+6. [Low-precision training](torchtitan/quantization/README.md) with [Float8](torchtitan/quantization/float8/README.md), [MXFP8](torchtitan/quantization/mxfp8/README.md), and [NVFP4](torchtitan/quantization/nvfp4/README.md)
+7. Supervised Fine-Tuning (SFT) with chat-formatted datasets
+8. DDP and HSDP
+9. [TorchFT](https://github.com/pytorch/torchft) integration
+10. Checkpointable data-loading, with the C4 dataset pre-configured (144M entries) and support for [custom datasets](torchtitan/components/data/README.md)
+11. Gradient accumulation, derived from `--training.num_tokens_per_train_step`
+12. Flexible learning rate scheduler (warmup-stable-decay)
+13. [BF16 optimizer states](torchtitan/components/optimizer/bf16_optimizer_states.md) for reduced memory usage
+14. Loss, GPU memory, throughput (tokens/sec), TFLOPs, and MFU displayed and logged via [Tensorboard or Weights & Biases](/docs/metrics.md)
+15. [Debugging tools](docs/debugging.md) including CPU/GPU profiling, memory profiling, Flight Recorder, etc.
+    - [Deterministic SDC replay](torchtitan/observability/silent_data_corruption.md)
+16. All options easily configured in [Python](torchtitan/config/README.md) with `--module` and `--config` CLI flags
+17. Structured logging: per-rank trace of key training phases; (see [`torchtitan/observability/structured_logger/README.md`](torchtitan/observability/structured_logger/README.md))
+18. [Helper scripts](scripts/) to
+    - download tokenizers and other Hugging Face assets (`scripts/download_hf_assets.py`)
+    - convert checkpoints between Hugging Face and DCP formats (`scripts/checkpoint_conversion/`)
+    - compare training losses across commits or configs (`scripts/loss_compare.py`)
+    - run vLLM inference with TorchTitan models (`torchtitan/rl/generate.py`)
+
+We report [performance](benchmarks/llama3_h100_202412_torchtitan.md) on up to 512 GPUs, and verify [loss converging](docs/converging.md) correctness of various techniques.
+
+## Installation
+
+One can directly run the source code, or install `torchtitan` from a nightly build, or a stable release.
+
+### From source
+
+This method requires the nightly build of PyTorch, or the latest PyTorch built [from source](https://github.com/pytorch/pytorch?tab=readme-ov-file#from-source).
+
+```bash
+git clone https://github.com/pytorch/torchtitan
+cd torchtitan
+pip install -r requirements.txt
+```
+
+> **Note:** You can run directly from the source tree. If you need to import `torchtitan` as a package from elsewhere, install it in editable mode without re-resolving dependencies: `pip install -e . --no-deps`.
+
+`torchao` is not installed by the command above. It is only needed for the
+low-precision training recipes (float8, MXFP8, NVFP4), and it is deliberately
+left out so that it does not get resolved independently of the `torch` you
+already have. Install a nightly matching your accelerator build when you need
+one, replacing `cu130` to match:
+
+```bash
+USE_CPP=0 python -m pip install --pre --upgrade torchao --index-url https://download.pytorch.org/whl/nightly/cu130
+```
+
+### Nightly builds
+
+This method requires the nightly build of PyTorch. You can replace `cu130` with another version of cuda or an AMD GPU (e.g. `rocm6.3`).
+
+```sh
+pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 --force-reinstall
+pip install --pre torchtitan --index-url https://download.pytorch.org/whl/nightly/cu130
+```
+
+### Stable releases
+One can install the latest [stable release](https://github.com/pytorch/torchtitan/releases) of `torchtitan` via `pip` or `conda`.
+```sh
+pip install torchtitan
+```
+```sh
+conda install conda-forge::torchtitan
+```
+Note that each stable release pins the nightly versions of `torch` and `torchao`. Please see [release.md](docs/release.md) for more details.
+
+### Downloading a tokenizer
+
+`torchtitan` currently supports training Llama 3.1 (8B, 70B, 405B) out of the box. To get started training these models, we need to download the tokenizer. Follow the instructions on the official [meta-llama](https://huggingface.co/meta-llama/Llama-3.1-8B) repository to ensure you have access to the Llama model weights.
+
+Once you have confirmed access, you can run the following command to download the Llama 3.1 tokenizer to your local machine.
+
+```bash
+# Get your HF token from https://huggingface.co/settings/tokens
+
+# Llama 3.1 tokenizer
+python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=...
+```
+
+### Start a training run
+Llama 3 8B model locally on 8 GPUs
+
+```bash
+MODULE=llama3 CONFIG=llama3_8b ./run_train.sh
+```
+
+### Multi-Node Training
+For training on ParallelCluster/Slurm type configurations, you can use the `multinode_trainer.slurm` file to submit your sbatch job.
+
+To get started adjust the number of nodes and GPUs
+```
+#SBATCH --ntasks=2
+#SBATCH --nodes=2
+```
+
+Then start a run where `nnodes` is your total node count, matching the sbatch node count above.
+
+```
+srun torchrun --nnodes 2
+```
+
+If your gpu count per node is not 8, adjust `--nproc_per_node` in the torchrun command and `#SBATCH --gpus-per-task` in the SBATCH command section.
+
+## Citation
+
+We provide a detailed look into the parallelisms and optimizations available in `torchtitan`, along with summary advice on when to use various techniques.
+
+[TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training](https://openreview.net/forum?id=SFN6Wm7YBI)
+```
+@inproceedings{
+   liang2025torchtitan,
+   title={TorchTitan: One-stop PyTorch native solution for production ready {LLM} pretraining},
+   author={Wanchao Liang and Tianyu Liu and Less Wright and Will Constable and Andrew Gu and Chien-Chin Huang and Iris Zhang and Wei Feng and Howard Huang and Junjie Wang and Sanket Purandare and Gokul Nadathur and Stratos Idreos},
+   booktitle={The Thirteenth International Conference on Learning Representations},
+   year={2025},
+   url={https://openreview.net/forum?id=SFN6Wm7YBI}
+}
+```
+
 
 ## License
 
-BSD 3-Clause, inherited from upstream TorchTitan. See [LICENSE](LICENSE).
+Source code is made available under a [BSD 3 license](./LICENSE), however you may have other legal obligations that govern your use of other content linked in this repository, such as the license or terms of service for third-party data and models.

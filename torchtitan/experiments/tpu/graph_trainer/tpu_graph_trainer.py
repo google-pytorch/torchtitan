@@ -44,6 +44,7 @@ from torchtitan.experiments.graph_trainer.trainer import (
     GraphTrainer,
     GraphTrainingEngine,
 )
+from torchtitan.training_engine import TrainingEngine
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
@@ -124,6 +125,78 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         self._opt_state_registered = False
         self._optstate_param_fqns: list[str] = []
         self._optstate_fqn_to_canonical: dict[str, str] = {}
+        self._traced_step = None
+        self._trainable_params: tuple[torch.Tensor, ...] | None = None
+
+    def _initialize_forward_backward(self) -> None:
+        if self.parallelism_context.pp_enabled:
+            super()._initialize_forward_backward()
+            return
+        TrainingEngine._initialize_forward_backward(self)
+
+    def _get_trainable_parameters(
+        self,
+        model: nn.Module,
+    ) -> tuple[torch.Tensor, ...]:
+        if self._trainable_params is None:
+            self._trainable_params = tuple(
+                parameter
+                for _, parameter in model.named_parameters(remove_duplicate=False)
+                if parameter.requires_grad
+            )
+        return self._trainable_params
+
+    def _prepare_trace_inputs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        from torchtitan.experiments.graph_trainer.configs import trace_input_preparer_keys
+        from torchtitan.experiments.graph_trainer.registry import TRACE_INPUT_PREPARERS
+
+        for pass_name in trace_input_preparer_keys(self.config.compile):
+            prepare = TRACE_INPUT_PREPARERS.get(pass_name)
+            if prepare is not None:
+                prepare(self.config.compile, args, kwargs)
+
+    def _prepare_trace_call_inputs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        from torchtitan.experiments.graph_trainer.configs import trace_input_preparer_keys
+        from torchtitan.experiments.graph_trainer.registry import TRACE_CALL_INPUT_PREPARERS
+
+        for pass_name in trace_input_preparer_keys(self.config.compile):
+            prepare = TRACE_CALL_INPUT_PREPARERS.get(pass_name)
+            if prepare is not None:
+                prepared = prepare(self.config.compile, args, kwargs)
+                if prepared is not None:
+                    args, kwargs = prepared
+        return args, kwargs
+
+    def _non_pp_forward_backward_body(
+        self,
+        *,
+        inputs: Any,
+        labels: Any,
+        model_kwargs: Any,
+        loss_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        model = self.model_parts[0]
+        params = self._get_trainable_parameters(model)
+        if isinstance(inputs, list) and len(inputs) == 1 and isinstance(inputs[0], tuple):
+            inputs = inputs[0][0]
+            labels = labels[0]
+            model_kwargs = model_kwargs[0]
+        return self._make_fx_forward_backward_microbatch(
+            model,
+            inputs,
+            labels,
+            loss_kwargs["global_valid_tokens"],
+            params,
+            model_kwargs,
+        )
 
     def _build_model(self) -> BaseModel:
         model = super()._build_model()
@@ -175,6 +248,13 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
 
         with set_unflatten_seq_len(self.config.training.max_context_length):
             if not self._optimizer_in_graph:
+                if not self.parallelism_context.pp_enabled:
+                    return TrainingEngine.forward_backward_microbatch(
+                        self,
+                        microbatch_group=microbatch_group,
+                        global_valid_tokens=global_valid_tokens,
+                        accumulation_index=accumulation_index,
+                    )
                 return super().forward_backward_microbatch(
                     microbatch_group=microbatch_group,
                     global_valid_tokens=global_valid_tokens,
@@ -583,6 +663,20 @@ class TpuGraphTrainer(GraphTrainer):
         set_global_vocab_size(config.loss, config.model)
 
         super().__init__(config)
+        if not self.engine.parallelism_context.pp_enabled:
+            self.num_pp_microbatches = 1
+            num_tokens_per_train_step = self.config.training.num_tokens_per_train_step
+            if num_tokens_per_train_step < 0:
+                self.gradient_accumulation_steps = 1
+            else:
+                num_tokens_per_microbatch = (
+                    self.config.training.num_tokens_per_microbatch_per_dp_rank
+                    * self.engine.parallelism_context.dp_replicate
+                    * self.engine.parallelism_context.dp_shard
+                )
+                self.gradient_accumulation_steps = (
+                    num_tokens_per_train_step // num_tokens_per_microbatch
+                )
 
         self._mfu_benchmark = None
         if config.tpu_config.enable_mfu_benchmark:

@@ -22,7 +22,8 @@ from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 def parallelize_qwen3(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: torchtitan.config.CompileConfig,
@@ -38,6 +39,9 @@ def parallelize_qwen3(
   `--parallelism.use_simple_fsdp` is set, it skips upstream Data Parallelism
   and instead applies the TPU-specific Simple FSDP implementation.
   """
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
   if parallel_dims.cp_enabled:

@@ -1,16 +1,23 @@
 """Qwen3.5 attention, transformer block, and model modules for TPU."""
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+from torchtitan.config import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types, set_current_spmd_mesh
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
-from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.attention import AttentionMasksType, FlexInnerAttention, VarlenInnerAttention
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
+from torchtitan.models.qwen3_5.sharding import annotate_deltanet_cu_seqlens
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -121,6 +128,14 @@ class TpuQwen35Model(Qwen35Model):
   ``auto_scale_token_chunks`` is enabled. ``parallelize`` upgrades unconfigured
   TPU expert layers to unpaired Pallas grouped matmuls so dynamic or empty
   expert segments under EP never hit ``torch._grouped_mm``.
+
+  Under context parallelism, ``preprocess_inputs`` shards the inputs through
+  the CP inner attention's ``cp_shard``, as core ``Decoder.preprocess_inputs``
+  does; upstream ``Qwen35Model`` calls ``prepare_context_parallel_input``
+  itself. The TPU KV all-gather ``cp_shard`` lays every sequence out head-tail
+  (upstream would head-tail the folded ``[B * S]`` token stream), caches the
+  CP-rank tensor and precomputes the full-sequence ``segment_ids``; the CP
+  GatedDeltaNet (``cp_gated_delta``) relies on the same layout.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -227,3 +242,56 @@ class TpuQwen35Model(Qwen35Model):
           dispatcher = getattr(module, "token_dispatcher", None)
           if isinstance(dispatcher, token_dispatcher.TpuQwen35TokenDispatcher):
             dispatcher.bind_ep_rank_holder(self)
+
+  def preprocess_inputs(
+      self,
+      input_dict: dict[str, torch.Tensor],
+      *,
+      parallel_dims: ParallelDims,
+      parallelism: ParallelismConfig,
+      max_num_documents: int | None = None,
+      max_context_length: int | None = None,
+  ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    if not parallel_dims.cp_enabled:
+      return super().preprocess_inputs(
+          input_dict,
+          parallel_dims=parallel_dims,
+          parallelism=parallelism,
+          max_num_documents=max_num_documents,
+          max_context_length=max_context_length,
+      )
+    batch: dict[str, Any] = dict(input_dict)
+    padding_mask = batch.pop("padding_mask", None)
+    if batch.pop("mrope_positions", None) is not None:
+      # TPU: CP shards text tokens only; vision tokens would need scattering
+      # into the sequence before sharding.
+      raise NotImplementedError(
+          "Qwen3.5 context parallelism on TPU is text-only (no"
+          " mrope_positions)."
+      )
+    positions = batch.get("positions")
+    assert positions is not None, "Qwen3.5 needs RoPE positions."
+    inner = self.config.first_full_attention_backend
+    if isinstance(
+        inner, (FlexInnerAttention.Config, VarlenInnerAttention.Config)
+    ):
+      batch["attention_masks"] = self.get_attention_masks(
+          positions=positions,
+          padding_mask=padding_mask,
+          max_num_documents=max_num_documents,
+          max_context_length=max_context_length,
+      )
+    input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
+    # TPU: the CP inner attention shards the inputs (see the class docstring).
+    batch = self._cp_shard_inputs(
+        batch, input_sharding, parallel_dims, parallelism
+    )
+    if parallelism.spmd_backend == "spmd_types":
+      batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
+      attention_masks = batch.get("attention_masks")
+      if attention_masks is not None:
+        with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
+          annotate_deltanet_cu_seqlens(attention_masks)
+    inputs = batch.pop("input")
+    labels = batch.pop("labels")
+    return inputs, labels, batch

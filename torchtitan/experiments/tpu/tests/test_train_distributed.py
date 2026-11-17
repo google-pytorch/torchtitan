@@ -763,6 +763,26 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
+      # EP + CP: the routed experts dispatch each rank's CP-sharded tokens over
+      # ep=2 (ep divides dp_shard * cp).
+      dict(
+          testcase_name="qwen3_5_moe_ep2_cp2_all_gather",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.expert_parallel_degree=2"],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_ep2_cp2_ulysses",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.expert_parallel_degree=2"],
+      ),
   ])
   def test_train_distributed(
       self,

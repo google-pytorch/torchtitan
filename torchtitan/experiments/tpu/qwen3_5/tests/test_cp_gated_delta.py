@@ -301,6 +301,28 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     for _, attn, _, _ in attentions:
       self.assertTrue(issubclass(attn.inner_attention._owner, mixin))
 
+  @parameterized.parameters(
+      ("qwen35_moe_35b_split_tokamax_ep_allgather_cp2", "headtail"),
+      ("qwen35_moe_35b_split_tokamax_ep_ulysses_cp2", None),
+  )
+  def test_ep_cp_recipes_keep_expert_parallelism(self, recipe, load_balancer):
+    """CP on top of the 35B EP benchmark recipe keeps its EP settings."""
+    cfg = getattr(config_registry, recipe)()
+    self.assertEqual(cfg.parallelism.context_parallel_degree, 2)
+    self.assertEqual(
+        cfg.parallelism.context_parallel_load_balancer, load_balancer
+    )
+    self.assertEqual(cfg.parallelism.expert_parallel_degree, 4)
+    self.assertEqual(
+        cfg.compile.graph_split.backward_partition_mode, "by_layer"
+    )
+    delta_nets = list(cfg.model_spec.model.traverse(GatedDeltaNet.Config))
+    self.assertNotEmpty(delta_nets)
+    for _, delta_net, _, _ in delta_nets:
+      self.assertIsInstance(
+          delta_net.inner_gated_delta_net, CPTpuInnerGatedDeltaNet.Config
+      )
+
   def _cp_config(self, *, gated_delta_lb="unset", cp=2, strategy="ulysses"):
     cfg = config_registry.qwen35_debugmodel()
     cfg.parallelism.context_parallel_degree = cp

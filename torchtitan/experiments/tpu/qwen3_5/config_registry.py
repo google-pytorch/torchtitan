@@ -762,3 +762,26 @@ def qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2() -> (
       strategy="ulysses",
       cp_degree=2,
   )
+
+
+def qwen35_moe_35b_split_tokamax_ep_allgather_cp2() -> TpuGraphTrainer.Config:
+  """``qwen35_moe_35b_split_tokamax_ep_benchmark`` (EP=4) with KV all-gather CP2.
+
+  Expert parallelism and context parallelism compose: CP shards each sequence's
+  tokens over the ``cp`` axis and the routed experts dispatch every rank's
+  local tokens over the ``ep`` axis (``ep`` must divide ``dp_shard * cp``).
+  """
+  return _qwen35_cp(
+      qwen35_moe_35b_split_tokamax_ep_benchmark(),
+      strategy="all_gather",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_ep_ulysses_cp2() -> TpuGraphTrainer.Config:
+  """``qwen35_moe_35b_split_tokamax_ep_benchmark`` (EP=4) with Ulysses CP2."""
+  return _qwen35_cp(
+      qwen35_moe_35b_split_tokamax_ep_benchmark(),
+      strategy="ulysses",
+      cp_degree=2,
+  )

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import copy
 import unittest
 from unittest.mock import patch
@@ -1005,6 +1006,153 @@ class TestSingleGPUMixedPrecisionFSDP(DTensorTestBase):
             # bf16 reference. Would fail if mp_policy used param_dtype=fp32 instead,
             # since the ref model runs forward/backward in bf16.
             self.assertEqual(loss, ref_loss)
+
+
+class TestTopologyAwareMeshSpmdAxes(DTensorTestBase):
+    """Multi-axis meshes must typecheck when the rank order is a physical permutation.
+
+    ``enable_tpu_topo_mesh`` builds the world mesh from
+    ``torch.tpu.topology_aware_mesh``, which orders ranks along the physical
+    torus (a snake such as ``[0, 1, 2, 3, 7, 6, 5, 4]`` on a 2x4 slice). The
+    permutation is injected here so the test runs on CPU/gloo.
+
+    Regression test for b/587033846: spmd_types inferred each axis from the
+    sorted global ranks of the local process group, so outer-axis groups like
+    ``[0, 7]``/``[1, 6]``/``[2, 5]``/``[3, 4]`` got per-rank strides 7/5/3/1
+    that collided with the inner axis, and every 2D+ mesh (HSDP, FSDP+TP,
+    FSDP+CP, FSDP+EP) failed with ``SpmdTypeError: ... not orthogonal``.
+    """
+
+    # Physical rank order of a 2x4 slice: row 0 left-to-right, row 1 back.
+    SNAKE = [0, 1, 2, 3, 7, 6, 5, 4]
+
+    @property
+    def world_size(self):
+        return 8
+
+    def _build(self, **degrees) -> ParallelDims:
+        dims = dict(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1)
+        dims.update(degrees)
+        pd = ParallelDims(world_size=8, enable_tpu_topo_mesh=True, **dims)
+        pd.build_mesh()
+        return pd
+
+    def _patch_topology(self):
+        return (
+            patch("torchtitan.distributed.parallel_dims.device_type", self.device_type),
+            patch(
+                "torchtitan.distributed.parallel_dims._topology_aware_rank_mesh",
+                lambda device_type, mesh_shape: torch.tensor(self.SNAKE).view(
+                    mesh_shape
+                ),
+            ),
+        )
+
+    def _assert_mesh_typechecks(self, mesh):
+        # set_current_mesh converts every dim via MeshAxis.of(pg) and runs
+        # normalize_mesh, which raises SpmdTypeError on non-orthogonal axes.
+        with spmd.set_current_mesh(mesh):
+            pass
+
+    @with_comms
+    def test_world_mesh_follows_physical_order(self):
+        """Sanity check that the injected permutation reaches the process groups."""
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_topology():
+                stack.enter_context(p)
+            pd = self._build(dp_shard=2, tp=4)
+            self.assertEqual(pd.world_mesh.mesh.tolist(), self.SNAKE)
+            # tp groups are the snake's rows; the dp_shard group of rank 0
+            # pairs it with rank 7 (the chip below it), not rank 4.
+            tp_ranks = dist.get_process_group_ranks(pd.get_mesh("tp").get_group())
+            self.assertIn(sorted(tp_ranks), [[0, 1, 2, 3], [4, 5, 6, 7]])
+            shard_ranks = dist.get_process_group_ranks(
+                pd.get_mesh("dp_shard").get_group()
+            )
+            self.assertIn(sorted(shard_ranks), [[0, 7], [1, 6], [2, 5], [3, 4]])
+
+    @with_comms
+    def test_multi_axis_meshes_typecheck(self):
+        """HSDP, FSDP+TP, FSDP+CP and FSDP+EP all typecheck under a snake order."""
+        cases = {
+            "hsdp": dict(dp_replicate=2, dp_shard=4),
+            "fsdp_tp": dict(dp_shard=4, tp=2),
+            "fsdp_cp": dict(dp_shard=4, cp=2),
+            "fsdp_ep": dict(dp_shard=4, tp=2, ep=2),
+            "hsdp_tp": dict(dp_replicate=2, dp_shard=2, tp=2),
+        }
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_topology():
+                stack.enter_context(p)
+            for name, degrees in cases.items():
+                with self.subTest(name):
+                    pd = self._build(**degrees)
+                    self._assert_mesh_typechecks(pd.spmd_dense_mesh())
+                    # The storage mesh that fully_shard() and FSDPParam
+                    # typecheck against.
+                    self._assert_mesh_typechecks(
+                        pd.get_mesh(["dp_replicate", "dp_shard"])
+                        if pd.dp_replicate_enabled
+                        else pd.get_mesh("dp_shard")
+                    )
+                    sparse = pd.spmd_sparse_mesh()
+                    if sparse is not None:
+                        self._assert_mesh_typechecks(sparse)
+                        self._assert_mesh_typechecks(
+                            pd.get_mesh(["efsdp", "ep"])
+                        )
+
+    @with_comms
+    def test_registered_axes_are_logical_and_rank_invariant(self):
+        """Axes come from DeviceMesh._layout, so every rank sees the same strides."""
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_topology():
+                stack.enter_context(p)
+            pd = self._build(dp_shard=4, tp=2)
+            dp_shard_pg = pd.get_mesh("dp_shard").get_group()
+            tp_pg = pd.get_mesh("tp").get_group()
+            self.assertEqual(spmd.MeshAxis.of(dp_shard_pg), spmd.MeshAxis.of(4, 2))
+            self.assertEqual(spmd.MeshAxis.of(tp_pg), spmd.MeshAxis.of(2, 1))
+            self.assertTrue(
+                spmd.MeshAxis.of(dp_shard_pg).isorthogonal(spmd.MeshAxis.of(tp_pg))
+            )
+
+    @with_comms
+    def test_inferring_axes_from_ranks_is_not_orthogonal(self):
+        """Documents the failure mode the registration guards against.
+
+        Dropping the registered axes makes spmd_types fall back to inferring
+        them from global ranks; on ranks whose dp_shard group is ``[2, 5]`` or
+        ``[3, 4]`` the inferred stride (3 or 1) lands inside the tp axis's span.
+        """
+        from spmd_types import _mesh_axis
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_topology():
+                stack.enter_context(p)
+            # 2x4: dp_shard groups are the snake's columns [0, 7], [1, 6],
+            # [2, 5], [3, 4]; tp is a contiguous 4:1 row.
+            pd = self._build(dp_shard=2, tp=4)
+            dense = pd.spmd_dense_mesh()
+            self._assert_mesh_typechecks(dense)
+
+            _mesh_axis._reset()
+            try:
+                failed = False
+                try:
+                    self._assert_mesh_typechecks(dense)
+                except spmd.SpmdTypeError:
+                    failed = True
+                shard_ranks = sorted(
+                    dist.get_process_group_ranks(pd.get_mesh("dp_shard").get_group())
+                )
+                # Groups [0, 7] and [1, 6] infer strides 7 and 5, which clear
+                # tp's 0..3 span; [2, 5] and [3, 4] infer 3 and 1, which do not.
+                self.assertEqual(failed, shard_ranks in ([2, 5], [3, 4]), shard_ranks)
+            finally:
+                # Restore the logical axes so later tests see a sane cache.
+                pd.register_spmd_axes()
+            self._assert_mesh_typechecks(dense)
 
 
 if __name__ == "__main__":

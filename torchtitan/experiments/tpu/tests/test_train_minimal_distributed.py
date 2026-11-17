@@ -255,6 +255,30 @@ class TrainMinimalDistributedTest(
           param_atol=1e-2,
           param_rtol=1e-3,
       ),
+      # The same (dp_replicate, dp_shard, cp) mesh over the topology-ordered
+      # rank permutation, checked for parity against the CPU reference. Every
+      # multi-axis mesh failed spmd_types' orthogonality check under that
+      # permutation (b/587033846). TPU only: the flag is a no-op elsewhere.
+      dict(
+          testcase_name="qwen3_hsdp_cp2_all_gather_topo_mesh",
+          module="qwen3",
+          config="qwen3_debugmodel_allgather_cp2",
+          data_parallel_replicate_degree=2,
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.enable_tpu_topo_mesh"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
       # torch.compile (skipped on CPU) with TPUSelectiveAC and the Tokamax
       # Splash kernel, exercising set_local_attention, cp_rank propagation, and
       # head-tail mask slicing end-to-end against the CPU reference.

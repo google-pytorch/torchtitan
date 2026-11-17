@@ -707,6 +707,62 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
+      # qwen3_5 CP: CP full attention + head-parallel GatedDeltaNet. The debug
+      # models have 2 GatedDeltaNet key heads, so cp=2. Eager TPU runs with
+      # dp_shard > 1 can hit the torch_tpu subgroup all-to-all issue noted in
+      # test_train_minimal_distributed (a non-finite step fails the run).
+      dict(
+          testcase_name="qwen3_5_cp2_all_gather",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+      ),
+      dict(
+          testcase_name="qwen3_5_cp2_ulysses",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+      ),
+      # FSDP2 over the flattened (dp_shard, cp) mesh instead of SimpleFSDP.
+      dict(
+          testcase_name="qwen3_5_fsdp_cp2_all_gather",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.no-use_simple_fsdp"],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_cp2_all_gather_splash",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--splash_attention_kernel.use_splash_attention_kernel"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_cp2_ulysses_splash",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--splash_attention_kernel.use_splash_attention_kernel"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
   ])
   def test_train_distributed(
       self,

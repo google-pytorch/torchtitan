@@ -439,6 +439,60 @@ def test_pallas_padding_keeps_unrouted_tail_rows_out_of_the_last_expert(
         torch.testing.assert_close(grad, want, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "tile_m, tgmm_m, w2_tgmm_m, padded_rows",
+    [
+        # M tiles that divide each other pad to the largest one.
+        (128, 512, 256, 512),
+        # Twice the largest tile is still allowed: lcm(256, 384) = 768.
+        (256, 384, 384, 768),
+        # lcm(384, 512) = 1536 is three times the largest tile.
+        (384, 512, 512, None),
+    ],
+)
+def test_pallas_row_alignment_is_capped_at_twice_the_largest_m_tile(
+    tile_m, tgmm_m, w2_tgmm_m, padded_rows
+):
+    """The rows are padded to the lcm of the M tiles, at most twice the largest.
+
+    Tiles that divide each other, like the power-of-two tiles every recipe
+    uses, need only the largest tile. Others can need a large multiple of it,
+    all zero rows, so the experts refuse them before calling a kernel.
+    """
+    experts = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        pallas_grouped_mm_tile_m=tile_m,
+        pallas_grouped_mm_tgmm_tiling=(tgmm_m, 0, 0),
+        pallas_grouped_mm_w2_tgmm_tiling=(w2_tgmm_m, 0, 0),
+    ).build()
+    for param in experts.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    x = torch.randn(7, 16)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+    kernel_rows = []
+
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        kernel_rows.append(x.shape[0])
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    with patch(
+        "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ):
+        if padded_rows is None:
+            with pytest.raises(ValueError, match="lcm, 1536, more than twice"):
+                experts.forward(x, counts)
+        else:
+            experts.forward(x, counts)
+
+    assert kernel_rows == ([] if padded_rows is None else [padded_rows] * 3)
+
+
 def test_kernel_native_layout_preserves_initialization_and_state_dict():
     param_init = {
         "w1_EFD": lambda x: torch.nn.init.normal_(x, std=0.02),

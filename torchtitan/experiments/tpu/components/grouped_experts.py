@@ -326,11 +326,17 @@ class TpuGroupedExperts(GroupedExperts):
         # group over them instead would also pull in any rows between that sum
         # and num_rows, such as the stale tail of a static-size EP receive
         # buffer. A no-op for aligned batches.
-        row_align = math.lcm(
-            tile_m,
-            max(1, tgmm_tiling[0]),
-            max(1, w2_tgmm_tiling[0]),
-        )
+        row_tiles = (tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0]))
+        row_align = math.lcm(*row_tiles)
+        # M tiles that divide each other, like powers of two, need only the
+        # largest tile. Others can need a large multiple of it, all zero rows,
+        # so refuse an lcm past twice the largest.
+        if row_align > 2 * max(row_tiles):
+            raise ValueError(
+                f"Pallas grouped matmul M tiles {row_tiles} would pad the rows "
+                f"to a multiple of their lcm, {row_align}, more than twice the "
+                "largest tile; use M tiles that divide each other"
+            )
         num_rows = x_bf16.shape[0]
         pad_rows = -num_rows % row_align
         if pad_rows:

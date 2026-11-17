@@ -28,6 +28,7 @@ class TpuQwen35Attention(Qwen35Attention):
       x_TD: torch.Tensor,
       attention_masks: AttentionMasksType | None,
       positions: torch.Tensor | None = None,
+      segment_ids: torch.Tensor | None = None,
   ) -> torch.Tensor:
     num_tokens = x_TD.shape[0]
 
@@ -55,6 +56,9 @@ class TpuQwen35Attention(Qwen35Attention):
     xq_THK = torch.cat([xq_THR, xq_THP], dim=-1)
     xk_THK = torch.cat([xk_THR, xk_THP], dim=-1)
 
+    # `segment_ids` (from `Qwen35Model.forward`, when given) are the ids the
+    # inner attention would derive from `positions`.
+    extra = {} if segment_ids is None else {"segment_ids": segment_ids}
     out_THV = self.inner_attention(
         xq_THK,
         xk_THK,
@@ -64,6 +68,7 @@ class TpuQwen35Attention(Qwen35Attention):
         enable_gqa=self.enable_gqa,
         # TPU: pass `positions`; SDPA / Splash mask packed documents with it.
         positions=positions,
+        **extra,
     ).contiguous()
 
     # Output gating
@@ -84,11 +89,15 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
   class Config(Qwen35TransformerBlock.Config):
     pass
 
+  # `Qwen35Model.forward` computes `segment_ids` once and passes it here.
+  accepts_segment_ids = True
+
   def forward(
       self,
       x_TD: torch.Tensor,
       attention_masks: Qwen35AttentionMaskDict | None,
       positions: torch.Tensor | None = None,
+      segment_ids: torch.Tensor | None = None,
   ) -> torch.Tensor:
     layer_mask = (
         attention_masks[self.attn_mask_key]
@@ -96,8 +105,12 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
         else None
     )
     h_TD = self.attention_norm(x_TD)
-    # TPU: both layer types get `positions` (upstream: full attention only).
-    h_TD = self.attn(h_TD, layer_mask, positions)
+    # TPU: both layer types get `positions` (upstream: full attention only),
+    # and the per-step `segment_ids` when the model computed them.
+    if segment_ids is None:
+      h_TD = self.attn(h_TD, layer_mask, positions)
+    else:
+      h_TD = self.attn(h_TD, layer_mask, positions, segment_ids=segment_ids)
     x_TD = x_TD + h_TD
 
     h_TD = self.ffn_norm(x_TD)

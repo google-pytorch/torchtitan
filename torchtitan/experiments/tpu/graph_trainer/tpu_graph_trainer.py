@@ -20,7 +20,7 @@ Note there are 2 ways of compiling the optimizer graph on TPU:
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 import logging
 import os
@@ -212,6 +212,11 @@ class TpuGraphTrainer(GraphTrainer):
                 final_step=config.training.steps,
             )
 
+        # Capacity-bounded EP: compiled steps return each MoE layer's dropped
+        # and total routes as one extra output, kept here for logging.
+        self._ep_drop_stats_L2: torch.Tensor | None = None
+        self._ep_drop_stats_enabled = self._configure_ep_drop_stats(config)
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
@@ -222,6 +227,100 @@ class TpuGraphTrainer(GraphTrainer):
             self._train_step_optimizer_in_graph(data_iterator)
         if self._mfu_benchmark is not None:
             self._mfu_benchmark.record(self.step, self.ntokens_seen)
+        if self.step in (1, 5, self.config.training.steps):
+            self._maybe_log_ep_drop_stats()
+
+    def _configure_ep_drop_stats(self, config: Config) -> bool:
+        """Turns on dropped-route counts when any MoE layer is capacity-bounded.
+
+        Returns whether they are collected. Warns when they can't be, since a
+        capacity-bounded run must report its drop rate.
+        """
+        from torchtitan.experiments.tpu.components.token_dispatcher import (  # pylint: disable=g-import-not-at-top
+            configure_ep_drop_stats,
+            ep_capacity_bounded,
+        )
+        from torchtitan.experiments.tpu.graph_trainer.layer_stack import (  # pylint: disable=g-import-not-at-top
+            StackedLayers,
+        )
+
+        if not ep_capacity_bounded(self.model_parts):
+            return False
+        unavailable = None
+        if config.compile.precompile_artifact_dir:
+            unavailable = "a precompiled step does not return them"
+        elif any(
+            isinstance(module, StackedLayers)
+            for part in self.model_parts
+            for module in part.modules()
+        ):
+            unavailable = "stacked layers all run through layer 0's modules"
+        if unavailable is not None:
+            logger.warning(
+                "[ep_capacity] EP is capacity-bounded, but dropped-route stats "
+                f"are unavailable: {unavailable}"
+            )
+            return False
+        return configure_ep_drop_stats(self.model_parts, enabled=True)
+
+    def _pop_ep_drop_stat_outputs(self, outputs: Sequence[Any]) -> Sequence[Any]:
+        """Removes and keeps the output ``_with_ep_drop_stat_outputs`` appended."""
+        if not self._ep_drop_stats_enabled:
+            return outputs
+        self._ep_drop_stats_L2 = outputs[-1]
+        return outputs[:-1]
+
+    def _maybe_log_ep_drop_stats(self) -> torch.Tensor | None:
+        """Logs global and worst-layer EP dropped-route rates when capacity-bounded.
+
+        Sums the latest step's per-layer ``[dropped, total]`` route counts over
+        the batch mesh and logs one line; with gradient accumulation that is
+        the last microbatch. Runs at only a few steps because it waits for the
+        device. Returns the summed int64 ``[n_moe_layers, 2]`` counts on the
+        CPU, or ``None`` when the counts aren't collected.
+        """
+        if not self._ep_drop_stats_enabled:
+            return None
+        local_L2 = self._ep_drop_stats_L2
+        if local_L2 is None:
+            # Untraced step (compile.mode is not aot_fx_trace): the forward
+            # left the counts on the MoE layers.
+            from torchtitan.experiments.tpu.components.token_dispatcher import (  # pylint: disable=g-import-not-at-top
+                collect_ep_drop_stat_tensors,
+            )
+
+            (local_L2,) = collect_ep_drop_stat_tensors(self.model_parts)
+        with torch.no_grad():
+            mesh = (
+                self.parallel_dims.get_mesh("batch")
+                if self.parallel_dims.dp_enabled
+                else None
+            )
+            global_L2 = dist_utils.dist_sum_tensor(
+                local_L2.detach().to(torch.int64), mesh
+            ).cpu()
+        dropped_L = global_L2[:, 0].to(torch.float64)
+        routes_L = global_L2[:, 1].to(torch.float64)
+        total_dropped = int(global_L2[:, 0].sum().item())
+        total_routes = int(global_L2[:, 1].sum().item())
+        if total_routes <= 0:
+            logger.warning(
+                f"[ep_capacity] step={self.step} recorded no routed tokens"
+            )
+            return global_L2
+        layer_rates = dropped_L / routes_L.clamp_min(1.0) * 100.0
+        max_layer_pct = float(layer_rates.max().item())
+        max_layer_idx = int(layer_rates.argmax().item())
+        overall_pct = total_dropped / total_routes * 100.0
+        logger.info(
+            f"[ep_capacity] step={self.step} "
+            f"dropped_routes={total_dropped}/{total_routes} "
+            f"({overall_pct:.4f}%) "
+            f"max_layer_drop={max_layer_pct:.4f}% (moe_layer={max_layer_idx}) "
+            f"layers_with_drops={int((dropped_L > 0).sum().item())}"
+            f"/{global_L2.shape[0]}"
+        )
+        return global_L2
 
     def _register_optimizer_buffers(self) -> None:
         """Register persistent optstate buffers for the in-graph optimizer."""
@@ -400,6 +499,8 @@ class TpuGraphTrainer(GraphTrainer):
                     self.loss_fn,
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
+                if self._ep_drop_stats_enabled:
+                    fwd_bwd_fn = _with_ep_drop_stat_outputs(fwd_bwd_fn, model)
                 maybe_register_blockmask_pytree_node()
                 trace_context = dist_utils.get_spmd_context(
                     parallel_dims=self.parallel_dims,
@@ -451,6 +552,7 @@ class TpuGraphTrainer(GraphTrainer):
                 global_valid_tokens,
                 extra_kwargs,
             )
+        outputs = self._pop_ep_drop_stat_outputs(outputs)
         loss = outputs[0]
         grads = outputs[1 : 1 + len(params)]
         if self._collect_moe_routing_metrics:
@@ -525,6 +627,8 @@ class TpuGraphTrainer(GraphTrainer):
                 max_norm=max_norm,
                 collect_moe_routing_metrics=self._collect_moe_routing_metrics,
             )
+            if self._ep_drop_stats_enabled:
+                fwd_bwd_adamw = _with_ep_drop_stat_outputs(fwd_bwd_adamw, model)
 
             trace_context = dist_utils.get_spmd_context(
                 parallel_dims=self.parallel_dims,
@@ -559,6 +663,7 @@ class TpuGraphTrainer(GraphTrainer):
                 extra_kwargs,
             )
 
+        outputs = self._pop_ep_drop_stat_outputs(outputs)
         loss = outputs[0]
         n = len(self._optstate_param_fqns)
         new_params = outputs[1 : 1 + n]
@@ -584,6 +689,24 @@ class TpuGraphTrainer(GraphTrainer):
         )
 
         return loss
+
+
+def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:
+    """Returns ``step_fn`` with the MoE layers' EP drop stats as a last output.
+
+    ``TpuGraphTrainer._pop_ep_drop_stat_outputs`` removes it after the step
+    runs, so the positions of the step's other outputs don't change.
+    """
+    from torchtitan.experiments.tpu.components.token_dispatcher import (  # pylint: disable=g-import-not-at-top
+        collect_ep_drop_stat_tensors,
+    )
+
+    def step_with_ep_drop_stats(inputs, labels, global_valid_tokens, extra_kwargs):
+        outputs = step_fn(inputs, labels, global_valid_tokens, extra_kwargs)
+        (stats_L2,) = collect_ep_drop_stat_tensors([model])
+        return [*outputs, stats_L2]
+
+    return step_with_ep_drop_stats
 
 
 _GRAD_CLIP_EPS = 1e-6

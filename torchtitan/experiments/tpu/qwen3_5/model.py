@@ -122,4 +122,13 @@ class TpuQwen35Model(Qwen35Model):
 
     def update_from_config(self, *, config, **kwargs) -> None:
       Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
-      use_expert_parallel(self, ep_degree=config.parallelism.expert_parallel_degree)
+      tpu_cfg = getattr(config, "tpu_config", None)
+      use_expert_parallel(
+          self,
+          ep_degree=config.parallelism.expert_parallel_degree,
+          ep_transport=getattr(tpu_cfg, "ep_transport", None),
+          scale_before_down_proj=getattr(
+              tpu_cfg, "ep_scale_before_down_proj", None
+          ),
+          ep_capacity_factor=getattr(tpu_cfg, "ep_capacity_factor", None),
+      )

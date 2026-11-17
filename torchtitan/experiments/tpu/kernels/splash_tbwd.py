@@ -14,14 +14,15 @@ latched weight tile is half empty. This kernel computes S = Q K^T with
 rows = q, which makes P and dS natural [Q, C] weight tiles, and produces dK and
 dV transposed:
 
-  S     = Q    [Q, D] @ K^T [D, C]   (K^T latched, shared by the G heads)
-  P     = exp2(scale * log2(e) * S - lse2) * mask
-          (lse2: the forward's log2-domain logsumexp)
+  S     = Q2   [Q, D] @ K^T [D, C]   (K^T latched, shared by the G heads)
+  P     = exp2(S - lse2) * mask
+          (Q2 = bf16(bf16(Q * scale) * log2(e)): q rounded as the forward
+          rounds it; lse2: the forward's log2-domain logsumexp)
   dP    = dO   [Q, D] @ V^T [D, C]
   dS    = P * (dP - di)   (di = rowsum(o * dO), once per q block)
   dV^T += dO^T [D, Q] @ P   [Q, C]   (P latched; full-width output)
-  dK^T += Q^T  [D, Q] @ dS  [Q, C]   (dS latched)
-  dQ   += dS   [Q, C] @ K   [C, D]
+  dK^T += Q^T  [D, Q] @ dS  [Q, C]   (dS latched; times the scale on write)
+  dQ   += dS   [Q, C] @ K   [C, D]   (times the scale on write)
 
 At D = 128, S and dP still contract over 128 and dQ still has a 128-wide
 output; those half-filled matmuls are 3/5 of the MXU pushes and bound the
@@ -56,6 +57,9 @@ Supported shapes
 `tokamax_splash_attention` routes it to the Tokamax backward (faster there).
 
 - dtype: bf16 q, k, v, dO.
+- v has k's shape (the V head dim equals the q / k head dim). Not supported
+  yet: MLA (DeepSeek-V3, Kimi K2 / K3), whose V head dim differs from Q / K's
+  (e.g. 128 vs 192); MLA also has G = 1, which goes to Tokamax regardless.
 - G = H / N: integer, 1 <= G <= 16.
 - D: multiple of 32, D >= 64; the upper bound comes from VMEM (below).
 - S: multiple of 128, q and kv equal length. Tile (q block = kv block) is
@@ -63,8 +67,9 @@ Supported shapes
 - B: any; the upper bound comes from SMEM (below).
 - VMEM: K / V and the dK^T / dV^T accumulators stay resident for the whole
   sequence, so VMEM grows with D * S. This estimate (`_vmem_bytes`, bytes)
-  must stay <= 60 MiB, with Dl = D rounded up to 128 lanes and
-  kv_buffers = 1 (2 when that fits):
+  must stay within the VMEM limit (the core's VMEM less 4 MiB: 60 MiB on
+  TPU7x), with Dl = D rounded up to 128 lanes and kv_buffers = 1 (2 when that
+  fits):
 
     12 * G * block * D           q^T, dO^T, o^T blocks: bf16, 2 buffers
     + 8 * G * block * Dl         dq block: bf16, 2 buffers, + f32 accumulator
@@ -83,14 +88,31 @@ Supported shapes
     G = 16, D = 256: S <= 1024
   Past the real limit Mosaic fails at compile time with RESOURCE_EXHAUSTED.
 - SMEM: the 8 int32 schedule arrays hold every causal tile, so
-  8 * 4 * B * nb * (nb + 1) / 2 bytes (nb = S / block) must stay
-  <= 1 MiB - 16 KiB.
+  8 * 4 * B * nb * (nb + 1) / 2 bytes (nb = S / block) must stay within the
+  core's SMEM less 16 KiB (1 MiB - 16 KiB on TPU7x).
+
+Hardware
+--------
+The kernel is for head dims below the MXU width (e.g. D = 128 or 64 on a
+256-wide MXU). TPU7x is supported; v6e (also 256 wide) should work but has not
+been measured.
 
 Other limitations
 -----------------
-- Causal attention only: no sliding window, no non-causal masks.
-- No context parallelism (kv length must equal q length).
-- No logit soft cap, no dropout, no attention sinks.
+The transposed formulation does not depend on the mask: causality lives only
+in `build_schedule` (kj <= qi) and in the kernel's element mask. These are
+unimplemented, not fundamental:
+- Causal attention only. A sliding window needs a band condition in both
+  places; non-causal needs neither condition, and a schedule (SMEM) bound of
+  B * nb * nb tiles. VMEM does not depend on the mask.
+- No context parallelism (kv length must equal q length). The resident
+  K / V / dK^T / dV^T and the VMEM estimate would scale with the kv length,
+  and the schedule bound with nq * nk tiles; untested.
+- No attention sinks: P and dS are unchanged when the forward's logsumexp
+  includes the sink, and the sink gradient, -sum_q p_sink * di, can be
+  computed outside the kernel.
+- No logit soft cap (one more tanh per element and a (1 - tanh^2) factor in
+  dS), no dropout.
 - Packed documents only via segment ids (optional; None = one document).
 - Code size: the body has two copies (masked and unmasked tile), each with
   all G heads unrolled, so the program grows with 2 * G. A TPU7x program
@@ -101,12 +123,14 @@ Other limitations
 """
 
 import functools
+import math
 
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import numpy as np
 
 # Tile sizes (q block = kv block), largest first: 512 when it divides S, else
 # 256, else 128. 128-wide tiles half-fill the 256-wide MXU.
@@ -116,10 +140,20 @@ BLOCK_SIZES = (512, 256, 128)
 MIN_HEAD_DIM = 64
 MAX_GROUP_SIZE = 16
 NUM_LANES = 128
-_VMEM_LIMIT_BYTES = 60 << 20
-# TPU7x scalar memory is 1 MiB; the schedule arrays are prefetched into it, next
-# to a few KiB of compiler state.
-_SMEM_BUDGET_BYTES = (1 << 20) - (16 << 10)
+# The Tokamax forward kernel (SplashConfig.use_base2_exp) multiplies q by this
+# constant in q's dtype; the kernel repeats that rounding.
+LOG2E = math.log2(math.e)
+# The transpose fills the MXU only when it is 256 wide (module docstring).
+MIN_MXU_COLUMN_SIZE = 256
+# Generations splash_tbwd has been measured on (module docstring, "Hardware").
+VALIDATED_GENERATIONS = (7,)
+# VMEM / SMEM left for the compiler next to this kernel's buffers. The schedule
+# arrays are prefetched into SMEM, next to a few KiB of compiler state.
+_VMEM_HEADROOM_BYTES = 4 << 20
+_SMEM_RESERVED_BYTES = 16 << 10
+# TPU7x capacities, used when no TPU info is available (shape checks on CPU).
+_DEFAULT_VMEM_CAPACITY_BYTES = 64 << 20
+_DEFAULT_SMEM_CAPACITY_BYTES = 1 << 20
 
 # A BlockSpec index map's result: block indices, one per array dim.
 _BlockIndex = tuple[jax.Array | int, ...]
@@ -279,8 +313,7 @@ def _kernel(
     *,
     group_size: int,
     block: int,
-    log2_scale: float,
-    grad_scale: float,
+    q_scale: float,
 ) -> None:
   del b_ref  # used by the index maps only
   lse2_rows = lse2_GQ if group_size % 8 else lse2_GQ_ref
@@ -292,6 +325,9 @@ def _kernel(
   should_initialize_dkv = b_bounds_start_ref[step].astype(jnp.bool_)
   should_write_dkv = b_bounds_end_ref[step].astype(jnp.bool_)
   kv_start = pl.multiple_of(kj_ref[step] * block, block)
+  q_dtype = q_GDQ_ref.dtype
+  # bf16 q * a bf16 scale is exact in f32, so a bf16 multiply rounds it once.
+  scale_in_q_dtype = float(np.asarray(q_scale, q_dtype)) == q_scale
 
   @pl.when(should_initialize_dkv)
   def _():
@@ -347,13 +383,21 @@ def _kernel(
         di_QC = jnp.broadcast_to(di_Q8[:, j : j + 1], (block, block))
         qt_DQ = q_GDQ_ref[g]
         dot_DQ = do_GDQ_ref[g]
+        # Round q as the forward does before its Q.K (scale in XLA, then the
+        # Tokamax kernel's bf16 `q *= LOG2E`), so that P matches lse2. dK
+        # below uses the unrounded q.
+        if scale_in_q_dtype:
+          qk_DQ = (qt_DQ * q_scale).astype(q_dtype)
+        else:
+          qk_DQ = (qt_DQ.astype(jnp.float32) * q_scale).astype(q_dtype)
+        q2t_DQ = (qk_DQ * LOG2E).astype(q_dtype)
         # S and dP contract dim 0 of the SEQ_MINOR q^T / dO^T tiles; Mosaic
         # transposes them on the XLU, which is idle in this MXU-bound loop
         # (cheaper than also DMA-ing HEAD_DIM_MINOR copies).
         s_QC = lax.dot_general(
-            qt_DQ, kt_DC, tn, preferred_element_type=jnp.float32
+            q2t_DQ, kt_DC, tn, preferred_element_type=jnp.float32
         )
-        p_QC = jnp.exp2(s_QC * log2_scale - lse2_QC)
+        p_QC = jnp.exp2(s_QC - lse2_QC)
         if masked:
           p_QC = jnp.where(mask_QC, p_QC, 0.0)
         dp_QC = lax.dot_general(
@@ -382,11 +426,11 @@ def _kernel(
 
   @pl.when(should_write_dq)
   def _():
-    dq_GQD_ref[...] = (dq_GQD_acc[...] * grad_scale).astype(dq_GQD_ref.dtype)
+    dq_GQD_ref[...] = (dq_GQD_acc[...] * q_scale).astype(dq_GQD_ref.dtype)
 
   @pl.when(should_write_dkv)
   def _():
-    dkt_DS_ref[...] = (dkt_DS_acc[...] * grad_scale).astype(dkt_DS_ref.dtype)
+    dkt_DS_ref[...] = (dkt_DS_acc[...] * q_scale).astype(dkt_DS_ref.dtype)
     dvt_DS_ref[...] = dvt_DS_acc[...].astype(dvt_DS_ref.dtype)
 
 
@@ -404,8 +448,7 @@ def splash_tbwd_call(
     *,
     block: int,
     single_buffer_kv: bool,
-    scale: float,
-    log2e: float,
+    q_scale: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """The pallas_call on kernel layouts.
 
@@ -413,13 +456,11 @@ def splash_tbwd_call(
 
   Args:
     lse2_BNGS: log2-domain logsumexp of the base-2 logits (Tokamax's
-      `logsumexp` residual): lse2 = log2(sum_k 2 ** (scale * log2e * q.k)).
+      `logsumexp` residual): lse2 = log2(sum_k 2 ** (q2 . k)), with
+      q2 = bf16(bf16(q * q_scale) * log2(e)).
     o_BHDS: forward output, for di = rowsum(o * dO).
-    log2e: the constant the forward actually multiplied by, so that P matches
-      lse2: log2(e), or bf16(log2(e)) = 1.4453125 (+1.8e-3) for Tokamax, which
-      multiplies bf16 q by it. dq and dk are still scaled by `scale` only (as
-      Tokamax's backward): also folding log2e's rounding into them moved
-      dq / dk 0.18% further from a dense f32 reference.
+    q_scale: the softmax scale exactly as the forward applied it to q (the
+      product of its bf16-rounded constants); also scales dq and dk.
 
   Returns:
     dq [B, H, S, D], dk^T and dv^T [B, N, D, S], in the input dtype.
@@ -427,7 +468,6 @@ def splash_tbwd_call(
   num_b, num_h, d, s = q_BHDS.shape
   num_kv = k_BNDS.shape[1]
   g = num_h // num_kv
-  num_steps = sched["b"].shape[0]
 
   def q_seq_minor(
       h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
@@ -488,13 +528,9 @@ def splash_tbwd_call(
       pltpu.VMEM((_round_up(g, 8), block), jnp.float32),
       pltpu.VMEM((_round_up(g, 8), block), jnp.float32),
   ]
-  # Static cost estimate, so XLA's latency-hiding scheduler overlaps async
-  # collectives (FSDP reduce-scatters) with this call instead of treating it
-  # as free. With T_max = num_steps (every causal tile, an upper bound on the
-  # active ones):
-  #   flops           = N * T_max * G * 5 matmuls * 2 * block * block * D
-  #   transcendentals = N * T_max * G * block * block   (one exp2 per P entry)
-  #   bytes_accessed  = every operand and output, read / written once
+  # No pl.CostEstimate: on the Qwen3-235B recipe it gave no step-time gain
+  # (4x4x4: 22.237 vs 22.252 s; 8 layers: -0.3%) and, at 8 layers, made XLA
+  # overlap the MoE backward with the activation reloads, +3.5 GiB of HBM.
   operands = (
       q_BHDS,
       do_BHDS,
@@ -506,21 +542,12 @@ def splash_tbwd_call(
       qseg_BSL,
       kvseg_B8S,
   )
-  tile_heads = num_kv * num_steps * g
-  cost = pl.CostEstimate(
-      flops=tile_heads * 5 * 2 * block * block * d,
-      transcendentals=tile_heads * block * block,
-      bytes_accessed=sum(
-          x.size * x.dtype.itemsize for x in (*operands, *out_shape)
-      ),
-  )
   return pl.pallas_call(
       functools.partial(
           _kernel,
           group_size=g,
           block=block,
-          log2_scale=scale * log2e,
-          grad_scale=scale,
+          q_scale=q_scale,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=len(_SCHEDULE_KEYS),
@@ -532,11 +559,61 @@ def splash_tbwd_call(
       out_shape=out_shape,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("arbitrary", "arbitrary"),
-          vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=_vmem_limit_bytes(),
       ),
-      cost_estimate=cost,
       name="splash_tbwd",
   )(*(sched[key] for key in _SCHEDULE_KEYS), *operands)
+
+
+def _tpu_info():
+  """`pltpu.get_tpu_info()`, or None without TPU info (e.g. on CPU)."""
+  try:
+    return pltpu.get_tpu_info()
+  except (AttributeError, RuntimeError, ValueError):
+    return None
+
+
+def _vmem_limit_bytes() -> int:
+  """Scoped VMEM limit of the call: the core's VMEM less some headroom."""
+  info = _tpu_info()
+  capacity = (
+      info.vmem_capacity_bytes
+      if info is not None
+      else _DEFAULT_VMEM_CAPACITY_BYTES
+  )
+  return capacity - _VMEM_HEADROOM_BYTES
+
+
+def _smem_budget_bytes() -> int:
+  """SMEM the schedule arrays may use: the core's SMEM less compiler state."""
+  info = _tpu_info()
+  capacity = (
+      info.smem_capacity_bytes
+      if info is not None
+      else _DEFAULT_SMEM_CAPACITY_BYTES
+  )
+  return capacity - _SMEM_RESERVED_BYTES
+
+
+def hardware_unsupported_reason() -> str | None:
+  """Why splash_tbwd should not run on the attached TPU, or None.
+
+  See "Hardware" in the module docstring.
+  """
+  info = _tpu_info()
+  if info is None:
+    return "no TPU info is available (pltpu.get_tpu_info failed)"
+  if info.mxu_column_size < MIN_MXU_COLUMN_SIZE:
+    return (
+        f"it needs a {MIN_MXU_COLUMN_SIZE}-wide MXU to beat Tokamax; this TPU's"
+        f" is {info.mxu_column_size} wide"
+    )
+  if info.generation not in VALIDATED_GENERATIONS:
+    return (
+        f"it is validated on TPU generations {VALIDATED_GENERATIONS} only;"
+        f" got generation {info.generation}"
+    )
+  return None
 
 
 def _round_up(x: int, multiple: int) -> int:
@@ -571,12 +648,16 @@ def _vmem_bytes(
 
 
 def unsupported_reason(
-    q_shape: tuple[int, ...], k_shape: tuple[int, ...], dtype: jnp.dtype
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+    dtype: jnp.dtype,
 ) -> str | None:
-  """Why splash_tbwd cannot run q [B, S, H, D] / k [B, S, N, D], or None.
+  """Why splash_tbwd cannot run q [B, S, H, D] / k, v [B, S, N, D], or None.
 
   Checks the "Supported shapes" in the module docstring. The caller checks the
-  attention itself (causal, no window, no context parallelism).
+  attention itself (causal, no window, no context parallelism) and the
+  hardware (`hardware_unsupported_reason`).
   """
   if len(q_shape) != 4 or len(k_shape) != 4:
     return (
@@ -589,6 +670,9 @@ def unsupported_reason(
         f"k {k_shape} does not match q {q_shape} (self-attention, equal"
         " lengths)"
     )
+  if tuple(v_shape) != tuple(k_shape):
+    # The V, O, dO and dV blocks are sized from q's head dim.
+    return f"needs v of k's shape {k_shape}; got {v_shape}"
   if dtype != jnp.bfloat16:
     return f"needs bf16 q / k / v / dO; got {dtype}"
   if num_h % num_kv != 0 or num_h // num_kv > MAX_GROUP_SIZE:
@@ -603,18 +687,20 @@ def unsupported_reason(
     return f"needs seq_len a multiple of {BLOCK_SIZES[-1]}; got {s}"
   g = num_h // num_kv
   vmem = _vmem_bytes(d, g, s, block, single_buffer_kv=True)
-  if vmem > _VMEM_LIMIT_BYTES:
+  vmem_limit = _vmem_limit_bytes()
+  if vmem > vmem_limit:
     return (
         f"head_dim {d}, {g} q heads per kv head and seq_len {s} need"
         f" ~{vmem >> 20} MiB of VMEM "
-        f"(limit {_VMEM_LIMIT_BYTES >> 20} MiB)"
+        f"(limit {vmem_limit >> 20} MiB)"
     )
   smem = len(_SCHEDULE_KEYS) * 4 * _num_steps(num_b, s, block)
-  if smem > _SMEM_BUDGET_BYTES:
+  smem_budget = _smem_budget_bytes()
+  if smem > smem_budget:
     return (
         f"batch {num_b} x seq_len {s} needs a {smem >> 10} KiB tile"
         " schedule in SMEM "
-        f"(limit {_SMEM_BUDGET_BYTES >> 10} KiB)"
+        f"(limit {smem_budget >> 10} KiB)"
     )
   return None
 
@@ -628,22 +714,23 @@ def transposed_attention_bwd(
     do_BSHD: jax.Array,
     segment_ids_BS: jax.Array | None,
     *,
-    scale: float,
-    log2e: float,
+    q_scale: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """dq, dk, dv of causal attention, in the model layout [B, S, heads, D].
 
   Args:
-    q_BSHD, k_BSND, v_BSND, out_BSHD, do_BSHD: forward inputs, forward output
-      and output gradient.
+    q_BSHD, k_BSND, v_BSND, out_BSHD, do_BSHD: forward inputs (q unscaled),
+      forward output and output gradient.
     lse2_BHS: the forward's log2-domain logsumexp (see `splash_tbwd_call`).
     segment_ids_BS: document id per token; None means one document per example.
-    scale, log2e: the constants the forward used (see `splash_tbwd_call`).
+    q_scale: see `splash_tbwd_call`.
 
   Raises:
     ValueError: for shapes outside "Supported shapes" (module docstring).
   """
-  reason = unsupported_reason(q_BSHD.shape, k_BSND.shape, q_BSHD.dtype)
+  reason = unsupported_reason(
+      q_BSHD.shape, k_BSND.shape, v_BSND.shape, q_BSHD.dtype
+  )
   if reason is not None:
     raise ValueError(f"splash_tbwd {reason}.")
   num_b, s, num_h, d = q_BSHD.shape
@@ -658,7 +745,7 @@ def transposed_attention_bwd(
   block = block_size(s)
   single_buffer_kv = (
       _vmem_bytes(d, num_h // num_kv, s, block, single_buffer_kv=False)
-      > _VMEM_LIMIT_BYTES
+      > _vmem_limit_bytes()
   )
   sched = build_schedule(segment_ids_BS, block)
   seg_BS = segment_ids_BS.astype(jnp.int32)
@@ -677,8 +764,7 @@ def transposed_attention_bwd(
       jnp.broadcast_to(seg_BS[:, None, :], (num_b, 8, s)),
       block=block,
       single_buffer_kv=single_buffer_kv,
-      scale=scale,
-      log2e=log2e,
+      q_scale=q_scale,
   )
   return (
       jnp.swapaxes(dq_BHSD, 1, 2),

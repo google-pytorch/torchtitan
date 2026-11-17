@@ -399,26 +399,50 @@ def jax_attention_fwd(
 def _transposed_bwd_unsupported_reason(
     q: jax.Array,
     k: jax.Array,
+    v: jax.Array,
     is_causal: bool,
     local_window_size: int | None,
 ) -> str | None:
   """Why splash_tbwd cannot compute this backward, or None if it can."""
   if not is_causal or local_window_size is not None:
+    # Not fundamental (see "Other limitations" in splash_tbwd.py), but no
+    # model needs it from splash_tbwd yet.
     return (
         "it implements causal attention without a window; got"
         f" is_causal={is_causal}, local_window_size={local_window_size}"
     )
   if k.shape[1] != q.shape[1]:
+    # Not fundamental either, but splash_tbwd's VMEM / SMEM limits assume
+    # kv_seq_len == seq_len (K / V / dK / dV stay resident along the kv
+    # length) and the head-tail CP path is untested with it.
     return (
         "it does not support context parallelism (kv_seq_len"
         f" {k.shape[1]} != seq_len {q.shape[1]})"
     )
+  hardware_reason = splash_tbwd.hardware_unsupported_reason()
+  if hardware_reason is not None:
+    return hardware_reason
   if q.shape[2] == k.shape[2]:
     # Supported, but slower: with one q head per step, the per-step work
     # (K / V tile loads, lse / di, step overhead) is not shared across heads.
     # TPU7x shape sweep: 0.51-0.90x Tokamax's best backward config.
     return "with one q head per kv head the Tokamax backward is faster"
-  return splash_tbwd.unsupported_reason(q.shape, k.shape, q.dtype)
+  return splash_tbwd.unsupported_reason(q.shape, k.shape, v.shape, q.dtype)
+
+
+def _forward_q_scale(q: jax.Array, scale: float) -> float:
+  """The softmax scale as the forward applies it to q, before the Tokamax kernel.
+
+  jax_attention_fwd multiplies q by scale / default_scale when the scale is not
+  the default, then splash_fn by 1 / sqrt(head_dim); both constants are rounded
+  to q.dtype (bf16(1/sqrt(128)) is 1.1e-4 below the exact value). XLA fuses the
+  two multiplies and rounds q once, so their product (exact in f32) is enough.
+  """
+  default_scale = 1.0 / math.sqrt(q.shape[-1])
+  q_scale = float(np.asarray(default_scale, dtype=q.dtype))
+  if abs(scale - default_scale) > 1e-6:
+    q_scale *= float(np.asarray(scale / default_scale, dtype=q.dtype))
+  return q_scale
 
 
 @functools.cache
@@ -474,7 +498,7 @@ def jax_attention_bwd(
 
   tbwd_reason = (
       _transposed_bwd_unsupported_reason(
-          q, k, is_causal, local_window_size_opt
+          q, k, v, is_causal, local_window_size_opt
       )
       if use_transposed_bwd
       else None
@@ -482,31 +506,12 @@ def jax_attention_bwd(
   if tbwd_reason is not None:
     _warn_transposed_bwd_fallback(tbwd_reason)
   if use_transposed_bwd and tbwd_reason is None:
-    # Tokamax's logsumexp residual is already in the log2 domain splash_tbwd
-    # takes (SplashConfig.use_base2_exp, the default): it is the log2-sum-exp2
-    # of q_scaled.k * log2(e). splash_tbwd applies the scale itself (so q stays
-    # unscaled and dq needs no chain-rule factor), but it must be the scale the
-    # forward actually used: splash_fn multiplies q by 1/sqrt(head_dim) held in
-    # q.dtype, and bf16(1/sqrt(128)) is 1.1e-4 below the exact value. With the
-    # exact value P would no longer match the saved lse and the gradients
-    # would carry a systematic bias (measured: step-1 grad-norm 1.1e-3 rel).
-    # A non-default scale is applied in jax_attention_fwd as
-    # q_tr * (scale / default_scale): a bf16 multiply that rounds the ratio to
-    # bf16 too (e.g. 0.5657 -> 0.5664, +1.3e-3), so use the rounded ratio.
-    default_scale = 1.0 / math.sqrt(q.shape[-1])
-    forward_scale = float(np.asarray(default_scale, dtype=q.dtype))
-    if abs(scale - default_scale) > 1e-6:
-      forward_scale *= float(
-          np.asarray(scale / default_scale, dtype=q.dtype)
-      )
-    # Likewise the Tokamax forward kernel (use_base2_exp) multiplies bf16 q by
-    # log2(e), i.e. by bf16(log2(e)) = 1.4453125, 1.8e-3 above log2(e). The
-    # exact constant left P 0.2% low against the saved lse (measured: dq/dk/dv
-    # biased by -2.1e-3, step-1 grad-norm 1.2e-3 rel off the Tokamax backward).
-    forward_log2e = float(np.asarray(math.log2(math.e), dtype=q.dtype))
+    # Tokamax's logsumexp residual is in the log2 domain splash_tbwd takes
+    # (SplashConfig.use_base2_exp, the default). splash_tbwd rounds q as the
+    # forward does to rebuild P from it, so P matches the saved lse.
     return splash_tbwd.transposed_attention_bwd(
-        q, k, v, out, logsumexp, grad_out, segment_ids, scale=forward_scale,
-        log2e=forward_log2e,
+        q, k, v, out, logsumexp, grad_out, segment_ids,
+        q_scale=_forward_q_scale(q, scale),
     )
 
   # 1. Transpose/Squeeze inputs inside JAX

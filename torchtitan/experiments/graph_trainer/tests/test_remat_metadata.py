@@ -70,7 +70,7 @@ class TestRematMetadata(TestCase):
             return torch.nn.functional.mse_loss(prediction, target)
 
         def full_step(x: torch.Tensor, target: torch.Tensor) -> list[torch.Tensor]:
-            loss = compute_annotated_loss(loss_fn, model(x), target)
+            loss, _ = compute_annotated_loss(loss_fn, model(x), target)
             named_params = [
                 (name, parameter)
                 for name, parameter in model.named_parameters(remove_duplicate=False)

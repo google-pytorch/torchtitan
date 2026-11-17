@@ -16,6 +16,10 @@ Wraps upstream ``torchtitan.models.qwen3_5`` for the TPU lane
 * Swaps every full-attention layer for ``TpuQwen35Attention`` with a
   ``SlidingWindowScaledDotProductInnerAttention`` without a window, so packed
   documents are masked on SDPA and the Splash patch sees ``positions``.
+* Uses ``TpuQwen35Model``, whose context-parallel input sharding goes through
+  the CP inner attention's ``cp_shard`` (as core ``Decoder`` does). CP recipes
+  also run the GatedDeltaNet head-parallel (``cp_gated_delta``; see
+  ``config_registry._qwen35_cp``).
 * Turns off the expert-bias balancer (``load_balance_coeff=None``): HF
   checkpoints, and so ``Qwen35StateDictAdapter``, have no ``expert_bias``.
 * Gives the GatedDeltaNet's depthwise convolutions a ``param_init`` (the
@@ -34,6 +38,9 @@ from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScale
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+
+# Registers the GatedDeltaNet CP validator with validate_tpu_context_parallel.
+from torchtitan.experiments.tpu.qwen3_5 import cp_gated_delta  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
     TpuGatedDeltaKernel,
     TpuGatedDeltaNet,

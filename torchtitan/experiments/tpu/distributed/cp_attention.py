@@ -62,7 +62,12 @@ __all__ = [
     "KVAllGatherCPInnerAttention",
     "KVAllGatherCPScaledDotProductInnerAttention",
     "KVAllGatherCPVarlenInnerAttention",
+    "cp_all_gather",
+    "cp_all_to_all",
+    "cp_rank_tensor",
     "reorder_sequence",
+    "register_tpu_cp_inner_attention",
+    "register_tpu_cp_validator",
     "tpu_cp_inner_attention",
     "tpu_cp_load_balancer",
     "validate_tpu_context_parallel",
@@ -109,6 +114,38 @@ def _cache_cp_rank_for_mesh(cp_mesh: DeviceMesh) -> None:
   key = (dev, r)
   if key not in _CP_RANK_CACHE:
     _CP_RANK_CACHE[key] = torch.tensor([r], dtype=torch.int32, device=dev)
+
+
+def cp_rank_tensor(device: torch.device | str, group: Any) -> torch.Tensor:
+  """This rank's index in the CP ``group`` as a ``(1,)`` int32 tensor.
+
+  Rank-dependent selections (``index_select`` with it) keep one compiled graph
+  for every rank: the tensor cached by ``cp_shard`` (or by an earlier eager
+  call) becomes a graph input instead of a rank constant baked into the graph.
+
+  Args:
+    device: The device the tensor lives on.
+    group: The CP process group.
+
+  Returns:
+    The cached rank tensor.
+  """
+  r = int(group.rank())
+  dev = _normalize_cp_device(device)
+  key = (dev, r)
+  cached = _CP_RANK_CACHE.get(key)
+  if cached is not None:
+    return cached
+  if _tracing():
+    logger.debug(
+        "CP rank cache miss while tracing for key=%s; falling back to inline"
+        " tensor creation.",
+        key,
+    )
+  t = torch.tensor([r], dtype=torch.int32, device=dev)
+  if not _tracing():
+    _CP_RANK_CACHE[key] = t
+  return t
 
 
 def _type_checking() -> bool:
@@ -200,6 +237,29 @@ def _all_gather_kv(
         backward_options={"op_dtype": reduce_dtype},
     )
   return _AllGatherKV.apply(x, group, seq_dim, reduce_dtype)
+
+
+def cp_all_to_all(
+    x: torch.Tensor, group: Any, *, src_dim: int, dst_dim: int
+) -> torch.Tensor:
+  """Reshards ``x`` from ``S(src_dim)`` to ``S(dst_dim)`` over the CP ``group``.
+
+  Differentiable (the backward is the reverse all-to-all), eager
+  (``spmd.redistribute``) or traced (functional collectives). The received
+  chunks are concatenated along ``src_dim`` in rank order.
+  """
+  return _all_to_all(x, group, src_dim=src_dim, dst_dim=dst_dim)
+
+
+@spmd.no_typecheck()
+def cp_all_gather(x: torch.Tensor, group: Any, *, dim: int = 0) -> torch.Tensor:
+  """All-gathers ``x`` along ``dim`` over the CP ``group``, in rank order.
+
+  Forward only (for integer metadata such as ``positions``): no gradient.
+  """
+  if _tracing():
+    return _wait(funcol.all_gather_tensor(x, dim, group))
+  return spmd.redistribute(x, group, src=spmd.S(dim), dst=spmd.R)
 
 
 def reorder_sequence(
@@ -339,6 +399,9 @@ class UlyssesCPInnerAttention(_TPUCPInnerAttention):
     # no per-rank causal imbalance to load-balance. Precompute full-sequence
     # segment_ids once per step before sharding positions so Decoder.forward
     # can thread them into every layer without per-layer positions all-gathers.
+    # Cache the CP rank tensor before tracing for head-parallel layers that
+    # select their rank's heads (e.g. Qwen3.5's GatedDeltaNet).
+    _cache_cp_rank_for_mesh(cp_mesh)
     _patch_segment_ids_from_positions()
     raw_positions = input_dict.get("positions")
     full_segment_ids = (
@@ -475,22 +538,7 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
   def _get_cp_rank_tensor(
       self, device: torch.device, group: Any
   ) -> torch.Tensor:
-    r = int(group.rank())
-    dev = _normalize_cp_device(device)
-    key = (dev, r)
-    cached = _CP_RANK_CACHE.get(key)
-    if cached is not None:
-      return cached
-    if _tracing():
-      logger.debug(
-          "CP rank cache miss while tracing for key=%s; falling back to inline"
-          " tensor creation.",
-          key,
-      )
-    t = torch.tensor([r], dtype=torch.int32, device=dev)
-    if not _tracing():
-      _CP_RANK_CACHE[key] = t
-    return t
+    return cp_rank_tensor(device, group)
 
   @classmethod
   def cp_shard(
@@ -891,8 +939,10 @@ class KVAllGatherCPVarlenInnerAttention(
 
 CPStrategy = Literal["ulysses", "all_gather"]
 
-# (single-device inner attention, Ulysses CP, KV All-Gather CP)
-_CP_INNER_ATTENTIONS = (
+# (single-device inner attention, Ulysses CP, KV All-Gather CP). Model packages
+# add CP variants of their own inner attentions with
+# `register_tpu_cp_inner_attention`.
+_CP_INNER_ATTENTIONS: list[tuple[type[Any], type[Any], type[Any]]] = [
     (
         ScaledDotProductInnerAttention,
         UlyssesCPScaledDotProductInnerAttention,
@@ -903,7 +953,62 @@ _CP_INNER_ATTENTIONS = (
         UlyssesCPVarlenInnerAttention,
         KVAllGatherCPVarlenInnerAttention,
     ),
-)
+]
+
+
+def register_tpu_cp_inner_attention(
+    single: type[Any], ulysses: type[Any], all_gather: type[Any]
+) -> None:
+  """Registers the Ulysses and KV all-gather CP versions of ``single``.
+
+  ``tpu_cp_inner_attention`` then maps ``single`` to them, and
+  ``revert_tpu_context_parallel`` maps them back. ``ulysses`` and
+  ``all_gather`` must subclass ``single`` and ``UlyssesCPInnerAttention`` /
+  ``KVAllGatherCPInnerAttention``.
+
+  Args:
+    single: A single-device inner attention class.
+    ulysses: Its Ulysses CP version.
+    all_gather: Its KV all-gather CP version.
+  """
+  for cls, mixin in (
+      (ulysses, UlyssesCPInnerAttention),
+      (all_gather, KVAllGatherCPInnerAttention),
+  ):
+    if not (issubclass(cls, single) and issubclass(cls, mixin)):
+      raise TypeError(
+          f"{cls.__qualname__} must subclass {single.__qualname__} and"
+          f" {mixin.__qualname__}."
+      )
+  entry = (single, ulysses, all_gather)
+  if entry not in _CP_INNER_ATTENTIONS:
+    _CP_INNER_ATTENTIONS.append(entry)
+
+
+# Extra CP checks for layers other than attention (e.g. Qwen3.5's
+# GatedDeltaNet), registered by the model packages that define those layers;
+# each is called as fn(model, parallelism) by validate_tpu_context_parallel.
+_TPU_CP_VALIDATORS: list[Callable[[Any, Any], None]] = []
+
+
+def register_tpu_cp_validator(
+    fn: Callable[[Any, Any], None],
+) -> Callable[[Any, Any], None]:
+  """Registers ``fn(model, parallelism)`` to run in ``validate_tpu_context_parallel``.
+
+  Lets a model package reject CP configs of its own layers (e.g. a sequence
+  mixer that is not CP-aware) instead of training them on token shards as if
+  they were whole sequences. Usable as a decorator.
+
+  Args:
+    fn: Raises if the model config is invalid under the parallelism config.
+
+  Returns:
+    ``fn``.
+  """
+  if fn not in _TPU_CP_VALIDATORS:
+    _TPU_CP_VALIDATORS.append(fn)
+  return fn
 
 
 def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
@@ -920,10 +1025,13 @@ def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
   for single, ulysses, all_gather in _CP_INNER_ATTENTIONS:
     if base is single:
       return all_gather if strategy == "all_gather" else ulysses
+  supported = ", ".join(
+      single.__qualname__ for single, _, _ in _CP_INNER_ATTENTIONS
+  )
   raise ValueError(
       f"No TPU CP inner attention for {base.__qualname__}; TPU CP supports"
-      " ScaledDotProductInnerAttention and VarlenInnerAttention (Flex"
-      " attention does not run on TPU)."
+      f" {supported} (Flex attention does not run on TPU; see"
+      " register_tpu_cp_inner_attention)."
   )
 
 
@@ -1061,7 +1169,9 @@ def validate_tpu_context_parallel(
   CP + TP/EP under FSDP2 on torch builds that ``install_tpu_cp_patches``
   cannot fix and, given ``training`` (and ``splash_attention_kernel``), the
   sequence lengths each strategy can shard and the Splash block sizes for
-  them. Does not modify anything.
+  them. Then runs the validators model packages registered with
+  ``register_tpu_cp_validator`` for their non-attention layers (e.g. Qwen3.5's
+  GatedDeltaNet). Does not modify anything.
   """
   cp = parallelism.context_parallel_degree
   if cp <= 1:
@@ -1093,8 +1203,11 @@ def validate_tpu_context_parallel(
     if issubclass(owner, KVAllGatherCPInnerAttention):
       strategy = "all_gather"
       expected_lb = "headtail"
+      # Varlen windows are (left, right) tuples; SDPA-based inner attentions
+      # (e.g. SlidingWindowScaledDotProductInnerAttention) keep a causal int
+      # window or None.
       window = getattr(attn.inner_attention, "window_size", (-1, 0))
-      if window[1] != 0:
+      if isinstance(window, tuple) and window[1] != 0:
         raise NotImplementedError(
             f"{fqn}.inner_attention: KV all-gather CP supports causal"
             f" attention only, i.e. window_size=(left, 0); got {window}."
@@ -1117,6 +1230,8 @@ def validate_tpu_context_parallel(
       _validate_sequence_lengths(
           strategy, cp, training, splash_attention_kernel
       )
+  for validator in _TPU_CP_VALIDATORS:
+    validator(model, parallelism)
 
 
 def revert_tpu_context_parallel(model: Any) -> None:

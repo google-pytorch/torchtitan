@@ -48,7 +48,6 @@ class _FakeParallelDims:
     self.dp_shard_enabled = True
     self.cp_enabled = False
     self.ep_enabled = False
-    self.spmd_backend = "spmd_types"
 
   def get_mesh(self, names):
     return self._mesh

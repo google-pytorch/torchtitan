@@ -1,8 +1,6 @@
 # Copyright 2026 Google LLC
 """Parallelization strategies for Mamba-3 architecture on TPU."""
 
-# pylint: disable=g-import-not-at-top
-
 from torchtitan.config import CompileConfig
 from torchtitan.config import ParallelismConfig
 from torchtitan.config import TORCH_DTYPE_MAP
@@ -11,6 +9,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan.distributed.fsdp import resolve_fsdp_mesh
 from .model import Mamba3LM
 
 
@@ -47,18 +46,7 @@ def parallelize_mamba3(
   if skip_dp:
     return model
 
-  if parallelism.spmd_backend == "spmd_types":
-    from torchtitan.distributed.fsdp import resolve_fsdp_mesh
-
-    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-  else:
-    names = (
-        ["dp_replicate", "fsdp"]
-        if parallel_dims.dp_replicate_enabled
-        else ["fsdp"]
-    )
-    dp_mesh = parallel_dims.get_mesh(names)
-    dp_mesh_dims = None
+  dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
 
   apply_fsdp_to_decoder(
       model,

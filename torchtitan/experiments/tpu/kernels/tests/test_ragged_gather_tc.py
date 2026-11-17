@@ -1,5 +1,7 @@
 """Unit and accelerator tests for TensorCore ragged gather / gather-reduce kernels."""
 
+import contextlib
+import os
 from types import SimpleNamespace
 from unittest import mock
 
@@ -60,7 +62,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
       self.skipTest("Pallas ragged_gather_tc kernels require TPU.")
 
   def test_tpu_generation_device_name_parsing(self):
-    self.addCleanup(ragged_gather_tc._tpu_generation.cache_clear)
+    self.addCleanup(ragged_gather_tc._tpu_gen_cache.clear)
     cases = (
         ("TPU v5 lite", 5),
         ("TPU v6e", 6),
@@ -70,7 +72,7 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
         ("unknown accelerator", None),
     )
     for dev_name, expected in cases:
-      ragged_gather_tc._tpu_generation.cache_clear()
+      ragged_gather_tc._tpu_gen_cache.clear()
       fake_tpu = SimpleNamespace(
           get_device_properties=lambda n=dev_name: SimpleNamespace(name=n)
       )
@@ -80,12 +82,55 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
       ):
         self.assertEqual(ragged_gather_tc._tpu_generation(), expected)
 
-    ragged_gather_tc._tpu_generation.cache_clear()
+    ragged_gather_tc._tpu_gen_cache.clear()
     failing_tpu = SimpleNamespace(
         get_device_properties=mock.Mock(side_effect=RuntimeError("no device"))
     )
     with mock.patch.object(torch, "tpu", failing_tpu, create=True):
       self.assertIsNone(ragged_gather_tc._tpu_generation())
+
+  def test_vmem_helpers_compile_fullgraph_without_tracing_device_query(self):
+    """Tests the VMEM helpers under per-layer ``torch.compile(fullgraph=True)``.
+
+    The regular TPU trainer's ``--compile.enable`` compiles every block with
+    ``fullgraph=True``, and Ring-of-Experts dispatch sizes its Pallas blocks
+    from the TPU generation inside the block. torch_tpu's device query scans
+    the host's devices, which Dynamo cannot trace, so the generation must be
+    evaluated once at trace time instead.
+    """
+    self.addCleanup(ragged_gather_tc._tpu_gen_cache.clear)
+    self.addCleanup(torch._dynamo.reset)
+    ragged_gather_tc._tpu_gen_cache.clear()
+
+    def get_device_properties():
+      os.listdir(".")  # Untraceable by Dynamo, like torch_tpu's device scan.
+      return SimpleNamespace(name="TPU7x")
+
+    def block_sizes(x: torch.Tensor):
+      reduce_block = ragged_gather_tc.safe_reduce_block_size(
+          hidden_dim=2048, itemsize=2, top_k=8
+      )
+      return x * reduce_block, ragged_gather_tc._tpu_vmem_limit_bytes()
+
+    # Replace only the device query: Dynamo itself uses the rest of a real
+    # `torch.tpu` (e.g. `is_available`) on TPU hosts.
+    real_tpu = getattr(torch, "tpu", None)
+    patch_props = (
+        mock.patch.object(torch, "tpu", SimpleNamespace(), create=True)
+        if real_tpu is None
+        else contextlib.nullcontext()
+    )
+    torch._dynamo.reset()
+    with patch_props, mock.patch.object(
+        torch.tpu, "get_device_properties", get_device_properties, create=True
+    ):
+      compiled = torch.compile(block_sizes, backend="eager", fullgraph=True)
+      out, vmem_limit = compiled(torch.ones(2))
+      expected_block = ragged_gather_tc.safe_reduce_block_size(
+          hidden_dim=2048, itemsize=2, top_k=8
+      )
+    self.assertEqual(vmem_limit, 64 * 1024 * 1024)
+    torch.testing.assert_close(out, torch.full((2,), float(expected_block)))
 
   def test_packed_stable_sort_packed_and_wide_key_fallback(self):
     # Empty and singleton inputs.

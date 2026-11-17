@@ -11,6 +11,12 @@ from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
 import torchtitan.experiments.tpu.train
 
+# Tokamax's Mosaic KDA GatedDeltaNet (`qwen3_5/config_registry.py`).
+_QWEN35_TOKAMAX_GDN_OVERRIDE = (
+    "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta."
+    "tokamax_gated_delta_kernel"
+)
+
 
 class TrainDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
@@ -603,6 +609,26 @@ class TrainDistributedTest(
               "--parallelism.expert_parallel_degree=2",
           ],
       ),
+      # Per-layer torch.compile (the regular trainer's --compile.enable, with
+      # fullgraph=True) through Ring-of-Experts dispatch (skipped on CPU), with
+      # the Tokamax GatedDeltaNet as in `qwen35_moe_35b_ep`: per-layer compile
+      # of the default XLA chunked recurrence fails in the backward on TPU
+      # (`RuntimeProgramInputMismatch` in a torch_tpu split-compiled
+      # partition, also without EP).
+      dict(
+          testcase_name="qwen3_5_moe_ep2_simplefsdp_compile",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.expert_parallel_degree=2",
+              "--override.imports",
+              _QWEN35_TOKAMAX_GDN_OVERRIDE,
+          ],
+      ),
       # The routed experts of qwen35_moe_35b: Pallas paired grouped matmuls on
       # kernel-native weights and the fused route-score backward, which needs
       # bf16 expert outputs (as in the recipe).
@@ -628,6 +654,25 @@ class TrainDistributedTest(
               "--training.mixed_precision_param=bfloat16",
               "--parallelism.expert_parallel_degree=2",
               "--optimizer.implementation=fused",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_ep2_tpu_moe_kernels_compile",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_tpu_moe_kernels",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.mixed_precision_param=bfloat16",
+              "--parallelism.expert_parallel_degree=2",
+              "--optimizer.implementation=fused",
+              "--override.imports",
+              _QWEN35_TOKAMAX_GDN_OVERRIDE,
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,

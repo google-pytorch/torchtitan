@@ -41,7 +41,6 @@ d_chunks)``
 """
 
 import dataclasses
-import functools
 import math
 import re
 
@@ -63,21 +62,34 @@ _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
 
 
+# A list, not `functools.lru_cache`: Dynamo does not consult an lru_cache but
+# traces the wrapped function, so per-layer `torch.compile(fullgraph=True)`
+# (the regular TPU trainer's `--compile.enable`) would trace
+# `torch.tpu.get_device_properties()` into torch_tpu's host device scan, which
+# Dynamo cannot trace. The plain `assume_constant_result` function below is
+# instead evaluated once at trace time and baked into the graph, as in
+# `causal_conv1d._tpu_generation`.
+_tpu_gen_cache: list[int | None] = []
+
+
 @torch._dynamo.assume_constant_result
-@functools.lru_cache(maxsize=1)
 def _tpu_generation() -> int | None:
   """Returns the TPU generation (e.g., 5, 6, 7), or ``None`` if unavailable."""
+  if _tpu_gen_cache:
+    return _tpu_gen_cache[0]
+  gen: int | None = None
   get_props = getattr(
       getattr(torch, "tpu", None), "get_device_properties", None
   )
-  if get_props is None:
-    return None
-  try:
-    name = get_props().name.lower()
-  except RuntimeError:
-    return None
-  match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
-  return int(match.group(1)) if match else None
+  if get_props is not None:
+    try:
+      name = get_props().name.lower()
+      match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
+      gen = int(match.group(1)) if match else None
+    except RuntimeError:
+      gen = None
+  _tpu_gen_cache.append(gen)
+  return gen
 
 
 def _tpu_vmem_limit_bytes() -> int:

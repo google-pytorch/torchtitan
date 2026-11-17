@@ -1665,6 +1665,49 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         parsed.libtpu_init_flags, {"xla_tpu_scoped_vmem_limit_kib": "65472"}
     )
 
+  def test_35b_ep_recipe_on_regular_trainer(self):
+    """Tests the regular-trainer EP recipe, also with per-layer compile."""
+    cfg = config_registry.qwen35_moe_35b_ep()
+    self.assertIs(type(cfg), type(config_registry.qwen35_moe_35b()))
+    self.assertNotIsInstance(cfg, TpuGraphTrainer.Config)
+    self.assertEqual(cfg.parallelism.expert_parallel_degree, 4)
+    self.assertFalse(cfg.compile.enable)
+    self.assertFalse(cfg.compile.compile_grad_norm)
+    self.assertEqual(cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    self.assertEqual(
+        cfg.libtpu_init_flags.get(
+            "xla_tpu_enable_sparse_core_reduce_scatter_v2"
+        ),
+        "true",
+    )
+    self.assertIn(
+        config_registry.TOKAMAX_GATED_DELTA_OVERRIDE, cfg.override.imports
+    )
+    self.assertIn(config_registry.FUSED_LOSS_OVERRIDE, cfg.override.imports)
+    cfg.model_spec.model.update_from_config(
+        config=cfg, global_batch_size=8, local_global_batch_size=8
+    )
+    routed = list(
+        cfg.model_spec.model.traverse(
+            qwen35_token_dispatcher.TpuQwen35RoutedExperts.Config
+        )
+    )
+    self.assertLen(routed, len(cfg.model_spec.model.layers))
+    self.assertTrue(all(r.num_token_chunks == 4 for _, r, _, _ in routed))
+
+    # Per-layer compile is accepted with EP (the gradient norm stays eager).
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_ep",
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.enable",
+        "--compile.backend=tpu",
+    ])
+    self.assertNotIsInstance(parsed, TpuGraphTrainer.Config)
+    self.assertTrue(parsed.compile.enable)
+    self.assertFalse(parsed.compile.compile_grad_norm)
+    self.assertEqual(parsed.parallelism.expert_parallel_degree, 2)
+
   def test_35b_benchmark_graph_trainer_config(self):
     """Tests the benchmark recipe as train.py hands it to TpuGraphTrainer."""
     gt_cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()

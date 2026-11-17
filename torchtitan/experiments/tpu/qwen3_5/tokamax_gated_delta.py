@@ -97,26 +97,45 @@ _MIN_TPU_GENERATION = 6
 _KERNEL_DTYPES = (torch.bfloat16, torch.float32)
 
 
-@functools.lru_cache(maxsize=1)
+# The lookups below are called from the traced forward, so they cache in
+# module globals instead of `functools.lru_cache`: Dynamo does not consult an
+# lru_cache but traces the wrapped function again, which fails under per-layer
+# `torch.compile(fullgraph=True)` (the regular TPU trainer's `--compile.enable`)
+# on torch_tpu's host device scan behind `get_device_properties()`. The KDA op
+# is a callable, so it cannot go through `torch._dynamo.assume_constant_result`
+# either: Dynamo gives it a `ConstantSource`, whose `CLOSURE_MATCH` guard is not
+# implemented inside activation checkpointing. A module global is guarded
+# through a regular `GlobalSource`. On TPUs that run the kernels,
+# `TokamaxGatedDeltaKernel.__init__` fills both caches eagerly, before any
+# tracing.
+_kda_imported = False
+_kda_op: Any = None
+_kda_import_error: Exception | None = None
+
+
 def _import_kda() -> tuple[Any, Exception | None]:
   """Imports Tokamax's KDA op on first use: ``(kimi_delta_attention, error)``.
 
   Imported lazily, so config validation, override resolution and the XLA
   fallback work without Tokamax.
   """
-  try:
-    # pylint: disable=g-import-not-at-top
-    from tokamax import ops as tokamax_ops
-    # Check that the Mosaic TPU backend imports: the KDA op catches a missing
-    # Pallas/Mosaic dependency at import time and leaves only `"xla"`.
-    from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
-    # pylint: enable=g-import-not-at-top
+  global _kda_imported, _kda_op, _kda_import_error
+  if not _kda_imported:
+    try:
+      # pylint: disable=g-import-not-at-top
+      from tokamax import ops as tokamax_ops
+      # Check that the Mosaic TPU backend imports: the KDA op catches a missing
+      # Pallas/Mosaic dependency at import time and leaves only `"xla"`.
+      from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
+      # pylint: enable=g-import-not-at-top
 
-    return tokamax_ops.kimi_delta_attention, None
-  except (ImportError, AttributeError, SyntaxError) as e:
-    # Tokamax releases before 0.0.17 have no KDA op, and some do not import
-    # under typeguard >= 3 (SyntaxError, openxla/tokamax#240).
-    return None, e
+      _kda_op, _kda_import_error = tokamax_ops.kimi_delta_attention, None
+    except (ImportError, AttributeError, SyntaxError) as e:
+      # Tokamax releases before 0.0.17 have no KDA op, and some do not import
+      # under typeguard >= 3 (SyntaxError, openxla/tokamax#240).
+      _kda_op, _kda_import_error = None, e
+    _kda_imported = True
+  return _kda_op, _kda_import_error
 
 
 def has_tokamax_kda() -> bool:
@@ -138,20 +157,31 @@ def _require_tokamax_kda():
   return kimi_delta_attention
 
 
-@functools.lru_cache(maxsize=1)
+_tpu_gen_cache: list[int | None] = []
+
+
+@torch._dynamo.assume_constant_result
 def _tpu_generation() -> int | None:
-  """Attached TPU generation (e.g. 5 for v5e/v5p, 6 for v6e, 7 for TPU7x)."""
+  """Attached TPU generation (e.g. 5 for v5e/v5p, 6 for v6e, 7 for TPU7x).
+
+  Evaluated once at trace time and baked into the graph (see ``_import_kda``
+  and ``causal_conv1d._tpu_generation``).
+  """
+  if _tpu_gen_cache:
+    return _tpu_gen_cache[0]
+  gen: int | None = None
   get_props = getattr(
       getattr(torch, "tpu", None), "get_device_properties", None
   )
-  if get_props is None:
-    return None
-  try:
-    name = get_props().name.lower()
-  except RuntimeError:
-    return None
-  match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
-  return int(match.group(1)) if match else None
+  if get_props is not None:
+    try:
+      name = get_props().name.lower()
+      match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
+      gen = int(match.group(1)) if match else None
+    except RuntimeError:
+      gen = None
+  _tpu_gen_cache.append(gen)
+  return gen
 
 
 def supports_current_tpu() -> bool:

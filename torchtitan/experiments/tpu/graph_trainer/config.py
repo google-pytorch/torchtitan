@@ -318,6 +318,19 @@ def apply_tpu_graph_trainer_model_transforms(
         "compile.compile_grad_norm cannot be combined with "
         "compile.optimizer_compile='in_graph'"
     )
+  if config.tpu_config.donate_in_graph_optimizer_state:
+    if compile_config.optimizer_compile != "in_graph":
+      raise ValueError(
+          "tpu_config.donate_in_graph_optimizer_state requires "
+          "compile.optimizer_compile='in_graph'"
+      )
+    # The scan model's checkpoint hooks hand out slices of the stacked
+    # parameters, and donation of stacked layer state is untested.
+    if compile_config.use_scan_layers:
+      raise ValueError(
+          "tpu_config.donate_in_graph_optimizer_state is not supported with "
+          "compile.use_scan_layers"
+      )
   if compile_config.fsdp_barrier_policy != "none" and (
       compile_config.memory_policy in (None, "none")
       or not compile_config.enable_remat_barriers

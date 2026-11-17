@@ -29,6 +29,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from torchtitan.components.checkpointer.base import MODEL
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer.optimizer import (
     collect_moe_routing_metric_tensors,
@@ -41,6 +42,12 @@ from torchtitan.experiments.graph_trainer.configs import (
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
+from torchtitan.experiments.tpu.compiled_optimizers.functional import (
+    adamw_donated_input_indices,
+    aliased_state_fqns,
+    rebind_model_and_optstate_buffers,
+    update_model_and_optstate_buffers,
+)
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
@@ -540,10 +547,24 @@ class TpuGraphTrainer(GraphTrainer):
                     global_valid_tokens,
                     extra_kwargs,
                 )
+            donated = ()
+            if self.config.tpu_config.donate_in_graph_optimizer_state:
+                # Donate the parameter and moment inputs to their outputs,
+                # except state that sits in several argument slots (tied
+                # parameters, shared submodules, buffers viewing parameters).
+                self._optstate_aliased_fqns = aliased_state_fqns(model)
+                donated = adamw_donated_input_indices(
+                    self._traced_step.state_fqns,
+                    self._traced_step.input_subclass_layouts,
+                    aliased_fqns=self._optstate_aliased_fqns,
+                )
             pipeline_fn = PASS_PIPELINE_REGISTRY[
                 self.config.compile.pass_pipeline
             ]
-            passes = pipeline_fn(self._traced_step, self.config)
+            pipeline_kwargs = (
+                {"donated_input_positions": tuple(donated)} if donated else {}
+            )
+            passes = pipeline_fn(self._traced_step, self.config, **pipeline_kwargs)
             self._traced_step.gm = apply_graph_passes(
                 self._traced_step.gm,
                 self._traced_step.example_inputs,
@@ -551,6 +572,10 @@ class TpuGraphTrainer(GraphTrainer):
                 compile_config=self.config.compile,
             )
 
+        # The step updates (or, with donation, consumes) the parameters, so an
+        # asynchronous checkpoint must finish staging them first, as the base
+        # trainer does before optimizers.step().
+        self.checkpointer.maybe_wait_for_staging()
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
                 inputs,
@@ -570,15 +595,35 @@ class TpuGraphTrainer(GraphTrainer):
                 [model], list(outputs[2 + 3 * n :])
             )
 
-        from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
-
-        update_model_and_optstate_buffers(
-            model,
-            self._optstate_param_fqns,
-            new_params,
-            new_exp_avgs,
-            new_exp_avg_sqs,
-        )
+        if self.config.tpu_config.donate_in_graph_optimizer_state:
+            # The step program donated the parameter / moment inputs to its
+            # outputs, so the inputs are consumed and the outputs replace them
+            # instead of being copied back; the optimizer's param_groups follow
+            # so checkpointing never touches a consumed buffer.
+            rebind_model_and_optstate_buffers(
+                model,
+                self._optstate_param_fqns,
+                new_params,
+                new_exp_avgs,
+                new_exp_avg_sqs,
+                aliased_fqns=self._optstate_aliased_fqns,
+                optimizers=self.optimizers.optimizers,
+            )
+            if self.checkpointer.enable:
+                # ModelWrapper caches the state_dict tensors and copy_()s fresh
+                # values into them on save; those still reference the consumed
+                # inputs. Start a fresh cache (a new dict, so a save that still
+                # holds the old one is not emptied under it) that the next save
+                # rebuilds from the rebound module.
+                self.checkpointer.states[MODEL].cached_state_dict = {}
+        else:
+            update_model_and_optstate_buffers(
+                model,
+                self._optstate_param_fqns,
+                new_params,
+                new_exp_avgs,
+                new_exp_avg_sqs,
+            )
         model._optstate_step.copy_(
             new_step.detach() if isinstance(new_step, torch.Tensor) else new_step
         )

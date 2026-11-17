@@ -28,6 +28,10 @@ class TPUConfig:
   # precision.
   enable_amp: bool = True
   log_freq: int = 10
+  # Graph trainer with optimizer_compile="in_graph": donate the step program's
+  # parameter and AdamW-moment inputs to their outputs and rebind the module to
+  # the outputs, instead of holding both copies and copying back.
+  donate_in_graph_optimizer_state: bool = False
   eager_mode: Literal[
       "",
       "DEFER_AND_FUSE",

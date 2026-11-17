@@ -742,6 +742,34 @@ def qwen35_moe_35b_ulysses_cp2() -> TPUTrainerConfig:
   return _qwen35_cp(qwen35_moe_35b(), strategy="ulysses", cp_degree=2)
 
 
+def qwen35_moe_35b_ep_allgather_cp2() -> TPUTrainerConfig:
+  """``qwen35_moe_35b_ep`` (EP=4) with KV all-gather CP2, compiled per block.
+
+  The regular-trainer counterpart of
+  ``qwen35_moe_35b_split_tokamax_ep_allgather_cp2``, with the Tokamax
+  GatedDeltaNet of ``qwen35_moe_35b_ep``. Every block is compiled
+  (``--compile.enable --compile.backend=tpu``) by default because eager
+  Qwen3.5 CP with ``dp_shard > 1`` is unreliable on the tpu7x torch_tpu build
+  (see ``test_train_minimal_distributed``); ``--compile.no-enable`` runs it
+  eagerly. Per-block-compiled CP can also give intermittent non-finite steps
+  on that build (seen on the debug MoE model and 35B CP-only runs), so the
+  ``TpuGraphTrainer`` recipes remain the stable CP path.
+  """
+  cfg = qwen35_moe_35b_ep()
+  cfg.compile.enable = True
+  return _qwen35_cp(cfg, strategy="all_gather", cp_degree=2)
+
+
+def qwen35_moe_35b_ep_ulysses_cp2() -> TPUTrainerConfig:
+  """``qwen35_moe_35b_ep`` (EP=4) with Ulysses CP2, compiled per block.
+
+  See ``qwen35_moe_35b_ep_allgather_cp2``.
+  """
+  cfg = qwen35_moe_35b_ep()
+  cfg.compile.enable = True
+  return _qwen35_cp(cfg, strategy="ulysses", cp_degree=2)
+
+
 def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
     TpuGraphTrainer.Config
 ):

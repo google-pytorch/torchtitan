@@ -783,6 +783,9 @@ class TrainDistributedTest(
           context_parallel_degree=2,
           args=["--parallelism.expert_parallel_degree=2"],
       ),
+      # No per-layer-compiled EP + CP debug cases: on the tpu7x torch_tpu
+      # build, compiled CP on the debug MoE model intermittently gives
+      # non-finite steps 1-2, with or without EP or the Tokamax GatedDeltaNet.
   ])
   def test_train_distributed(
       self,

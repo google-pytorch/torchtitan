@@ -13,7 +13,7 @@ import functools
 import logging
 import operator
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import torch
 from torch._dynamo.utils import detect_fake_mode
@@ -371,6 +371,10 @@ def tpu_backend_compile_pass(
         tensor_index += 1
     compiler_kwargs = {"is_fwd": is_fwd}
     if donated_inputs:
+        logger.info(
+            "[tpu_backend_pass] donating %d inputs to their outputs",
+            len(donated_inputs),
+        )
         # Added in TorchTPU PR #2800. Keep this keyword conditional so the
         # default no-donation path also works with older TorchTPU builds.
         compiler_kwargs["donated_inputs"] = donated_inputs
@@ -647,11 +651,27 @@ def construct_tpu_transform_passes(
 def construct_tpu_pass_pipeline(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
+    *,
+    donated_input_positions: Sequence[int] | None = None,
 ) -> list[Callable]:
-    """Build the normal unsplit pipeline: joint transforms, then compilation."""
+    """Build the normal unsplit pipeline: joint transforms, then compilation.
+
+    With ``optimizer_in_graph`` the step program returns updated parameters and
+    AdamW moments; their inputs are donated so XLA aliases them instead of
+    holding both copies (``_fwd_bwd_adamw_step`` rebinds the outputs). Only
+    the trainer knows which parameters are tied, so it computes
+    ``donated_input_positions`` with ``adamw_donated_input_indices``; without
+    them nothing is donated.
+    """
+    compile_pass: Callable = tpu_backend_compile_pass
+    if donated_input_positions:
+        compile_pass = functools.partial(
+            tpu_backend_compile_pass,
+            donated_input_positions=tuple(donated_input_positions),
+        )
     return [
         *construct_tpu_transform_passes(traced_result, config),
-        tpu_backend_compile_pass,
+        compile_pass,
     ]
 
 

@@ -493,6 +493,24 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "must be nonnegative"):
       apply_tpu_graph_trainer_model_transforms(config)
 
+  def test_donation_requires_in_graph_optimizer(self) -> None:
+    config = qwen3_8b()
+    config.compile.optimizer_compile = "separate_graph"
+    config.tpu_config.donate_in_graph_optimizer_state = True
+
+    with self.assertRaisesRegex(ValueError, "requires compile.optimizer_compile"):
+      apply_tpu_graph_trainer_model_transforms(config)
+
+  def test_donation_rejects_scan(self) -> None:
+    config = qwen3_8b()
+    config.compile.optimizer_compile = "in_graph"
+    config.compile.compile_grad_norm = False
+    config.compile.use_scan_layers = True
+    config.tpu_config.donate_in_graph_optimizer_state = True
+
+    with self.assertRaisesRegex(ValueError, "not supported with compile.use_scan_layers"):
+      apply_tpu_graph_trainer_model_transforms(config)
+
   def test_tpu_selective_cli_is_native(self) -> None:
     graph_config = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3",

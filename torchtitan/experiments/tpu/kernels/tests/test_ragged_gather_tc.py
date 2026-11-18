@@ -1,8 +1,5 @@
 """Unit and accelerator tests for TensorCore ragged gather / gather-reduce kernels."""
 
-from types import SimpleNamespace
-from unittest import mock
-
 from absl.testing import absltest
 import jax.numpy as jnp
 import numpy as np
@@ -58,34 +55,6 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
   def _require_tpu(self) -> None:
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
       self.skipTest("Pallas ragged_gather_tc kernels require TPU.")
-
-  def test_tpu_generation_device_name_parsing(self):
-    self.addCleanup(ragged_gather_tc._tpu_generation.cache_clear)
-    cases = (
-        ("TPU v5 lite", 5),
-        ("TPU v6e", 6),
-        ("tpu7x", 7),
-        ("TPU-7", 7),
-        ("TPU 7", 7),
-        ("unknown accelerator", None),
-    )
-    for dev_name, expected in cases:
-      ragged_gather_tc._tpu_generation.cache_clear()
-      fake_tpu = SimpleNamespace(
-          get_device_properties=lambda n=dev_name: SimpleNamespace(name=n)
-      )
-      with (
-          self.subTest(dev_name=dev_name),
-          mock.patch.object(torch, "tpu", fake_tpu, create=True),
-      ):
-        self.assertEqual(ragged_gather_tc._tpu_generation(), expected)
-
-    ragged_gather_tc._tpu_generation.cache_clear()
-    failing_tpu = SimpleNamespace(
-        get_device_properties=mock.Mock(side_effect=RuntimeError("no device"))
-    )
-    with mock.patch.object(torch, "tpu", failing_tpu, create=True):
-      self.assertIsNone(ragged_gather_tc._tpu_generation())
 
   def test_packed_stable_sort_packed_and_wide_key_fallback(self):
     # Empty and singleton inputs.

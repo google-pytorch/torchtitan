@@ -41,9 +41,7 @@ d_chunks)``
 """
 
 import dataclasses
-import functools
 import math
-import re
 
 import jax
 from jax.experimental import pallas as pl
@@ -51,6 +49,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.kernels import pallas_vmem
 
 _RAGGED_GATHER_TC_NUM_BUFFERS = 2
 
@@ -61,33 +60,6 @@ _RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL = 8
 _RAGGED_GATHER_REDUCE_TC_ALIGN = 128
 _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
-
-
-@torch._dynamo.assume_constant_result
-@functools.lru_cache(maxsize=1)
-def _tpu_generation() -> int | None:
-  """Returns the TPU generation (e.g., 5, 6, 7), or ``None`` if unavailable."""
-  get_props = getattr(
-      getattr(torch, "tpu", None), "get_device_properties", None
-  )
-  if get_props is None:
-    return None
-  try:
-    name = get_props().name.lower()
-  except RuntimeError:
-    return None
-  match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
-  return int(match.group(1)) if match else None
-
-
-def _tpu_vmem_limit_bytes() -> int:
-  """Returns the per-kernel VMEM limit in bytes for the active TPU generation."""
-  gen = _tpu_generation()
-  if gen is not None and gen >= 7:
-    return 64 * 1024 * 1024
-  if gen == 6:
-    return 32 * 1024 * 1024
-  return 16 * 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,7 +88,7 @@ def safe_gather_block_size(
     requested_block_size: int = 1024,
 ) -> int:
   """Clamps ``gather_block_size`` so 2 VMEM buffers fit within generation VMEM."""
-  vmem_budget = int(0.875 * _tpu_vmem_limit_bytes())
+  vmem_budget = int(0.875 * pallas_vmem.vmem_limit_bytes())
   token_bytes = _token_vmem_bytes(hidden_dim, itemsize)
   max_fit = vmem_budget // (_RAGGED_GATHER_TC_NUM_BUFFERS * token_bytes)
   if max_fit >= 128:
@@ -131,7 +103,7 @@ def safe_reduce_block_size(
     requested_block_size: int = 896,
 ) -> int:
   """Clamps ``reduce_block_size`` so 4 VMEM buffers fit within generation VMEM."""
-  vmem_budget = int(0.875 * _tpu_vmem_limit_bytes())
+  vmem_budget = int(0.875 * pallas_vmem.vmem_limit_bytes())
   token_bytes = _token_vmem_bytes(hidden_dim, itemsize)
   max_fit = vmem_budget // (_RAGGED_GATHER_REDUCE_TC_NUM_BUFFERS * token_bytes)
   if max_fit >= 128:
@@ -396,7 +368,7 @@ def ragged_gather_tc(
       ],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=(pltpu.ARBITRARY,),
-          vmem_limit_bytes=_tpu_vmem_limit_bytes(),
+          vmem_limit_bytes=pallas_vmem.vmem_limit_bytes(),
       ),
       name="ragged_gather_tc",
   )(scalars, indices, x)
@@ -809,7 +781,7 @@ def ragged_gather_reduce_tc(
       out_specs=hbm_spec,
       scratch_shapes=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=_tpu_vmem_limit_bytes(),
+          vmem_limit_bytes=pallas_vmem.vmem_limit_bytes(),
       ),
       name=kernel_name,
   )(*call_args)
@@ -850,7 +822,7 @@ def _ragged_scale_and_dscore_tc(
   cap, d_dim = g_gathered_RD.shape
   block = 1024
   itemsize = jnp.dtype(g_gathered_RD.dtype).itemsize
-  vmem_limit = _tpu_vmem_limit_bytes()
+  vmem_limit = pallas_vmem.vmem_limit_bytes()
   d_chunk = (
       _scale_dscore_d_chunk(d_dim, block, itemsize, vmem_limit)
       if d_dim % 128 == 0

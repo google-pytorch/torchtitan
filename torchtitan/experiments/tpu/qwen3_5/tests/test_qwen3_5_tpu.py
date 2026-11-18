@@ -1810,6 +1810,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         "--tpu_config.ep_transport=ring_of_experts",
         "--tpu_config.ep_scale_before_down_proj=True",
         "--tpu_config.ep_capacity_factor=1.5",
+        "--tpu_config.ep_token_chunks=4",
+        "--tpu_config.ep_max_inflight_chunks=3",
         config="qwen35_moe_debugmodel_pallas_gmm",
     )
     roe_cfg.model_spec.model.update_from_config(
@@ -1819,6 +1821,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         TpuRoutedExperts.Config
     ):
       self.assertTrue(experts.scale_before_down_proj)
+      self.assertEqual(experts.num_token_chunks, 4)
+      self.assertEqual(experts.max_inflight_chunks, 3)
     for _, experts, _, _ in roe_cfg.model_spec.model.traverse(
         TpuGroupedExperts.Config
     ):

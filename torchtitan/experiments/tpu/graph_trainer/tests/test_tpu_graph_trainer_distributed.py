@@ -451,21 +451,20 @@ class TpuGraphTrainerDistributedTest(
       )
 
   def test_qwen3_5_moe_graph_trainer_ep2_matches_ep1(self):
-    """GraphTrainer Qwen3.5 MoE at EP=2 (Ring-of-Experts via auto) matches EP=1 at step 1."""
+    """GraphTrainer Qwen3.5 MoE at EP=2 (unchunked and 4-chunk RoE) matches EP=1."""
     tempdir = self.create_tempdir().full_path
     step1_loss = {}
-    for ep, extra_args in (
-        (1, []),
-        (
-            2,
-            [
-                "--parallelism.expert_parallel_degree=2",
-                "--compile.no-compile_grad_norm",
-                "--compile.graph_split.backward_partition_mode=by_layer",
-            ],
-        ),
+    ep2_base = [
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+        "--compile.graph_split.backward_partition_mode=by_layer",
+    ]
+    for arm, extra_args in (
+        ("ep1", []),
+        ("ep2", ep2_base),
+        ("ep2_chunk4", ep2_base + ["--tpu_config.ep_token_chunks=4"]),
     ):
-      path = os.path.join(tempdir, f"ep{ep}.json")
+      path = os.path.join(tempdir, f"{arm}.json")
       self._test_train_distributed(
           config_args=_train_args(
               "torchtitan.experiments.tpu.qwen3_5",
@@ -480,12 +479,15 @@ class TpuGraphTrainerDistributedTest(
           enable_compile=True,
       )
       with open(path) as f:
-        step1_loss[ep] = dict(json.load(f))[1]
-    logging.info("qwen3_5 MoE GraphTrainer step-1 loss by EP: %s", step1_loss)
-    self.assertTrue(math.isfinite(step1_loss[2]))
-    self.assertLess(
-        abs(step1_loss[2] - step1_loss[1]), abs(step1_loss[1]) * 1e-3
-    )
+        step1_loss[arm] = dict(json.load(f))[1]
+    logging.info("qwen3_5 MoE GraphTrainer step-1 loss by arm: %s", step1_loss)
+    for arm in ("ep2", "ep2_chunk4"):
+      self.assertTrue(math.isfinite(step1_loss[arm]))
+      self.assertLess(
+          abs(step1_loss[arm] - step1_loss["ep1"]),
+          abs(step1_loss["ep1"]) * 1e-3,
+          msg=arm,
+      )
 
   def test_qwen3_5_moe_graph_trainer_ep2_capacity_reports_drops(self):
     """Capacity-bounded EP=2 reports every MoE layer's drops from the step.
@@ -501,6 +503,10 @@ class TpuGraphTrainerDistributedTest(
       balanced load. With 2048 routes over two ranks each holding 1024, fewer
       than half can drop (only if every route went to one rank would half).
     - ``roe_worst_case``: 2.0 is the EP=2 worst case, so nothing drops.
+    - ``ragged_chunk4_half``: 4 token chunks, each capped separately at
+      int(256 * 0.5) = 128 rows, so at least half drop; the stats carry the
+      sum over chunks. (Ring-of-Experts would round each chunk's cap up to
+      1024 rows, above the chunk's 512-row worst case, and drop nothing.)
     """
     tokens_per_rank = 512  # _train_args' per-rank token budget.
     ep2 = [
@@ -516,6 +522,11 @@ class TpuGraphTrainerDistributedTest(
         ],
         "roe_half_rounded": ["--tpu_config.ep_capacity_factor=0.5"],
         "roe_worst_case": ["--tpu_config.ep_capacity_factor=2.0"],
+        "ragged_chunk4_half": [
+            "--tpu_config.ep_transport=ragged_all_to_all",
+            "--tpu_config.ep_token_chunks=4",
+            "--tpu_config.ep_capacity_factor=0.5",
+        ],
         "dropless": [],
     }
     tempdir = self.create_tempdir().full_path
@@ -556,7 +567,7 @@ class TpuGraphTrainerDistributedTest(
           self.assertEqual(routes, self.num_devices * tokens_per_rank * 2, msg=msg)
           if arm == "roe_worst_case":
             self.assertEqual(dropped, 0, msg=msg)
-          elif arm == "ragged_half":
+          elif arm in ("ragged_half", "ragged_chunk4_half"):
             self.assertGreaterEqual(2 * dropped, routes, msg=msg)
             self.assertLess(dropped, routes, msg=msg)
           else:

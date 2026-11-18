@@ -92,6 +92,16 @@ class EpParityDistributedTest(
               "--tpu_config.ep_capacity_factor=2.0",
           ],
       ),
+      ("_ep2_chunk4", 2, ["--tpu_config.ep_token_chunks=4"]),
+      (
+          "_ep4_chunk4_w2",
+          4,
+          [
+              _PALLAS_GMM_CONFIG,
+              "--tpu_config.ep_token_chunks=4",
+              "--tpu_config.ep_scale_before_down_proj=True",
+          ],
+      ),
   )
   def test_qwen3_5_moe_ep_matches_single_device(
       self, ep_degree: int, extra_args: list[str]

@@ -39,8 +39,9 @@ from torch.distributed._functional_collectives import (
     all_gather_single,
     reduce_scatter_single,
 )
+from torch.distributed._composable.fsdp import FSDPModule
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
-from torch.fx.traceback import annotate_fn
+from torch.fx.traceback import annotate, annotate_fn
 
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
@@ -50,13 +51,14 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     MOE_EP_DISPATCH,
     MOE_ROUTING,
 )
-from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.moe import _tokens_per_expert, RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
 from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.tools.logging import logger
 
 EpTransport = Literal[
     "all_to_all", "ragged_all_to_all", "ring_of_experts", "auto"
@@ -1405,6 +1407,9 @@ class TpuRoutedExperts(RoutedExperts):
   @dataclass(kw_only=True, slots=True)
   class Config(RoutedExperts.Config):
     scale_before_down_proj: bool = False
+    num_token_chunks: int = 1
+    max_inflight_chunks: int = 2
+    accumulate_chunk_weight_grads_fp32: bool = True
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -1414,6 +1419,20 @@ class TpuRoutedExperts(RoutedExperts):
     # a traced step back to the module; the step returns these as an output.
     self.collect_ep_drop_stats = False
     self._last_ep_drop_stats_2: torch.Tensor | None = None
+    if config.num_token_chunks < 1:
+      raise ValueError(
+          f"num_token_chunks must be >= 1, got {config.num_token_chunks}"
+      )
+    if config.max_inflight_chunks < 1:
+      raise ValueError(
+          f"max_inflight_chunks must be >= 1, got {config.max_inflight_chunks}"
+      )
+    self.num_token_chunks = config.num_token_chunks
+    self.max_inflight_chunks = config.max_inflight_chunks
+    self.accumulate_chunk_weight_grads_fp32 = (
+        config.accumulate_chunk_weight_grads_fp32
+    )
+    self._warned_chunk_snap: set[tuple[int, int]] = set()
     self.scale_before_down_proj = config.scale_before_down_proj
     if not self.scale_before_down_proj:
       return
@@ -1512,6 +1531,135 @@ class TpuRoutedExperts(RoutedExperts):
       total = torch.full_like(dropped, num_tokens * self.token_dispatcher.top_k)
       self._last_ep_drop_stats_2 = torch.stack([dropped, total])
 
+  def _forward_ep_chunked(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+      *,
+      num_chunks: int,
+      ep_size: int,
+  ) -> torch.Tensor:
+    if isinstance(self.inner_experts, FSDPModule):
+      raise NotImplementedError(
+          "EP token chunking unshards the expert weights once per layer and"
+          " needs SimpleFSDP (--parallelism.use_simple_fsdp); FSDP2 reshards"
+          " them when the unshard call returns. Use num_token_chunks=1."
+      )
+    is_roe = (
+        isinstance(self.token_dispatcher, TpuAllToAllTokenDispatcher)
+        and self.token_dispatcher._resolve_ep_transport(ep_size, x_TD)
+        == "ring_of_experts"
+    )
+    needs_chunk_counts = not is_roe
+
+    unsharded_weights = None
+    if hasattr(self.inner_experts, "unshard_weights"):
+      # Unshard the SimpleFSDP expert parameters once, outside the chunk loop
+      # (`TpuGroupedExperts.unshard_weights` explains how its all-gathers keep
+      # the experts' `module_fqn` for SimpleFSDP bucketing). Widening the
+      # unsharded weights to FP32 here causes ``TpuGroupedExperts.forward``'s
+      # per-chunk ``.bfloat16()`` casts to widen each chunk's dWeight to FP32
+      # before PyTorch autograd sums across chunks; ``insert_ep_chunk_barriers``
+      # keeps those widening casts out of forward barriers so XLA folds
+      # ``bf16(fp32(w_bf16))`` to ``w_bf16``.
+      with maybe_set_sparse_mesh():
+        unsharded_weights = self.inner_experts.unshard_weights()
+        # TODO(b/587943723): TpuGraphTrainer ZeRO-3 with chunk barriers folds
+        # this cast away (see insert_ep_chunk_barriers), but the eager trainer
+        # without activation checkpointing saves one BF16 weight copy per
+        # chunk (each chunk's `.bfloat16()` re-cast), and GraphTrainer ZeRO-2
+        # saves this FP32 cast as the unshard output
+        # (graph_trainer/fsdp_patterns.py, `_find_last_user_in_wait_chain`).
+        # Fix with a storage-free FP32 grad accumulator that keeps the forward
+        # weights in BF16.
+        if self.accumulate_chunk_weight_grads_fp32:
+          unsharded_weights = tuple(
+              w.float() if w.dtype != torch.float32 else w
+              for w in unsharded_weights
+          )
+
+    x_chunks = x_TD.chunk(num_chunks, dim=0)
+    score_chunks = topk_scores_TK.chunk(num_chunks, dim=0)
+    id_chunks = topk_expert_ids_TK.chunk(num_chunks, dim=0)
+    num_experts = num_local_tokens_per_expert_E.numel()
+    extra_expert_kwargs = (
+        {"pre_unsharded_weights": unsharded_weights}
+        if unsharded_weights is not None
+        else {}
+    )
+
+    out_chunks: list[torch.Tensor] = []
+    dropped_chunks: list[torch.Tensor] = []
+    # Sum the chunks' dropped routes eagerly, and when tracing only if this
+    # layer returns drop stats from the step (dropless graphs are unchanged).
+    record_eager_drops = isinstance(
+        self.token_dispatcher, TpuAllToAllTokenDispatcher
+    ) and (
+        self.collect_ep_drop_stats
+        or (
+            get_proxy_mode() is None
+            and not isinstance(x_TD, torch._subclasses.FakeTensor)
+        )
+    )
+    for chunk_idx, (x_c, scores_c, ids_c) in enumerate(
+        zip(x_chunks, score_chunks, id_chunks)
+    ):
+      with annotate({
+          "ep_chunk_idx": chunk_idx,
+          "ep_max_inflight_chunks": self.max_inflight_chunks,
+      }):
+        counts_c = (
+            _tokens_per_expert(ids_c, num_experts)
+            if needs_chunk_counts
+            else num_local_tokens_per_expert_E
+        )
+        routed_input_c, num_tokens_per_expert_e, metadata_c = (
+            self.token_dispatcher.dispatch(x_c, scores_c, ids_c, counts_c)
+        )
+        if (
+            record_eager_drops
+            and isinstance(metadata_c, TpuEpDispatchMetadata)
+        ):
+          dropped_chunks.append(metadata_c.dropped_count)
+        if self.scale_before_down_proj:
+          if not isinstance(metadata_c, TpuEpDispatchMetadata):
+            raise ValueError(
+                "Chunked EP scale_before_down_proj requires TPU EP dispatch"
+                f" metadata, got {type(metadata_c).__name__}"
+            )
+          if metadata_c.row_scale_R is None:
+            raise ValueError(
+                "scale_before_down_proj expected EP dispatch metadata with"
+                " row_scale_R populated"
+            )
+          with maybe_set_sparse_mesh():
+            routed_output_c = self.inner_experts(
+                routed_input_c,
+                num_tokens_per_expert_e,
+                row_scale_R=metadata_c.row_scale_R,
+                **extra_expert_kwargs,
+            )
+          metadata_c = replace(metadata_c, row_scale_applied=True)
+        else:
+          with maybe_set_sparse_mesh():
+            routed_output_c = self.inner_experts(
+                routed_input_c,
+                num_tokens_per_expert_e,
+                **extra_expert_kwargs,
+            )
+        out_chunks.append(
+            self.token_dispatcher.combine(routed_output_c, metadata_c, x_c)
+        )
+    if dropped_chunks and isinstance(
+        self.token_dispatcher, TpuAllToAllTokenDispatcher
+    ):
+      self.token_dispatcher._record_dropped_count(
+          x_TD, torch.stack(dropped_chunks).sum(dtype=torch.int32)
+      )
+    return torch.cat(out_chunks, dim=0)
+
   def forward(
       self,
       x_TD: torch.Tensor,
@@ -1543,6 +1691,42 @@ class TpuRoutedExperts(RoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
+    ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
+    num_tokens = x_TD.shape[0]
+    if (
+        ep_mesh is not None
+        and ep_mesh.size() > 1
+        and self.num_token_chunks > 1
+        and num_tokens > 0
+        and getattr(self.token_dispatcher, "ep_transport", "all_to_all")
+        in ("ring_of_experts", "ragged_all_to_all", "auto")
+    ):
+      num_chunks = self.num_token_chunks
+      if num_tokens % num_chunks != 0:
+        num_chunks = next(
+            d
+            for d in range(min(num_chunks, num_tokens), 0, -1)
+            if num_tokens % d == 0
+        )
+        if (num_tokens, num_chunks) not in self._warned_chunk_snap:
+          self._warned_chunk_snap.add((num_tokens, num_chunks))
+          logger.warning(
+              "%d tokens are not divisible by num_token_chunks=%d; using %d"
+              " chunks (fewer chunks keep more EP buffers live).",
+              num_tokens,
+              self.num_token_chunks,
+              num_chunks,
+          )
+      if num_chunks > 1:
+        return self._forward_ep_chunked(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+            num_chunks=num_chunks,
+            ep_size=ep_mesh.size(),
+        )
+
     if not self.scale_before_down_proj:
       return super().forward(
           x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E

@@ -36,13 +36,21 @@ __all__ = ["SCAN_SAVE_REGIONS", "scan_body_policy", "scan_with_remat_policy"]
 SCAN_SAVE_REGIONS = frozenset({ATTENTION_INNER_ATTENTION})
 
 
-def scan_body_policy(save_regions: Set[str]) -> Callable:
-    """The SAC policy: save the expert counts and ``save_regions``, recompute the rest."""
+def scan_body_policy(
+    save_regions: Set[str], saved: set[str] | None = None
+) -> Callable:
+    """The SAC policy: save the expert counts and ``save_regions``, recompute the rest.
+
+    Adds each region it saves to ``saved``, if given.
+    """
     save = {MOE_EXPERT_COUNTS, *save_regions}
 
     def policy(ctx, op, *args, **kwargs) -> CheckpointPolicy:
         custom = fx.traceback.get_current_meta().get("custom") or {}
-        if custom.get(REMAT_REGION) in save:
+        region = custom.get(REMAT_REGION)
+        if region in save:
+            if saved is not None:
+                saved.add(region)
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.MUST_RECOMPUTE
 
@@ -52,7 +60,11 @@ def scan_body_policy(save_regions: Set[str]) -> Callable:
 def scan_with_remat_policy(
     body: Callable, init, xs, save_regions: Set[str] = frozenset()
 ):
-    """``scan(body, init, xs)``, with the body saving only what the policy picks."""
+    """``scan(body, init, xs)``, with the body saving only what the policy picks.
+
+    Raises if a requested save region matches no op in the body, e.g.
+    ``attention.inner_attention`` with SDPA instead of Splash.
+    """
     unknown = set(save_regions) - SCAN_SAVE_REGIONS
     if unknown:
         raise ValueError(f"a scan body cannot save regions {sorted(unknown)}")
@@ -66,9 +78,10 @@ def scan_with_remat_policy(
         )
     # Mutation allowed: the MoE aux loss all-reduces its saved counts in place,
     # once per mesh axis.
+    saved: set[str] = set()
     context_fn = functools.partial(
         create_selective_checkpoint_contexts,
-        scan_body_policy(save_regions),
+        scan_body_policy(save_regions, saved),
         allow_cache_entry_mutation=True,
     )
 
@@ -80,4 +93,12 @@ def scan_with_remat_policy(
     with fx.traceback.preserve_node_meta(), functorch_config.patch(
         activation_memory_budget=1.0
     ):
-        return scan(checkpointed, init, xs)
+        result = scan(checkpointed, init, xs)
+    missing = set(save_regions) - saved
+    if missing:
+        raise ValueError(
+            f"Save region(s) {sorted(missing)} matched no op in the scan body; "
+            "the model or its tracing no longer exposes them (e.g. SDPA "
+            "instead of Splash for attention.inner_attention)."
+        )
+    return result

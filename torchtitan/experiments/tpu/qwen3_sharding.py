@@ -12,7 +12,7 @@ import torchtitan.distributed
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.tools.logging import logger
 
 

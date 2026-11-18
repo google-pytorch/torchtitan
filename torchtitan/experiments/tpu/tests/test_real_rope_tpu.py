@@ -19,7 +19,7 @@ from absl.testing import absltest
 import torch
 from torch._higher_order_ops.scan import scan
 
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.overrides.real_rope import (
     TpuRealArithmeticComplexRoPE,
     tpu_real_arithmetic_complex_rope,

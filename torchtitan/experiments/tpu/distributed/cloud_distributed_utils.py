@@ -19,7 +19,7 @@ import os
 import re
 
 import frozendict
-from torchtitan.experiments.tpu import local_tpu_device
+from torchtitan.experiments.tpu.distributed import local_tpu_device
 from torchtitan.tools.logging import logger
 
 

@@ -7,18 +7,27 @@
     attn_stack  = getitem(fwd_scan, 2)   # [6, 2, 1024, 256], larger
     bwd_scan(init=[grad], xs=[counter], additional_inputs=[layer_stack, attn_stack])
 
-The real llama3 case is in test_tpu_host_offload_distributed.py.
+`RealScanTest` traces a real `scan` instead, to check the pass finds the
+saved carry after the split. The real llama3 case is in test_tpu_host_offload_distributed.py.
 """
 
 import operator
+from unittest import mock
 
 from absl.testing import absltest
 import torch
+from torch._higher_order_ops.scan import scan
 
+from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+from torchtitan.experiments.tpu.components import scan_backward_patch
+from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
+    scan_with_remat_policy,
+)
 from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import (
     offload_scan_activations,
 )
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
+    annotate_region,
     ATTENTION_INNER_ATTENTION,
     REMAT_REGION,
 )
@@ -184,6 +193,16 @@ class ScanOffloadTest(absltest.TestCase):
             offload_scan_activations(gm)
         self._assert_untouched(gm, fwd, bwd)
 
+    def test_the_graph_output_reading_the_stack_raises(self):
+        # The output node has no users, but it is not a dead reader.
+        fwd, stack, bwd = self._pair()
+        self.graph.output((bwd, stack))
+
+        gm = self._gm()
+        with self.assertRaisesRegex(RuntimeError, "outside the backward scan"):
+            offload_scan_activations(gm)
+        self._assert_untouched(gm, fwd, bwd)
+
     def test_a_body_that_reads_the_stack_whole_raises(self):
         # Reloading the whole stack every iteration is worse than no offload.
         fwd, _, bwd = self._pair(reads="whole")
@@ -199,7 +218,9 @@ class ScanOffloadTest(absltest.TestCase):
         self.graph.output(bwd)
 
         gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "no saved layer input"):
+        with self.assertRaisesRegex(
+            RuntimeError, "1 forward scans, none saves its carry"
+        ):
             offload_scan_activations(gm)
         self._assert_untouched(gm, fwd, bwd)
 
@@ -209,6 +230,82 @@ class ScanOffloadTest(absltest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "use-scan-layers"):
             offload_scan_activations(self._gm())
+
+
+_LAYERS, _TOKENS, _DIM = 3, 16, 8
+
+
+def _plain_layer(h, w):
+    return torch.tanh(h @ w)
+
+
+def _attention_layer(h, w):
+    q = h @ w
+    with annotate_region(ATTENTION_INNER_ATTENTION):
+        a = torch.sigmoid(torch.cat([q, q], -1))
+    return torch.tanh(h + a[:, :_DIM] * a[:, _DIM:])
+
+
+class RealScanTest(absltest.TestCase):
+    """The pass finds the saved carry, ``clone(carry)``, after ``scan``'s split."""
+
+    def _trace(self, layer, save_regions):
+        def step(h, w):
+            out, _ = scan_with_remat_policy(
+                lambda c, ww: (layer(c, ww), c.new_zeros(())), h, w, save_regions
+            )
+            return torch.autograd.grad(out.square().sum(), (h, w))
+
+        self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+        torch._dynamo.reset()
+        h = torch.randn(_TOKENS, _DIM, requires_grad=True)
+        w = torch.randn(_LAYERS, _DIM, _DIM, requires_grad=True)
+        # Trace the reverse-by-index backward that TPU runs.
+        with mock.patch.object(scan_backward_patch, "_REVERSE_SCAN_DEVICE_TYPE", "cpu"):
+            gm = minimal_fx_tracer(step)(h, w).gm
+        (fwd,) = [
+            n for n in gm.graph.find_nodes(op="call_function", target=_SCAN)
+            if not n.meta.get("autograd_backward")
+        ]
+        return gm, fwd
+
+    def _outputs(self, gm, fwd):
+        return list(_body_of(gm, fwd).graph.find_nodes(op="output")[0].args[0])
+
+    def _saved_carry(self, gm, fwd):
+        carry = _body_of(gm, fwd).graph.find_nodes(op="placeholder")[0]
+        (saved,) = [
+            o
+            for o in self._outputs(gm, fwd)
+            if o.target is torch.ops.aten.clone.default and o.args[0] is carry
+        ]
+        return saved
+
+    def test_the_saved_carry_reaches_the_forward_body(self):
+        gm, fwd = self._trace(_plain_layer, frozenset())
+        saved = self._saved_carry(gm, fwd)
+
+        offload_scan_activations(gm)
+        (offload,) = [
+            n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
+        ]
+        self.assertIs(offload.args[0], saved)
+
+    def test_a_saved_region_is_saved_next_to_the_carry(self):
+        gm, fwd = self._trace(_attention_layer, {ATTENTION_INNER_ATTENTION})
+        saved = self._saved_carry(gm, fwd)
+        regions = [
+            (o.meta.get("custom") or {}).get(REMAT_REGION)
+            for o in self._outputs(gm, fwd)
+        ]
+        self.assertIn(ATTENTION_INNER_ATTENTION, regions)
+
+        offload_scan_activations(gm)
+        # Only the layer input goes to host.
+        (offload,) = [
+            n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
+        ]
+        self.assertIs(offload.args[0], saved)
 
 
 if __name__ == "__main__":

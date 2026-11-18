@@ -20,7 +20,7 @@ class WorkaroundsTest(parameterized.TestCase):
     """Patched splash attention converts positions to segment ids."""
     import unittest.mock
     from torchtitan.experiments.tpu import workarounds
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     from torchtitan.models.common.attention import GQAttention as Attention
     from torchtitan.experiments.tpu.llama3 import llama3_configs
 
@@ -150,7 +150,7 @@ class WorkaroundsTest(parameterized.TestCase):
     import torch.nn.functional as F
     from torchtitan.components import loss as components_loss
     from torchtitan.experiments.tpu import kernels
-    from torchtitan.experiments.tpu.loss import pallas_cross_entropy_loss
+    from torchtitan.experiments.tpu.components.loss import pallas_cross_entropy_loss
     from torchtitan.experiments.tpu.overrides.fused_loss import (
         fused_loss_lm_head,
     )
@@ -354,7 +354,8 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertEqual(TokamaxConfig.block_q, 512, "precondition: class default")
     sa.sa_num_stacked_q_heads = 16
     sa.use_batch_loop_fwd = True
-    for name in ("num_stacked_q_heads", "use_batch_loop_fwd"):
+    sa.use_transposed_bwd = True
+    for name in ("num_stacked_q_heads", "use_batch_loop_fwd", "use_transposed_bwd"):
       self.addCleanup(setattr, TokamaxConfig, name, getattr(TokamaxConfig, name))
 
     workarounds.use_tokamax_splash_attention_patch(model, sa)
@@ -371,6 +372,7 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertTrue(TokamaxConfig.use_vmap_bwd)
     self.assertEqual(TokamaxConfig.num_stacked_q_heads, 16)
     self.assertTrue(TokamaxConfig.use_batch_loop_fwd)
+    self.assertTrue(TokamaxConfig.use_transposed_bwd)
 
   def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
     """A real splash config whose fields resolve to nothing must fail loudly."""
@@ -499,7 +501,7 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.experiments.tpu import workarounds
     from torchtitan.models.common.attention import GQAttention as Attention
     from torchtitan.models.common.attention import ScaledDotProductInnerAttention
-    from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention
+    from torchtitan.experiments.tpu.distributed.cp_attention import tpu_cp_inner_attention
     from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention
     from torchtitan.experiments.tpu.qwen3 import qwen3_configs
     import copy
@@ -525,7 +527,7 @@ class WorkaroundsTest(parameterized.TestCase):
     import copy
     import types
     from torchtitan.experiments.tpu import workarounds
-    from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention
+    from torchtitan.experiments.tpu.distributed.cp_attention import tpu_cp_inner_attention
     from torchtitan.experiments.tpu.qwen3 import qwen3_configs
     from torchtitan.models.common.attention import GQAttention as Attention
     from torchtitan.models.common.attention import ScaledDotProductInnerAttention
@@ -555,7 +557,7 @@ class WorkaroundsTest(parameterized.TestCase):
 
   def test_qwen3_ulysses_cp_recipe_and_validation(self):
     """The Ulysses CP recipe applies ContextParallelTransform; TPU rules validate it."""
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         UlyssesCPScaledDotProductInnerAttention,
         revert_tpu_context_parallel,
         validate_tpu_context_parallel,
@@ -565,7 +567,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     config = config_registry.qwen3_debugmodel_ulysses_cp2()
     self.assertEqual(config.parallelism.context_parallel_degree, 2)
-    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
     self.assertIsNone(config.parallelism.context_parallel_load_balancer)
     for layer in config.model_spec.model.layers:
       self.assertIsInstance(
@@ -602,7 +603,7 @@ class WorkaroundsTest(parameterized.TestCase):
 
   def test_tpu_cp_inner_attention_lookup(self):
     """SDPA and Varlen map to TPU CP attentions; Flex is rejected (not on TPU)."""
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         KVAllGatherCPScaledDotProductInnerAttention,
         UlyssesCPVarlenInnerAttention,
         tpu_cp_inner_attention,
@@ -665,7 +666,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     config = config_registry.qwen3_debugmodel()
     config.parallelism.context_parallel_degree = 2
-    config.parallelism.spmd_backend = "spmd_types"
     with self.assertRaisesRegex(ValueError, "CPInnerAttention"):
       config.__post_init__()
 
@@ -673,7 +673,7 @@ class WorkaroundsTest(parameterized.TestCase):
     """`_wait` leaves traced (already waited) funcol results alone and waits eager ones once."""
     from unittest import mock
     import torch.distributed._functional_collectives as funcol
-    from torchtitan.experiments.tpu import cp_attention
+    from torchtitan.experiments.tpu.distributed import cp_attention
 
     x = torch.ones(4, 2)
     with mock.patch.object(
@@ -689,7 +689,7 @@ class WorkaroundsTest(parameterized.TestCase):
   def test_tpu_selective_ac_recomputes_saved_collectives(self):
     """TPUSelectiveAC is core SelectiveAC minus the collectives core saves."""
     from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-    from torchtitan.experiments.tpu.activation_checkpoint import (
+    from torchtitan.experiments.tpu.components.activation_checkpoint import (
         TPUSelectiveAC,
         tpu_selective_ac_config,
     )
@@ -720,8 +720,8 @@ class WorkaroundsTest(parameterized.TestCase):
     from types import SimpleNamespace
     from unittest import mock
     import spmd_types as spmd
-    from torchtitan.experiments.tpu import cp_attention
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed import cp_attention
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         UlyssesCPScaledDotProductInnerAttention,
     )
 
@@ -778,20 +778,19 @@ class WorkaroundsTest(parameterized.TestCase):
     from types import SimpleNamespace
     from unittest import mock
     import spmd_types as spmd
-    from torchtitan.experiments.tpu import cp_attention
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed import cp_attention
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         KVAllGatherCPScaledDotProductInnerAttention,
         reorder_sequence,
         revert_tpu_context_parallel,
         validate_tpu_context_parallel,
     )
-    from torchtitan.experiments.tpu.headtail import headtail_positions
+    from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
     from torchtitan.experiments.tpu.qwen3 import config_registry
     from torchtitan.models.common.attention import ScaledDotProductInnerAttention
 
     # 1. Verify the all_gather CP recipe and reverting it for cp=1.
     config = config_registry.qwen3_debugmodel_allgather_cp2()
-    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
     self.assertEqual(
         config.parallelism.context_parallel_load_balancer, "headtail"
     )
@@ -962,8 +961,8 @@ class WorkaroundsTest(parameterized.TestCase):
   def test_all_gather_cp_needs_a_kernel_off_cpu(self):
     """Off CPU, KV all-gather CP runs its reference attention only on opt-in."""
     from unittest import mock
-    from torchtitan.experiments.tpu import cp_attention
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed import cp_attention
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         KVAllGatherCPScaledDotProductInnerAttention,
     )
 
@@ -989,7 +988,7 @@ class WorkaroundsTest(parameterized.TestCase):
 
   def test_all_gather_cp_reference_attention_limits(self):
     """The reference attention needs cp_rank for a CP shard and has no windows."""
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         KVAllGatherCPScaledDotProductInnerAttention,
         KVAllGatherCPVarlenInnerAttention,
     )
@@ -1019,7 +1018,7 @@ class WorkaroundsTest(parameterized.TestCase):
   def test_all_gather_cp_requires_headtail_inputs(self):
     """cp_shard rejects any load balancer but head-tail, which forward assumes."""
     from types import SimpleNamespace
-    from torchtitan.experiments.tpu.cp_attention import (
+    from torchtitan.experiments.tpu.distributed.cp_attention import (
         KVAllGatherCPInnerAttention,
     )
 
@@ -1035,7 +1034,7 @@ class WorkaroundsTest(parameterized.TestCase):
     """CP + TP/EP with FSDP2 on torch without spmd_types FSDP fails clearly."""
     from types import SimpleNamespace
     from unittest import mock
-    from torchtitan.experiments.tpu import cp_attention
+    from torchtitan.experiments.tpu.distributed import cp_attention
     from torchtitan.experiments.tpu.qwen3 import config_registry
 
     config = config_registry.qwen3_debugmodel_allgather_cp2()

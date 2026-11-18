@@ -7,8 +7,8 @@ import tempfile
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 import torchtitan.experiments.tpu.train
 
 
@@ -403,6 +403,70 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
       ),
+      dict(
+          testcase_name="gemma4_simplefsdp_use_splash_attention_kernel",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--splash_attention_kernel.use_splash_attention_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="gemma4_simplefsdp_use_tokamax_splash_attention_kernel",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="gemma4_simplefsdp_fused_ce",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_debugmodel_fused_ce",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="gemma4_moe_simplefsdp_pallas",
+          module="torchtitan.experiments.tpu.examples.gemma4",
+          config="gemma4_moe_debug_pallas",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       # muse_glimmer (text-only). TP is capped at 2: the debugmodel has 2 KV
       # heads (see muse_glimmer_fsdp_tp2).
       dict(
@@ -501,6 +565,31 @@ class TrainDistributedTest(
               "--parallelism.no-use_simple_fsdp",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      # The same 2-D (dp_shard, tp) mesh over the topology-ordered rank
+      # permutation. FSDP2 + spmd_types typecheck the storage and fwd/bwd
+      # meshes, which failed on every multi-axis mesh (b/587033846). TPU only:
+      # the flag is a no-op without torch.tpu.topology_aware_mesh.
+      dict(
+          testcase_name="muse_glimmer_fsdp_tp2_topo_mesh",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=2,
+          args=[
+              "--parallelism.no-use_simple_fsdp",
+              "--parallelism.enable_tpu_topo_mesh",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              # TODO(b/587033846): multi-axis meshes fail on spmd_types under
+              # enable_tpu_topo_mesh; enable with the fix. CPU/CUDA: the flag
+              # is a no-op there.
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       # qwen3_5 (hybrid GatedDeltaNet + Attention, Dense and MoE).

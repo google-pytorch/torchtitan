@@ -13,7 +13,7 @@ kernels, and TPU-specific trainer and parallelism paths.
 * **Pick a recipe**: [`torchtitan/experiments/tpu/recipes`](torchtitan/experiments/tpu/recipes) has
   per-model, per-topology configs, each with its launch block.
 * **Tune a model**: the
-  [TorchTPU optimization guide](torchtitan/experiments/tpu/torch-tpu-optimization-guide.md).
+  [TorchTPU optimization guide](torchtitan/experiments/tpu/docs/torch-tpu-optimization-guide.md).
 * **Everything else**: upstream's
   [README](https://github.com/pytorch/torchtitan/blob/main/README.md) and
   [docs](https://github.com/pytorch/torchtitan/tree/main/docs) apply unchanged.

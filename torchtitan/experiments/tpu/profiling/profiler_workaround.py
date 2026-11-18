@@ -53,7 +53,7 @@ def custom_enter(self: torchtitan_profiler.Profiler) -> torchtitan_profiler.Prof
     if use_jax:
       try:
         # pylint: disable=g-import-not-at-top
-        from torchtitan.experiments.tpu import jax_profiler
+        from torchtitan.experiments.tpu.profiling import jax_profiler
       except ImportError:
         jax_profiler = None
 

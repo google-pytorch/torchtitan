@@ -14,7 +14,7 @@ from torchtitan.config.configs import (
 )
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.examples.gemma4 import (
     Gemma4Model,
     model_registry,
@@ -29,16 +29,21 @@ from torchtitan.experiments.tpu.graph_trainer.gemma4 import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.experiments.tpu.grouped_experts import (
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
-from torchtitan.experiments.tpu.token_dispatcher import (
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
+    SplashAttentionKernelConfig,
     TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
+from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 
 
 # Host-offload copy-insertion flags shared with the Qwen3 235B graph-splitter
@@ -51,6 +56,97 @@ _GEMMA4_GRAPH_SPLIT_OFFLOAD_FLAGS = tpu_flags.merge_flags(
         "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
     },
 )
+
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss."
+    "fused_loss_soft_capped_lm_head"
+)
+
+
+def _default_h_block_size(dim: int) -> int:
+  """Pick an h_block_size dividing dim to avoid wasted MXU work on the last tile.
+
+  The kernel default h_block_size=512 divides neither Gemma 4 production model
+  (31B dim=5376 has 11 blocks with the last half-filled; 26B-A4B dim=2816 has
+  6 blocks with the last half-filled), wasting ~4.5% and ~8.3% of the loss
+  matmul on zeroed trailing columns.
+
+  Multiples of 128 that divide each model's hidden dimension without exceeding
+  VMEM capacity (e.g. 32 MiB on TPU v6e):
+    - 31B (dim=5376): 384 (14 blocks) or 256 (21 blocks). 384 minimizes loop
+      iterations while staying within the same VMEM allocation (h_alloc=512).
+    - 26B-A4B (dim=2816): 256 (11 blocks; 1408 exceeds VMEM).
+    - debugmodel (dim=256): 256 (1 block).
+  """
+  if dim % 384 == 0:
+    return 384
+  if dim % 256 == 0:
+    return 256
+  return 512
+
+
+def _enable_pallas_cross_entropy(
+    config: TPUTrainerConfig,
+    *,
+    b_block_size: int = 1024,
+    h_block_size: int | None = None,
+    v_block_size: int = 2048,
+) -> None:
+  """Select the soft-capped fused Pallas loss and its LM-head override."""
+  assert config.model_spec is not None
+  model_config = cast(Gemma4Model.Config, config.model_spec.model)
+  lm_head = cast(SoftCappedLinear.Config, model_config.lm_head)
+  if h_block_size is None:
+    h_block_size = _default_h_block_size(model_config.dim)
+  config.loss = PallasCrossEntropyLoss.Config(
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
+      soft_cap=lm_head.output_soft_cap_temp,
+      output_multiplier=lm_head.output_multiplier,
+  )
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
+
+def _enable_moe_pallas_kernels(config: TPUTrainerConfig) -> None:
+  """Enable Pallas grouped MM, paired W1/W3, native weight layout, and fused route-score bwd."""
+  assert config.model_spec is not None
+  model_config = cast(Gemma4Model.Config, config.model_spec.model)
+  dispatchers = list(
+      model_config.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError(
+        "Gemma4 MoE Pallas configuration requires TpuTokenDispatcherConverter"
+    )
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
+
+  experts_list = list(model_config.traverse(TpuGroupedExperts.Config))
+  if not experts_list:
+    raise ValueError(
+        "Gemma4 MoE Pallas configuration requires TpuGroupedExpertsConverter"
+    )
+  for _, experts, _, _ in experts_list:
+    experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tile_k = 0
+    experts.pallas_grouped_mm_tile_n = 0
+    if model_config.dim > 256:
+      # 26B-A4B: D=2816, F=704. Paired W1/W3 dWeight has K=2816, N=1408.
+      # Tiling K=1408 (2 tiles, 0% waste) drops scoped VMEM from 34.5 MiB to
+      # ~17.3 MiB, fitting within the 32 MiB v6e default without requiring
+      # xla_tpu_scoped_vmem_limit_kib.
+      experts.pallas_grouped_mm_tgmm_tiling = (256, 1408, 0)
+      # W2 dWeight has K=F=704, N=D=2816. Untiled K needs only ~7.9 MiB VMEM;
+      # keep untiled to avoid inheriting K=1408 (which exceeds F=704).
+      experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 0, 0)
+    else:
+      experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+      experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 0, 0)
+    experts.use_kernel_native_weight_layout = True
 
 
 def gemma4_debugmodel() -> TPUTrainerConfig:
@@ -73,7 +169,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -105,6 +201,13 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
   )
 
 
+def gemma4_debugmodel_fused_ce() -> TPUTrainerConfig:
+  """Gemma4 dense debug model with fused Pallas cross-entropy and soft-cap."""
+  cfg = gemma4_debugmodel()
+  _enable_pallas_cross_entropy(cfg)
+  return cfg
+
+
 def gemma4_moe_testmodel() -> TPUTrainerConfig:
   """Gemma4 MoE test model configuration for TPU."""
   cfg = gemma4_debugmodel()
@@ -130,6 +233,20 @@ def gemma4_moe_debug() -> TPUTrainerConfig:
       ],
       enable_weight_tying=False,
   )
+  return cfg
+
+
+def gemma4_moe_debug_fused_ce() -> TPUTrainerConfig:
+  """Gemma4 MoE debug model with fused Pallas cross-entropy and soft-cap."""
+  cfg = gemma4_moe_debug()
+  _enable_pallas_cross_entropy(cfg)
+  return cfg
+
+
+def gemma4_moe_debug_pallas() -> TPUTrainerConfig:
+  """Gemma4 MoE debug model with Pallas grouped MM, paired W1/W3, native weights, and fused route-score backward."""
+  cfg = gemma4_moe_debug()
+  _enable_moe_pallas_kernels(cfg)
   return cfg
 
 
@@ -165,11 +282,11 @@ def gemma4_31b() -> TPUTrainerConfig:
   model_spec = model_registry(
       "31B", attn_backend="sdpa", enable_weight_tying=False
   )
-  return TPUTrainerConfig(
+  cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=200,
           decay_ratio=0.8,
@@ -211,7 +328,12 @@ def gemma4_31b() -> TPUTrainerConfig:
           freq=5,
           steps=10,
       ),
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+      ),
   )
+  _enable_pallas_cross_entropy(cfg)
+  return cfg
 
 
 def gemma4_26b_a4b() -> TPUTrainerConfig:
@@ -227,6 +349,14 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
       ],
       enable_weight_tying=False,
   )
+  # 26B-A4B routes tokens across 128 experts with top-8 (M_expert = B*T*8/128 =
+  # B*T/16 tokens/expert) and has 3.8B active parameters/token (vs. 31B dense),
+  # so B=6 at max_context_length=4096 (24,576 tokens/rank, ~1,536 tokens/expert)
+  # reaches the MXU compute saturation regime (+66.3% TPS/MFU over inherited
+  # B=2) with zero HBM defragmentation retries on TPU v7x.
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 6 * 4096
+  _enable_pallas_cross_entropy(cfg)
+  _enable_moe_pallas_kernels(cfg)
   return cfg
 
 

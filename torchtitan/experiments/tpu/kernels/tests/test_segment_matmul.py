@@ -8,7 +8,7 @@ The reference is a pure-PyTorch per-group matmul. The tested kernel is
 from absl import logging
 from absl.testing import absltest
 import torch
-from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels import segment_matmul
 
 

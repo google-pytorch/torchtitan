@@ -137,4 +137,4 @@ How it is checked, in this order:
   including a subclass with its own forward, runs the `[T]` path silently
   (OLMo 2 does). Say which path the model runs in the PR; extending the match
   is a lever for later rungs, not rung 1. A non-stock `Decoder.forward` must
-  make `tpu_model_class` raise rather than silently skip (`tpu/layer_loop.py`).
+  make `tpu_model_class` raise rather than silently skip (`tpu/components/layer_loop.py`).

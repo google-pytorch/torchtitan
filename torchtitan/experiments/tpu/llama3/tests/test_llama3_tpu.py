@@ -9,8 +9,8 @@ from absl.testing import absltest
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import test_utils
 import torchtitan.experiments.tpu.llama3 as llama3_tpu
 from torchtitan.models.common.attention import GQAttention as Attention, QKVLinear, ScaledDotProductInnerAttention
 from torchtitan.models.common.decoder import TransformerBlock
@@ -239,7 +239,7 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
       positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").repeat(batch)
       positions_device = positions_cpu.to(self.accelerator_device)
       with set_unflatten_seq_len(seq_len):
@@ -352,7 +352,7 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
       positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").repeat(batch)
       positions_device = positions_cpu.to(self.accelerator_device)
       with set_unflatten_seq_len(seq_len):

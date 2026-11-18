@@ -28,34 +28,14 @@ meant for int8). FP8 residuals cross the torch boundary bitcast to int8.
 """
 
 import jax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-import jaxtyping
-
-# Workaround for https://github.com/openxla/tokamax/issues/240 (as in
-# tokamax_splash_attention.py): typeguard cannot parse the jaxtyping shape
-# strings tokamax applies at import time, so make `jaxtyped` a pass-through
-# for the duration of the import.
-_real_jaxtyped = jaxtyping.jaxtyped
-
-
-def _passthrough_jaxtyped(*args, **kwargs):
-    del kwargs
-    if len(args) == 1 and callable(args[0]):
-        return args[0]
-    return lambda f: f
-
-
-jaxtyping.jaxtyped = _passthrough_jaxtyped
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as tokamax_gmm  # noqa: E402  pylint: disable=g-import-not-at-top
-
-jaxtyping.jaxtyped = _real_jaxtyped
-
-from jax.experimental import pallas as pl  # noqa: E402  pylint: disable=g-import-not-at-top
-from jax.experimental.pallas import tpu as pltpu  # noqa: E402  pylint: disable=g-import-not-at-top
-import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
-from torch_tpu._internal import pallas  # noqa: E402  pylint: disable=g-import-not-at-top
-from torchtitan.experiments.tpu.kernels import fp8_scale  # noqa: E402  pylint: disable=g-import-not-at-top
-from torchtitan.experiments.tpu.kernels.pallas_naming import call_named  # noqa: E402  pylint: disable=g-import-not-at-top
+from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as tokamax_gmm
+import torch
+from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.kernels import fp8_scale
+from torchtitan.experiments.tpu.kernels.pallas_naming import call_named
 
 FWD_DTYPE = jnp.float8_e4m3fn
 BWD_DTYPE = jnp.float8_e5m2

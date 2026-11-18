@@ -9,6 +9,7 @@ set -uo pipefail
 ulimit -n 65536
 
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+MODULE_TIMEOUT="${MODULE_TIMEOUT:-1500}"
 
 # Retry only infra-side TPU init failures on the 4-chip runners
 # ("START_SESSION failed", "vbar.sock" DEADLINE_EXCEEDED). Both log this
@@ -25,7 +26,7 @@ for module in "$@"; do
     echo "=================================================="
     echo "Running test module: $module (attempt $attempt/$MAX_ATTEMPTS)"
     echo "=================================================="
-    if timeout 900 python -m "$module" --device=tpu 2>&1 | tee "$log"; then
+    if timeout "$MODULE_TIMEOUT" python -m "$module" --device=tpu 2>&1 | tee "$log"; then
       [ "$attempt" -gt 1 ] && retried+=("$module")
       continue 2
     fi

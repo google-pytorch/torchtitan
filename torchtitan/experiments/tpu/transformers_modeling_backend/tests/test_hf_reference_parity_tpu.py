@@ -32,8 +32,8 @@ import torch.nn.functional as F
 import torchtitan.config
 from transformers.modeling_utils import PreTrainedModel
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import train_minimal
 from torchtitan.experiments.tpu.transformers_modeling_backend import (
     attention as splash_adapter,

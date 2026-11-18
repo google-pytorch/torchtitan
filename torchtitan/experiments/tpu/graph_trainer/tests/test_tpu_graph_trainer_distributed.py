@@ -139,6 +139,31 @@ class TpuGraphTrainerDistributedTest(
               "--compile.use_scan_layers",
           ],
       ),
+      # The HSDP mesh over the topology-ordered rank permutation, as the
+      # recipes run it. Every multi-axis mesh failed spmd_types' orthogonality
+      # check under that permutation (b/587033846). TPU only: the flag is a
+      # no-op without torch.tpu.topology_aware_mesh.
+      dict(
+          testcase_name="llama3_simple_fsdp_scan_layers_hsdp_topo_mesh",
+          module="torchtitan.experiments.tpu.llama3",
+          config="graph_trainer_llama3_debugmodel",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          data_parallel_replicate_degree=2,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--parallelism.enable_tpu_topo_mesh",
+              "--compile.use_scan_layers",
+          ],
+          skip_devices=[
+              # TODO(b/587033846): multi-axis meshes fail on spmd_types under
+              # enable_tpu_topo_mesh; enable with the fix. CPU/CUDA: the flag
+              # is a no-op there.
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       # Muse Glimmer (text-only). Context 256 exceeds the debugmodel's
       # 128-token sliding window, so the SWA layers actually mask; the token
       # budget keeps 4 sequences per rank. No scan case: the SWA/RoPE and

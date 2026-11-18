@@ -1,13 +1,12 @@
+import math
 from dataclasses import dataclass, replace
 
 import torch
 import spmd_types as spmd
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import spmd_mesh_size
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
@@ -256,19 +255,10 @@ class TpuGroupedExperts(GroupedExperts):
         ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
         silu.
         """
-        if isinstance(self.w1_EFD, DTensor):
-            w1_EFD = self.w1_EFD.to_local()
-            w2_EDF = self.w2_EDF.to_local()
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
+        w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
 
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if (
-            get_spmd_backend() == "spmd_types"
-            and spmd.is_type_checking()
-            and spmd_mesh_size("ep") == 1
-        ):
+        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
@@ -305,17 +295,14 @@ class TpuGroupedExperts(GroupedExperts):
             if self.activation == "silu":
                 return super().forward(x_RD, num_tokens_per_expert_E)
             return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
-        def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.to_local() if isinstance(tensor, DTensor) else tensor
-
         if self.use_kernel_native_weight_layout:
-            w1_EKN = local_tensor(self.w1_EDF)
-            w2_EKN = local_tensor(self.w2_EFD)
-            w3_EKN = local_tensor(self.w3_EDF)
+            w1_EKN = self.w1_EDF
+            w2_EKN = self.w2_EFD
+            w3_EKN = self.w3_EDF
         else:
-            w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
-            w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
-            w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
+            w1_EKN = self.w1_EFD.transpose(-2, -1)
+            w2_EKN = self.w2_EDF.transpose(-2, -1)
+            w3_EKN = self.w3_EFD.transpose(-2, -1)
 
         if self._use_transposed_w2_rhs:
             w2_EKN = w2_EKN.transpose(-2, -1)
@@ -324,16 +311,6 @@ class TpuGroupedExperts(GroupedExperts):
         # model is FP32, and the final result is restored to the caller's dtype.
         x_bf16 = x_RD.bfloat16()
         tile_m = self.pallas_grouped_mm_tile_m
-        # The kernels need a row count divisible by tile_m. Append zero rows to
-        # the last expert's group: they add nothing to dWeight and are sliced
-        # off the output. A no-op for tile-aligned batches.
-        num_rows = x_bf16.shape[0]
-        pad_rows = -num_rows % tile_m
-        if pad_rows:
-            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
-            num_tokens_per_expert_E = torch.cat(
-                [num_tokens_per_expert_E[:-1], num_tokens_per_expert_E[-1:] + pad_rows]
-            )
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
@@ -342,6 +319,28 @@ class TpuGroupedExperts(GroupedExperts):
             w2_tgmm_tiling = (
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
+        # The kernels need a row count divisible by tile_m and by both dWeight
+        # M tiles. Append zero rows but leave num_tokens_per_expert_E alone:
+        # every kernel skips rows past its sum, so the pad rows add nothing to
+        # dWeight and are sliced off the output. Growing the last expert's
+        # group over them instead would also pull in any rows between that sum
+        # and num_rows, such as the stale tail of a static-size EP receive
+        # buffer. A no-op for aligned batches.
+        row_tiles = (tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0]))
+        row_align = math.lcm(*row_tiles)
+        # M tiles that divide each other, like powers of two, need only the
+        # largest tile. Others can need a large multiple of it, all zero rows,
+        # so refuse an lcm past twice the largest.
+        if row_align > 2 * max(row_tiles):
+            raise ValueError(
+                f"Pallas grouped matmul M tiles {row_tiles} would pad the rows "
+                f"to a multiple of their lcm, {row_align}, more than twice the "
+                "largest tile; use M tiles that divide each other"
+            )
+        num_rows = x_bf16.shape[0]
+        pad_rows = -num_rows % row_align
+        if pad_rows:
+            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16

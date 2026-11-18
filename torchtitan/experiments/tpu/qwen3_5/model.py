@@ -8,7 +8,6 @@ import torch
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.distributed.spmd_types import spmd_local_context
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.components.layer_loop import TpuLayerLoop, register_layer_loop_forward
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
@@ -142,7 +141,7 @@ def _layer_loop_forward(
     else:
       x = tokens
 
-  if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+  if spmd.is_type_checking():
     spmd.assert_type(
         x,
         {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},

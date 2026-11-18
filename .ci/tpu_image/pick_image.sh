@@ -19,11 +19,15 @@ summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 # Everything the Dockerfile reads from the build context, other than the
 # torchtitan/ and tests/ sources that CI runs from the checkout instead.
+# requirements.txt and requirements-dev.txt are symlinks into .ci/docker/;
+# `git diff` only sees the link itself, so the targets are listed as well.
 image_inputs=(
   torchtitan/experiments/tpu/Dockerfile
   torchtitan/experiments/tpu/requirements.txt
   requirements.txt
+  .ci/docker/requirements.txt
   requirements-dev.txt
+  .ci/docker/requirements-dev.txt
   .ci/docker/requirements-flux.txt
 )
 

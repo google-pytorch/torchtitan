@@ -382,10 +382,16 @@ class TestScanBodyRematWindow(unittest.TestCase):
         with self.assertRaises(ValueError):
             _run(_saving("moe.routing"))
 
-    def test_the_budget_is_restored(self):
-        before = functorch_config.activation_memory_budget
-        _run(_saving())
-        self.assertEqual(functorch_config.activation_memory_budget, before)
+    def test_the_policy_holds_at_the_default_budget(self):
+        """No budget pin: torch's default, 1.0, already honours every tag."""
+        self.assertEqual(functorch_config.activation_memory_budget, 1.0)
+        want, _ = _run(_legacy, extra=_attention_term)
+        got, captured = _run(
+            _saving(ATTENTION_INNER_ATTENTION), extra=_attention_term
+        )
+        self.assertEqual({budget for budget, _ in captured}, {1.0})
+        self.assertNotIn("aten.sigmoid.default", _ops(captured[0][1]))
+        self._check_same_grads(got, want)
 
 
 if __name__ == "__main__":

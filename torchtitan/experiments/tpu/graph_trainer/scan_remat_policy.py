@@ -16,7 +16,6 @@ from collections.abc import Callable, Set
 
 import torch.utils.checkpoint as checkpoint_module
 from torch import fx
-from torch._functorch import config as functorch_config
 from torch._higher_order_ops.scan import scan
 from torch.utils.checkpoint import (
     checkpoint,
@@ -88,12 +87,10 @@ def scan_with_remat_policy(
     def checkpointed(*args):
         return checkpoint(body, *args, use_reentrant=False, context_fn=context_fn)
 
-    # preserve_node_meta: the tags reach the traced nodes. Budget 1.0: min-cut
-    # honours every tag.
-    with fx.traceback.preserve_node_meta(), functorch_config.patch(
-        activation_memory_budget=1.0
-    ):
-        result = scan(checkpointed, init, xs)
+    # No budget pin and no preserve_node_meta: min-cut honours every tag at
+    # torch's default budget (1.0), and scan's partitioner keeps node meta
+    # while it re-traces the body.
+    result = scan(checkpointed, init, xs)
     missing = set(save_regions) - saved
     if missing:
         raise ValueError(

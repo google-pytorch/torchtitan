@@ -1,4 +1,4 @@
-"""Tests for TPU context parallelism (``torchtitan/experiments/tpu/cp_attention.py``).
+"""Tests for TPU context parallelism (``torchtitan/experiments/tpu/distributed/cp_attention.py``).
 
 The CP attentions run here on CPU, every rank of a CP group on its own thread.
 The collectives they issue are emulated across those threads: the functional
@@ -30,9 +30,9 @@ from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalanc
 import torch.nn.functional as F
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import MeshAxisName
-from torchtitan.experiments.tpu import cp_attention
-from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
-from torchtitan.experiments.tpu.cp_attention import (
+from torchtitan.experiments.tpu.distributed import cp_attention
+from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
+from torchtitan.experiments.tpu.distributed.cp_attention import (
     KVAllGatherCPInnerAttention,
     KVAllGatherCPScaledDotProductInnerAttention,
     KVAllGatherCPVarlenInnerAttention,
@@ -42,10 +42,10 @@ from torchtitan.experiments.tpu.cp_attention import (
     reorder_sequence,
     validate_tpu_context_parallel,
 )
-from torchtitan.experiments.tpu.headtail import headtail_positions
+from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
 from torchtitan.experiments.tpu.qwen3 import config_registry
-from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import segment_ids_from_positions
 
 _C10D = torch.ops._c10d_functional

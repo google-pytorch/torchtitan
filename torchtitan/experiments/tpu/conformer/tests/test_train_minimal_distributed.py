@@ -3,7 +3,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
-from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.conformer import train_minimal as conformer_train_minimal
 
 

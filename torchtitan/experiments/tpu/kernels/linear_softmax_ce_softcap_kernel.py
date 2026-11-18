@@ -776,6 +776,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       xw_tiled_ref,
   ):
     def fwd_pipeline(
+        step: pltpu.PipelineStep,
         x_ref,
         labels_ref,
         w_ref,
@@ -783,10 +784,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         lse_ref,
         xw_tiled,
     ):
-      b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
-      num_b_blocks, num_v_blocks, num_h_blocks = (
-          pl.num_programs(i) for i in range(3)
-      )
+      b_index, v_index, h_index = step.index
 
       # xw_tiled += x_ref @ w_ref
       calculate_xw_tiled(
@@ -907,6 +905,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
             pltpu.ARBITRARY,
             pltpu.ARBITRARY,
         ),
+        _explicit_indices=True,
     )(
         x_hbm_ref,
         labels_hbm_ref,
@@ -1143,6 +1142,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     c_index = jax.lax.axis_index("core")
 
     def bwd_pipeline(
+        step: pltpu.PipelineStep,
         dout_ref,
         x_ref,
         labels_ref,
@@ -1159,7 +1159,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         x_write_sem,
         w_write_sem,
     ):
-      b_index, v_step, h_index = (pl.program_id(i) for i in range(3))
+      b_index, v_step, h_index = step.index
       global_v = c_index * num_v_blocks_per_core + v_step
       v_vm1 = jnp.maximum(0, v_step - 1)
       global_v_vm1 = c_index * num_v_blocks_per_core + v_vm1
@@ -1507,6 +1507,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             pl.BlockSpec(memory_space=pltpu.HBM),  # x_grad
             pl.BlockSpec(memory_space=pltpu.HBM),  # w_grad
         ],
+        _explicit_indices=True,
     )(
         dout_hbm_ref,
         x_hbm_ref,

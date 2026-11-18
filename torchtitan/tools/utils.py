@@ -206,7 +206,7 @@ def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
 def get_device_info() -> tuple[str, ModuleType]:
     # Upstream falls back to "cuda"; this fork falls back to "cpu" so that a
     # machine with no accelerator -- or one where the accelerator was hidden on
-    # purpose, see experiments/tpu/device_env.py -- reports what it will run on.
+    # purpose, see experiments/tpu/distributed/device_env.py -- reports what it will run on.
     device_type = _get_available_device_type() or "cpu"
     device_module = _get_device_module(device_type)
     if device_type == "cpu":

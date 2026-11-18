@@ -9,9 +9,9 @@ Wraps upstream ``torchtitan.models.muse_glimmer`` for the TPU lane:
   on TPU.
 * Swaps every layer's ``Attention`` for ``TpuMuseGlimmerAttention``, which
   passes ``positions`` to the inner attention so packed documents are masked.
-* Replaces upstream's ``spmd_types``-only ``parallelize_fn`` with
-  ``infra.parallelize.parallelize_muse_glimmer`` (``partial_dtensor`` +
-  SimpleFSDP).
+* Replaces upstream's ``parallelize_fn`` with
+  ``infra.parallelize.parallelize_muse_glimmer`` (adds SimpleFSDP and the TPU
+  compile modes).
 """
 
 import dataclasses

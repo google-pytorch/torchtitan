@@ -14,7 +14,7 @@ lane's existing ones.
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
@@ -23,7 +23,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.experiments.tpu.activation_checkpoint import AttentionSavingSelectiveAC
+from torchtitan.experiments.tpu.components.activation_checkpoint import AttentionSavingSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
@@ -37,7 +37,7 @@ from torchtitan.experiments.transformers_modeling_backend.model import HFTransfo
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TpuTrainerCompileConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.validate import Validator
-from torchtitan.experiments.tpu.datasets import TPUGrainDataLoader
+from torchtitan.experiments.tpu.components.datasets import TPUGrainDataLoader
 from torchtitan.experiments.transformers_modeling_backend.tokenizer import HFBackendTokenizer
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -235,9 +235,8 @@ def _tpu_hf_config(
           local_batch_size=local_batch_size, seq_len=seq_len, steps=steps
       ),
       # SimpleFSDP is the data-parallel implementation on this lane; see
-      # parallelize.py for why it is not FSDP2. The shared backend requires
-      # spmd_types, which this fork does not default to.
-      parallelism=ParallelismConfig(use_simple_fsdp=True, spmd_backend="spmd_types"),
+      # parallelize.py for why it is not FSDP2.
+      parallelism=ParallelismConfig(use_simple_fsdp=True),
       # Kernel tuning for the splash_tpu attention implementation, pushed to
       # the HF adapter by workarounds.apply_patches; CLI overrides via
       # --splash_attention_kernel.sa_*. 1024 forward/dkv blocks are the

@@ -5,7 +5,7 @@ from typing import Literal
 
 import torchtitan.config
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.cp_attention import validate_tpu_context_parallel
+from torchtitan.experiments.tpu.distributed.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
 
 
@@ -17,7 +17,7 @@ class TPUConfig:
   apply_rope_complex_workaround: bool = False
   # Compute dense Llama3/Qwen3 transformer blocks on [B, L, ...] views instead
   # of upstream's folded [T, ...] tensors, which make XLA pick slow TPU layouts
-  # (see experiments/tpu/bld_layout.py). Numerics match to rounding order.
+  # (see experiments/tpu/components/bld_layout.py). Numerics match to rounding order.
   bld_block_layout: bool = True
   use_jax_profiler: bool = False
   # Emit one aggregate MFU measurement after the configured start log step
@@ -122,6 +122,17 @@ class SplashAttentionKernelConfig:
   # Tokamax skips tiles with no same-document pair, but a vmapped call must keep
   # every tile that any example in the batch needs.
   use_batch_loop_fwd: bool = False
+  # Tokamax only. Compute the backward with the transposed Splash kernel
+  # (kernels/splash_tbwd.py: one call for the whole batch, dK/dV produced
+  # transposed so P and dS fill the MXU) instead of Tokamax's dkv kernel; the
+  # forward is unchanged. Takes precedence over use_vmap_bwd. Supports causal
+  # self-attention (optional packed-document segment ids), bf16, 2-16 query
+  # heads per KV head, head_dim a multiple of 32 and >= 64, seq_len a multiple
+  # of 128, within a VMEM / SMEM estimate (see "Supported shapes" in
+  # splash_tbwd.py); no window and no context parallelism. Anything else
+  # (and 1 query head per KV head, where Tokamax is faster) warns and uses the
+  # Tokamax backward.
+  use_transposed_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512
@@ -192,6 +203,11 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # after decoration, leaving the ``__class__`` cell that zero-arg
     # ``super()`` relies on pointing at a stale class. See bpo-46404.
     super(BaseTPUTrainerConfig, self).__post_init__()
+    # ``loss.global_vocab_size`` (spmd_types loss-parallel CE needs the full
+    # vocab) is filled from the final model config by the trainers right before
+    # ``Trainer.__init__`` (``components.loss.set_global_vocab_size``), not
+    # here: the model vocab can still change after construction
+    # (``train_minimal`` widens it to the tokenizer's).
     if (
         self.model_spec is not None
         and self.parallelism.context_parallel_degree > 1

@@ -14,10 +14,10 @@ from torch.distributed.tensor import parallel
 from torch.distributed.tensor import DTensor, Replicate, Shard
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import test_utils
-from torchtitan.experiments.tpu import distributed
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
+from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu.distributed import distributed
 import torch.compiler
 
 

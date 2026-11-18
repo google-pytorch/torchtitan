@@ -23,8 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from torchtitan.components import loss as components_loss
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu import loss as tpu_loss
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.components import loss as tpu_loss
 from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel
 from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss as wrapper
 

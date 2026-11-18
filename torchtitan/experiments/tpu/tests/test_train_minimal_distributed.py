@@ -3,8 +3,8 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.testing import base_distributed_device_test
 
 
 class TrainMinimalDistributedTest(
@@ -247,6 +247,34 @@ class TrainMinimalDistributedTest(
           skip_devices=[
               # Needs 2 (replicate) x 2 (cp) devices or more.
               device_type.AcceleratorDeviceType.CPU,
+          ],
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
+      ),
+      # The same (dp_replicate, dp_shard, cp) mesh over the topology-ordered
+      # rank permutation, checked for parity against the CPU reference. Every
+      # multi-axis mesh failed spmd_types' orthogonality check under that
+      # permutation (b/587033846). TPU only: the flag is a no-op elsewhere.
+      dict(
+          testcase_name="qwen3_hsdp_cp2_all_gather_topo_mesh",
+          module="qwen3",
+          config="qwen3_debugmodel_allgather_cp2",
+          data_parallel_replicate_degree=2,
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.enable_tpu_topo_mesh"],
+          skip_devices=[
+              # TODO(b/587033846): multi-axis meshes fail on spmd_types under
+              # enable_tpu_topo_mesh; enable with the fix. CPU/CUDA: the flag
+              # is a no-op there.
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
           ],
           loss_atol=2e-2,
           loss_rtol=1e-3,

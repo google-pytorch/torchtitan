@@ -11,7 +11,7 @@ from torchtitan.components.optimizer import lr_scheduler
 from torchtitan.config import configs
 from torchtitan.distributed import activation_checkpoint
 from torchtitan.experiments.tpu import tpu_job_config
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.protocols import model_spec
 from . import model
 from . import parallelize

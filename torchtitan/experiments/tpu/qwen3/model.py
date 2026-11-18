@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch.nn as nn
 
-from torchtitan.experiments.tpu.mfu_flops import (
+from torchtitan.experiments.tpu.profiling.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
 from torchtitan.models.qwen3.model import Qwen3Model

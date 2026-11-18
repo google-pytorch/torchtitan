@@ -12,8 +12,8 @@ import numpy as np
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
-from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.headtail import headtail_positions
+from torchtitan.experiments.tpu.testing import base_device_test
+from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
 from torchtitan.experiments.tpu.kernels.splash_attention import (
     _make_mask,
     _maybe_document_aware_mask_info,

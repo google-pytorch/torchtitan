@@ -1,4 +1,4 @@
-"""Tests for the TPU [B, L] block layout (`experiments/tpu/bld_layout.py`)."""
+"""Tests for the TPU [B, L] block layout (`experiments/tpu/components/bld_layout.py`)."""
 
 import copy
 import pickle
@@ -8,13 +8,13 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 
-from torchtitan.experiments.tpu.bld_layout import apply_bld_layout
-from torchtitan.experiments.tpu.bld_layout import bld_skip_reason
-from torchtitan.experiments.tpu.bld_layout import cossin_rotate
+from torchtitan.experiments.tpu.components.bld_layout import apply_bld_layout
+from torchtitan.experiments.tpu.components.bld_layout import bld_skip_reason
+from torchtitan.experiments.tpu.components.bld_layout import cossin_rotate
 from torchtitan.experiments.tpu.overrides.bf16_rope import tpu_activation_dtype_cossin_rope
 from torchtitan.experiments.tpu.overrides.real_rope import tpu_real_arithmetic_complex_rope
-from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
+from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import ComplexRoPE
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.llama3 import _build_llama3_layers

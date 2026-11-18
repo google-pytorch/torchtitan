@@ -48,7 +48,7 @@ class TpuActivationDtypeCosSinRoPE(CosSinRoPE):
   # Only the rotation differs; cache lookup stays in the inherited
   # `RoPE.forward` / `_reshape_cache`. Keeping the override in
   # `apply_rotary_emb` lets callers that fetch the cache themselves (e.g. the
-  # TPU [B, L] block layout in `experiments/tpu/bld_layout.py`) keep this
+  # TPU [B, L] block layout in `experiments/tpu/components/bld_layout.py`) keep this
   # numerical policy.
   @staticmethod
   def apply_rotary_emb(

@@ -24,7 +24,7 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-from torchtitan.experiments.tpu.remat_regions import (
+from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     MOE_EXPERT_COUNTS,
     REMAT_REGION,

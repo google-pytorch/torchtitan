@@ -6,7 +6,7 @@ from torchtitan.components.optimizer.optimizer import (
     OptimizersContainer,
 )
 from torchtitan.components.validate import Validator
-from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.protocols.model_spec import ModelSpec
 # NOTE: these are named directly rather than reached via

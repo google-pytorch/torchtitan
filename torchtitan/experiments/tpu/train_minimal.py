@@ -20,12 +20,13 @@ import torchtitan.distributed
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu.cp_attention import reorder_sequence
+from torchtitan.experiments.tpu.distributed import distributed_utils
+from torchtitan.experiments.tpu.distributed.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
-import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
@@ -100,17 +101,10 @@ class TrainerMinimal:
           enable_cpu_backend=job_config.training.enable_cpu_offload,
           base_folder=job_config.dump_folder,
       )
-    elif job_config.parallelism.spmd_backend == "spmd_types":
-      # spmd_types needs a device mesh, and a mesh needs torch.distributed.
-      # A single-process run (e.g. a parity test's CPU reference) has neither,
-      # and with one rank the backends are numerically identical.
-      logger.info(
-          "Single-process run: using the partial_dtensor SPMD backend"
-          " (spmd_types needs an initialized process group)"
-      )
-      job_config.parallelism.spmd_backend = "partial_dtensor"
-    # Same activation as Trainer.__init__: the backend is a process global.
-    dist_utils.set_spmd_backend(job_config.parallelism.spmd_backend)
+    else:
+      # spmd_types builds the device mesh from the default process group, so a
+      # single-process run still needs one (see init_single_rank_process_group).
+      distributed_utils.init_single_rank_process_group()
 
     parallelism_config = self.job_config.parallelism
     self.parallel_dims = ParallelDims(
@@ -121,7 +115,6 @@ class TrainerMinimal:
         pp=parallelism_config.pipeline_parallel_degree,
         ep=parallelism_config.expert_parallel_degree,
         world_size=self.world_size,
-        spmd_backend=parallelism_config.spmd_backend,
     )
 
     logger.info(f"parallel_dims: {self.parallel_dims}")
@@ -206,6 +199,9 @@ class TrainerMinimal:
     )
     self.model_config = model_config
 
+    # TODO(jerryx99): Consider stop widening model_config.vocab_size to the
+    # tokenizer's here and fail fast instead/always give the debug configs a
+    # vocab that matches the tokenizer they run with (see #158 review)
     if (
         hasattr(self.model_config, "vocab_size")
         and self.model_config.vocab_size is not None
@@ -244,6 +240,11 @@ class TrainerMinimal:
         f"size: {model_param_count:,} total parameters"
     )
 
+    # Fill ``global_vocab_size`` from the final model config (the vocab may
+    # have been widened to the tokenizer's above).
+    from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
+
+    set_global_vocab_size(job_config.loss, self.model_config)
     self.loss_fn = job_config.loss.build(compile_config=job_config.compile)
 
     # Apply TPU-specific patches/workarounds
@@ -282,11 +283,9 @@ class TrainerMinimal:
         "You can disable this by setting --optimizer.implementation=foreach")
     self.optimizers = job_config.optimizer.build(model_parts=[self.model])
 
-    # get_spmd_context activates the configured SPMD backend (default,
-    # full_dtensor, or spmd_types) and global DeviceMesh. Components such as
-    # ChunkedLossWrapper then natively support loss parallelism automatically,
-    # eliminating need to handle loss_parallellism explicitly in the training
-    # loop.
+    # get_spmd_context sets the process-wide SPMD mesh the spmd_types
+    # collectives read, so components such as ChunkedLossWrapper support loss
+    # parallelism without the training loop handling it explicitly.
     self.train_context = dist_utils.get_spmd_context(
         parallel_dims=self.parallel_dims,
     )
@@ -294,7 +293,7 @@ class TrainerMinimal:
 
   def train(self):
     """Runs a simple training loop on the specified device."""
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
     from torchtitan.models.common.decoder import Decoder  # pylint: disable=g-import-not-at-top
     from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
 
@@ -537,7 +536,7 @@ def start_trainer(config: JobConfig):
           json.dumps(config.to_dict(), indent=2)
       )
     # TT-UNFLATTEN-SHIM:
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     # Upstream d771abb0 renamed training.seq_len ->
     # training.max_context_length.
     with set_unflatten_seq_len(config.training.max_context_length):

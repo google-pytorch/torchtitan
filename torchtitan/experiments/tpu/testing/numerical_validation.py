@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict
 
 import torch
 from torch import nn
-from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu.testing import test_utils
 
 
 def clean_parameter_name(name: str) -> str:

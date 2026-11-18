@@ -354,7 +354,8 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertEqual(TokamaxConfig.block_q, 512, "precondition: class default")
     sa.sa_num_stacked_q_heads = 16
     sa.use_batch_loop_fwd = True
-    for name in ("num_stacked_q_heads", "use_batch_loop_fwd"):
+    sa.use_transposed_bwd = True
+    for name in ("num_stacked_q_heads", "use_batch_loop_fwd", "use_transposed_bwd"):
       self.addCleanup(setattr, TokamaxConfig, name, getattr(TokamaxConfig, name))
 
     workarounds.use_tokamax_splash_attention_patch(model, sa)
@@ -371,6 +372,7 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertTrue(TokamaxConfig.use_vmap_bwd)
     self.assertEqual(TokamaxConfig.num_stacked_q_heads, 16)
     self.assertTrue(TokamaxConfig.use_batch_loop_fwd)
+    self.assertTrue(TokamaxConfig.use_transposed_bwd)
 
   def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
     """A real splash config whose fields resolve to nothing must fail loudly."""
@@ -565,7 +567,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     config = config_registry.qwen3_debugmodel_ulysses_cp2()
     self.assertEqual(config.parallelism.context_parallel_degree, 2)
-    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
     self.assertIsNone(config.parallelism.context_parallel_load_balancer)
     for layer in config.model_spec.model.layers:
       self.assertIsInstance(
@@ -665,7 +666,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     config = config_registry.qwen3_debugmodel()
     config.parallelism.context_parallel_degree = 2
-    config.parallelism.spmd_backend = "spmd_types"
     with self.assertRaisesRegex(ValueError, "CPInnerAttention"):
       config.__post_init__()
 
@@ -791,7 +791,6 @@ class WorkaroundsTest(parameterized.TestCase):
 
     # 1. Verify the all_gather CP recipe and reverting it for cp=1.
     config = config_registry.qwen3_debugmodel_allgather_cp2()
-    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
     self.assertEqual(
         config.parallelism.context_parallel_load_balancer, "headtail"
     )

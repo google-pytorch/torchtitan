@@ -269,7 +269,6 @@ jobs:
 
     env:
       PYTHONDONTWRITEBYTECODE: 1
-      TORCH_DEVICE_BACKEND_AUTOLOAD: 0
       # Stops libtpu querying the GCP metadata server for TPU topology. This
       # prevents a 10 minute 404 retry loop for tests importing torch_tpu that
       # run on CPU only.

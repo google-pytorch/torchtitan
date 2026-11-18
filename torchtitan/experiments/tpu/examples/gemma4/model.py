@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import sdpa_kernel
 
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     FlexInnerAttention,
@@ -111,7 +110,7 @@ class QKVLinearKeqV(QKVLinear):
         def local_qkv_head_split(tensor: torch.Tensor) -> torch.Tensor:
             with spmd.local():
                 tensor_ = tensor.view(num_tokens, -1, self.head_dim)
-                if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                if spmd.is_type_checking():
                     spmd.assert_type(
                         tensor_,
                         spmd.V,

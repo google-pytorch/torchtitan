@@ -488,6 +488,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         if self._ep_rank_holder_ref is not None
         else None
     )
+    rank_buf = None
     if holder is not None:
       rank_buf = getattr(holder, "_ep_local_rank", None)
       if (
@@ -498,12 +499,32 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       ):
         return rank_buf
 
-    local_rank = int(self.ep_mesh.get_local_rank())
     if get_proxy_mode() is not None or isinstance(
         x, torch._subclasses.FakeTensor
     ):
-      return torch.full((1,), local_rank, dtype=torch.long, device=x.device)
+      # A traced graph must read the rank from the owner's buffer, a graph
+      # input, so that every rank traces the same program. A constant would
+      # bake this rank's index into the graph, so fail instead under EP > 1.
+      ep_size = self.ep_mesh.size()
+      if ep_size > 1:
+        found = (
+            f"{type(rank_buf).__name__} on {rank_buf.device}"
+            if isinstance(rank_buf, torch.Tensor)
+            else "missing"
+        )
+        raise RuntimeError(
+            f"Tracing EP dispatch at ep_size={ep_size} needs the bound"
+            " TpuRoutedExperts' `_ep_local_rank` buffer as a graph input on"
+            f" the input's device (buffer: {found}; input:"
+            f" {type(x).__name__} on {x.device}). A constant would bake this"
+            " rank's index into the graph. TpuRoutedExperts.parallelize"
+            " registers the buffer; trace with module buffers as graph"
+            " inputs, as TpuGraphTrainer does."
+        )
+      # A single EP rank has index 0 everywhere.
+      return torch.zeros((1,), dtype=torch.long, device=x.device)
 
+    local_rank = int(self.ep_mesh.get_local_rank())
     buf = self._ep_local_rank_buf
     if buf is None or buf.device != x.device:
       buf = torch.tensor([local_rank], dtype=torch.long).to(device=x.device)
@@ -615,6 +636,8 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       pg = self.ep_mesh.get_group()
       with torch.no_grad():
         with annotate_region(MOE_ROUTING):
+          # Integer on purpose: TpuGraphTrainer's Splash and FSDP passes skip
+          # integer gathers, so they never take this one for a weight gather.
           local_counts_E = num_local_tokens_per_expert_E.to(
               torch.int32
           ).reshape(-1)

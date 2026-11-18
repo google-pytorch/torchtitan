@@ -13,6 +13,10 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    minimal_fx_tracer,
+    run_traced,
+)
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExperts,
@@ -174,6 +178,82 @@ def test_dispatch_without_a_rank_owner_raises():
     dispatcher = _ragged_dispatcher_with_fake_mesh()
     with pytest.raises(RuntimeError, match="bound to a"):
         dispatcher.dispatch(*_inputs())
+
+
+def _traceable_dispatcher():
+    """A fake-mesh dispatcher with local stand-ins for its two collectives."""
+    dispatcher = _ragged_dispatcher_with_fake_mesh()
+    dispatcher.ep_mesh.get_local_rank.return_value = 0
+
+    def gather_counts(local_counts_E, pg, ep_size):
+        # This rank's counts, then the reverse as the other rank's.
+        del pg, ep_size
+        return torch.cat([local_counts_E, local_counts_E.flip(0)])
+
+    dispatcher._gather_expert_counts = mock.Mock(side_effect=gather_counts)
+    dispatcher._ragged_all_to_all = mock.Mock(
+        side_effect=lambda operand, rows, *_: operand.new_zeros(
+            rows, operand.shape[1]
+        )
+    )
+    return dispatcher
+
+
+@pytest.mark.parametrize(
+    "rank_buffer, tracing_mode",
+    [
+        (None, "real"),
+        (torch.zeros(1, dtype=torch.long, device="meta"), "real"),
+        (torch.zeros(1, dtype=torch.long), "fake"),
+    ],
+    ids=["missing", "other_device", "not_a_graph_input"],
+)
+def test_tracing_without_a_usable_rank_buffer_raises(rank_buffer, tracing_mode):
+    # Falling back to a constant would bake this rank's index into the graph.
+    dispatcher = _traceable_dispatcher()
+    owner = torch.nn.Module()
+    if rank_buffer is not None:
+        owner.register_buffer("_ep_local_rank", rank_buffer, persistent=False)
+    dispatcher.bind_ep_rank_holder(owner)
+
+    def dispatch(x, scores, ids, counts):
+        return dispatcher.dispatch(x, scores, ids, counts)
+
+    with pytest.raises(RuntimeError, match="_ep_local_rank"):
+        make_fx(dispatch, tracing_mode=tracing_mode)(*_inputs())
+
+
+def test_graph_trainer_trace_reads_the_rank_from_the_owner_buffer():
+    # TpuGraphTrainer's tracer makes module buffers graph inputs, so one traced
+    # program computes each rank's offsets from that rank's own buffer.
+    dispatcher = _traceable_dispatcher()
+    owner = _RankHolder(0)
+    dispatcher.bind_ep_rank_holder(owner)
+
+    def send_sizes(x, scores, ids, counts):
+        return dispatcher.dispatch(x, scores, ids, counts)[2].disp_send_sizes
+
+    traced = minimal_fx_tracer(send_sizes, module=owner)(*_inputs())
+    run = run_traced(traced, module=owner)
+    torch.testing.assert_close(
+        run(*_inputs()), torch.tensor([2, 0], dtype=torch.int32)
+    )
+    owner._ep_local_rank.fill_(1)
+    torch.testing.assert_close(
+        run(*_inputs()), torch.tensor([0, 2], dtype=torch.int32)
+    )
+
+
+def test_eager_dispatch_without_a_rank_buffer_uses_the_mesh_rank():
+    # Eagerly the index is data, not part of a graph, so the mesh's rank works.
+    dispatcher = _ragged_dispatcher_with_fake_mesh()
+    dispatcher.ep_mesh.get_local_rank.return_value = 1
+    owner = torch.nn.Module()
+    dispatcher.bind_ep_rank_holder(owner)
+    torch.testing.assert_close(
+        dispatcher._get_ep_local_rank_tensor(torch.randn(2, 4)),
+        torch.tensor([1]),
+    )
 
 
 @pytest.mark.parametrize(

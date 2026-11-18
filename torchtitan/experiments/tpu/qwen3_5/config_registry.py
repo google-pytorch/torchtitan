@@ -1,5 +1,7 @@
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
+from typing import Literal
+
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -12,8 +14,13 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.config.transform import ContextParallelTransform, apply_transforms
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.cp_attention import (
+    tpu_cp_inner_attention,
+    tpu_cp_load_balancer,
+)
 from torchtitan.experiments.tpu.datasets import (
     TPUGrainDataLoader,
     c4_test_dataloader,
@@ -33,6 +40,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
 from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher as qwen35_token_dispatcher
+from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import GatedDeltaNetContextParallelTransform
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -44,6 +52,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
+from torchtitan.models.common.attention import BaseAttention
 
 _TPU_MOE_CONVERTERS = [
     TpuTokenDispatcherConverter.Config(),
@@ -634,3 +643,173 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (tm, 0, 2048)
   _use_expert_parallel(cfg, ep_degree=8, num_token_chunks=12)
   return cfg
+
+
+def _qwen35_cp(
+    config: TPUTrainerConfig,
+    *,
+    strategy: Literal["ulysses", "all_gather"],
+    cp_degree: int,
+) -> TPUTrainerConfig:
+  """Enables TPU context parallelism for hybrid Qwen3.5.
+
+  As ``qwen3/config_registry.py::_qwen3_cp``, sets the CP degree, the SPMD
+  backend and the load balancer of ``strategy`` and applies core
+  ``ContextParallelTransform`` with the TPU CP inner attention to the
+  full-attention layers. Also applies ``GatedDeltaNetContextParallelTransform``,
+  which runs the GatedDeltaNet layers head-parallel over the same token layout
+  (``cp_gated_delta``): ``n_key_heads`` and ``n_value_heads`` must be divisible
+  by ``cp_degree``.
+
+  Args:
+    config: The recipe to enable CP on.
+    strategy: The full-attention CP strategy, ``"all_gather"`` (load-balanced KV
+      all-gather) or ``"ulysses"``.
+    cp_degree: The context-parallel degree.
+
+  Returns:
+    A validated copy of ``config`` with CP enabled.
+  """
+  assert config.model_spec is not None
+  load_balancer = tpu_cp_load_balancer(strategy)
+  config.parallelism.context_parallel_degree = cp_degree
+  config.parallelism.spmd_backend = "spmd_types"
+  config.parallelism.context_parallel_load_balancer = load_balancer
+  inner_attention = config.model_spec.model.first_full_attention_backend
+  assert inner_attention is not None
+  return apply_transforms(
+      config,
+      [
+          ContextParallelTransform(
+              inner_attention=tpu_cp_inner_attention(
+                  inner_attention._owner, strategy
+              )
+          ),
+          GatedDeltaNetContextParallelTransform(load_balancer=load_balancer),
+      ],
+  )
+
+
+def _allow_reference_attention(cfg: TPUTrainerConfig) -> None:
+  """Lets KV all-gather CP run its plain-PyTorch attention (no Splash kernel)."""
+  assert cfg.model_spec is not None
+  for _, attn, _, _ in cfg.model_spec.model.traverse(BaseAttention.Config):
+    attn.inner_attention.allow_reference_attention = True
+
+
+def qwen35_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 debug model with KV all-gather CP degree 2 (head-parallel GDN).
+
+  The debug model runs without the Splash kernel, so KV all-gather CP opts in
+  to its plain-PyTorch reference attention, which is fine at this size.
+  """
+  cfg = _qwen35_cp(qwen35_debugmodel(), strategy="all_gather", cp_degree=2)
+  _allow_reference_attention(cfg)
+  return cfg
+
+
+def qwen35_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 debug model with Ulysses CP degree 2 (head-parallel GDN)."""
+  return _qwen35_cp(qwen35_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def qwen35_moe_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 MoE debug model with KV all-gather CP degree 2."""
+  cfg = _qwen35_cp(qwen35_moe_debugmodel(), strategy="all_gather", cp_degree=2)
+  _allow_reference_attention(cfg)
+  return cfg
+
+
+def qwen35_moe_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 MoE debug model with Ulysses CP degree 2."""
+  return _qwen35_cp(qwen35_moe_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def qwen35_moe_35b_allgather_cp2() -> TPUTrainerConfig:
+  """``qwen35_moe_35b`` with KV all-gather CP degree 2 (head-parallel GDN).
+
+  A CP group shares one data-parallel rank's token budget
+  (``training.num_tokens_per_microbatch_per_dp_rank``), so each of its ranks
+  holds ``1 / cp`` of it. Long-context runs set
+  ``--training.max_context_length`` (and ``--parallelism.
+  context_parallel_degree``) on the command line.
+  """
+  return _qwen35_cp(qwen35_moe_35b(), strategy="all_gather", cp_degree=2)
+
+
+def qwen35_moe_35b_ulysses_cp2() -> TPUTrainerConfig:
+  """``qwen35_moe_35b`` with Ulysses CP degree 2 (head-parallel GDN)."""
+  return _qwen35_cp(qwen35_moe_35b(), strategy="ulysses", cp_degree=2)
+
+
+def qwen35_moe_35b_ep_allgather_cp2() -> TPUTrainerConfig:
+  """``qwen35_moe_35b_ep`` (EP=4) with KV all-gather CP2, compiled per block.
+
+  The regular-trainer counterpart of
+  ``qwen35_moe_35b_split_tokamax_ep_allgather_cp2``, with the Tokamax
+  GatedDeltaNet of ``qwen35_moe_35b_ep``. Every block is compiled
+  (``--compile.enable --compile.backend=tpu``) by default because eager
+  Qwen3.5 CP with ``dp_shard > 1`` is unreliable on the tpu7x torch_tpu build
+  (see ``test_train_minimal_distributed``); ``--compile.no-enable`` runs it
+  eagerly. Per-block-compiled CP can also give intermittent non-finite steps
+  on that build (seen on the debug MoE model and 35B CP-only runs), so the
+  ``TpuGraphTrainer`` recipes remain the stable CP path.
+  """
+  cfg = qwen35_moe_35b_ep()
+  cfg.compile.enable = True
+  return _qwen35_cp(cfg, strategy="all_gather", cp_degree=2)
+
+
+def qwen35_moe_35b_ep_ulysses_cp2() -> TPUTrainerConfig:
+  """``qwen35_moe_35b_ep`` (EP=4) with Ulysses CP2, compiled per block.
+
+  See ``qwen35_moe_35b_ep_allgather_cp2``.
+  """
+  cfg = qwen35_moe_35b_ep()
+  cfg.compile.enable = True
+  return _qwen35_cp(cfg, strategy="ulysses", cp_degree=2)
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
+    TpuGraphTrainer.Config
+):
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with KV all-gather CP degree 2."""
+  return _qwen35_cp(
+      qwen35_moe_35b_split_tokamax_benchmark(),
+      strategy="all_gather",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2() -> (
+    TpuGraphTrainer.Config
+):
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with Ulysses CP degree 2."""
+  return _qwen35_cp(
+      qwen35_moe_35b_split_tokamax_benchmark(),
+      strategy="ulysses",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_ep_allgather_cp2() -> TpuGraphTrainer.Config:
+  """``qwen35_moe_35b_split_tokamax_ep_benchmark`` (EP=4) with KV all-gather CP2.
+
+  Expert parallelism and context parallelism compose: CP shards each sequence's
+  tokens over the ``cp`` axis and the routed experts dispatch every rank's
+  local tokens over the ``ep`` axis (``ep`` must divide ``dp_shard * cp``).
+  """
+  return _qwen35_cp(
+      qwen35_moe_35b_split_tokamax_ep_benchmark(),
+      strategy="all_gather",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_ep_ulysses_cp2() -> TpuGraphTrainer.Config:
+  """``qwen35_moe_35b_split_tokamax_ep_benchmark`` (EP=4) with Ulysses CP2."""
+  return _qwen35_cp(
+      qwen35_moe_35b_split_tokamax_ep_benchmark(),
+      strategy="ulysses",
+      cp_degree=2,
+  )

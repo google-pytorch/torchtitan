@@ -702,6 +702,13 @@ def split_forward_graph_by_layer(
   return chunked
 
 
+def _collective_group_name(node: torch.fx.Node) -> str | None:
+  """The process-group name of a functional collective (its last str arg)."""
+  return next(
+      (arg for arg in reversed(node.args) if isinstance(arg, str)), None
+  )
+
+
 def _collect_backward_collective_owners(
     collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
     n_layers: int,
@@ -712,18 +719,31 @@ def _collect_backward_collective_owners(
   A parameter gather is owned by the layer of its first consumer, a gradient
   reduction by the layer that produced its input (``classify_fsdp_roles``).
   Collectives with neither role stay with their inputs. An all-gather or
-  reduce-scatter of a ``pipelined_kinds`` kind that has neither role raises,
-  since pipelining it as FSDP traffic would be wrong.
+  reduce-scatter of a ``pipelined_kinds`` kind that has neither role raises if
+  it runs on the process group of a gradient reduction, since pipelining it as
+  FSDP traffic would be wrong; on another group (e.g. the context-parallel K/V
+  gathers and their gradient reduce-scatters) it is not FSDP traffic and stays
+  with its inputs. Only gradient reductions name the FSDP groups: a gather of
+  activations saved from forward is also fed only by graph inputs.
   """
   owners: dict[torch.fx.Node, tuple[str, int]] = {}
-  for launch, role in classify_fsdp_roles(collective_chains).items():
+  roles = classify_fsdp_roles(collective_chains)
+  fsdp_groups = {
+      _collective_group_name(launch)
+      for launch, role in roles.items()
+      if role == "rs"
+  }
+  for launch, role in roles.items():
     if role is None:
-      if (is_gather(launch) and "ag" in pipelined_kinds) or (
-          is_reduce_scatter(launch) and "rs" in pipelined_kinds
-      ):
+      if (
+          (is_gather(launch) and "ag" in pipelined_kinds)
+          or (is_reduce_scatter(launch) and "rs" in pipelined_kinds)
+      ) and _collective_group_name(launch) in fsdp_groups:
         raise ValueError(
             f"Backward collective {launch.name!r} is neither a parameter "
-            "gather nor a gradient reduction, so fsdp_pipeline cannot move it"
+            "gather nor a gradient reduction, so fsdp_pipeline cannot move it "
+            f"(group {_collective_group_name(launch)!r}; gradient reductions "
+            f"run on {sorted(map(str, fsdp_groups))})"
         )
       continue
     inputs, users = chain_boundary(collective_chains[launch])

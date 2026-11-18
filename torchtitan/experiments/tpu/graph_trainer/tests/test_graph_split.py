@@ -955,6 +955,21 @@ class GraphSplitTest(absltest.TestCase):
       self.assertNotIn(launch, owners)
     with self.assertRaisesRegex(ValueError, "neither a parameter gather"):
       graph_split_lib._collect_backward_collective_owners(chains, 4, ("rs",))
+    # On another process group (e.g. a context-parallel K/V gradient
+    # reduce-scatter) it is not FSDP traffic: it stays with its inputs even
+    # when RS are pipelined.
+    group_index = max(
+        i for i, arg in enumerate(launch.args) if isinstance(arg, str)
+    )
+    fsdp_args = launch.args
+    launch.args = (
+        fsdp_args[:group_index] + ("cp_group",) + fsdp_args[group_index + 1 :]
+    )
+    owners = graph_split_lib._collect_backward_collective_owners(
+        chains, 4, ("ag", "rs")
+    )
+    self.assertNotIn(launch, owners)
+    launch.args = fsdp_args
     with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
       split_backward_graph_by_layer(
           backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=()

@@ -232,18 +232,10 @@ def test_paired_grouped_mm_validates_supported_configuration():
         pallas_grouped_mm_tgmm_tiling=(128, 128, 0),
     ).build()
 
-    experts = _build_experts(
+    _build_experts(
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
     )
-
-    class ParallelDimsWithEp:
-        @staticmethod
-        def get_optional_mesh(name):
-            return object() if name == "ep" else None
-
-    with pytest.raises(ValueError, match="requires EP=1 exact-row dispatch"):
-        experts.parallelize(ParallelDimsWithEp())
 
 
 def test_paired_grouped_mm_forwards_tgmm_tile_k():

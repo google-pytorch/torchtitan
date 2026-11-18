@@ -570,6 +570,72 @@ class TpuGraphTrainerDistributedTest(
             self.assertGreaterEqual(dropped, 0, msg=msg)
             self.assertLess(2 * dropped, routes, msg=msg)
 
+  def test_qwen3_5_moe_graph_trainer_tpu_moe_kernels_ep2_matches_ep1(self):
+    """GraphTrainer with the split recipes' MoE kernels: EP=2 matches EP=1.
+
+    Paired W1+W3 Pallas grouped matmuls on kernel-native expert weights and
+    the fused route-score backward (`_use_tpu_moe_kernels`), under EP=2
+    Ring-of-Experts on the topology-aware mesh: unchunked, with 4 token chunks
+    and routing weights before W2 (the 397B recipe's combination), and an
+    unpaired control. All 3 steps are compared, so dWeights count too.
+    """
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    common = [
+        "--training.steps=3",
+        # The fused route-score backward needs BF16 expert outputs.
+        "--training.mixed_precision_param=bfloat16",
+    ]
+    ep2_base = [
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+        "--compile.graph_split.backward_partition_mode=by_layer",
+        "--parallelism.enable_tpu_topo_mesh",
+    ]
+    for arm, extra_args in (
+        ("ep1", []),
+        ("ep2_paired_topo", ep2_base),
+        (
+            "ep2_paired_chunk4_w2_topo",
+            ep2_base
+            + [
+                "--tpu_config.ep_token_chunks=4",
+                "--tpu_config.ep_scale_before_down_proj=True",
+            ],
+        ),
+        (
+            "ep2_unpaired_topo",
+            ep2_base + ["--tpu_config.ep_paired_grouped_mm=False"],
+        ),
+    ):
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=_train_args(
+              "torchtitan.experiments.tpu.qwen3_5",
+              "graph_trainer_qwen35_moe_debugmodel_tpu_moe_kernels",
+              use_splash_attention_kernel=False,
+          )
+          + common
+          + extra_args,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        losses[arm] = dict(json.load(f))
+    logging.info("qwen3_5 MoE TPU-kernel GraphTrainer losses by arm: %s", losses)
+    for arm, arm_losses in losses.items():
+      if arm == "ep1":
+        continue
+      for step in (1, 2, 3):
+        self.assertTrue(math.isfinite(arm_losses[step]), msg=f"{arm} step {step}")
+        self.assertLess(
+            abs(arm_losses[step] - losses["ep1"][step]),
+            abs(losses["ep1"][step]) * 2e-3,
+            msg=f"{arm} step {step}",
+        )
+
   def test_qwen3_5_graph_trainer_matches_eager(self):
     """The graph-split GraphTrainer must train Qwen3.5 MoE to eager's losses.
 

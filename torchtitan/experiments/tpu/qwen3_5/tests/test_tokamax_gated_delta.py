@@ -2,13 +2,19 @@
 
 import contextlib
 import copy
+import functools
+import os
+from types import SimpleNamespace
 from unittest import mock
 
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 import torch.nn.functional as F
+from torch.utils.checkpoint import CheckpointPolicy
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
@@ -215,7 +221,7 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
           ("tpu-4", 4),
           ("unknown", None),
       ):
-        tokamax_gated_delta._tpu_generation.cache_clear()  # pylint: disable=protected-access
+        tokamax_gated_delta._tpu_gen_cache.clear()  # pylint: disable=protected-access
         fake_tpu = mock.Mock()
         fake_tpu.get_device_properties.return_value = mock.Mock(name=dev_name)
         fake_tpu.get_device_properties.return_value.name = dev_name
@@ -226,7 +232,81 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
               msg=dev_name,
           )
     finally:
-      tokamax_gated_delta._tpu_generation.cache_clear()  # pylint: disable=protected-access
+      tokamax_gated_delta._tpu_gen_cache.clear()  # pylint: disable=protected-access
+
+  def test_lookups_compile_fullgraph_under_selective_ac(self):
+    """Tests the TPU generation and KDA lookups under per-layer compile.
+
+    The regular TPU trainer's ``--compile.enable`` compiles every block with
+    ``fullgraph=True`` inside selective activation checkpointing, and the
+    kernel looks up the TPU generation (a host device scan in torch_tpu,
+    untraceable by Dynamo) and the Tokamax KDA op (a callable) from the traced
+    forward.
+    """
+    self.addCleanup(tokamax_gated_delta._tpu_gen_cache.clear)  # pylint: disable=protected-access
+    self.addCleanup(torch._dynamo.reset)
+    tokamax_gated_delta._tpu_gen_cache.clear()  # pylint: disable=protected-access
+
+    def get_device_properties():
+      os.listdir(".")  # Untraceable by Dynamo, like torch_tpu's device scan.
+      return SimpleNamespace(name="TPU7x")
+
+    def fake_kda(x: torch.Tensor) -> torch.Tensor:
+      return x + 1.0
+
+    class Block(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones(4))
+
+      def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gen = tokamax_gated_delta._tpu_generation()  # pylint: disable=protected-access
+        kda = tokamax_gated_delta._require_tokamax_kda()  # pylint: disable=protected-access
+        out = kda(x * self.w)
+        return out * float(gen) if gen is not None else out
+
+    def recompute_all(ctx, op, *args, **kwargs):
+      del ctx, op, args, kwargs
+      return CheckpointPolicy.PREFER_RECOMPUTE
+
+    # Replace only the device query: Dynamo itself uses the rest of a real
+    # `torch.tpu` (e.g. `device_count`) on TPU hosts.
+    real_tpu = getattr(torch, "tpu", None)
+    patch_tpu = (
+        mock.patch.object(torch, "tpu", SimpleNamespace(), create=True)
+        if real_tpu is None
+        else contextlib.nullcontext()
+    )
+    torch._dynamo.reset()
+    with (
+        patch_tpu,
+        mock.patch.object(
+            torch.tpu,
+            "get_device_properties",
+            get_device_properties,
+            create=True,
+        ),
+        mock.patch.multiple(
+            tokamax_gated_delta,
+            _kda_imported=True,
+            _kda_op=fake_kda,
+            _kda_import_error=None,
+        ),
+    ):
+      block = checkpoint_wrapper(
+          Block(),
+          context_fn=functools.partial(
+              create_selective_checkpoint_contexts, recompute_all
+          ),
+          preserve_rng_state=False,
+      )
+      block.compile(backend="aot_eager", fullgraph=True)
+      x = torch.ones(4, requires_grad=True)
+      out = block(x)
+      out.sum().backward()
+    torch.testing.assert_close(out.detach(), torch.full((4,), 14.0))
+    torch.testing.assert_close(x.grad, torch.full((4,), 7.0))
 
   def test_unsupported_inputs_fall_back_to_xla(self):
     """Tests that unsupported inputs run XLA with the same min_log_decay clamp."""

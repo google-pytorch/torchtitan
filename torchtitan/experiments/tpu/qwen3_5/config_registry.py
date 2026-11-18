@@ -573,6 +573,27 @@ def qwen35_moe_35b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   return cfg
 
 
+def qwen35_moe_35b_ep() -> TPUTrainerConfig:
+  """`qwen35_moe_35b` on the regular `TPUTrainer` with EP=4.
+
+  Ring-of-Experts dispatch over `--parallelism.expert_parallel_degree` ranks
+  with token chunks, SparseCore collective offload and the eager
+  (`DEFER_AND_FUSE`) gradient norm, as in
+  `qwen35_moe_35b_split_tokamax_ep_benchmark` but without the graph split.
+  Runs eagerly like `qwen35_moe_35b`; `--compile.enable --compile.backend=tpu`
+  compiles every block with `fullgraph=True`.
+
+  The GatedDeltaNet layers run Tokamax's Mosaic KDA kernels (with
+  packed-document resets): the per-block compile of the default XLA
+  recurrence needs ~204 GB of HLO temporaries for one 35B block's backward at
+  8K context (`CompileTimeHbmOom` on TPU7x, 32K tokens per rank).
+  """
+  cfg = qwen35_moe_35b()
+  _use_tokamax_gated_delta(cfg)
+  _use_expert_parallel(cfg, ep_degree=4)
+  return cfg
+
+
 def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   """Qwen3.5-397B-A17B 8K pretraining benchmark with Expert Parallelism (EP=8).
 

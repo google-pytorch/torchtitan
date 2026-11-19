@@ -724,7 +724,8 @@ def _collect_backward_collective_owners(
   FSDP traffic would be wrong; on another group (e.g. the context-parallel K/V
   gathers and their gradient reduce-scatters) it is not FSDP traffic and stays
   with its inputs. Only gradient reductions name the FSDP groups: a gather of
-  activations saved from forward is also fed only by graph inputs.
+  activations saved from forward is also fed only by graph inputs. Without any
+  recognized gradient reduction, every such collective raises.
   """
   owners: dict[torch.fx.Node, tuple[str, int]] = {}
   roles = classify_fsdp_roles(collective_chains)
@@ -735,10 +736,15 @@ def _collect_backward_collective_owners(
   }
   for launch, role in roles.items():
     if role is None:
+      # Without a recognized gradient reduction there is no FSDP group to
+      # tell CP traffic apart by, so keep the strict check.
+      on_fsdp_group = (
+          not fsdp_groups or _collective_group_name(launch) in fsdp_groups
+      )
       if (
           (is_gather(launch) and "ag" in pipelined_kinds)
           or (is_reduce_scatter(launch) and "rs" in pipelined_kinds)
-      ) and _collective_group_name(launch) in fsdp_groups:
+      ) and on_fsdp_group:
         raise ValueError(
             f"Backward collective {launch.name!r} is neither a parameter "
             "gather nor a gradient reduction, so fsdp_pipeline cannot move it "

@@ -91,7 +91,10 @@ _CP_RANK_MISS_WARNED: set[tuple[torch.device, int]] = set()
 # sequence dim of `rows` rows of `row_len` tokens each was sharded (and, for
 # KV all-gather, head-tail reordered) per row. Layers that undo the layout at
 # forward time (Qwen3.5's head-parallel GatedDeltaNet) check against it
-# instead of re-deriving it from `set_unflatten_seq_len` alone.
+# instead of re-deriving it from `set_unflatten_seq_len` alone. A module
+# global rather than an attribute of the sharded tensors, which compiled
+# blocks receive as plain graph inputs; keyed by the token count so that a
+# later micro-batch of another size is not checked against a stale layout.
 _CP_INPUT_LAYOUT: tuple[int, int, int] | None = None
 
 
@@ -108,7 +111,8 @@ def cp_input_layout(num_tokens: int) -> tuple[int, int] | None:
 
   Returns:
     The ``(rows, row_len)`` the inputs were sharded with, or None if no
-    ``cp_shard`` over ``num_tokens`` tokens has run (e.g. hand-sharded inputs).
+    ``cp_shard`` over ``num_tokens`` tokens has run (e.g. hand-sharded inputs
+    in tests), in which case callers cannot check the layout.
   """
   layout = _CP_INPUT_LAYOUT
   if layout is None or layout[0] != num_tokens:
@@ -185,10 +189,17 @@ def cp_rank_tensor(device: torch.device | str, group: Any) -> torch.Tensor:
   cached = _CP_RANK_CACHE.get(key)
   if cached is not None:
     return cached
+  if torch.compiler.is_dynamo_compiling():
+    # Dynamo cannot trace a logger call (a hard error under fullgraph), and a
+    # rank constant baked into the graph would give every rank its own graph.
+    raise RuntimeError(
+        f"CP rank tensor for {key} is not cached while compiling; shard the"
+        " inputs with the CP inner attention's cp_shard (which caches it)"
+        " before running the compiled model."
+    )
   if _tracing() and key not in _CP_RANK_MISS_WARNED:
-    # The rank becomes a constant of the traced graph: every rank compiles its
-    # own graph, and a graph cache that ignores constants could hand one rank
-    # another rank's selection. cp_shard fills the cache before tracing.
+    # Non-strict tracing (e.g. the graph trainer's export) runs this Python
+    # code as is: the rank becomes a constant of the traced graph.
     _CP_RANK_MISS_WARNED.add(key)
     logger.warning(
         "CP rank cache miss while tracing for key=%s; baking rank %d into the"
@@ -1039,6 +1050,12 @@ def register_tpu_cp_inner_attention(
           f" {mixin.__qualname__}."
       )
   entry = (single, ulysses, all_gather)
+  for registered in _CP_INNER_ATTENTIONS:
+    if registered[0] is single and registered != entry:
+      raise ValueError(
+          f"{single.__qualname__} already has TPU CP inner attentions"
+          f" {registered[1].__qualname__} / {registered[2].__qualname__}."
+      )
   if entry not in _CP_INNER_ATTENTIONS:
     _CP_INNER_ATTENTIONS.append(entry)
 

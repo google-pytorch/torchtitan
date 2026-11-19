@@ -112,7 +112,7 @@ def _parallelize_text_qwen3_5_with_cp(
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointingConfig | None",
     dump_folder: str,
     skip_dp: bool,
-) -> None:
+) -> nn.Module:
   """Upstream ``parallelize_qwen3_5`` for a text-only model, allowing CP.
 
   Upstream rejects context parallelism because its GatedDeltaNet needs the
@@ -120,6 +120,9 @@ def _parallelize_text_qwen3_5_with_cp(
   (``cp_gated_delta``) and validate that in ``validate_tpu_context_parallel``.
   The steps are upstream's: sharding annotations, activation checkpointing,
   per-block compile and FSDP2 (on the ``(dp_shard, cp)`` mesh).
+
+  Keep in sync with the text-only path of
+  ``torchtitan/models/qwen3_5/parallelize.py::parallelize_qwen3_5``.
   """
   if model.vision_encoder is not None:
     raise NotImplementedError(
@@ -133,7 +136,7 @@ def _parallelize_text_qwen3_5_with_cp(
         model, compile_config=compile_config, parallel_dims=parallel_dims
     )
   if skip_dp:
-    return
+    return model
   dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
   edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
   apply_fsdp_to_decoder(
@@ -154,6 +157,7 @@ def _parallelize_text_qwen3_5_with_cp(
       edp_mesh_dims=edp_mesh_dims,
       enable_symm_mem=parallelism.enable_fsdp_symm_mem,
   )
+  return model
 
 
 def parallelize_qwen3_5(

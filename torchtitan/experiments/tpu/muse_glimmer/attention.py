@@ -258,8 +258,9 @@ class KVAllGatherCPSlidingWindowScaledDotProductInnerAttention(
     """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""
 
   def local_forward(self, q, k, v, **kwargs) -> torch.Tensor:
-    # The reference attention ignores segment_ids for plain SDPA, which does
-    # not mask documents (it sees `attention_masks`); this one does.
+    # Drop attention_masks so the reference attention applies the segment_ids
+    # document mask: it skips that mask for plain SDPA when attention_masks is
+    # passed (as from GQAttention), but this attention masks documents.
     kwargs.pop("attention_masks", None)
     return super().local_forward(q, k, v, **kwargs)
 

@@ -82,17 +82,22 @@ LoadBalancer = Literal["headtail"] | None
 def _rows(num_tokens: int) -> tuple[int, int]:
   """``(B, S)`` of a folded ``[B * S]`` token stream in head-tail layout.
 
-  ``S`` comes from the shim, as in KV all-gather ``cp_shard``, which
-  reorders per sequence of length ``S`` and treats a stream that ``S`` does
-  not divide as one sequence. Raises if that disagrees with the layout
+  ``S`` comes from ``set_unflatten_seq_len``, as in KV all-gather
+  ``cp_shard``, which reorders per sequence of length ``S``; without it the
+  stream is one sequence. Raises if that disagrees with the layout
   ``cp_shard`` recorded for this token count (e.g. a different
   ``set_unflatten_seq_len`` at sharding and at forward time), which would
   otherwise silently scramble the token order.
   """
   seq_len = get_unflatten_seq_len()
-  if seq_len is None or num_tokens % seq_len:
-    # One sequence, as the CP input sharding treats a shorter stream.
+  if seq_len is None:
     seq_len = num_tokens
+  elif num_tokens % seq_len:
+    # TpuInnerGatedDeltaNet unflattens to [B, S] rows and rejects this too.
+    raise ValueError(
+        f"GatedDeltaNet CP: {num_tokens} tokens are not a multiple of the"
+        f" set_unflatten_seq_len sequence length {seq_len}."
+    )
   rows = (num_tokens // seq_len, seq_len)
   recorded = cp_input_layout(num_tokens)
   if recorded is not None and recorded != rows:
@@ -231,7 +236,7 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
       _check_contiguous_layout(query_TC.shape[0])
     full_positions = None
     if positions is not None:
-      # Document resets need every token's position (4 bytes per token).
+      # Document resets need every token's position (one per token).
       full_positions = cp_all_gather(positions.reshape(-1), group)
     type_check = spmd.is_type_checking()
     if type_check:
@@ -336,7 +341,12 @@ def validate_gated_delta_context_parallel(model: Any, parallelism: Any) -> None:
   cp = parallelism.context_parallel_degree
   if cp <= 1:
     return
-  for fqn, delta_net, _, _ in model.traverse(GatedDeltaNet.Config):
+  delta_nets = list(model.traverse(GatedDeltaNet.Config))
+  if delta_nets and parallelism.tensor_parallel_degree > 1:
+    raise NotImplementedError(
+        "GatedDeltaNet context parallelism does not support tensor parallelism."
+    )
+  for fqn, delta_net, _, _ in delta_nets:
     inner = delta_net.inner_gated_delta_net
     owner = getattr(inner, "_owner", None)
     if owner is None or not issubclass(owner, CPTpuInnerGatedDeltaNet):
@@ -353,11 +363,6 @@ def validate_gated_delta_context_parallel(model: Any, parallelism: Any) -> None:
           f" {inner.load_balancer!r} token layout, but"
           " context_parallel_load_balancer is"
           f" {parallelism.context_parallel_load_balancer!r}."
-      )
-    if parallelism.tensor_parallel_degree > 1:
-      raise NotImplementedError(
-          "GatedDeltaNet context parallelism does not support tensor"
-          " parallelism."
       )
     n_key_heads = delta_net.in_proj_q.out_features // delta_net.key_head_dim
     n_value_heads = delta_net.in_proj_v.out_features // delta_net.value_head_dim

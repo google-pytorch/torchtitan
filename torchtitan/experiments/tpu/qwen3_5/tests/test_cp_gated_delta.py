@@ -10,6 +10,8 @@ token layouts (KV all-gather's head-tail and Ulysses' contiguous one).
 
 import contextlib
 import copy
+import types
+import unittest
 from unittest import mock
 
 from absl.testing import absltest
@@ -19,6 +21,7 @@ from absl.testing import parameterized
 import torch
 import spmd_types as spmd  # pylint: disable=unused-import
 # pyformat: enable
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
@@ -36,10 +39,12 @@ from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 _STRATEGIES = ("all_gather", "ulysses")
 
 
-def _reset_cp_input_layout(test: absltest.TestCase) -> None:
-  """Forgets the layout of earlier cp_shard calls (hand-sharded inputs here)."""
+def _reset_cp_state(test: absltest.TestCase) -> None:
+  """Forgets the layout and rank-miss state of earlier cp_shard calls."""
   cp_attention._CP_INPUT_LAYOUT = None
   test.addCleanup(setattr, cp_attention, "_CP_INPUT_LAYOUT", None)
+  cp_attention._CP_RANK_MISS_WARNED.clear()
+  test.addCleanup(cp_attention._CP_RANK_MISS_WARNED.clear)
 
 
 @contextlib.contextmanager
@@ -59,7 +64,7 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
     torch.manual_seed(0)
     cp_attention._CP_RANK_CACHE.clear()
     self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
-    _reset_cp_input_layout(self)
+    _reset_cp_state(self)
 
   def _inputs(self, n_key_heads, n_value_heads, head_dim, tokens):
     key_dim, value_dim = n_key_heads * head_dim, n_value_heads * head_dim
@@ -231,6 +236,103 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
         ranks.run(run_rank)
 
 
+class CompiledCPGatedDeltaNetTest(parameterized.TestCase):
+  """The head-parallel GatedDeltaNet under real Dynamo (``fullgraph=True``).
+
+  Runs rank 0 of a fake 2-rank process group, so only tracing matters: the
+  per-layer ``torch.compile(fullgraph=True)`` of the TPU trainer must see no
+  graph break.
+  """
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    if dist.is_initialized():
+      raise unittest.SkipTest("a process group is already initialized")
+    from torch.testing._internal.distributed.fake_pg import FakeStore  # pylint: disable=g-import-not-at-top
+
+    dist.init_process_group("fake", rank=0, world_size=2, store=FakeStore())
+
+  @classmethod
+  def tearDownClass(cls):
+    dist.destroy_process_group()
+    super().tearDownClass()
+
+  def setUp(self):
+    super().setUp()
+    torch._dynamo.reset()
+    self.addCleanup(torch._dynamo.reset)
+    cp_attention._CP_RANK_CACHE.clear()
+    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
+    self.enter_context(
+        mock.patch.object(
+            cp_gated_delta, "spmd_mesh_group", lambda axis: dist.group.WORLD
+        )
+    )
+
+  def _compile_and_run(self, load_balancer):
+    """Compiles one CP GatedDeltaNet call on rank 0; returns the graph count."""
+    strategy = "all_gather" if load_balancer == "headtail" else "ulysses"
+    n_key_heads, n_value_heads, head_dim = 2, 4, 8
+    tokens = _SEQ_LEN * len(_DOCS)
+    acts = [
+        torch.randn(tokens, n_key_heads * head_dim),
+        torch.randn(tokens, n_key_heads * head_dim),
+        torch.randn(tokens, n_value_heads * head_dim),
+        torch.randn(tokens, n_value_heads),
+        torch.randn(tokens, n_value_heads),
+    ]
+    local = [
+        _shard(t, strategy, 2, 0, _SEQ_LEN).requires_grad_(True) for t in acts
+    ]
+    params = [
+        torch.randn(n_key_heads * head_dim, 1, 4),
+        torch.randn(n_key_heads * head_dim, 1, 4),
+        torch.randn(n_value_heads * head_dim, 1, 4),
+        torch.randn(n_value_heads),
+        torch.randn(n_value_heads),
+    ]
+    positions = _shard(_packed_positions(_DOCS), strategy, 2, 0, _SEQ_LEN)
+    module = CPTpuInnerGatedDeltaNet(
+        CPTpuInnerGatedDeltaNet.Config(
+            kernel=TpuGatedDeltaKernel.Config(chunk_size=8),
+            load_balancer=load_balancer,
+        )
+    )
+    graphs = []
+
+    def count(gm, _):
+      graphs.append(gm)
+      return gm.forward
+
+    def fn(*local_acts):
+      return module(
+          *local_acts,
+          *params,
+          torch.tensor([0, tokens], dtype=torch.int32),
+          key_head_dim=head_dim,
+          value_head_dim=head_dim,
+          positions=positions,
+      )
+
+    with set_unflatten_seq_len(_SEQ_LEN):
+      torch.compile(fn, backend=count, fullgraph=True)(*local).sum().backward()
+    return len(graphs)
+
+  @parameterized.parameters("headtail", None)
+  def test_compiles_to_one_graph(self, load_balancer):
+    # cp_shard caches the rank tensor before the compiled forward runs.
+    cp_attention._cache_cp_rank_for_mesh(
+        types.SimpleNamespace(device_type="cpu", get_local_rank=lambda: 0)
+    )
+    self.assertEqual(self._compile_and_run(load_balancer), 1)
+
+  def test_uncached_rank_raises_while_compiling(self):
+    with self.assertRaisesRegex(Exception, "not cached while compiling"):
+      self._compile_and_run("headtail")
+
+
 def _small_vocab(cfg, vocab_size: int = 512):
   """Shrinks the debug model's 248K vocabulary for fast CPU tests."""
   model = cfg.model_spec.model
@@ -248,7 +350,7 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
     torch.manual_seed(0)
     cp_attention._CP_RANK_CACHE.clear()
     self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
-    _reset_cp_input_layout(self)
+    _reset_cp_state(self)
 
   @parameterized.product(strategy=_STRATEGIES, traced=(False, True))
   def test_debug_model_matches_single_device(self, strategy, traced):
@@ -410,7 +512,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       ("ulysses", _SEQ_LEN, 2 * _SEQ_LEN, (1, 2 * _SEQ_LEN)),
   )
   def test_cp_shard_records_the_layout(self, strategy, seq_len, tokens, want):
-    _reset_cp_input_layout(self)
+    _reset_cp_state(self)
     owner = tpu_cp_inner_attention(
         cp_attention.ScaledDotProductInnerAttention, strategy
     )

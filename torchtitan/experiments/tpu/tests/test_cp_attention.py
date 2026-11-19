@@ -358,6 +358,35 @@ class CPAttentionParityTest(parameterized.TestCase):
     )
     self._check(inputs, got, use_documents=True)
 
+  @parameterized.product(traced=(False, True), cp=(2, 4))
+  def test_ulysses_sliding_window_matches_single_device(self, traced, cp):
+    """Ulysses CP over the Muse Glimmer sliding-window SDPA (no kernel) applies its window."""
+    from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention, UlyssesCPSlidingWindowScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
+
+    window = 8
+    cls = UlyssesCPSlidingWindowScaledDotProductInnerAttention
+    inputs, got = self._run(
+        "ulysses",
+        lambda: cls(cls.Config(window_size=window)),
+        cp,
+        4,
+        4,
+        lambda local_positions: dict(positions=local_positions),
+        traced,
+    )
+    q, k, v, grad, positions = inputs
+    q, k, v = (t.clone().requires_grad_(True) for t in (q, k, v))
+    single = SlidingWindowScaledDotProductInnerAttention(
+        SlidingWindowScaledDotProductInnerAttention.Config(window_size=window)
+    )
+    with set_unflatten_seq_len(_SEQ_LEN):
+      want = single(q, k, v, positions=positions)
+    want.backward(grad)
+    for name, g, w in zip(
+        ("out", "dq", "dk", "dv"), got, (want.detach(), q.grad, k.grad, v.grad)
+    ):
+      torch.testing.assert_close(g, w, rtol=2e-5, atol=2e-5, msg=name)
+
 
 class CPShardTest(parameterized.TestCase):
   """KV all-gather input sharding and the head-tail order."""
@@ -366,6 +395,8 @@ class CPShardTest(parameterized.TestCase):
     super().setUp()
     cp_attention._CP_RANK_CACHE.clear()  # cp_shard caches the rank tensor.
     self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    # cp_shard also records its token layout.
+    self.addCleanup(setattr, cp_attention, "_CP_INPUT_LAYOUT", None)
 
   @parameterized.parameters((2, 1), (2, 3), (4, 1), (4, 2))
   def test_kv_all_gather_cp_shard_layout(self, cp, bsz):
@@ -813,6 +844,25 @@ class CPValidationTest(parameterized.TestCase):
           NotImplementedError, "Tokamax \\*_diag_skip assumes natural Q order"
       ):
         config.__post_init__()
+
+  def test_register_rejects_a_second_cp_pair_for_the_same_attention(self):
+    """A second, different CP pair for a registered attention would be ignored."""
+
+    class OtherUlysses(UlyssesCPScaledDotProductInnerAttention):
+      pass
+
+    # Re-registering the same pair is a no-op.
+    cp_attention.register_tpu_cp_inner_attention(
+        cp_attention.ScaledDotProductInnerAttention,
+        UlyssesCPScaledDotProductInnerAttention,
+        KVAllGatherCPScaledDotProductInnerAttention,
+    )
+    with self.assertRaisesRegex(ValueError, "already has TPU CP"):
+      cp_attention.register_tpu_cp_inner_attention(
+          cp_attention.ScaledDotProductInnerAttention,
+          OtherUlysses,
+          KVAllGatherCPScaledDotProductInnerAttention,
+      )
 
   def test_rejects_non_causal_kv_all_gather(self):
     config = self._config("all_gather")

@@ -55,6 +55,11 @@ class TPUTrainer(torchtitan.train.Trainer):
   """
 
   def __init__(self, job_config: Configurable.Config):
+    from torchtitan.experiments.tpu.components.scatter_add import (  # pylint: disable=g-import-not-at-top
+        install_tpu_scatter_add_row_gather,
+    )
+
+    install_tpu_scatter_add_row_gather()
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
       # Trainer.__init__ builds `loss_fn` from `job_config.loss` (and, under
       # pipeline parallelism, binds it into the PP schedule), so fill

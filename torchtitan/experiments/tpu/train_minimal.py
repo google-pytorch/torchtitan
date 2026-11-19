@@ -94,6 +94,11 @@ class TrainerMinimal:
     self.rank = rank
     self.world_size = world_size
     self.job_config = job_config
+    from torchtitan.experiments.tpu.components.scatter_add import (  # pylint: disable=g-import-not-at-top
+        install_tpu_scatter_add_row_gather,
+    )
+
+    install_tpu_scatter_add_row_gather()
 
     if world_size > 1:
       dist_utils.init_distributed(

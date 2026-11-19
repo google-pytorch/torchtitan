@@ -44,3 +44,8 @@ except ImportError:
   pass
 
 from torchtitan.experiments.tpu import utils as _tpu_utils
+from torchtitan.experiments.tpu.components.scatter_add import (
+    install_tpu_scatter_add_row_gather as _install_tpu_scatter_add_row_gather,
+)
+
+_install_tpu_scatter_add_row_gather()

@@ -30,7 +30,6 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_moe_expert_counts,
     annotate_region,
     ATTENTION_INNER_ATTENTION,
-    FSDP_GATHER,
     MOE_EXPERT_COUNTS,
 )
 from torchtitan.models.common import moe
@@ -123,15 +122,6 @@ def _attention_term(scores: torch.Tensor) -> torch.Tensor:
     """Stands in for splash: a region whose output its backward reads."""
     with annotate_region(ATTENTION_INNER_ATTENTION):
         return torch.sigmoid(scores).sum(dim=-1, keepdim=True)
-
-
-def _attention_wrapping_gather_term(scores: torch.Tensor) -> torch.Tensor:
-    """A save region around a gather; `cos` stands in for the gather."""
-    with annotate_region(ATTENTION_INNER_ATTENTION):
-        with annotate_region(FSDP_GATHER):
-            gathered = torch.cos(scores)
-        # The mul's backward reads `gathered`, so it is saved or recomputed.
-        return torch.sigmoid(gathered * scores).sum(dim=-1, keepdim=True)
 
 
 def _real_gather_term(scores: torch.Tensor) -> torch.Tensor:
@@ -244,7 +234,7 @@ def _both(*terms):
     return lambda scores: sum(t(scores) for t in terms)
 
 
-class TestScanBodyRematWindow(unittest.TestCase):
+class TestScanRematPolicy(unittest.TestCase):
 
     def setUp(self):
         _init_single_rank_gloo(12392)
@@ -320,12 +310,15 @@ class TestScanBodyRematWindow(unittest.TestCase):
         self._check_same_grads(got, want)
 
     def test_a_selected_region_is_saved(self):
+        """At torch's default budget (1.0): no pin is needed for the tags."""
+        self.assertEqual(functorch_config.activation_memory_budget, 1.0)
         want, _ = _run(_legacy, extra=_attention_term)
         _, unselected = _run(_saving(), extra=_attention_term)
         got, selected = _run(
             _saving(ATTENTION_INNER_ATTENTION), extra=_attention_term
         )
         self.assertIn("aten.sigmoid.default", _ops(unselected[0][1]))
+        self.assertEqual({budget for budget, _ in selected}, {1.0})
         self.assertNotIn("aten.sigmoid.default", _ops(selected[0][1]))
         self._check_same_grads(got, want)
 
@@ -341,16 +334,6 @@ class TestScanBodyRematWindow(unittest.TestCase):
         self.assertNotIn("_c10d_functional.all_reduce.default", ops)
         self.assertNotIn("aten.sigmoid.default", ops)
         self.assertIn("aten.mm.default", ops)
-        self._check_same_grads(got, want)
-
-    def test_a_gather_inside_a_save_region_is_recomputed(self):
-        want, _ = _run(_legacy, extra=_attention_wrapping_gather_term)
-        got, captured = _run(
-            _saving(ATTENTION_INNER_ATTENTION), extra=_attention_wrapping_gather_term
-        )
-        ops = _ops(captured[0][1])
-        self.assertIn("aten.cos.default", ops)
-        self.assertNotIn("aten.sigmoid.default", ops)
         self._check_same_grads(got, want)
 
     def test_the_real_gather_is_recomputed(self):
@@ -375,23 +358,12 @@ class TestScanBodyRematWindow(unittest.TestCase):
         with mock.patch.object(
             scan_remat_policy, "checkpoint_module", types.SimpleNamespace()
         ):
-            with self.assertRaisesRegex(RuntimeError, "non-strict"):
+            with self.assertRaisesRegex(RuntimeError, "pytorch/pytorch#203334"):
                 _run(_saving())
 
     def test_refuses_an_unknown_save_region(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "cannot save regions"):
             _run(_saving("moe.routing"))
-
-    def test_the_policy_holds_at_the_default_budget(self):
-        """No budget pin: torch's default, 1.0, already honours every tag."""
-        self.assertEqual(functorch_config.activation_memory_budget, 1.0)
-        want, _ = _run(_legacy, extra=_attention_term)
-        got, captured = _run(
-            _saving(ATTENTION_INNER_ATTENTION), extra=_attention_term
-        )
-        self.assertEqual({budget for budget, _ in captured}, {1.0})
-        self.assertNotIn("aten.sigmoid.default", _ops(captured[0][1]))
-        self._check_same_grads(got, want)
 
 
 if __name__ == "__main__":

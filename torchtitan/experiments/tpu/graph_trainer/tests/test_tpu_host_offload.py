@@ -14,7 +14,7 @@ saved carry after the split. The real llama3 case is in test_tpu_host_offload_di
 import operator
 from unittest import mock
 
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 import torch
 from torch._higher_order_ops.scan import scan
 
@@ -102,7 +102,7 @@ def _bwd_body(reads):
     return g
 
 
-class ScanOffloadTest(absltest.TestCase):
+class ScanOffloadTest(parameterized.TestCase):
 
     def setUp(self):
         super().setUp()
@@ -146,10 +146,6 @@ class ScanOffloadTest(absltest.TestCase):
         bwd.meta["autograd_backward"] = True
         return fwd, stacks[0], bwd
 
-    def _assert_untouched(self, gm, fwd, bwd):
-        self.assertEqual(_ao_targets(_body_of(gm, fwd).graph), [])
-        self.assertEqual(_ao_targets(_body_of(gm, bwd).graph), [])
-
     def test_only_the_saved_carry_goes_to_host(self):
         fwd, stack, bwd = self._pair()
         self.graph.output(bwd)
@@ -183,46 +179,24 @@ class ScanOffloadTest(absltest.TestCase):
         self.assertIn(_OFFLOAD, _ao_targets(_body_of(gm, fwd).graph))
         self.assertIn(_RELOAD, _ao_targets(_body_of(gm, bwd).graph))
 
-    def test_a_live_second_reader_raises(self):
+    @parameterized.named_parameters(
         # It would silently read host memory.
-        fwd, stack, bwd = self._pair()
-        self.graph.output((bwd, _mm(self.graph, stack, _STACK)))
-
-        gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "outside the backward scan"):
-            offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
-
-    def test_the_graph_output_reading_the_stack_raises(self):
+        ("a_live_second_reader", {}, lambda g, s: [_mm(g, s, _STACK)], "outside"),
         # The output node has no users, but it is not a dead reader.
-        fwd, stack, bwd = self._pair()
-        self.graph.output((bwd, stack))
-
-        gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "outside the backward scan"):
-            offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
-
-    def test_a_body_that_reads_the_stack_whole_raises(self):
+        ("the_graph_output", {}, lambda g, s: [s], "outside the backward scan"),
         # Reloading the whole stack every iteration is worse than no offload.
-        fwd, _, bwd = self._pair(reads="whole")
-        self.graph.output(bwd)
+        ("a_whole_stack_read", {"reads": "whole"}, lambda g, s: [], "whole"),
+        ("no_saved_carry", {"saves_carry": False}, lambda g, s: [], "none saves"),
+    )
+    def test_raises_and_leaves_the_bodies_untouched(self, pair, outputs, error):
+        fwd, stack, bwd = self._pair(**pair)
+        self.graph.output((bwd, *outputs(self.graph, stack)))
 
         gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "whole"):
+        with self.assertRaisesRegex(RuntimeError, error):
             offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
-
-    def test_a_body_that_does_not_save_its_carry_raises(self):
-        fwd, _, bwd = self._pair(saves_carry=False)
-        self.graph.output(bwd)
-
-        gm = self._gm()
-        with self.assertRaisesRegex(
-            RuntimeError, "1 forward scans, none saves its carry"
-        ):
-            offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
+        self.assertEqual(_ao_targets(_body_of(gm, fwd).graph), [])
+        self.assertEqual(_ao_targets(_body_of(gm, bwd).graph), [])
 
     def test_a_graph_with_no_scan_raises(self):
         big = _mm(self.graph, self.x, (4096, 2048), name="log_softmax")
@@ -246,7 +220,7 @@ def _attention_layer(h, w):
     return torch.tanh(h + a[:, :_DIM] * a[:, _DIM:])
 
 
-class RealScanTest(absltest.TestCase):
+class RealScanTest(parameterized.TestCase):
     """The pass finds the saved carry, ``clone(carry)``, after ``scan``'s split."""
 
     def _trace(self, layer, save_regions):
@@ -281,27 +255,20 @@ class RealScanTest(absltest.TestCase):
         ]
         return saved
 
-    def test_the_saved_carry_reaches_the_forward_body(self):
-        gm, fwd = self._trace(_plain_layer, frozenset())
-        saved = self._saved_carry(gm, fwd)
-
-        offload_scan_activations(gm)
-        (offload,) = [
-            n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
-        ]
-        self.assertIs(offload.args[0], saved)
-
-    def test_a_saved_region_is_saved_next_to_the_carry(self):
-        gm, fwd = self._trace(_attention_layer, {ATTENTION_INNER_ATTENTION})
+    @parameterized.named_parameters(
+        ("plain_layer", _plain_layer, frozenset()),
+        ("saved_attention", _attention_layer, {ATTENTION_INNER_ATTENTION}),
+    )
+    def test_only_the_saved_carry_goes_to_host(self, layer, save_regions):
+        gm, fwd = self._trace(layer, save_regions)
         saved = self._saved_carry(gm, fwd)
         regions = [
             (o.meta.get("custom") or {}).get(REMAT_REGION)
             for o in self._outputs(gm, fwd)
         ]
-        self.assertIn(ATTENTION_INNER_ATTENTION, regions)
+        self.assertEqual(ATTENTION_INNER_ATTENTION in regions, bool(save_regions))
 
         offload_scan_activations(gm)
-        # Only the layer input goes to host.
         (offload,) = [
             n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
         ]

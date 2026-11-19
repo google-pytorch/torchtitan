@@ -6,8 +6,9 @@
 
 """CPU unit tests for the TPU row-gather backward of deterministic_scatter_add."""
 
-import importlib
-from unittest import mock
+import os
+import subprocess
+import sys
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -23,7 +24,6 @@ from torchtitan.experiments.tpu.components.scatter_add import (
 )
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 from torchtitan.ops.scatter_add import deterministic_scatter_add
-from torchtitan.tools import utils as titan_utils
 
 
 class _OpRecorderMode(TorchDispatchMode):
@@ -57,14 +57,44 @@ class ScatterAddRowGatherCpuTest(parameterized.TestCase):
     uninstall_tpu_scatter_add_row_gather()
     self.assertFalse(is_tpu_scatter_add_row_gather_installed())
 
-    # On non-TPU hosts, importing torchtitan.experiments.tpu avoids global
-    # side effects; on TPU hosts, package import installs automatically.
-    with mock.patch.object(titan_utils, "device_type", "cpu"):
-      importlib.reload(tpu_pkg)
-      self.assertFalse(is_tpu_scatter_add_row_gather_installed())
-    with mock.patch.object(titan_utils, "device_type", "tpu"):
-      importlib.reload(tpu_pkg)
-      self.assertTrue(is_tpu_scatter_add_row_gather_installed())
+    # On non-TPU hosts, _maybe_install_tpu_scatter_add avoids global side
+    # effects; on TPU hosts, it installs automatically.
+    self.assertFalse(tpu_pkg._maybe_install_tpu_scatter_add("cpu"))
+    self.assertFalse(is_tpu_scatter_add_row_gather_installed())
+    self.assertFalse(tpu_pkg._maybe_install_tpu_scatter_add("cuda"))
+    self.assertFalse(is_tpu_scatter_add_row_gather_installed())
+    self.assertTrue(tpu_pkg._maybe_install_tpu_scatter_add("tpu"))
+    self.assertTrue(is_tpu_scatter_add_row_gather_installed())
+
+    # Also verify in a fresh subprocess that importing torchtitan.experiments.tpu
+    # on CPU leaves the custom op uninstalled.
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../../../..")
+    )
+    env = os.environ.copy()
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH")
+        else repo_root
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import torchtitan.experiments.tpu; "
+                "from torchtitan.experiments.tpu.components.scatter_add import "
+                "is_tpu_scatter_add_row_gather_installed; "
+                "assert not is_tpu_scatter_add_row_gather_installed()"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(proc.returncode, 0, msg=proc.stderr)
 
   def test_needs_input_grad_skips_unused_inputs(self):
     gen = torch.Generator().manual_seed(101)

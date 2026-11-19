@@ -149,11 +149,31 @@ def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
   )
 
 
+def _use_tpu7x_expert_tiles(cfg: TPUTrainerConfig) -> None:
+  """Runs the routed experts with the Pallas grouped matmul in 512x2048x1024 tiles.
+
+  On TPU7x, XLA's lowering of `torch._grouped_mm` for these expert shapes
+  (dim 8192, hidden 2048) needs 64.9 MB of scoped VMEM at the 63.9 MB limit
+  `_TPU7X_FLAGS` sets, and the Pallas grouped matmul's default tiles (whole
+  K x N weight panels) need 108-120 MB. These tiles fit, ran on a TPU7x 4x4x4
+  slice, and on TPU v6e match `torch._grouped_mm` at the per-rank shapes
+  (8 experts, empty leading experts included) to a relative error of about
+  1e-4 in the output and every gradient. The paired variant needs EP=1, so
+  this is the plain one.
+  """
+  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 512
+    experts.pallas_grouped_mm_tile_k = 2048
+    experts.pallas_grouped_mm_tile_n = 1024
+
+
 def qwen38_2_4t_a95b_proxy_tpu7x() -> TPUTrainerConfig:
   """2.4T-A95B proxy for one TPU7x 4x4x4 slice: 4 layers, 512 experts, EP=64.
 
   The full model's 512 experts at its EP degree (8 experts per rank) on 64
-  chips / 128 ranks, with the TPU7x libtpu flags. 1K tokens per rank: the
+  chips / 128 ranks, with the TPU7x libtpu flags and the Pallas grouped
+  matmul experts (`_use_tpu7x_expert_tiles`). 1K tokens per rank: the
   ragged EP receive buffer is 64 * T * 10 rows of dim 8192, 10.7 GB bf16 at
   T = 1024 and 21.5 GB at 2048, and the dispatch, the combine and their
   gradients each hold one. Raise `--training.max_context_length` and
@@ -167,6 +187,7 @@ def qwen38_2_4t_a95b_proxy_tpu7x() -> TPUTrainerConfig:
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, _TPU7X_FLAGS
   )
+  _use_tpu7x_expert_tiles(cfg)
   return cfg
 
 
@@ -182,29 +203,7 @@ def qwen38_2_4t_a95b_proxy_tpu7x_8l() -> TPUTrainerConfig:
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, _TPU7X_FLAGS
   )
-  return cfg
-
-
-def qwen38_2_4t_a95b_proxy_tpu7x_pallas_gmm() -> TPUTrainerConfig:
-  """`qwen38_2_4t_a95b_proxy_tpu7x` with the Pallas grouped matmul experts.
-
-  On TPU7x, XLA's lowering of `torch._grouped_mm` for these expert shapes
-  (dim 8192, hidden 2048) needs 64.9 MB of scoped VMEM, above the 63.9 MB
-  that TPU7x accepts (first TPU7x smoke run). The lane's Pallas grouped
-  matmul tiles explicitly. The paired variant needs EP=1, so this uses the
-  plain one. Its default tiles load whole K x N weight panels (tile_k =
-  tile_n = 0), 8192 x 2048 for W1/W3, which needed 108-120 MB of VMEM on
-  TPU7x (second smoke run); 512 x 2048 x 1024 tiles keep every buffer at a
-  few MB. On TPU v6e these tiles match `torch._grouped_mm` at the per-rank
-  shapes (8 experts, empty leading experts included) to a relative error of
-  about 1e-4 in the output and every gradient.
-  """
-  cfg = qwen38_2_4t_a95b_proxy_tpu7x()
-  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
-    experts.use_pallas_grouped_mm = True
-    experts.pallas_grouped_mm_tile_m = 512
-    experts.pallas_grouped_mm_tile_k = 2048
-    experts.pallas_grouped_mm_tile_n = 1024
+  _use_tpu7x_expert_tiles(cfg)
   return cfg
 
 

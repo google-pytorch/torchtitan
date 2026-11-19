@@ -21,7 +21,10 @@ import torch
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
-from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpertsConverter
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    TpuGroupedExperts,
+    TpuGroupedExpertsConverter,
+)
 from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.qwen3_5 import use_tpu_modules
@@ -397,7 +400,6 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       "qwen38_2_4t_a95b_proxy",
       "qwen38_2_4t_a95b_proxy_tpu7x",
       "qwen38_2_4t_a95b_proxy_tpu7x_8l",
-      "qwen38_2_4t_a95b_proxy_tpu7x_pallas_gmm",
       "qwen38_2_4t_a95b",
   )
   def test_recipe_parses(self, config_name: str):
@@ -520,6 +522,12 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
         cfg.training.max_context_length,
     )
     self.assertIn("xla_tpu_scoped_vmem_limit_kib", cfg.libtpu_init_flags)
+    # The XLA grouped matmul overflows TPU7x VMEM at these shapes.
+    for _, experts, _, _ in cfg.model_spec.model.traverse(
+        TpuGroupedExperts.Config
+    ):
+      self.assertTrue(experts.use_pallas_grouped_mm)
+      self.assertEqual(experts.pallas_grouped_mm_tile_k, 2048)
 
 
 if __name__ == "__main__":

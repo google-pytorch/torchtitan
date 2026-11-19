@@ -103,6 +103,11 @@ def _record_cp_input_layout(rows: int, row_len: int) -> None:
   _CP_INPUT_LAYOUT = (rows * row_len, rows, row_len)
 
 
+def _clear_cp_input_layout() -> None:
+  global _CP_INPUT_LAYOUT
+  _CP_INPUT_LAYOUT = None
+
+
 def cp_input_layout(num_tokens: int) -> tuple[int, int] | None:
   """``(rows, row_len)`` of the last ``cp_shard`` over ``num_tokens`` tokens.
 
@@ -126,6 +131,8 @@ def _record_layout_of_input(
   """Records the layout of ``input`` as sharded along its CP sequence dim."""
   inp = input_dict.get("input")
   if not isinstance(inp, torch.Tensor) or inp.ndim < 1:
+    # Nothing to record: do not leave an earlier cp_shard's layout behind.
+    _clear_cp_input_layout()
     return
   shard_dims = (
       _cp_shard_dims(input_shardings)
@@ -181,7 +188,9 @@ def cp_rank_tensor(device: torch.device | str, group: Any) -> torch.Tensor:
     group: The CP process group.
 
   Returns:
-    The cached rank tensor.
+    The cached rank tensor (cached now on an eager miss). Under non-strict
+    tracing, a miss returns an uncached tensor that the trace records as a
+    constant.
   """
   r = int(group.rank())
   dev = _normalize_cp_device(device)
@@ -1069,7 +1078,9 @@ _TPU_CP_VALIDATORS: list[Callable[[Any, Any], None]] = []
 def register_tpu_cp_validator(
     fn: Callable[[Any, Any], None],
 ) -> Callable[[Any, Any], None]:
-  """Registers ``fn(model, parallelism)`` to run in ``validate_tpu_context_parallel``.
+  """Registers a CP validator for ``validate_tpu_context_parallel``.
+
+  It is called as ``fn(model, parallelism)``.
 
   Lets a model package reject CP configs of its own layers (e.g. a sequence
   mixer that is not CP-aware) instead of training them on token shards as if

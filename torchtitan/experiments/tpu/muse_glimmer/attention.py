@@ -249,13 +249,13 @@ class UlyssesCPSlidingWindowScaledDotProductInnerAttention(
 class KVAllGatherCPSlidingWindowScaledDotProductInnerAttention(
     KVAllGatherCPInnerAttention, SlidingWindowScaledDotProductInnerAttention
 ):
-  """Load-balanced KV all-gather CP over ``SlidingWindowScaledDotProductInnerAttention``."""
+  """Load-balanced KV all-gather CP over the sliding-window SDPA."""
 
   @dataclass(kw_only=True, slots=True)
   class Config(SlidingWindowScaledDotProductInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_reference_attention: bool = False
-    """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""
+    """Run ``local_forward`` on TPU without a kernel (tests, tiny models)."""
 
   def local_forward(self, q, k, v, **kwargs) -> torch.Tensor:
     # Drop attention_masks so the reference attention applies the segment_ids

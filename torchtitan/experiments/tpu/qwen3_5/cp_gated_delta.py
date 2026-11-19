@@ -127,7 +127,7 @@ def _check_contiguous_layout(num_tokens: int) -> None:
 
 
 def _headtail_to_sequence_order(x: torch.Tensor, cp: int) -> torch.Tensor:
-  """``[T, ...]`` gathered from the CP ranks in head-tail layout -> sequence order.
+  """Puts ``[T, ...]`` gathered in head-tail layout back in sequence order.
 
   Rank ``r`` held ``[B, S / cp]`` (chunks ``r`` and ``2 * cp - 1 - r`` of each
   sequence), so the rank-major concatenation is ``[cp, B, S / cp]``.
@@ -151,7 +151,7 @@ def _sequence_to_headtail_order(x: torch.Tensor, cp: int) -> torch.Tensor:
 
 
 def _local_heads(x: torch.Tensor, rank: torch.Tensor, cp: int) -> torch.Tensor:
-  """Rank ``rank``'s contiguous ``1 / cp`` slice of dim 0 (per-head parameters)."""
+  """Rank ``rank``'s contiguous ``1 / cp`` slice of dim 0 (per-head params)."""
   local = x.shape[0] // cp
   rest = list(x.shape[1:])
   return (
@@ -307,7 +307,7 @@ class GatedDeltaNetContextParallelTransform(ModelConfigTransform):
 
 @register_tpu_cp_reverter
 def revert_gated_delta_context_parallel(model: Any) -> None:
-  """Swaps every ``CPTpuInnerGatedDeltaNet`` config back to ``TpuInnerGatedDeltaNet``.
+  """Swaps the CP GatedDeltaNet configs back to ``TpuInnerGatedDeltaNet``.
 
   Registered with ``revert_tpu_context_parallel``, for ``cp == 1`` reruns of
   CP recipes (``CPTpuInnerGatedDeltaNet`` requires an active CP mesh axis).

@@ -531,7 +531,7 @@ def _qwen35_cp(
 
 
 def _allow_reference_attention(cfg: TPUTrainerConfig) -> None:
-  """Lets KV all-gather CP run its plain-PyTorch attention (no Splash kernel)."""
+  """Lets KV all-gather CP run its plain-PyTorch attention (no Splash)."""
   assert cfg.model_spec is not None
   for _, attn, _, _ in cfg.model_spec.model.traverse(BaseAttention.Config):
     attn.inner_attention.allow_reference_attention = True
@@ -585,7 +585,7 @@ def qwen35_moe_35b_ulysses_cp2() -> TPUTrainerConfig:
 def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
     TpuGraphTrainer.Config
 ):
-  """``qwen35_moe_35b_split_tokamax_benchmark`` with KV all-gather CP degree 2."""
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with KV all-gather CP 2."""
   return _qwen35_cp(
       qwen35_moe_35b_split_tokamax_benchmark(),
       strategy="all_gather",

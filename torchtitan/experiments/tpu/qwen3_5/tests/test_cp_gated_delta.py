@@ -32,19 +32,11 @@ from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import cp_gated_delta
 from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import CPTpuInnerGatedDeltaNet, GatedDeltaNetContextParallelTransform
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, TpuInnerGatedDeltaNet
-from torchtitan.experiments.tpu.tests.test_cp_attention import _DOCS, _emulated_cp_group, _packed_positions, _Ranks, _SEQ_LEN, _shard, _unshard
+from torchtitan.experiments.tpu.tests.test_cp_attention import _DOCS, _emulated_cp_group, _packed_positions, _Ranks, _reset_cp_state, _SEQ_LEN, _shard, _unshard
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 
 _STRATEGIES = ("all_gather", "ulysses")
-
-
-def _reset_cp_state(test: absltest.TestCase) -> None:
-  """Forgets the layout and rank-miss state of earlier cp_shard calls."""
-  cp_attention._CP_INPUT_LAYOUT = None
-  test.addCleanup(setattr, cp_attention, "_CP_INPUT_LAYOUT", None)
-  cp_attention._CP_RANK_MISS_WARNED.clear()
-  test.addCleanup(cp_attention._CP_RANK_MISS_WARNED.clear)
 
 
 @contextlib.contextmanager
@@ -62,8 +54,6 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
     _reset_cp_state(self)
 
   def _inputs(self, n_key_heads, n_value_heads, head_dim, tokens):
@@ -92,7 +82,7 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
       documents=(False, True),
   )
   def test_matches_single_device(self, strategy, cp, traced, documents):
-    """Output and input / per-head parameter gradients match a single device (B=2)."""
+    """Output, input and per-head parameter grads match one device (B=2)."""
     n_key_heads, n_value_heads, head_dim = 4, 8, 8
     tokens = _SEQ_LEN * len(_DOCS)
     acts, params, grad = self._inputs(
@@ -165,7 +155,7 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
       )
 
   def test_requires_cp_group(self):
-    """Without an active CP axis it raises instead of running on token shards."""
+    """Without an active CP axis it raises instead of using token shards."""
     acts, params, _ = self._inputs(2, 4, 8, 32)
     kernel = TpuGatedDeltaKernel.Config(chunk_size=8)
     args = (*acts, *params, torch.tensor([0, 32], dtype=torch.int32))
@@ -179,7 +169,7 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
 
   @parameterized.parameters(2, 4)
   def test_headtail_matches_upstream_load_balancer(self, cp):
-    """One unfolded sequence (no shim, as verl runs) sharded by torch's head-tail balancer."""
+    """Inverts torch's head-tail balancer on one sequence (no shim, as verl)."""
     tokens = 64
     perm = _HeadTailLoadBalancer(tokens, cp, torch.device("cpu"))
     shards = torch.arange(tokens)[perm._generate_indices().reshape(-1)].chunk(
@@ -262,8 +252,6 @@ class CompiledCPGatedDeltaNetTest(parameterized.TestCase):
     super().setUp()
     torch._dynamo.reset()
     self.addCleanup(torch._dynamo.reset)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
     _reset_cp_state(self)
     self.enter_context(
         mock.patch.object(
@@ -333,6 +321,36 @@ class CompiledCPGatedDeltaNetTest(parameterized.TestCase):
       self._compile_and_run("headtail")
 
 
+def _cp_shard_per_rank(owner, batch, load_balancer, cp):
+  """Each rank's output of ``owner.cp_shard`` on a mocked ``cp``-rank mesh.
+
+  ``prepare_context_parallel_input`` (the torch sharding at the end of
+  ``cp_shard``) is replaced by taking the rank's contiguous chunk of each
+  input: both strategies' ``cp_shard`` ask it for no further reordering
+  (Ulysses always; KV all-gather once it has reordered each folded sequence).
+  """
+  shards = []
+  for rank in range(cp):
+    mesh = mock.Mock(device_type="cpu")
+    mesh.size.return_value = cp
+    mesh.get_local_rank.return_value = rank
+
+    def take_chunk(input_dict, shardings, mesh, balancer, ptrr_key, rank=rank):
+      del shardings, mesh, ptrr_key
+      assert balancer is None, balancer
+      for key in ("input", "labels", "positions"):
+        input_dict[key] = input_dict[key].chunk(cp)[rank]
+      return input_dict
+
+    with mock.patch.object(
+        cp_attention, "prepare_context_parallel_input", side_effect=take_chunk
+    ):
+      shards.append(
+          owner.cp_shard(dict(batch), None, mesh, load_balancer, None)
+      )
+  return shards
+
+
 def _small_vocab(cfg, vocab_size: int = 512):
   """Shrinks the debug model's 248K vocabulary for fast CPU tests."""
   model = cfg.model_spec.model
@@ -348,8 +366,6 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
     _reset_cp_state(self)
 
   @parameterized.product(strategy=_STRATEGIES, traced=(False, True))
@@ -374,17 +390,30 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
     labels = torch.randint(0, 512, (tokens,))
     positions = _packed_positions(_DOCS)
     ranks = _Ranks(cp)
+    # The real cp_shard of the recipe's CP attention (it records the token
+    # layout that the GatedDeltaNet checks during the forward below).
+    owner = cp_cfg.model_spec.model.first_full_attention_backend._owner
+    with set_unflatten_seq_len(_SEQ_LEN):
+      shards = _cp_shard_per_rank(
+          owner,
+          {"input": inputs, "labels": labels, "positions": positions},
+          tpu_cp_load_balancer(strategy),
+          cp,
+      )
+    for rank, shard in enumerate(shards):
+      torch.testing.assert_close(
+          shard["input"], _shard(inputs, strategy, cp, rank, _SEQ_LEN)
+      )
+    self.assertEqual(
+        cp_attention.cp_input_layout(tokens)[0],
+        1 if strategy == "ulysses" else len(_DOCS),
+    )
 
     def run_rank(rank):
       model = copy.deepcopy(cp_model)
-      logits = model(
-          _shard(inputs, strategy, cp, rank, _SEQ_LEN),
-          positions=_shard(positions, strategy, cp, rank, _SEQ_LEN),
-      )
+      logits = model(shards[rank]["input"], positions=shards[rank]["positions"])
       loss = F.cross_entropy(
-          logits.float(),
-          _shard(labels, strategy, cp, rank, _SEQ_LEN),
-          reduction="sum",
+          logits.float(), shards[rank]["labels"], reduction="sum"
       )
       loss.backward()
       return loss.detach(), {
@@ -420,6 +449,10 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       ("qwen35_debugmodel_ulysses_cp2", None),
       ("qwen35_moe_debugmodel_allgather_cp2", "headtail"),
       ("qwen35_moe_debugmodel_ulysses_cp2", None),
+      ("qwen35_moe_35b_allgather_cp2", "headtail"),
+      ("qwen35_moe_35b_ulysses_cp2", None),
+      ("qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2", "headtail"),
+      ("qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2", None),
   )
   def test_recipes_convert_every_layer(self, recipe, load_balancer):
     cfg = getattr(config_registry, recipe)()
@@ -490,7 +523,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       self.assertEqual(inner.load_balancer, "headtail")
 
   def test_revert_restores_single_device_gated_delta(self):
-    """revert_tpu_context_parallel also swaps the GatedDeltaNet back (cp == 1 reruns)."""
+    """revert_tpu_context_parallel also reverts the GatedDeltaNet (cp == 1)."""
     cfg = config_registry.qwen35_debugmodel_allgather_cp2()
     model = cfg.model_spec.model
     cp_attention.revert_tpu_context_parallel(model)
@@ -565,6 +598,32 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     )
     torch.testing.assert_close(inputs, tokens)
     self.assertIn("positions", extra)
+
+  @parameterized.named_parameters(
+      ("without_positions", "positions", None, ValueError, "RoPE positions"),
+      (
+          "with_mrope_positions",
+          "mrope_positions",
+          torch.zeros(2 * _SEQ_LEN, 3, dtype=torch.long),
+          NotImplementedError,
+          "text-only",
+      ),
+  )
+  def test_tpu_model_cp_rejects_unsupported_inputs(
+      self, key, value, error, regex
+  ):
+    cfg = _small_vocab(config_registry.qwen35_debugmodel_allgather_cp2())
+    with torch.device("cpu"):
+      model = cfg.model_spec.model.build()
+    tokens = torch.arange(2 * _SEQ_LEN)
+    batch = {"input": tokens, "labels": tokens, "positions": tokens % _SEQ_LEN}
+    batch[key] = value
+    with self.assertRaisesRegex(error, regex):
+      model.preprocess_inputs(
+          batch,
+          parallel_dims=mock.Mock(cp_enabled=True),
+          parallelism=cfg.parallelism,
+      )
 
 
 if __name__ == "__main__":

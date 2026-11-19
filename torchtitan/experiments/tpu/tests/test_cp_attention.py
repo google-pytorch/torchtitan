@@ -248,6 +248,17 @@ def _dense_local_attention(q, k, v, *, segment_ids=None, scale=None, **unused):
   )
 
 
+def _reset_cp_state(test: absltest.TestCase) -> None:
+  """Clears the CP rank cache, rank-miss warnings and recorded input layout."""
+  for clear in (
+      cp_attention._CP_RANK_CACHE.clear,
+      cp_attention._CP_RANK_MISS_WARNED.clear,
+      cp_attention._clear_cp_input_layout,
+  ):
+    clear()
+    test.addCleanup(clear)
+
+
 # Two sequences of 32 tokens, with documents crossing the head-tail chunks.
 _SEQ_LEN = 32
 _DOCS = ((5, 11, 9, 7), (16, 3, 13))
@@ -259,8 +270,7 @@ class CPAttentionParityTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
 
   def _run(
       self, strategy, make_attn, cp, n_heads, n_kv_heads, kwargs_fn, traced
@@ -360,7 +370,7 @@ class CPAttentionParityTest(parameterized.TestCase):
 
   @parameterized.product(traced=(False, True), cp=(2, 4))
   def test_ulysses_sliding_window_matches_single_device(self, traced, cp):
-    """Ulysses CP over the Muse Glimmer sliding-window SDPA (no kernel) applies its window."""
+    """Ulysses CP over the sliding-window SDPA (no kernel) applies the window."""
     from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention, UlyssesCPSlidingWindowScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
 
     window = 8
@@ -393,10 +403,8 @@ class CPShardTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    cp_attention._CP_RANK_CACHE.clear()  # cp_shard caches the rank tensor.
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
-    # cp_shard also records its token layout.
-    self.addCleanup(setattr, cp_attention, "_CP_INPUT_LAYOUT", None)
+    # cp_shard caches the rank tensor and records its token layout.
+    _reset_cp_state(self)
 
   @parameterized.parameters((2, 1), (2, 3), (4, 1), (4, 2))
   def test_kv_all_gather_cp_shard_layout(self, cp, bsz):
@@ -616,8 +624,7 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
     super().setUp()
     torch._dynamo.reset()
     self.addCleanup(torch._dynamo.reset)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
     self.enter_context(
         mock.patch.object(
             cp_attention, "spmd_mesh_group", lambda axis: dist.group.WORLD
@@ -846,7 +853,7 @@ class CPValidationTest(parameterized.TestCase):
         config.__post_init__()
 
   def test_register_rejects_a_second_cp_pair_for_the_same_attention(self):
-    """A second, different CP pair for a registered attention would be ignored."""
+    """A second, different CP pair for a registered attention is rejected."""
 
     class OtherUlysses(UlyssesCPScaledDotProductInnerAttention):
       pass

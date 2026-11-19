@@ -1032,6 +1032,7 @@ class GraphSplitTest(absltest.TestCase):
         i for i, arg in enumerate(launch.args) if isinstance(arg, str)
     )
     fsdp_args = launch.args
+    self.addCleanup(setattr, launch, "args", fsdp_args)
     launch.args = (
         fsdp_args[:group_index] + ("cp_group",) + fsdp_args[group_index + 1 :]
     )

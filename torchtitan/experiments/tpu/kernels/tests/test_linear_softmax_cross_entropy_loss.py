@@ -10,6 +10,7 @@ from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax.numpy as jnp
+import numpy
 import torch
 from torchtitan.components import loss
 from torchtitan.experiments.tpu.testing import base_device_test
@@ -49,6 +50,68 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
       )
 
     self.assertEqual(backward.call_args.args[0].shape, ())
+
+  def test_backward_keeps_per_row_cotangent_for_reduction_none(self):
+    dout = jnp.asarray([0.5, -2.0], dtype=jnp.float32)
+    lse = jnp.zeros((2,), dtype=jnp.float32)
+    x = jnp.zeros((2, 4), dtype=jnp.bfloat16)
+    labels = jnp.zeros((2,), dtype=jnp.int32)
+    weights = jnp.zeros((4, 8), dtype=jnp.bfloat16)
+    kernel = importlib.import_module(
+        "tokamax._src.ops.linear_softmax_cross_entropy_loss."
+        "pallas_mosaic_tpu_kernel"
+    )
+
+    with mock.patch.object(
+        kernel,
+        "linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu",
+        return_value=(jnp.zeros_like(x), jnp.zeros_like(weights)),
+    ) as backward:
+      # pylint: disable=protected-access
+      linear_softmax_cross_entropy_loss._my_bwd(
+          dout, lse, x, labels, weights, "none", "mosaic_tpu", 1, 1, 1
+      )
+
+    passed = backward.call_args.args[0]
+    self.assertEqual(passed.shape, (2,))
+    self.assertEqual(passed.tolist(), [0.5, -2.0])
+
+  def test_reduction_none_xla_backward_matches_autograd(self):
+    # The XLA reference path runs on CPU: check the per-row backward's values.
+    torch.manual_seed(0)
+    rows, hidden, vocab = 6, 8, 16
+    x = torch.randn(rows, hidden)
+    weights = torch.randn(hidden, vocab) / 4
+    labels = torch.randint(0, vocab, (rows,))
+    dout = torch.randn(rows)
+
+    xr = x.clone().requires_grad_(True)
+    wr = weights.clone().requires_grad_(True)
+    logits = xr @ wr
+    loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+    (loss * dout).sum().backward()
+    lse = torch.logsumexp(logits.detach(), dim=-1)
+
+    to_jax = lambda t: jnp.asarray(t.numpy())
+    # pylint: disable=protected-access
+    grad_x, grad_w = linear_softmax_cross_entropy_loss._my_bwd(
+        to_jax(dout),
+        to_jax(lse),
+        to_jax(x),
+        to_jax(labels.to(torch.int32)),
+        to_jax(weights),
+        "none",
+        "xla",
+        rows,
+        hidden,
+        vocab,
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(numpy.asarray(grad_x)), xr.grad, rtol=1e-4, atol=1e-5
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(numpy.asarray(grad_w)), wr.grad, rtol=1e-4, atol=1e-5
+    )
 
   def test_backward_uses_single_buffer_when_double_buffering_exceeds_vmem(self):
     dout = jnp.ones((1,), dtype=jnp.float32)
@@ -268,6 +331,62 @@ class LinearSoftmaxCrossEntropyLossTest(
         dtype,
         actual_out,
         expected_out,
+    )
+
+  @parameterized.parameters(
+      (torch.float32, "mosaic_tpu", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.float32, "xla", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.bfloat16, "mosaic_tpu", 1.6e-2, 1e-2, 5e-2, 5e-2),
+      (torch.bfloat16, "xla", 1.6e-2, 1e-2, 5e-2, 5e-2),
+  )
+  def test_gradient_reduction_none(
+      self, dtype, implementation, loss_rtol, loss_atol, grad_rtol, grad_atol
+  ):
+    """Per-row loss and its backward with a per-row cotangent."""
+    device = self.accelerator_device
+    b, h, v = 1024, 128, 1024
+    x = torch.randn(b, h, dtype=dtype)
+    weights = torch.randn(h, v, dtype=dtype)
+    labels = torch.randint(0, v, (b,), dtype=torch.int64)
+    dout = torch.randn(b, dtype=torch.float32)
+
+    x_ref = x.detach().clone().to(device).requires_grad_(True)
+    w_ref = weights.detach().clone().to(device).requires_grad_(True)
+    expected = torch.nn.functional.cross_entropy(
+        (x_ref @ w_ref).float(), labels.to(device), reduction="none"
+    )
+    (expected * dout.to(device)).sum().backward()
+
+    x_tpu = x.detach().clone().to(device).requires_grad_(True)
+    w_tpu = weights.detach().clone().to(device).requires_grad_(True)
+    lce = linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss
+    actual = lce(
+        x_tpu,
+        labels.to(device),
+        w_tpu,
+        reduction="none",
+        implementation=implementation,
+        b_block_size=128,
+        h_block_size=128,
+        v_block_size=128,
+    )
+    self.assertEqual(tuple(actual.shape), (b,))
+    (actual * dout.to(device)).sum().backward()
+
+    torch.testing.assert_close(
+        actual.cpu(), expected.detach().cpu(), rtol=loss_rtol, atol=loss_atol
+    )
+    torch.testing.assert_close(
+        x_tpu.grad.float().cpu(),
+        x_ref.grad.float().cpu(),
+        rtol=grad_rtol,
+        atol=grad_atol,
+    )
+    torch.testing.assert_close(
+        w_tpu.grad.float().cpu(),
+        w_ref.grad.float().cpu(),
+        rtol=grad_rtol,
+        atol=grad_atol,
     )
 
   @parameterized.parameters(

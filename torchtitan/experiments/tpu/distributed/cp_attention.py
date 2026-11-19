@@ -64,9 +64,11 @@ __all__ = [
     "KVAllGatherCPVarlenInnerAttention",
     "cp_all_gather",
     "cp_all_to_all",
+    "cp_input_layout",
     "cp_rank_tensor",
     "reorder_sequence",
     "register_tpu_cp_inner_attention",
+    "register_tpu_cp_reverter",
     "register_tpu_cp_validator",
     "tpu_cp_inner_attention",
     "tpu_cp_load_balancer",
@@ -82,6 +84,53 @@ _HEAD_DIM = 1
 # populated during cp_shard / eager setup so torch.compile lifts it as a dynamic
 # graph input instead of baking a constant rank into the traced graph.
 _CP_RANK_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+# Keys whose cache miss while tracing was already logged.
+_CP_RANK_MISS_WARNED: set[tuple[torch.device, int]] = set()
+
+# The token layout of the last cp_shard: (num_tokens, rows, row_len). The
+# sequence dim of `rows` rows of `row_len` tokens each was sharded (and, for
+# KV all-gather, head-tail reordered) per row. Layers that undo the layout at
+# forward time (Qwen3.5's head-parallel GatedDeltaNet) check against it
+# instead of re-deriving it from `set_unflatten_seq_len` alone.
+_CP_INPUT_LAYOUT: tuple[int, int, int] | None = None
+
+
+def _record_cp_input_layout(rows: int, row_len: int) -> None:
+  global _CP_INPUT_LAYOUT
+  _CP_INPUT_LAYOUT = (rows * row_len, rows, row_len)
+
+
+def cp_input_layout(num_tokens: int) -> tuple[int, int] | None:
+  """``(rows, row_len)`` of the last ``cp_shard`` over ``num_tokens`` tokens.
+
+  Args:
+    num_tokens: The unsharded token count of the micro-batch.
+
+  Returns:
+    The ``(rows, row_len)`` the inputs were sharded with, or None if no
+    ``cp_shard`` over ``num_tokens`` tokens has run (e.g. hand-sharded inputs).
+  """
+  layout = _CP_INPUT_LAYOUT
+  if layout is None or layout[0] != num_tokens:
+    return None
+  return layout[1], layout[2]
+
+
+def _record_layout_of_input(
+    input_dict: dict[str, Any], input_shardings: dict[str, Any] | None
+) -> None:
+  """Records the layout of ``input`` as sharded along its CP sequence dim."""
+  inp = input_dict.get("input")
+  if not isinstance(inp, torch.Tensor) or inp.ndim < 1:
+    return
+  shard_dims = (
+      _cp_shard_dims(input_shardings)
+      if input_shardings is not None
+      else {"input": 0}
+  )
+  seq_dim = shard_dims.get("input", 0)
+  rows = math.prod(inp.shape[:seq_dim])
+  _record_cp_input_layout(rows, int(inp.shape[seq_dim]))
 
 
 def _normalize_cp_device(device: torch.device | str) -> torch.device:
@@ -136,11 +185,17 @@ def cp_rank_tensor(device: torch.device | str, group: Any) -> torch.Tensor:
   cached = _CP_RANK_CACHE.get(key)
   if cached is not None:
     return cached
-  if _tracing():
-    logger.debug(
-        "CP rank cache miss while tracing for key=%s; falling back to inline"
-        " tensor creation.",
+  if _tracing() and key not in _CP_RANK_MISS_WARNED:
+    # The rank becomes a constant of the traced graph: every rank compiles its
+    # own graph, and a graph cache that ignores constants could hand one rank
+    # another rank's selection. cp_shard fills the cache before tracing.
+    _CP_RANK_MISS_WARNED.add(key)
+    logger.warning(
+        "CP rank cache miss while tracing for key=%s; baking rank %d into the"
+        " graph. Shard the inputs with the CP inner attention's cp_shard"
+        " before tracing.",
         key,
+        r,
     )
   t = torch.tensor([r], dtype=torch.int32, device=dev)
   if not _tracing():
@@ -410,6 +465,7 @@ class UlyssesCPInnerAttention(_TPUCPInnerAttention):
         else None
     )
     attention_masks = input_dict.pop("attention_masks", None)
+    _record_layout_of_input(input_dict, input_shardings)
     prepare_context_parallel_input(
         input_dict, input_shardings, cp_mesh, None, None
     )
@@ -618,10 +674,12 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
             1, 0
         )
         input_dict[key] = v_grouped.reshape([bsz * seq_len] + rest)
+      _record_cp_input_layout(bsz, seq_len)
       prepare_context_parallel_input(
           input_dict, input_shardings, cp_mesh, None, ptrr_mask_key
       )
     else:
+      _record_layout_of_input(input_dict, input_shardings)
       prepare_context_parallel_input(
           input_dict, input_shardings, cp_mesh, "headtail", ptrr_mask_key
       )
@@ -1011,6 +1069,31 @@ def register_tpu_cp_validator(
   return fn
 
 
+# Reverts of CP layers other than attention, registered by the model packages
+# that define them; each is called as fn(model) by revert_tpu_context_parallel.
+_TPU_CP_REVERTERS: list[Callable[[Any], None]] = []
+
+
+def register_tpu_cp_reverter(
+    fn: Callable[[Any], None],
+) -> Callable[[Any], None]:
+  """Registers ``fn(model)`` to run in ``revert_tpu_context_parallel``.
+
+  Lets a model package swap its own CP layers (e.g. a head-parallel sequence
+  mixer that requires an active CP group) back to their single-device versions
+  for a ``cp == 1`` rerun of a CP recipe. Usable as a decorator.
+
+  Args:
+    fn: Converts the model config's CP layers back in place.
+
+  Returns:
+    ``fn``.
+  """
+  if fn not in _TPU_CP_REVERTERS:
+    _TPU_CP_REVERTERS.append(fn)
+  return fn
+
+
 def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
   """Returns the TPU CP inner attention for ``base`` under ``strategy``.
 
@@ -1203,11 +1286,12 @@ def validate_tpu_context_parallel(
     if issubclass(owner, KVAllGatherCPInnerAttention):
       strategy = "all_gather"
       expected_lb = "headtail"
-      # Varlen windows are (left, right) tuples; SDPA-based inner attentions
-      # (e.g. SlidingWindowScaledDotProductInnerAttention) keep a causal int
-      # window or None.
+      # Varlen windows are (left, right) pairs (a list when parsed from a
+      # config file or the command line); SDPA-based inner attentions (e.g.
+      # SlidingWindowScaledDotProductInnerAttention) keep a causal int window
+      # or None.
       window = getattr(attn.inner_attention, "window_size", (-1, 0))
-      if isinstance(window, tuple) and window[1] != 0:
+      if isinstance(window, (tuple, list)) and window[1] != 0:
         raise NotImplementedError(
             f"{fqn}.inner_attention: KV all-gather CP supports causal"
             f" attention only, i.e. window_size=(left, 0); got {window}."
@@ -1239,7 +1323,8 @@ def revert_tpu_context_parallel(model: Any) -> None:
 
   Lets a CP recipe be rerun on one device (cp == 1), e.g. as the CPU
   reference in the distributed parity tests; core validation rejects CP
-  attention when cp == 1.
+  attention when cp == 1. Then runs the reverters model packages registered
+  with ``register_tpu_cp_reverter`` for their non-attention CP layers.
   """
   for _, attn, _, _ in model.traverse(BaseAttention.Config):
     owner = attn.inner_attention._owner
@@ -1249,6 +1334,8 @@ def revert_tpu_context_parallel(model: Any) -> None:
             f.name: getattr(attn.inner_attention, f.name)
             for f in fields(single.Config)
         })
+  for reverter in _TPU_CP_REVERTERS:
+    reverter(model)
 
 
 _patched = False

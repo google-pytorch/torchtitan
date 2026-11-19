@@ -822,6 +822,11 @@ class CPValidationTest(parameterized.TestCase):
       )
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
       validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+    # A window parsed from a config file or the command line is a list.
+    for layer in config.model_spec.model.layers:
+      layer.attention.inner_attention.window_size = [-1, -1]
+    with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
+      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
       KVAllGatherCPVarlenInnerAttention(
           KVAllGatherCPVarlenInnerAttention.Config(window_size=(4, 2))

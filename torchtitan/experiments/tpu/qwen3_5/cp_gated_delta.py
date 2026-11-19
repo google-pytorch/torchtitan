@@ -33,10 +33,12 @@ way (twice with activation checkpointing, which reruns them in backward).
 Recipes enable it with ``GatedDeltaNetContextParallelTransform`` next to core
 ``ContextParallelTransform`` (see ``config_registry._qwen35_cp``);
 ``validate_gated_delta_context_parallel`` rejects CP configs whose
-GatedDeltaNet layers are not converted.
+GatedDeltaNet layers are not converted, and
+``revert_gated_delta_context_parallel`` (run by
+``revert_tpu_context_parallel``) converts them back for ``cp == 1`` reruns.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Literal
 
 # pyformat: disable
@@ -51,7 +53,9 @@ from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_s
 from torchtitan.experiments.tpu.distributed.cp_attention import (
     cp_all_gather,
     cp_all_to_all,
+    cp_input_layout,
     cp_rank_tensor,
+    register_tpu_cp_reverter,
     register_tpu_cp_validator,
     reorder_sequence,
 )
@@ -65,6 +69,7 @@ from torchtitan.protocols.module import Module
 __all__ = [
     "CPTpuInnerGatedDeltaNet",
     "GatedDeltaNetContextParallelTransform",
+    "revert_gated_delta_context_parallel",
     "validate_gated_delta_context_parallel",
 ]
 
@@ -75,12 +80,45 @@ LoadBalancer = Literal["headtail"] | None
 
 
 def _rows(num_tokens: int) -> tuple[int, int]:
-  """``(B, S)`` of a folded ``[B * S]`` token stream (``S`` from the shim)."""
+  """``(B, S)`` of a folded ``[B * S]`` token stream in head-tail layout.
+
+  ``S`` comes from the shim, as in KV all-gather ``cp_shard``, which
+  reorders per sequence of length ``S`` and treats a stream that ``S`` does
+  not divide as one sequence. Raises if that disagrees with the layout
+  ``cp_shard`` recorded for this token count (e.g. a different
+  ``set_unflatten_seq_len`` at sharding and at forward time), which would
+  otherwise silently scramble the token order.
+  """
   seq_len = get_unflatten_seq_len()
   if seq_len is None or num_tokens % seq_len:
     # One sequence, as the CP input sharding treats a shorter stream.
     seq_len = num_tokens
-  return num_tokens // seq_len, seq_len
+  rows = (num_tokens // seq_len, seq_len)
+  recorded = cp_input_layout(num_tokens)
+  if recorded is not None and recorded != rows:
+    raise RuntimeError(
+        f"GatedDeltaNet CP: cp_shard laid {num_tokens} tokens out as"
+        f" (rows, row_len)={recorded}, but set_unflatten_seq_len gives {rows}"
+        " at forward time; shard and run the model under the same"
+        " set_unflatten_seq_len."
+    )
+  return rows
+
+
+def _check_contiguous_layout(num_tokens: int) -> None:
+  """Raises unless ``cp_shard`` split one contiguous token stream (Ulysses).
+
+  The all-to-all concatenates the ranks' shards in rank order, which is
+  sequence order only if each rank holds a contiguous piece of the whole
+  folded stream (sequence dim 0), not ``[B, S / cp]`` of a ``[B, S]`` input.
+  """
+  recorded = cp_input_layout(num_tokens)
+  if recorded is not None and recorded[0] != 1:
+    raise RuntimeError(
+        "GatedDeltaNet Ulysses CP needs a folded [B * S] token stream sharded"
+        f" on dim 0, but cp_shard sharded {recorded[0]} rows of"
+        f" {recorded[1]} tokens."
+    )
 
 
 def _headtail_to_sequence_order(x: torch.Tensor, cp: int) -> torch.Tensor:
@@ -121,8 +159,9 @@ def _local_heads(x: torch.Tensor, rank: torch.Tensor, cp: int) -> torch.Tensor:
 class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
   """Head-parallel ``TpuInnerGatedDeltaNet`` for context parallelism.
 
-  See the module docstring. Without an active CP mesh axis (e.g. a ``cp == 1``
-  reference run) it is ``TpuInnerGatedDeltaNet``.
+  See the module docstring. Requires an active CP mesh axis: a ``cp == 1``
+  reference run of a CP recipe reverts it to ``TpuInnerGatedDeltaNet`` with
+  ``revert_tpu_context_parallel``.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -161,21 +200,14 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
   ) -> torch.Tensor:
     group = spmd_mesh_group(MeshAxisName.CP)
     if group is None:
-      return super().forward(
-          query_TC,
-          key_TC,
-          value_TC,
-          a_TH,
-          b_TH,
-          conv_q_weight_C1W,
-          conv_k_weight_C1W,
-          conv_v_weight_C1W,
-          A_log_H,
-          dt_bias_H,
-          cu_seqlens,
-          key_head_dim=key_head_dim,
-          value_head_dim=value_head_dim,
-          positions=positions,
+      # Running the single-device module here would silently compute the
+      # causal convolution and recurrence on each rank's token shard. As the
+      # CP inner attentions do, require the CP axis; a cp == 1 rerun of a CP
+      # recipe reverts the layer first (revert_tpu_context_parallel).
+      raise RuntimeError(
+          "CPTpuInnerGatedDeltaNet requires an active CP mesh axis of size > 1"
+          " (spmd_mesh_group('cp') is None). For a cp == 1 run of a CP recipe,"
+          " call revert_tpu_context_parallel on the model config."
       )
     cp = group.size()
     n_key_heads = query_TC.shape[-1] // key_head_dim
@@ -195,6 +227,8 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
         cp_all_to_all(x, group, src_dim=_TOKEN_DIM, dst_dim=_CHANNEL_DIM)
         for x in (query_TC, key_TC, value_TC, a_TH, b_TH)
     )
+    if not headtail:
+      _check_contiguous_layout(query_TC.shape[0])
     full_positions = None
     if positions is not None:
       # Document resets need every token's position (4 bytes per token).
@@ -264,6 +298,27 @@ class GatedDeltaNetContextParallelTransform(ModelConfigTransform):
       else:
         setattr(parent, attr, converted)
     return model
+
+
+@register_tpu_cp_reverter
+def revert_gated_delta_context_parallel(model: Any) -> None:
+  """Swaps every ``CPTpuInnerGatedDeltaNet`` config back to ``TpuInnerGatedDeltaNet``.
+
+  Registered with ``revert_tpu_context_parallel``, for ``cp == 1`` reruns of
+  CP recipes (``CPTpuInnerGatedDeltaNet`` requires an active CP mesh axis).
+
+  Args:
+    model: The model config, modified in place.
+  """
+  for _, inner, parent, attr in model.traverse(CPTpuInnerGatedDeltaNet.Config):
+    single = TpuInnerGatedDeltaNet.Config(**{
+        f.name: getattr(inner, f.name)
+        for f in fields(TpuInnerGatedDeltaNet.Config)
+    })
+    if isinstance(parent, list):
+      parent[attr] = single
+    else:
+      setattr(parent, attr, single)
 
 
 @register_tpu_cp_validator

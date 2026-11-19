@@ -172,7 +172,13 @@ class TpuQwen35Model(Qwen35Model):
           " mrope_positions)."
       )
     positions = batch.get("positions")
-    assert positions is not None, "Qwen3.5 needs RoPE positions."
+    if positions is None:
+      # Not an assert: the KV all-gather cp_shard and the GatedDeltaNet
+      # document resets need positions, also under `python -O`.
+      raise ValueError(
+          "Qwen3.5 context parallelism on TPU needs RoPE positions in the"
+          " batch."
+      )
     inner = self.config.first_full_attention_backend
     if isinstance(
         inner, (FlexInnerAttention.Config, VarlenInnerAttention.Config)

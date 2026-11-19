@@ -20,6 +20,7 @@ import torch
 import spmd_types as spmd  # pylint: disable=unused-import
 # pyformat: enable
 import torch.nn.functional as F
+from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.distributed import cp_attention
@@ -33,6 +34,12 @@ from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 
 _STRATEGIES = ("all_gather", "ulysses")
+
+
+def _reset_cp_input_layout(test: absltest.TestCase) -> None:
+  """Forgets the layout of earlier cp_shard calls (hand-sharded inputs here)."""
+  cp_attention._CP_INPUT_LAYOUT = None
+  test.addCleanup(setattr, cp_attention, "_CP_INPUT_LAYOUT", None)
 
 
 @contextlib.contextmanager
@@ -52,6 +59,7 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
     torch.manual_seed(0)
     cp_attention._CP_RANK_CACHE.clear()
     self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_input_layout(self)
 
   def _inputs(self, n_key_heads, n_value_heads, head_dim, tokens):
     key_dim, value_dim = n_key_heads * head_dim, n_value_heads * head_dim
@@ -151,22 +159,54 @@ class CPGatedDeltaNetParityTest(parameterized.TestCase):
           got_grad, ref_params[i].grad, rtol=2e-5, atol=2e-5, msg=name
       )
 
-  def test_without_cp_group_is_single_device(self):
-    """Without an active CP axis the module is TpuInnerGatedDeltaNet."""
+  def test_requires_cp_group(self):
+    """Without an active CP axis it raises instead of running on token shards."""
     acts, params, _ = self._inputs(2, 4, 8, 32)
     kernel = TpuGatedDeltaKernel.Config(chunk_size=8)
     args = (*acts, *params, torch.tensor([0, 32], dtype=torch.int32))
     kwargs = dict(key_head_dim=8, value_head_dim=8)
+    module = CPTpuInnerGatedDeltaNet(
+        CPTpuInnerGatedDeltaNet.Config(kernel=kernel, load_balancer="headtail")
+    )
     with set_unflatten_seq_len(16):
-      got = CPTpuInnerGatedDeltaNet(
-          CPTpuInnerGatedDeltaNet.Config(
-              kernel=kernel, load_balancer="headtail"
-          )
-      )(*args, **kwargs)
-      want = TpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet.Config(kernel=kernel))(
-          *args, **kwargs
-      )
-    torch.testing.assert_close(got, want)
+      with self.assertRaisesRegex(RuntimeError, "active CP mesh axis"):
+        module(*args, **kwargs)
+
+  @parameterized.parameters(2, 4)
+  def test_headtail_matches_upstream_load_balancer(self, cp):
+    """One unfolded sequence (no shim, as verl runs) sharded by torch's head-tail balancer."""
+    tokens = 64
+    perm = _HeadTailLoadBalancer(tokens, cp, torch.device("cpu"))
+    shards = torch.arange(tokens)[perm._generate_indices().reshape(-1)].chunk(
+        cp
+    )
+    cp_attention._record_cp_input_layout(1, tokens)
+    # The GatedDeltaNet all-to-all concatenates the shards in rank order.
+    got = cp_gated_delta._headtail_to_sequence_order(torch.cat(shards), cp)
+    torch.testing.assert_close(got, torch.arange(tokens))
+    torch.testing.assert_close(
+        cp_gated_delta._sequence_to_headtail_order(got, cp), torch.cat(shards)
+    )
+
+  def test_rejects_layout_that_disagrees_with_cp_shard(self):
+    """A different set_unflatten_seq_len at shard and forward time raises."""
+    cp_attention._record_cp_input_layout(2, 32)
+    with set_unflatten_seq_len(32):
+      self.assertEqual(cp_gated_delta._rows(64), (2, 32))
+    with self.assertRaisesRegex(RuntimeError, "set_unflatten_seq_len"):
+      cp_gated_delta._rows(64)
+    with set_unflatten_seq_len(16):
+      with self.assertRaisesRegex(RuntimeError, "set_unflatten_seq_len"):
+        cp_gated_delta._rows(64)
+    # Another token count (e.g. the next micro-batch) is not checked.
+    self.assertEqual(cp_gated_delta._rows(128), (1, 128))
+
+  def test_ulysses_rejects_row_sharded_input(self):
+    cp_attention._record_cp_input_layout(1, 64)
+    cp_gated_delta._check_contiguous_layout(64)
+    cp_attention._record_cp_input_layout(2, 32)
+    with self.assertRaisesRegex(RuntimeError, "folded"):
+      cp_gated_delta._check_contiguous_layout(64)
 
   def test_rejects_heads_not_divisible_by_cp(self):
     """2 key heads cannot be split over 4 ranks."""
@@ -208,6 +248,7 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
     torch.manual_seed(0)
     cp_attention._CP_RANK_CACHE.clear()
     self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_input_layout(self)
 
   @parameterized.product(strategy=_STRATEGIES, traced=(False, True))
   def test_debug_model_matches_single_device(self, strategy, traced):
@@ -345,6 +386,55 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       self.assertIs(type(inner), CPTpuInnerGatedDeltaNet.Config)
       self.assertIsInstance(inner.kernel, TpuGatedDeltaKernel.Config)
       self.assertEqual(inner.load_balancer, "headtail")
+
+  def test_revert_restores_single_device_gated_delta(self):
+    """revert_tpu_context_parallel also swaps the GatedDeltaNet back (cp == 1 reruns)."""
+    cfg = config_registry.qwen35_debugmodel_allgather_cp2()
+    model = cfg.model_spec.model
+    cp_attention.revert_tpu_context_parallel(model)
+    delta_nets = list(model.traverse(GatedDeltaNet.Config))
+    self.assertNotEmpty(delta_nets)
+    for _, delta_net, _, _ in delta_nets:
+      inner = delta_net.inner_gated_delta_net
+      self.assertIs(type(inner), TpuInnerGatedDeltaNet.Config)
+      self.assertIsInstance(inner.kernel, TpuGatedDeltaKernel.Config)
+    for _, attn, _, _ in model.traverse(BaseAttention.Config):
+      self.assertFalse(
+          issubclass(attn.inner_attention._owner, cp_attention.CPInnerAttention)
+      )
+
+  @parameterized.parameters(
+      # (strategy, shim seq_len, tokens, expected (rows, row_len))
+      ("all_gather", _SEQ_LEN, 2 * _SEQ_LEN, (2, _SEQ_LEN)),
+      ("all_gather", None, 2 * _SEQ_LEN, (1, 2 * _SEQ_LEN)),
+      ("ulysses", _SEQ_LEN, 2 * _SEQ_LEN, (1, 2 * _SEQ_LEN)),
+  )
+  def test_cp_shard_records_the_layout(self, strategy, seq_len, tokens, want):
+    _reset_cp_input_layout(self)
+    owner = tpu_cp_inner_attention(
+        cp_attention.ScaledDotProductInnerAttention, strategy
+    )
+    mesh = mock.Mock(device_type="cpu")
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    batch = {
+        "input": torch.arange(tokens),
+        "labels": torch.arange(tokens),
+        "positions": torch.arange(tokens) % _SEQ_LEN,
+    }
+    ctx = (
+        set_unflatten_seq_len(seq_len)
+        if seq_len is not None
+        else contextlib.nullcontext()
+    )
+    with ctx, mock.patch.object(
+        cp_attention,
+        "prepare_context_parallel_input",
+        side_effect=lambda d, *args: d,
+    ):
+      owner.cp_shard(batch, None, mesh, tpu_cp_load_balancer(strategy), None)
+    self.assertEqual(cp_attention.cp_input_layout(tokens), want)
+    self.assertIsNone(cp_attention.cp_input_layout(tokens + 1))
 
   def test_tpu_model_cp_shard_uses_inner_attention(self):
     """TpuQwen35Model shards CP inputs through the CP attention's cp_shard."""

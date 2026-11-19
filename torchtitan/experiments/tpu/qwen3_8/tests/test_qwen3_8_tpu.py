@@ -397,6 +397,7 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       "qwen38_2_4t_a95b_proxy",
       "qwen38_2_4t_a95b_proxy_tpu7x",
       "qwen38_2_4t_a95b_proxy_tpu7x_8l",
+      "qwen38_2_4t_a95b_proxy_tpu7x_pallas_gmm",
       "qwen38_2_4t_a95b",
   )
   def test_recipe_parses(self, config_name: str):

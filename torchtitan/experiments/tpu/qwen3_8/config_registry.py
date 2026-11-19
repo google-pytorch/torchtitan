@@ -13,6 +13,7 @@ from torchtitan.config.configs import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExpertsConverter,
@@ -181,6 +182,21 @@ def qwen38_2_4t_a95b_proxy_tpu7x_8l() -> TPUTrainerConfig:
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, _TPU7X_FLAGS
   )
+  return cfg
+
+
+def qwen38_2_4t_a95b_proxy_tpu7x_pallas_gmm() -> TPUTrainerConfig:
+  """`qwen38_2_4t_a95b_proxy_tpu7x` with the Pallas grouped matmul experts.
+
+  On TPU7x, XLA's lowering of `torch._grouped_mm` for these expert shapes
+  (dim 8192, hidden 2048) needs 64.9 MB of scoped VMEM, above the 63.9 MB
+  that TPU7x accepts (first TPU7x smoke run). The lane's Pallas grouped
+  matmul tiles explicitly. The paired variant needs EP=1, so this uses the
+  plain one.
+  """
+  cfg = qwen38_2_4t_a95b_proxy_tpu7x()
+  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
   return cfg
 
 

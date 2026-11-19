@@ -469,5 +469,57 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       )
       self.assertEqual(moe.router.gate.out_features, moe.num_experts)
 
+  # The argument sets of the launch commands in
+  # recipes/ironwood/qwen3.8-2.4t-a95b/tpu7x-4x4x4/README.md; keep in sync.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="_job_a_smoke",
+          args=[
+              "--config=qwen38_2_4t_a95b_proxy_tpu7x",
+              "--dump_folder=/data/qwen38/job-a/smoke",
+              "--training.steps=1",
+              "--metrics.log_freq=1",
+          ],
+      ),
+      dict(
+          testcase_name="_job_a",
+          args=[
+              "--config=qwen38_2_4t_a95b_proxy_tpu7x",
+              "--dump_folder=/data/qwen38/job-a/main",
+              "--training.steps=10",
+              "--metrics.log_freq=1",
+              "--metrics.enable_tensorboard",
+              "--profiler.enable_profiling",
+              "--profiler.profile_freq=8",
+              "--profiler.profiler_warmup=3",
+              "--profiler.profiler_active=1",
+          ],
+      ),
+      dict(
+          testcase_name="_job_b_point",
+          args=[
+              "--config=qwen38_2_4t_a95b_proxy_tpu7x_8l",
+              "--dump_folder=/data/qwen38/job-b/8l-t2048-float32",
+              "--training.steps=10",
+              "--metrics.log_freq=1",
+              "--metrics.enable_tensorboard",
+              "--training.max_context_length=2048",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--training.dtype=float32",
+          ],
+      ),
+  )
+  def test_launch_configs_parse(self, args):
+    cfg = ConfigManager().parse_args(
+        ["--module", "torchtitan.experiments.tpu.qwen3_8", *args]
+    )
+    self.assertEqual(cfg.parallelism.expert_parallel_degree, 64)
+    self.assertEqual(
+        cfg.training.num_tokens_per_microbatch_per_dp_rank,
+        cfg.training.max_context_length,
+    )
+    self.assertIn("xla_tpu_scoped_vmem_limit_kib", cfg.libtpu_init_flags)
+
+
 if __name__ == "__main__":
   absltest.main()

@@ -337,9 +337,12 @@ class _RotatePairs(torch.autograd.Function):
             x_imag = (pairs & ~0xFFFF).view(torch.float32)
         else:
             # Split views and other dtypes: read the two halves. An int32 view of a split
-            # view would be copied first.
+            # view would be copied first. Keep the pair dim ([..., 0:1], joined by cat):
+            # indexing it away and joining by stack made XLA copy each half out with a
+            # relayout, a llama3 8B scan step at batch 2 1% slower on TPU (2.96 vs 2.93 s).
             x_pairs = x.float().unflatten(-1, (-1, 2))
-            x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
+            x_real, x_imag = x_pairs[..., 0:1], x_pairs[..., 1:2]
+            cos, sin = cos.unsqueeze(-1), sin.unsqueeze(-1)
         real = (x_real * cos - x_imag * sin).type_as(x)
         imag = (x_real * sin + x_imag * cos).type_as(x)
         if pairs_as_int32:
@@ -347,8 +350,8 @@ class _RotatePairs(torch.autograd.Function):
             # writes every other element.
             low = real.view(torch.int16).to(torch.int32) & 0xFFFF
             high = imag.view(torch.int16).to(torch.int32) << 16
-            return (low | high).view(torch.bfloat16)
-        return torch.stack((real, imag), dim=-1).flatten(-2)
+            return (low | high).view(torch.bfloat16).reshape(x.shape)
+        return torch.cat((real, imag), dim=-1).flatten(-2)
 
 
 class CosSinRoPE(RoPE):

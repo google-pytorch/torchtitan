@@ -60,5 +60,34 @@ class ComplexRoPEInScanTest(absltest.TestCase):
     torch.testing.assert_close(w1.grad, w2.grad)
 
 
+class CompiledRotationTest(absltest.TestCase):
+  """Off CUDA, the compiled real-arithmetic rotation equals eager's complex one."""
+
+  def test_matches_complex_reference(self):
+    torch.manual_seed(0)
+    cache = torch.polar(
+        torch.ones(16, _HEAD_DIM // 2), torch.randn(16, _HEAD_DIM // 2)
+    ).view(16, 1, _HEAD_DIM // 2)
+    real_cache = torch.view_as_real(cache).flatten(-2)  # what _reshape_cache returns under compile
+    q = torch.randn(2, 16, 4, _HEAD_DIM, dtype=torch.bfloat16)
+    k = torch.randn(2, 16, 2, _HEAD_DIM, dtype=torch.bfloat16)
+    rotate = torch.compile(
+        ComplexRoPE.apply_rotary_emb, backend="aot_eager", fullgraph=True
+    )
+    for inverse in (False, True):
+      for c in (cache, real_cache):
+        q1, k1 = (t.clone().requires_grad_(True) for t in (q, k))
+        q2, k2 = (t.clone().requires_grad_(True) for t in (q, k))
+        got = rotate(q1, k1, c, inverse=inverse)
+        want = ComplexRoPE.apply_rotary_emb(q2, k2, cache, inverse=inverse)
+        for g, w in zip(got, want):
+          self.assertEqual(g.dtype, torch.bfloat16)
+          self.assertTrue(torch.equal(g, w))
+        sum(t.float().square().sum() for t in got).backward()
+        sum(t.float().square().sum() for t in want).backward()
+        self.assertTrue(torch.equal(q1.grad, q2.grad))
+        self.assertTrue(torch.equal(k1.grad, k2.grad))
+
+
 if __name__ == "__main__":
   absltest.main()

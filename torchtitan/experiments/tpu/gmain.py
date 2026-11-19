@@ -23,11 +23,6 @@ global_start_trainer_func = None
 def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the trainer with the specified eager mode if enabled."""
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
-  from torchtitan.experiments.tpu.components.scatter_add import (  # pylint: disable=g-import-not-at-top
-      install_tpu_scatter_add_row_gather,
-  )
-
-  install_tpu_scatter_add_row_gather()
   is_tpu = utils.device_type == "tpu"
   if is_tpu:
     # Render the config's XLA / libtpu flags into the environment before the

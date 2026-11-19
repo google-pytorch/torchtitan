@@ -6,13 +6,16 @@
 
 """CPU unit tests for the TPU row-gather backward of deterministic_scatter_add."""
 
+import importlib
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from functorch.compile import aot_function, make_boxed_func
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-import torchtitan.experiments.tpu  # noqa: F401 - triggers package init
+import torchtitan.experiments.tpu as tpu_pkg
 from torchtitan.experiments.tpu.components.scatter_add import (
     install_tpu_scatter_add_row_gather,
     is_tpu_scatter_add_row_gather_installed,
@@ -20,6 +23,7 @@ from torchtitan.experiments.tpu.components.scatter_add import (
 )
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 from torchtitan.ops.scatter_add import deterministic_scatter_add
+from torchtitan.tools import utils as titan_utils
 
 
 class _OpRecorderMode(TorchDispatchMode):
@@ -44,7 +48,7 @@ class ScatterAddRowGatherCpuTest(parameterized.TestCase):
     install_tpu_scatter_add_row_gather()
     super().tearDown()
 
-  def test_installed_on_tpu_package_import_and_idempotent(self):
+  def test_install_idempotency_and_tpu_package_import_gating(self):
     self.assertTrue(is_tpu_scatter_add_row_gather_installed())
     install_tpu_scatter_add_row_gather()
     self.assertTrue(is_tpu_scatter_add_row_gather_installed())
@@ -52,8 +56,59 @@ class ScatterAddRowGatherCpuTest(parameterized.TestCase):
     self.assertFalse(is_tpu_scatter_add_row_gather_installed())
     uninstall_tpu_scatter_add_row_gather()
     self.assertFalse(is_tpu_scatter_add_row_gather_installed())
-    install_tpu_scatter_add_row_gather()
-    self.assertTrue(is_tpu_scatter_add_row_gather_installed())
+
+    # On non-TPU hosts, importing torchtitan.experiments.tpu avoids global
+    # side effects; on TPU hosts, package import installs automatically.
+    with mock.patch.object(titan_utils, "device_type", "cpu"):
+      importlib.reload(tpu_pkg)
+      self.assertFalse(is_tpu_scatter_add_row_gather_installed())
+    with mock.patch.object(titan_utils, "device_type", "tpu"):
+      importlib.reload(tpu_pkg)
+      self.assertTrue(is_tpu_scatter_add_row_gather_installed())
+
+  def test_needs_input_grad_skips_unused_inputs(self):
+    gen = torch.Generator().manual_seed(101)
+    num_tokens, num_routed, dim = 16, 40, 64
+    out_base = torch.randn(
+        num_tokens, dim, dtype=torch.float32, generator=gen
+    )
+    src_base = torch.randn(
+        num_routed, dim, dtype=torch.float32, generator=gen
+    )
+    grad_out = torch.randn(
+        num_tokens, dim, dtype=torch.float32, generator=gen
+    )
+    idx_1d = torch.randint(
+        0, num_tokens, (num_routed,), dtype=torch.int64, generator=gen
+    )
+    index_2d = idx_1d.reshape(-1, 1).expand(-1, dim)
+
+    # Case 1: out requires grad, src does NOT require grad -> skip index_select
+    # and save zero tensors for backward.
+    packed: list[torch.Tensor] = []
+    out_only = out_base.clone().requires_grad_(True)
+    src_frozen = src_base.clone().requires_grad_(False)
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda t: (packed.append(t) or t), lambda t: t
+    ):
+      y1 = deterministic_scatter_add(out_only, index_2d, src_frozen)
+    with _OpRecorderMode() as recorder:
+      y1.backward(grad_out)
+    self.assertEqual(len(packed), 0)
+    assert out_only.grad is not None
+    self.assertTrue(torch.equal(out_only.grad, grad_out))
+    self.assertIsNone(src_frozen.grad)
+    self.assertFalse(any("aten.index_select" in op for op in recorder.ops))
+    self.assertFalse(any("aten.gather" in op for op in recorder.ops))
+
+    # Case 2: out does NOT require grad, src requires grad -> out.grad stays None.
+    out_frozen = out_base.clone().requires_grad_(False)
+    src_only = src_base.clone().requires_grad_(True)
+    y2 = deterministic_scatter_add(out_frozen, index_2d, src_only)
+    y2.backward(grad_out)
+    self.assertIsNone(out_frozen.grad)
+    assert src_only.grad is not None
+    self.assertTrue(torch.equal(src_only.grad, grad_out.index_select(0, idx_1d)))
 
   @parameterized.product(
       dtype=[torch.float32, torch.bfloat16, torch.float16],
@@ -158,10 +213,6 @@ class ScatterAddRowGatherCpuTest(parameterized.TestCase):
 
     install_tpu_scatter_add_row_gather()
     saved_shapes_and_nbytes: list[tuple[torch.Size, int]] = []
-    orig_pack = torch.autograd.graph.save_on_cpu
-
-    with orig_pack():
-      pass
 
     def _pack_hook(tensor: torch.Tensor) -> torch.Tensor:
       cpu_copy = tensor.detach().to("cpu", copy=True)

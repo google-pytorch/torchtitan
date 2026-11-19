@@ -43,8 +43,8 @@ class _TinyMoEBlock(nn.Module):
     scores, expert_ids = torch.topk(
         torch.softmax(logits.float(), dim=-1), k=self.top_k, dim=-1
     )
-    counts = torch.zeros(
-        self.num_experts, dtype=torch.int64, device=x_td.device
+    counts = torch.bincount(
+        expert_ids.view(-1), minlength=self.num_experts
     )
     routed_in, _, meta = self.dispatcher.dispatch(
         x_td, scores, expert_ids, counts
@@ -55,9 +55,80 @@ class _TinyMoEBlock(nn.Module):
 
 class ScatterAddRowGatherDeviceTest(BaseAcceleratorDeviceTest):
 
+  def setUp(self):
+    super().setUp()
+    install_tpu_scatter_add_row_gather()
+
   def tearDown(self):
     install_tpu_scatter_add_row_gather()
     super().tearDown()
+
+  def test_save_on_cpu_storage_bytes_on_accelerator(self):
+    device = self.accelerator_device
+    gen = torch.Generator().manual_seed(2718)
+    num_tokens, num_routed, dim = 64, 256, 128
+    out_dev = torch.zeros(num_tokens, dim, dtype=torch.float32, device=device)
+    src_dev = torch.randn(
+        num_routed, dim, dtype=torch.float32, generator=gen
+    ).to(device)
+    grad_dev = torch.randn(
+        num_tokens, dim, dtype=torch.float32, generator=gen
+    ).to(device)
+    idx_1d = torch.randint(
+        0, num_tokens, (num_routed,), dtype=torch.int64, generator=gen
+    ).to(device)
+    index_dev = idx_1d.reshape(-1, 1).expand(-1, dim)
+
+    def _measure_cpu_offloaded_saved_bytes(*, installed: bool):
+      if installed:
+        install_tpu_scatter_add_row_gather()
+      else:
+        uninstall_tpu_scatter_add_row_gather()
+      packed_meta: list[tuple[torch.Size, int]] = []
+
+      # Mirror torch.autograd.graph.save_on_cpu()'s pack/unpack behavior
+      # (`tensor.to("cpu", non_blocking=...)`) while inspecting storage bytes:
+      # on accelerator devices, `.to("cpu")` materializes an expanded `(N, D)`
+      # stride-(1, 0) view into a dense `N * D * 8`-byte CPU buffer when
+      # uninstalled, vs. a compact `N * 8`-byte 1D buffer when installed.
+      def _pack_to_cpu(t: torch.Tensor) -> tuple[torch.device, torch.Tensor]:
+        cpu_t = t.to("cpu")
+        packed_meta.append((cpu_t.shape, cpu_t.untyped_storage().nbytes()))
+        return (t.device, cpu_t)
+
+      def _unpack_from_cpu(packed: tuple[torch.device, torch.Tensor]) -> torch.Tensor:
+        orig_dev, cpu_t = packed
+        return cpu_t.to(orig_dev)
+
+      src_in = src_dev.clone().requires_grad_(True)
+      with torch.autograd.graph.saved_tensors_hooks(
+          _pack_to_cpu, _unpack_from_cpu
+      ):
+        y = deterministic_scatter_add(out_dev.clone(), index_dev, src_in)
+      y.backward(grad_dev)
+      assert src_in.grad is not None
+      return packed_meta, src_in.grad.detach().cpu()
+
+    ref_meta, ref_grad = _measure_cpu_offloaded_saved_bytes(installed=False)
+    opt_meta, opt_grad = _measure_cpu_offloaded_saved_bytes(installed=True)
+
+    self.assertEqual(opt_meta, [(torch.Size([num_routed]), num_routed * 8)])
+    if device.type != "cpu":
+      self.assertEqual(
+          ref_meta,
+          [(torch.Size([num_routed, dim]), num_routed * dim * 8)],
+      )
+    self.assertTrue(torch.equal(opt_grad, ref_grad))
+
+    # Also exercise stock torch.autograd.graph.save_on_cpu() end-to-end on device.
+    src_stock = src_dev.clone().requires_grad_(True)
+    with torch.autograd.graph.save_on_cpu():
+      y_stock = deterministic_scatter_add(
+          out_dev.clone(), index_dev, src_stock
+      )
+    y_stock.backward(grad_dev)
+    assert src_stock.grad is not None
+    self.assertTrue(torch.equal(src_stock.grad.detach().cpu(), ref_grad))
 
   @parameterized.parameters(
       (torch.float32, 256),
@@ -191,6 +262,8 @@ class ScatterAddRowGatherDeviceTest(BaseAcceleratorDeviceTest):
       loss.backward()
       grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       if step == 0:
+        # Step-0 forward loss equality is a sanity check on identical initial
+        # state; grad_norm equality below is the actual VJP bit-identity check.
         self.assertTrue(torch.equal(loss.detach().cpu(), ref_loss.detach().cpu()))
         self.assertTrue(
             torch.equal(grad_norm.detach().cpu(), ref_norm.detach().cpu())

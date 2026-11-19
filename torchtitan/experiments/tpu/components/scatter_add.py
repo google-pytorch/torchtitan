@@ -66,6 +66,9 @@ def _tpu_setup_context(
     output: torch.Tensor,
 ) -> None:
   del output
+  if not ctx.needs_input_grad[2]:
+    ctx.save_for_backward()
+    return
   out, index, src = inputs
   if _is_row_broadcast_2d(out, index, src):
     index = index[:, 0]
@@ -75,13 +78,17 @@ def _tpu_setup_context(
 def _tpu_backward(
     ctx: torch.autograd.function.FunctionCtx,
     grad_output: torch.Tensor,
-) -> tuple[torch.Tensor, None, torch.Tensor]:
-  (index,) = ctx.saved_tensors  # pyrefly: ignore[missing-attribute]
-  if index.ndim == 1 and grad_output.ndim == 2:
-    grad_src = grad_output.index_select(0, index)
+) -> tuple[torch.Tensor | None, None, torch.Tensor | None]:
+  grad_out = grad_output if ctx.needs_input_grad[0] else None
+  if not ctx.needs_input_grad[2]:
+    grad_src = None
   else:
-    grad_src = torch.gather(grad_output, dim=0, index=index)
-  return grad_output, None, grad_src
+    (index,) = ctx.saved_tensors  # pyrefly: ignore[missing-attribute]
+    if index.ndim == 1 and grad_output.ndim == 2:
+      grad_src = grad_output.index_select(0, index)
+    else:
+      grad_src = torch.gather(grad_output, dim=0, index=index)
+  return grad_out, None, grad_src
 
 
 def install_tpu_scatter_add_row_gather() -> None:
@@ -104,7 +111,14 @@ def install_tpu_scatter_add_row_gather() -> None:
 
 
 def uninstall_tpu_scatter_add_row_gather() -> None:
-  """Restores upstream's original autograd registration on ``deterministic_scatter_add``."""
+  """Restores upstream's original autograd registration (test-only).
+
+  Warning:
+    Intended strictly for unit tests comparing installed vs. uninstalled runs.
+    Do not toggle installation between a forward pass and its corresponding
+    backward pass: PyTorch's ``CustomOpDef`` dispatches ``_setup_context_fn``
+    at forward time and ``_backward_fn`` at backward time.
+  """
   global _INSTALLED
   if not _INSTALLED:
     return

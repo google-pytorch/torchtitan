@@ -29,6 +29,7 @@ import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
+import torchtitan.experiments.tpu.qwen3_8  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
 from torchtitan.tools.logging import init_logger, logger
@@ -309,6 +310,7 @@ def start_trainer(
           "muse_glimmer",
           "qwen3",
           "qwen3_5",
+          "qwen3_8",
           "gemma4",
       ):
         kwargs["tpu_compile_mode"] = train_config.compile.mode

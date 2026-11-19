@@ -790,22 +790,37 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     segment_ids = segment_ids.to(self.accelerator_device) if packed else None
     self._check_transposed_bwd(q, k, v, grad_out, segment_ids, dense, scale=scale)
 
-  def _dense_causal_grads(self, q, k, v, grad_out):
+  def _dense_causal_grads(self, q, k, v, grad_out, scale=None):
     """dq, dk, dv of dense f32 causal attention (one document), [B, S, heads, D]."""
     group = q.shape[2] // k.shape[2]
     ref = [x.float().transpose(1, 2).requires_grad_(True) for x in (q, k, v)]
     with attention.sdpa_kernel([attention.SDPBackend.MATH]):
       out_ref = F.scaled_dot_product_attention(
-          ref[0], *(x.repeat_interleave(group, dim=1) for x in ref[1:]), is_causal=True
+          ref[0], *(x.repeat_interleave(group, dim=1) for x in ref[1:]), is_causal=True, scale=scale
       )
     out_ref.backward(grad_out.float().transpose(1, 2))
     return [x.grad.transpose(1, 2) for x in ref]
+
+  def _assert_runs_transposed_bwd(self, q, k, v):
+    """The wrapper routes these shapes to splash_tbwd (else the test compares Tokamax with itself).
+
+    Skips on a TPU splash_tbwd does not run on; an unsupported shape fails.
+    """
+    hardware_reason = splash_tbwd.hardware_unsupported_reason()
+    if hardware_reason is not None:
+      self.skipTest(f"splash_tbwd does not run here: {hardware_reason}")
+    as_jax = lambda x: types.SimpleNamespace(shape=tuple(x.shape), dtype=jnp.dtype(jnp.bfloat16))
+    reason = tokamax_splash_attention._transposed_bwd_unsupported_reason(  # pylint: disable=protected-access
+        as_jax(q), as_jax(k), as_jax(v), is_causal=True, local_window_size=None
+    )
+    self.assertIsNone(reason)
 
   def _check_transposed_bwd(
       self, q, k, v, grad_out, segment_ids, dense, scale=None, max_error_ratio=1.05, max_norm_bias=1e-3
   ):
     """splash_tbwd's gradients are no further from `dense` than Tokamax's backward is, with no scale bias."""
     tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
+    self._assert_runs_transposed_bwd(q, k, v)
     self._set_tokamax_config(use_transposed_bwd=True)
     got = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
     for name, g, d, t in zip(("dq", "dk", "dv"), got, dense, tokamax):
@@ -826,8 +841,12 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="sink_logit20", sink_logit=20.0),
       dict(testcase_name="sink_logit50", sink_logit=50.0),
       dict(testcase_name="sink_logit100", sink_logit=100.0),
+      # Non-default scales (the forward rounds q twice before Q.K). The sink is built at the default scale, so its
+      # logit is scale_ratio * sink_logit (68.5 here).
+      dict(testcase_name="scale0p8_logit_std8", logit_std=8.0, scale_ratio=0.8),
+      dict(testcase_name="scale1p37_sink_logit68", sink_logit=50.0, scale_ratio=1.37),
   )
-  def test_transposed_bwd_large_logits(self, logit_std=1.0, sink_logit=None):
+  def test_transposed_bwd_large_logits(self, logit_std=1.0, sink_logit=None, scale_ratio=None):
     """splash_tbwd stays at Tokamax's accuracy with trained-model logits: large, or one attention-sink key.
 
     P must be rebuilt from q rounded exactly as the forward rounded it; folding rounded constants into an f32 Q.K
@@ -839,8 +858,9 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     """
     torch.manual_seed(7)
     b, seq_len, n_heads, n_kv_heads, head_dim = 1, 512, 4, 1, 128
-    # logit = q.k / sqrt(head_dim): with q, k ~ N(0, c^2) its std is c^2.
-    c = logit_std**0.5
+    scale = None if scale_ratio is None else scale_ratio / head_dim**0.5
+    # logit = q.k / sqrt(head_dim): with q, k ~ N(0, c^2) its std is c^2 (times scale_ratio).
+    c = (logit_std / (scale_ratio or 1.0))**0.5
     q = torch.randn(b, seq_len, n_heads, head_dim) * c
     k = torch.randn(b, seq_len, n_kv_heads, head_dim) * c
     if sink_logit is not None:
@@ -852,11 +872,19 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     q, k = q.bfloat16(), k.bfloat16()
     v = torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.bfloat16)
     grad_out = torch.randn(b, seq_len, n_heads, head_dim, dtype=torch.bfloat16)
-    dense = self._dense_causal_grads(q, k, v, grad_out)
-    self._check_transposed_bwd(q, k, v, grad_out, None, dense, max_error_ratio=1.1, max_norm_bias=None)
+    dense = self._dense_causal_grads(q, k, v, grad_out, scale=scale)
+    self._check_transposed_bwd(q, k, v, grad_out, None, dense, scale=scale, max_error_ratio=1.1, max_norm_bias=None)
 
-  @parameterized.named_parameters(("logit724", 8.0), ("logit11585", 32.0))
-  def test_transposed_bwd_rebuilds_forward_softmax(self, value):
+  @parameterized.named_parameters(
+      ("logit724", 8.0),
+      ("logit11585", 32.0),
+      # Non-default scale: the forward rounds q * bf16(scale / default) and then * bf16(1 / sqrt(D)); one rounding of
+      # q * (their product) differs by a bf16 step here (dV 1.914 at 1.03125; ~2e19 at 31.625 on CPU interpret).
+      # These pass on TPU main too; there the large-logit scale cases above catch the single rounding.
+      ("scale005_value1", 1.03125, 0.05),
+      ("scale005_value32", 31.625, 0.05),
+  )
+  def test_transposed_bwd_rebuilds_forward_softmax(self, value, scale=None):
     """P matches the forward's logsumexp even where every logit is huge.
 
     q = k = value everywhere, V = 1, dO = 1 at query 0 only. Query 0 attends to key 0 alone, so P[0, 0] = 1 in each
@@ -870,10 +898,11 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     grad_out[:, 0] = 1
     expected_dv = torch.zeros(1, 128, 1, 128)
     expected_dv[:, 0] = 2
-    tokamax = self._packed_grads(q, k, v, grad_out, None)
+    tokamax = self._packed_grads(q, k, v, grad_out, None, scale=scale)
     torch.testing.assert_close(tokamax[2], expected_dv)
+    self._assert_runs_transposed_bwd(q, k, v)
     self._set_tokamax_config(use_transposed_bwd=True)
-    got = self._packed_grads(q, k, v, grad_out, None)
+    got = self._packed_grads(q, k, v, grad_out, None, scale=scale)
     torch.testing.assert_close(got[2], expected_dv)
 
   @parameterized.named_parameters(

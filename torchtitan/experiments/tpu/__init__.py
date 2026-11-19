@@ -44,3 +44,22 @@ except ImportError:
   pass
 
 from torchtitan.experiments.tpu import utils as _tpu_utils
+from torchtitan.experiments.tpu.components.scatter_add import (
+    install_tpu_scatter_add_row_gather as _install_tpu_scatter_add_row_gather,
+)
+from torchtitan.tools import utils as _utils
+
+def _maybe_install_tpu_scatter_add(device_type_str: str) -> bool:
+  """Installs the TPU row-gather scatter_add backward iff running on TPU."""
+  if device_type_str == "tpu":
+    _install_tpu_scatter_add_row_gather()
+    return True
+  return False
+
+
+# Gate automatic registration on TPU availability to avoid global autograd side
+# effects on CPU/CUDA imports, while installing at ``torchtitan.experiments.tpu``
+# package import time so callers that construct TPU models without going through
+# ``TPUTrainer`` (e.g. ``torchtitan.experiments.tpu.qwen3_5.model_registry(...)``
+# or external RL harnesses) still receive the row-gather backward.
+_maybe_install_tpu_scatter_add(_utils.device_type)

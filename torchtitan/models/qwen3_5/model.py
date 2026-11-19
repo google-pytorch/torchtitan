@@ -30,6 +30,10 @@ from torchtitan.models.common.attention import (
     VarlenInnerAttention,
     VarlenMetadata,
 )
+from torchtitan.models.common.config_utils import (
+    moe_load_balance_aux_loss_configs,
+    update_moe_aux_loss_configs,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.multimodal import (
@@ -299,6 +303,29 @@ class Qwen35Model(Decoder):
         ) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
+            # As in Qwen3: MoELoadBalanceAuxLoss weights each forward by
+            # B / global_batch_size, in samples, which only the trainer can
+            # compute (the DP degree may be -1 until the mesh is built).
+            if moe_load_balance_aux_loss_configs(self.layers):
+                missing = [
+                    name
+                    for name in ("local_global_batch_size", "global_batch_size")
+                    if kwargs.get(name) is None
+                ]
+                if missing:
+                    raise ValueError(
+                        "MoELoadBalanceAuxLoss is configured, so "
+                        "update_from_config needs "
+                        f"{' and '.join(missing)} (in samples, as Trainer "
+                        "passes them)."
+                    )
+                update_moe_aux_loss_configs(
+                    self.layers,
+                    pp_enabled=parallelism.pipeline_parallel_degree > 1,
+                    local_global_batch_size=kwargs["local_global_batch_size"],
+                    global_batch_size=kwargs["global_batch_size"],
+                    seq_len=config.training.max_context_length,
+                )
 
             tp = parallelism.tensor_parallel_degree
             if tp > 1:

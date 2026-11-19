@@ -81,6 +81,8 @@ python3.14 -m venv venv; source venv/bin/activate
 
 #### Option A: TorchTPU release with PyTorch 2.15 (recommended)
 
+Scan layers (`--compile.use-scan-layers`) need the PyTorch nightly (Option B) until PyTorch 2.16.
+
 1. Clone the torchtitan repository:
 
     ```bash

@@ -49,7 +49,6 @@ from collections.abc import Iterator
 
 import torch
 from torch import nn
-from torch._higher_order_ops.scan import scan
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torch.func import functional_call
@@ -61,7 +60,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     ScanFSDPSpec,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
-    scan_body_remat_window,
+    scan_with_remat_policy,
 )
 from torchtitan.experiments.tpu.components.layer_loop import (
     model_subclass,
@@ -764,12 +763,13 @@ class LayerStack:
                 # a scalar and drop it.
                 return out, out.new_zeros(())
 
-            # The window picks what the body saves for backward, by region.
+            # The policy picks what the body saves for backward, by region.
             # Left alone, the partitioner would save the gathered weight, and
             # the saved copy is carried out of the loop: the whole memory win
             # gone. See `scan_remat_policy`.
-            with scan_body_remat_window(frozenset(save_regions)):
-                carry, _ = scan(scan_body, h, xs)
+            carry, _ = scan_with_remat_policy(
+                scan_body, h, xs, frozenset(save_regions)
+            )
             return carry
 
         stacks = {_mangle(n): getattr(self.holder, _mangle(n)) for n in self.names}

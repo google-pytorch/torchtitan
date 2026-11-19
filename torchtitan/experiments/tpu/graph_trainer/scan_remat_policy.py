@@ -1,180 +1,103 @@
 """Which values the scan body keeps for its backward, chosen by region.
 
-The scan body is split into forward and backward inside ``scan``'s own
-autograd, before any GraphTrainer memory policy runs. So while ``scan``
-traces, ``scan_body_remat_window`` tags each forward node of the body from its
-``remat_region`` (see ``remat_regions.py``):
+``scan`` splits its body into forward and backward while it traces, before any
+GraphTrainer memory policy runs. So ``scan_with_remat_policy`` runs the body
+under selective activation checkpointing, and the policy decides from each
+op's ``remat_region`` (see ``remat_regions.py``):
 
-* ``fsdp.gather``: recompute. Saving it would keep every layer's whole weight.
 * ``moe.expert_counts``: save. Redoing the all-reduce is an exposed round trip.
 * a region in ``save_regions``, e.g. ``attention.inner_attention``: save.
-* everything else: recompute.
-
-It also tags the carry (the layer input) ``layer_input``, so the scan offload
-pass can find its saved copy after the split.
+* everything else, ``fsdp.gather`` included: recompute. Saving the gather
+  would keep every layer's whole weight.
 """
 
-import contextlib
-from collections.abc import Callable, Iterator, Set
+import functools
+from collections.abc import Callable, Set
 
 import torch
+import torch.utils.checkpoint as checkpoint_module
 from torch import fx
-from torch._functorch import config as functorch_config
-from torch._functorch import partitioners
-from torch._higher_order_ops import partitioner as hop_partitioner
-from torch.utils.checkpoint import CheckpointPolicy
+from torch._higher_order_ops.scan import scan
+from torch.utils.checkpoint import (
+    checkpoint,
+    CheckpointPolicy,
+    create_selective_checkpoint_contexts,
+)
 
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
-    FSDP_GATHER,
-    LAYER_INPUT,
     MOE_EXPERT_COUNTS,
     REMAT_REGION,
 )
 
-__all__ = [
-    "SCAN_SAVE_REGIONS",
-    "scan_body_remat_window",
-    "tag_scan_body_joint_graph",
-]
+__all__ = ["SCAN_SAVE_REGIONS", "scan_body_policy", "scan_with_remat_policy"]
 
 # The regions a scan body can be asked to save.
 SCAN_SAVE_REGIONS = frozenset({ATTENTION_INNER_ATTENTION})
 
 
-def _region(node: fx.Node) -> str | None:
-    return (node.meta.get("custom") or {}).get(REMAT_REGION)
+def scan_body_policy(
+    save_regions: Set[str], saved: set[str] | None = None
+) -> Callable:
+    """The SAC policy: save the expert counts and ``save_regions``, recompute the rest.
 
-
-def _depends_on_tangents(graph: fx.Graph) -> set[fx.Node]:
-    """Nodes only backward can compute: ``tangents_*`` and what reads them."""
-    closure: set[fx.Node] = set()
-    for node in graph.nodes:
-        if node.op == "placeholder":
-            if str(node.target).startswith("tangents"):
-                closure.add(node)
-        elif any(i in closure for i in node.all_input_nodes):
-            closure.add(node)
-    return closure
-
-
-def tag_scan_body_joint_graph(graph: fx.Graph, save_regions: Set[str]) -> None:
-    """Set ``meta["recompute"]`` on every forward node, from its region.
-
-    Also tags the carry placeholder ``layer_input``. When min-cut saves it,
-    ``scan`` returns a clone of it that copies this meta, so the tag reaches
-    the forward body in the outer graph.
-
-    ``fsdp.gather`` is always recompute, whatever tag it came with: saving it
-    keeps every layer's whole weight. Other nodes keep a tag they already
-    have, if it is a recompute tag or the one this would set: ``scan``
-    partitions each body twice, and the HOP partitioner pre-tags complex
-    SymInt expressions. Any other save tag raises.
-
-    Raises if a requested save region tags no forward node, e.g.
-    ``attention.inner_attention`` with SDPA instead of Splash. Raises too if
-    the body has a collective but no region meta: then ``scan`` dropped it
-    while re-tracing the body, and the counts would silently be recomputed.
+    Adds each region it saves to ``saved``, if given.
     """
-    if not any(_region(n) for n in graph.nodes if n.op == "call_function"):
-        has_collective = any(
-            isinstance(n.target, torch._ops.OpOverload)
-            and n.target.namespace == "_c10d_functional"
-            for n in graph.nodes
-        )
-        if has_collective:
-            raise RuntimeError(
-                "the scan body has a collective but no remat_region meta; is "
-                "scan_body_remat_window's re-trace patch still in effect?"
-            )
-    # The joint graph's inputs are (carry, xs), and the carry is one tensor.
-    carry = next(iter(graph.find_nodes(op="placeholder")))
-    # A new dict: min-cut shares placeholder meta between graphs.
-    custom = carry.meta.get("custom") or {}
-    carry.meta["custom"] = {**custom, REMAT_REGION: LAYER_INPUT}
-    backward_only = _depends_on_tangents(graph)
-    saved_regions: set[str] = set()
-    for node in graph.nodes:
-        if node.op != "call_function" or node in backward_only:
-            continue
-        region = _region(node)
-        if region == FSDP_GATHER:
-            node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
-            continue
-        if region in save_regions:
-            saved_regions.add(region)
-        save = region == MOE_EXPERT_COUNTS or region in save_regions
-        policy = (
-            CheckpointPolicy.MUST_SAVE if save else CheckpointPolicy.MUST_RECOMPUTE
-        )
-        existing = node.meta.get("recompute")
-        if existing is None:
-            node.meta["recompute"] = policy
-        elif existing != policy and existing in (
-            CheckpointPolicy.MUST_SAVE,
-            CheckpointPolicy.PREFER_SAVE,
-        ):
-            raise RuntimeError(
-                f"scan body node {node.name} (region {region!r}) came tagged "
-                f"{existing.name}; only save_regions decide what the scan "
-                "body saves"
-            )
-    missing = set(save_regions) - saved_regions
-    if missing:
-        raise ValueError(
-            f"Save region(s) {sorted(missing)} matched no forward nodes in the "
-            "scan body; the model or its tracing no longer exposes them (e.g. "
-            "SDPA instead of Splash for attention.inner_attention)."
-        )
+    save = {MOE_EXPERT_COUNTS, *save_regions}
+
+    def policy(ctx, op, *args, **kwargs) -> CheckpointPolicy:
+        custom = fx.traceback.get_current_meta().get("custom") or {}
+        region = custom.get(REMAT_REGION)
+        if region in save:
+            if saved is not None:
+                saved.add(region)
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return policy
 
 
-def _keeping_meta(fn: Callable) -> Callable:
-    """Run a traced graph so its re-trace copies each node's meta.
+def scan_with_remat_policy(
+    body: Callable, init, xs, save_regions: Set[str] = frozenset()
+):
+    """``scan(body, init, xs)``, with the body saving only what the policy picks.
 
-    TODO: drop once torch's ``create_hop_joint_graph`` does this itself (it has
-    ``_maybe_run_with_interpreter`` for it).
-    """
-    if not isinstance(fn, fx.GraphModule):
-        return fn
-
-    def run(*args):
-        with fx.traceback.preserve_node_meta():
-            return fx.Interpreter(fn).run(*args)
-
-    return run
-
-
-@contextlib.contextmanager
-def scan_body_remat_window(save_regions: Set[str] = frozenset()) -> Iterator[None]:
-    """Wrap a ``scan`` call to partition its body by region.
-
-    ``create_hop_joint_graph`` re-traces the body twice, and each re-trace drops
-    node meta; both get patched to keep it. Then the partitioner tags the joint
-    graph and runs at budget 1.0, where every tag is honoured. Everything is
-    process-global, so it is a window and restored on exit.
+    Raises if a requested save region matches no op in the body, e.g.
+    ``attention.inner_attention`` with SDPA instead of Splash.
     """
     unknown = set(save_regions) - SCAN_SAVE_REGIONS
     if unknown:
         raise ValueError(f"a scan body cannot save regions {sorted(unknown)}")
-    min_cut = partitioners.min_cut_rematerialization_partition
-    create_bw_fn = hop_partitioner.create_bw_fn
-    functionalize = torch.func.functionalize
-
-    def partition(joint_module: fx.GraphModule, joint_inputs, *args, **kwargs):
-        tag_scan_body_joint_graph(joint_module.graph, save_regions)
-        with functorch_config.patch(activation_memory_budget=1.0):
-            return min_cut(joint_module, joint_inputs, *args, **kwargs)
-
-    partitioners.min_cut_rematerialization_partition = partition
-    hop_partitioner.create_bw_fn = lambda fn, *a, **k: create_bw_fn(
-        _keeping_meta(fn), *a, **k
+    if not hasattr(checkpoint_module, "_tag_recompute_for_partitioner"):
+        # Then, under the graph trainer's non-strict trace, checkpoint takes its
+        # eager path, no node is tagged, and the body silently saves the
+        # gathered weights of every layer.
+        raise RuntimeError(
+            "--compile.use-scan-layers needs PyTorch with pytorch/pytorch#203334 and "
+            "#203534 (nightly 2.16.0.dev<DATE> or later; not in 2.15). Found torch "
+            f"{torch.__version__}."
+        )
+    # Mutation allowed: the MoE aux loss all-reduces its saved counts in place,
+    # once per mesh axis.
+    saved: set[str] = set()
+    context_fn = functools.partial(
+        create_selective_checkpoint_contexts,
+        scan_body_policy(save_regions, saved),
+        allow_cache_entry_mutation=True,
     )
-    torch.func.functionalize = lambda fn, *a, **k: functionalize(
-        _keeping_meta(fn), *a, **k
-    )
-    try:
-        yield
-    finally:
-        partitioners.min_cut_rematerialization_partition = min_cut
-        hop_partitioner.create_bw_fn = create_bw_fn
-        torch.func.functionalize = functionalize
+
+    def checkpointed(*args):
+        return checkpoint(body, *args, use_reentrant=False, context_fn=context_fn)
+
+    # No budget pin and no preserve_node_meta: min-cut honours every tag at
+    # torch's default budget (1.0), and scan's partitioner keeps node meta
+    # while it re-traces the body.
+    result = scan(checkpointed, init, xs)
+    missing = set(save_regions) - saved
+    if missing:
+        raise ValueError(
+            f"Save region(s) {sorted(missing)} matched no op in the scan body; "
+            "the model or its tracing no longer exposes them (e.g. SDPA "
+            "instead of Splash for attention.inner_attention)."
+        )
+    return result

@@ -539,13 +539,16 @@ What it changes:
   405B recipe because the per-layer path does not compile at that size.
 - **FSDP gathers one layer at a time.** The all-gather runs inside the loop body on one layer's
   shard, next to the compute that needs it, so the full stack of weights is never resident.
-- **The body is fully recomputed in backward**, including its all-gather. The only per-layer save
-  is the layer input. See *CPU offload* below for why that one tensor matters.
+- **The body is recomputed in backward**, including its all-gather, except the MoE expert counts
+  and the regions in `compile.save_regions`. The other per-layer save is the layer input. See
+  *CPU offload* below for why that one tensor matters.
 
 Constraints:
 
 - It is a GraphTrainer compile option, traced with `compile.mode="aot_fx_trace"`: an eager
   `scan` does not run on TPU.
+- It needs PyTorch with pytorch/pytorch#203334 and #203534: a nightly from <DATE> or later, not
+  2.15. On an older PyTorch the first trace raises.
 - Not every parallelism is supported. Data-parallel meshes work, FSDP and HSDP (the 2-D shard x
   replicate mesh) are tested; tensor, context, pipeline and expert parallelism are rejected.
 - The layer body must not mutate its inputs or module state; `scan` raises at trace time. MoE

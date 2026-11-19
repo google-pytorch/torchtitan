@@ -551,9 +551,8 @@ Constraints:
 - The layer body must not mutate its inputs or module state; `scan` raises at trace time. MoE
   models hit this through load-balancing counters and routing metrics. `qwen3_moe_235b_scan()`
   shows the workarounds (an override for the counter, `metrics.enable_moe_routing = False`).
-- Some ops do not trace inside a `scan` body. Llama3's complex RoPE is one; the recipes swap in a
-  bit-identical real-arithmetic override
-  ([`overrides/real_rope.py`](../overrides/real_rope.py)).
+- Some ops do not trace inside a `scan` body. Llama3's complex RoPE traces because, under
+  compile, `ComplexRoPE` rotates in real arithmetic (`models/common/rope.py`).
 - `named_parameters()` reports the stacks, not per-layer names, so anything keyed off per-layer
   parameter names stops matching. Model checkpoints keep their per-layer keys and move freely
   between scan and non-scan runs. Optimizer checkpoints do not, so a run cannot resume across a

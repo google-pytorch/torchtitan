@@ -302,9 +302,12 @@ class TrainerMinimal:
     self.optimizers = job_config.optimizer.build(model_parts=[self.model])
     if cpu_offload_active:
       from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+          verify_tpu_fsdp_cpu_offload_no_pin_memory,
           wire_trainer_cpu_offload,
       )
 
+      if self.device.type == "tpu":
+        verify_tpu_fsdp_cpu_offload_no_pin_memory([self.model])
       wire_trainer_cpu_offload(self.optimizers)
 
     # get_spmd_context sets the process-wide SPMD mesh the spmd_types

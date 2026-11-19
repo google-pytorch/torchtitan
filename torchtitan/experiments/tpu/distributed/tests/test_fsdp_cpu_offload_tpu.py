@@ -26,6 +26,7 @@ from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (
     materialize_host_grads,
     reset_cpu_offload_stats,
     uninstall_tpu_fsdp_cpu_offload,
+    verify_tpu_fsdp_cpu_offload_no_pin_memory,
     wire_trainer_cpu_offload,
 )
 from torchtitan.experiments.tpu.testing.base_device_test import (
@@ -135,7 +136,7 @@ class FSDPCPUOffloadAcceleratorTest(BaseAcceleratorDeviceTest):
       reset_cpu_offload_stats()
 
       model = _shard_on_device(mesh, init_state, nested_blocks=False)
-      opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
+      opt = torch.optim.AdamW(model.parameters(), lr=5e-2, eps=1e-2)
       if use_optimized:
         wire_trainer_cpu_offload(opt)
 
@@ -197,8 +198,11 @@ class FSDPCPUOffloadAcceleratorTest(BaseAcceleratorDeviceTest):
 
     num_steps = 12
     grad_accum = 3
-    # Use a fixed set of 3 microbatches repeated across steps so training loss
-    # decreases monotonically while still exercising multi-microbatch accumulation.
+    # Use lr=5e-2 (25x larger than atol=2e-3) so any missed parameter update or
+    # stale cached shard across steps diverges immediately by >> atol, while
+    # eps=1e-2 avoids near-zero coordinate sign flips from 1-ulp bf16 fusion.
+    lr = 5e-2
+    eps = 1e-2
     fixed_microbatches = [
         (
             torch.randn(16, 64, dtype=torch.bfloat16).to(device),
@@ -207,7 +211,7 @@ class FSDPCPUOffloadAcceleratorTest(BaseAcceleratorDeviceTest):
         for _ in range(grad_accum)
     ]
 
-    def _run(*, use_optimized: bool) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    def _run(*, use_optimized: bool) -> list[dict[str, Any]]:
       if use_optimized:
         install_tpu_fsdp_cpu_offload(
             enable_param_cache=True,
@@ -218,23 +222,21 @@ class FSDPCPUOffloadAcceleratorTest(BaseAcceleratorDeviceTest):
       reset_cpu_offload_stats()
 
       model = _shard_on_device(mesh, init_state, nested_blocks=True)
+      verify_tpu_fsdp_cpu_offload_no_pin_memory([model])
       for p in model.parameters():
         self.assertEqual(p.to_local().device.type, "cpu")
-      opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
+      opt = torch.optim.AdamW(model.parameters(), lr=lr, eps=eps)
       if use_optimized:
         wire_trainer_cpu_offload(opt)
 
-      first_fwd_loss: torch.Tensor | None = None
       records: list[dict[str, Any]] = []
-      for step_idx in range(num_steps):
+      for _ in range(num_steps):
         opt.zero_grad(set_to_none=True)
         step_loss = torch.zeros((), dtype=torch.float32)
         mb_losses: list[torch.Tensor] = []
-        for mb_idx, (x, target) in enumerate(fixed_microbatches):
+        for x, target in fixed_microbatches:
           pred = model(x)
           loss = torch.nn.functional.mse_loss(pred.float(), target) / grad_accum
-          if step_idx == 0 and mb_idx == 0:
-            first_fwd_loss = loss.detach().cpu()
           loss.backward()
           loss_cpu = loss.detach().cpu()
           mb_losses.append(loss_cpu)
@@ -267,17 +269,25 @@ class FSDPCPUOffloadAcceleratorTest(BaseAcceleratorDeviceTest):
                 "params": params,
             }
         )
-      assert first_fwd_loss is not None
-      return first_fwd_loss, records
+      return records
 
-    ref_fwd0, ref_records = _run(use_optimized=False)
-    opt_fwd0, opt_records = _run(use_optimized=True)
+    ref_records = _run(use_optimized=False)
+    opt_records = _run(use_optimized=True)
     stats = get_cpu_offload_stats()
 
-    self.assertTrue(torch.equal(opt_fwd0, ref_fwd0))
     self.assertEqual(stats.param_cache_misses, num_params * num_steps)
-    self.assertGreater(stats.param_cache_hits, 0)
+    self.assertGreaterEqual(
+        stats.param_cache_hits,
+        num_params * num_steps * (2 * grad_accum - 1),
+    )
     self.assertEqual(stats.d2h_sync_calls, num_steps)
+
+    # Confirm step-0 parameter updates move weights far beyond atol=2e-3.
+    step0_max_delta = max(
+        float((opt_records[0]["params"][k] - init_state[k]).abs().max().item())
+        for k in init_state
+    )
+    self.assertGreater(step0_max_delta, 1e-2)
 
     losses: list[float] = []
     for step in range(num_steps):
@@ -317,22 +327,22 @@ class FSDPCPUOffloadAcceleratorTest(BaseAcceleratorDeviceTest):
         torch.testing.assert_close(
             opt_r["grad_norm"],
             ref_r["grad_norm"],
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=2e-3,
+            atol=2e-3,
         )
         for name in ref_r["grads"]:
           torch.testing.assert_close(
               opt_r["grads"][name],
               ref_r["grads"][name],
-              rtol=5e-3,
-              atol=5e-3,
+              rtol=2e-3,
+              atol=2e-3,
           )
         for name in ref_r["params"]:
           torch.testing.assert_close(
               opt_r["params"][name],
               ref_r["params"][name],
-              rtol=5e-3,
-              atol=5e-3,
+              rtol=2e-3,
+              atol=2e-3,
           )
 
       loss_val = float(opt_r["step_loss"].item())

@@ -46,18 +46,11 @@ def parallelize_llama(
     skip_dp: Whether to skip data parallelism wrapping.
     tpu_compile_mode: TPU compile mode ('layer' or 'fullgraph').
   """
-  if training.enable_cpu_offload:
-    if parallelism.use_simple_fsdp:
-      logger.warning(
-          "CPU offload is not supported with SimpleFSDP; setting it to False."
-      )
-      training.enable_cpu_offload = False
-    else:
-      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
-          install_tpu_cpu_offload_policy,
-      )
-
-      install_tpu_cpu_offload_policy()
+  if training.enable_cpu_offload and parallelism.use_simple_fsdp:
+    logger.warning(
+        "CPU offload is not supported with SimpleFSDP; setting it to False."
+    )
+    training.enable_cpu_offload = False
 
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config

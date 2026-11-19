@@ -120,6 +120,10 @@ DISABLED_TESTS = {
     # set_gqa_inner_attention_local_spmd also registers the SDPA q_BLHK/k_BLHK/
     # v_BLHV keys; the test asserts the exact varlen key set.
     "tests.unit_tests.cpu.test_varlen_attention",
+    # Imports spmd_types before torch; when torch autoloads torch_tpu, FSDP2
+    # _fsdp_param_group calls spmd_types.register_local_autograd_function while
+    # spmd_types is still partially initialized (circular import).
+    "tests.unit_tests.cpu.test_cp_attention",
     # Image torch rejects 'reorder_for_locality' in nested compile-region options.
     "torchtitan.experiments.graph_trainer.tests.test_subgraph_regions",
     # Missing optional dependency autoparallel

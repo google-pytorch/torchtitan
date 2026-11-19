@@ -78,20 +78,21 @@ class TPUTrainer(torchtitan.train.Trainer):
           configure_tpu_fsdp_cpu_offload_from_job_config,
       )
 
-      configure_tpu_fsdp_cpu_offload_from_job_config(job_config)
+      if (
+          configure_tpu_fsdp_cpu_offload_from_job_config(job_config)
+          and isinstance(job_config, tpu_job_config_module.TPUTrainerConfig)
+          and job_config.compile.optimizer_compile == "separate_graph"
+      ):
+        raise ValueError(
+            "training.enable_cpu_offload is incompatible with"
+            " compile.optimizer_compile='separate_graph' because FSDP2 CPU"
+            " offload keeps master parameters and optimizer state on CPU."
+        )
 
     super().__init__(job_config)
 
-    if getattr(getattr(self.config, "training", None), "enable_cpu_offload", False):
-      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
-          wire_trainer_cpu_offload,
-      )
-
-      wire_trainer_cpu_offload(
-          self.optimizers, getattr(self, "checkpointer", None)
-      )
-
     self._compiled_grad_norm: CompiledGradNorm | None = None
+    self._logged_cpu_offload_grad_norm_fallback: bool = False
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
       from torchtitan.experiments.tpu.components.loss import build_cross_entropy_loss
       self.loss_fn = build_cross_entropy_loss(job_config)
@@ -105,12 +106,34 @@ class TPUTrainer(torchtitan.train.Trainer):
         from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
         apply_compiled_optimizer(self)
 
+    if getattr(getattr(self.config, "training", None), "enable_cpu_offload", False):
+      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+          verify_tpu_fsdp_cpu_offload_no_pin_memory,
+          wire_trainer_cpu_offload,
+      )
+
+      if self.device.type == "tpu":
+        verify_tpu_fsdp_cpu_offload_no_pin_memory(self.model_parts)
+      wire_trainer_cpu_offload(
+          self.optimizers, getattr(self, "checkpointer", None)
+      )
+
   def _clip_grad_norm(self) -> torch.Tensor:
     if getattr(getattr(self.config, "training", None), "enable_cpu_offload", False):
       from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
           materialize_host_grads,
       )
 
+      if (
+          getattr(self, "_compiled_grad_norm", None) is not None
+          and not getattr(self, "_logged_cpu_offload_grad_norm_fallback", False)
+      ):
+        logger.info(
+            "TPU FSDP2 CPU offload: using host clip_grad_norm_ instead of"
+            " compile.compile_grad_norm because sharded gradients reside on"
+            " CPU."
+        )
+        self._logged_cpu_offload_grad_norm_fallback = True
       materialize_host_grads()
       total_norm = super()._clip_grad_norm()
       if total_norm.device != self.device:

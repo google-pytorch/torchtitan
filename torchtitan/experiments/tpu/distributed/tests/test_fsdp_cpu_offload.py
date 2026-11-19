@@ -6,9 +6,13 @@
 
 """CPU unit tests for TPU FSDP2 CPU offload policy, shard cache, and grad accumulation."""
 
+import importlib.abc
+import importlib.machinery
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -21,7 +25,9 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 
+from torchtitan.config import ParallelismConfig, TrainingConfig
 import torchtitan.distributed.fsdp as tt_fsdp
+from torchtitan.experiments.tpu.distributed import fsdp_cpu_offload as offload_mod
 from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (
     TPUCPUOffloadPolicy,
     configure_tpu_fsdp_cpu_offload_from_job_config,
@@ -33,9 +39,72 @@ from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (
     reset_cpu_offload_stats,
     uninstall_tpu_cpu_offload_policy,
     uninstall_tpu_fsdp_cpu_offload,
+    verify_tpu_fsdp_cpu_offload_no_pin_memory,
     wire_trainer_cpu_offload,
 )
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    TPUConfig,
+    TPUTrainerConfig,
+    TpuTrainerCompileConfig,
+)
+from torchtitan.models.llama3.config_registry import model_registry
+
+
+class _TorchTpuStubModule(ModuleType):
+  """Minimal package stub so pure-CPU envs without torch_tpu can import train.py."""
+
+  def __init__(self, name: str):
+    super().__init__(name)
+    self.__path__ = []
+
+  def __getattr__(self, name: str) -> Any:
+    if name.startswith("__"):
+      raise AttributeError(name)
+    val = mock.MagicMock(name=f"{self.__name__}.{name}")
+    setattr(self, name, val)
+    return val
+
+
+class _TorchTpuStubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+
+  def find_spec(self, fullname: str, path: Any = None, target: Any = None):
+    del path, target
+    if fullname == "torch_tpu" or fullname.startswith("torch_tpu."):
+      return importlib.machinery.ModuleSpec(
+          fullname, self, is_package=True
+      )
+    return None
+
+  def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
+    return _TorchTpuStubModule(spec.name)
+
+  def exec_module(self, module: ModuleType) -> None:
+    del module
+
+
+def _get_tpu_train_module() -> Any:
+  """Imports ``torchtitan.experiments.tpu.train`` on TPU or CPU-only envs."""
+  try:
+    from torchtitan.experiments.tpu import train as tpu_train  # pylint: disable=g-import-not-at-top
+
+    return tpu_train
+  except ModuleNotFoundError as exc:
+    if exc.name is None or not exc.name.startswith("torch_tpu"):
+      raise
+    finder = _TorchTpuStubFinder()
+    saved_tpu_mods = {
+        k: v for k, v in sys.modules.items() if k.startswith("torch_tpu")
+    }
+    sys.meta_path.append(finder)
+    try:
+      from torchtitan.experiments.tpu import train as tpu_train  # pylint: disable=g-import-not-at-top
+
+      return tpu_train
+    finally:
+      sys.meta_path.remove(finder)
+      for k in [m for m in sys.modules if m.startswith("torch_tpu")]:
+        if k not in saved_tpu_mods:
+          del sys.modules[k]
 
 
 def _ensure_single_rank_gloo() -> DeviceMesh:
@@ -159,7 +228,7 @@ class FSDPCPUOffloadTest(absltest.TestCase):
       model = _build_sharded_model(
           self.mesh, init_state, reshard_after_forward=True
       )
-      opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
+      opt = torch.optim.AdamW(model.parameters(), lr=5e-2)
       if use_optimized:
         wire_trainer_cpu_offload(opt)
 
@@ -211,7 +280,6 @@ class FSDPCPUOffloadTest(absltest.TestCase):
     )
     self.assertEqual(stats.d2h_sync_calls, num_steps)
 
-    step_losses: list[float] = []
     for step in range(num_steps):
       ref_s = ref_hist[step]
       opt_s = opt_hist[step]
@@ -236,11 +304,13 @@ class FSDPCPUOffloadTest(absltest.TestCase):
         )
       step_loss = sum(float(t.item()) for t in opt_s["mb_losses"])
       self.assertTrue(torch.isfinite(torch.tensor(step_loss)).item())
-      step_losses.append(step_loss)
 
     # Verify same-batch training converges cleanly when trained on fixed data.
     uninstall_tpu_fsdp_cpu_offload()
-    install_tpu_fsdp_cpu_offload()
+    install_tpu_fsdp_cpu_offload(
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
     conv_model = _build_sharded_model(self.mesh, init_state)
     conv_opt = torch.optim.AdamW(conv_model.parameters(), lr=1e-2)
     wire_trainer_cpu_offload(conv_opt)
@@ -249,7 +319,10 @@ class FSDPCPUOffloadTest(absltest.TestCase):
     for _ in range(10):
       conv_opt.zero_grad()
       for _ in range(2):
-        loss = torch.nn.functional.mse_loss(conv_model(x_fixed).float(), y_fixed) / 2
+        loss = (
+            torch.nn.functional.mse_loss(conv_model(x_fixed).float(), y_fixed)
+            / 2
+        )
         loss.backward()
       materialize_host_grads()
       torch.nn.utils.clip_grad_norm_(conv_model.parameters(), 1.0)
@@ -269,13 +342,16 @@ class FSDPCPUOffloadTest(absltest.TestCase):
 
     def _run(*, opt_mode: bool):
       if opt_mode:
-        install_tpu_fsdp_cpu_offload()
+        install_tpu_fsdp_cpu_offload(
+            enable_param_cache=True,
+            enable_device_grad_accum=True,
+        )
       else:
         uninstall_tpu_fsdp_cpu_offload()
       model = _build_sharded_model(
           self.mesh, init_state, reshard_after_forward=False
       )
-      opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+      opt = torch.optim.AdamW(model.parameters(), lr=3e-2)
       if opt_mode:
         wire_trainer_cpu_offload(opt)
       for step_batches in batches:
@@ -302,11 +378,14 @@ class FSDPCPUOffloadTest(absltest.TestCase):
 
     def _run(*, opt_mode: bool):
       if opt_mode:
-        install_tpu_fsdp_cpu_offload()
+        install_tpu_fsdp_cpu_offload(
+            enable_param_cache=True,
+            enable_device_grad_accum=True,
+        )
       else:
         uninstall_tpu_fsdp_cpu_offload()
       model = _build_sharded_model(self.mesh, init_state)
-      opt = torch.optim.AdamW(model.parameters(), lr=4e-3)
+      opt = torch.optim.AdamW(model.parameters(), lr=4e-2)
       if opt_mode:
         wire_trainer_cpu_offload(opt)
       for step_batches in batches:
@@ -324,28 +403,46 @@ class FSDPCPUOffloadTest(absltest.TestCase):
     for name in ref_params:
       self.assertTrue(torch.equal(opt_params[name], ref_params[name]), name)
 
-  def test_cache_invalidation_on_load_state_dict_and_checkpointer_load(self):
+  def test_cache_invalidation_on_load_state_dict_checkpointer_and_zero_grad(
+      self,
+  ):
     torch.manual_seed(101)
     init_a = {k: v.clone() for k, v in _ToyFSDPModel().state_dict().items()}
     torch.manual_seed(202)
     init_b = {k: v.clone() for k, v in _ToyFSDPModel().state_dict().items()}
     x = torch.randn(4, 32)
+    y = torch.randn(4, 32)
 
-    install_tpu_fsdp_cpu_offload()
+    install_tpu_fsdp_cpu_offload(
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
     model = _build_sharded_model(self.mesh, init_a)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    inner_opt = torch.optim.SGD(model.parameters(), lr=0.25)
+
+    # Wrap inner_opt in a container to test what happens if a caller steps
+    # inner_opt directly (bypassing optimizers.step) before calling zero_grad().
+    class _OptContainer:
+
+      def zero_grad(self, *args: Any, **kwargs: Any) -> None:
+        inner_opt.zero_grad(*args, **kwargs)
+
+      def step(self, *args: Any, **kwargs: Any) -> Any:
+        return inner_opt.step(*args, **kwargs)
+
+    opt_container = _OptContainer()
 
     # Populate parameter shard cache with init_a.
     _ = model(x)
 
-    # 1) load_state_dict(assign=True) via full state dict reload on reference vs model.
     uninstall_tpu_fsdp_cpu_offload()
     ref_b = _build_sharded_model(self.mesh, init_b)
     expected_out_b = ref_b(x).detach().clone()
 
-    install_tpu_fsdp_cpu_offload()
-    # Mutate underlying CPU shards inside checkpointer.load() hook to verify
-    # checkpointer wiring invalidates the device shard cache.
+    install_tpu_fsdp_cpu_offload(
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
     ref_b_state = ref_b.state_dict()
 
     class _DummyCheckpointer:
@@ -355,14 +452,41 @@ class FSDPCPUOffloadTest(absltest.TestCase):
         model.load_state_dict(ref_b_state)
 
     ckpt = _DummyCheckpointer()
-    wire_trainer_cpu_offload(opt, ckpt)
+    wire_trainer_cpu_offload(opt_container, ckpt)
     ckpt.load()
     actual_out_b = model(x).detach().clone()
     self.assertTrue(torch.equal(actual_out_b, expected_out_b))
 
+    # Defensive zero_grad() invalidation: step inner_opt directly without going
+    # through opt_container.step(), then call opt_container.zero_grad() and
+    # confirm cached shards are invalidated before the next forward pass.
+    loss = torch.nn.functional.mse_loss(model(x).float(), y)
+    loss.backward()
+    materialize_host_grads()
+    inner_opt.step()  # bypasses opt_container.step()
+    opt_container.zero_grad()
+
+    uninstall_tpu_fsdp_cpu_offload()
+    ref_after_direct_step = _build_sharded_model(self.mesh, init_b)
+    ref_after_direct_step.load_state_dict(model.state_dict())
+    expected_after_direct = ref_after_direct_step(x).detach().clone()
+
+    install_tpu_fsdp_cpu_offload(
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
+    actual_after_direct = model(x).detach().clone()
+    self.assertFalse(torch.equal(actual_after_direct, expected_out_b))
+    self.assertTrue(torch.equal(actual_after_direct, expected_after_direct))
+
     # Also test reset_sharded_param invalidation directly via assign=True reload.
+    uninstall_tpu_fsdp_cpu_offload()
     ref_a = _build_sharded_model(self.mesh, init_a)
     expected_out_a = ref_a(x).detach().clone()
+    install_tpu_fsdp_cpu_offload(
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
     model.load_state_dict(ref_a.state_dict(), assign=True)
     actual_out_a = model(x).detach().clone()
     self.assertTrue(torch.equal(actual_out_a, expected_out_a))
@@ -376,7 +500,10 @@ class FSDPCPUOffloadTest(absltest.TestCase):
 
     def _run(*, opt_mode: bool) -> tuple[int, dict[str, torch.Tensor]]:
       if opt_mode:
-        install_tpu_fsdp_cpu_offload()
+        install_tpu_fsdp_cpu_offload(
+            enable_param_cache=True,
+            enable_device_grad_accum=True,
+        )
       else:
         uninstall_tpu_fsdp_cpu_offload()
       model = _build_sharded_model(
@@ -391,7 +518,7 @@ class FSDPCPUOffloadTest(absltest.TestCase):
       handle = model.head.weight.register_post_accumulate_grad_hook(_grad_hook)
       try:
         opt = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad], lr=2e-3
+            [p for p in model.parameters() if p.requires_grad], lr=2e-2
         )
         if opt_mode:
           wire_trainer_cpu_offload(opt)
@@ -413,10 +540,15 @@ class FSDPCPUOffloadTest(absltest.TestCase):
     for name in ref_params:
       self.assertTrue(torch.equal(opt_params[name], ref_params[name]), name)
 
-  def test_policy_injection_config_gating_and_num_threads(self):
+  def test_policy_injection_opt_in_defaults_and_num_threads(self):
     self.assertFalse(TPUCPUOffloadPolicy().pin_memory)
     self.assertTrue(TPUCPUOffloadPolicy(pin_memory=True).pin_memory)
     self.assertIsInstance(TPUCPUOffloadPolicy(), CPUOffloadPolicy)
+
+    # TPUConfig defaults both persistent-HBM optimizations to False (opt-in).
+    default_tpu_cfg = TPUConfig()
+    self.assertFalse(default_tpu_cfg.enable_cpu_offload_param_cache)
+    self.assertFalse(default_tpu_cfg.enable_cpu_offload_device_grad_accum)
 
     orig_cls = tt_fsdp.CPUOffloadPolicy
     install_tpu_cpu_offload_policy(force=True)
@@ -425,7 +557,8 @@ class FSDPCPUOffloadTest(absltest.TestCase):
     uninstall_tpu_cpu_offload_policy()
     self.assertIs(tt_fsdp.CPUOffloadPolicy, orig_cls)
 
-    # SimpleFSDP disables enable_cpu_offload; FSDP2 preserves it and installs hooks.
+    # SimpleFSDP disables enable_cpu_offload; FSDP2 preserves it and installs
+    # TPUCPUOffloadPolicy(pin_memory=False) while keeping cache/accum off by default.
     simple_cfg = SimpleNamespace(
         training=SimpleNamespace(enable_cpu_offload=True),
         parallelism=SimpleNamespace(use_simple_fsdp=True),
@@ -435,25 +568,121 @@ class FSDPCPUOffloadTest(absltest.TestCase):
     self.assertFalse(simple_cfg.training.enable_cpu_offload)
     self.assertFalse(is_tpu_fsdp_cpu_offload_installed())
 
+    default_fsdp2_cfg = SimpleNamespace(
+        training=SimpleNamespace(enable_cpu_offload=True),
+        parallelism=SimpleNamespace(use_simple_fsdp=False),
+        tpu_config=None,
+    )
+    self.assertTrue(
+        configure_tpu_fsdp_cpu_offload_from_job_config(default_fsdp2_cfg)
+    )
+    self.assertIs(tt_fsdp.CPUOffloadPolicy, TPUCPUOffloadPolicy)
+    self.assertFalse(offload_mod._PARAM_CACHE_ENABLED)  # pylint: disable=protected-access
+    self.assertFalse(offload_mod._DEVICE_GRAD_ACCUM_ENABLED)  # pylint: disable=protected-access
+
     prev_threads = torch.get_num_threads()
     try:
-      fsdp2_cfg = SimpleNamespace(
+      opt_in_cfg = SimpleNamespace(
           training=SimpleNamespace(enable_cpu_offload=True),
           parallelism=SimpleNamespace(use_simple_fsdp=False),
-          tpu_config=TPUConfig(cpu_offload_num_threads=2),
+          tpu_config=TPUConfig(
+              enable_cpu_offload_param_cache=True,
+              enable_cpu_offload_device_grad_accum=True,
+              cpu_offload_num_threads=2,
+          ),
       )
-      self.assertTrue(configure_tpu_fsdp_cpu_offload_from_job_config(fsdp2_cfg))
-      self.assertTrue(fsdp2_cfg.training.enable_cpu_offload)
-      self.assertTrue(is_tpu_fsdp_cpu_offload_installed())
+      self.assertTrue(configure_tpu_fsdp_cpu_offload_from_job_config(opt_in_cfg))
+      self.assertTrue(offload_mod._PARAM_CACHE_ENABLED)  # pylint: disable=protected-access
+      self.assertTrue(offload_mod._DEVICE_GRAD_ACCUM_ENABLED)  # pylint: disable=protected-access
       self.assertEqual(torch.get_num_threads(), 2)
     finally:
       torch.set_num_threads(prev_threads)
 
-  def test_legacy_foreach_reduce_fallback_bitwise_parity(self):
+  def test_separate_graph_optimizer_compile_rejected_with_cpu_offload(self):
+    # 1) Rejected at TPUTrainerConfig validation time.
+    with self.assertRaisesRegex(
+        ValueError, "optimizer_compile='separate_graph'"
+    ):
+      TPUTrainerConfig(
+          model_spec=model_registry("debugmodel", attn_backend="sdpa"),
+          training=TrainingConfig(enable_cpu_offload=True),
+          parallelism=ParallelismConfig(use_simple_fsdp=False),
+          compile=TpuTrainerCompileConfig(optimizer_compile="separate_graph"),
+      )
+
+    # 2) Also rejected at TPUTrainer.__init__ if mutated post-construction.
+    tpu_train = _get_tpu_train_module()
+    cfg = TPUTrainerConfig(
+        model_spec=model_registry("debugmodel", attn_backend="sdpa"),
+        training=TrainingConfig(enable_cpu_offload=True),
+        parallelism=ParallelismConfig(use_simple_fsdp=False),
+        compile=TpuTrainerCompileConfig(optimizer_compile="eager"),
+    )
+    cfg.compile.optimizer_compile = "separate_graph"
+    with self.assertRaisesRegex(
+        ValueError, "optimizer_compile='separate_graph'"
+    ):
+      tpu_train.TPUTrainer(cfg)
+
+    # 3) Allowed when use_simple_fsdp=True (which disables enable_cpu_offload).
+    simple_cfg = TPUTrainerConfig(
+        model_spec=model_registry("debugmodel", attn_backend="sdpa"),
+        training=TrainingConfig(enable_cpu_offload=True),
+        parallelism=ParallelismConfig(use_simple_fsdp=True),
+        compile=TpuTrainerCompileConfig(optimizer_compile="separate_graph"),
+    )
+    self.assertEqual(simple_cfg.compile.optimizer_compile, "separate_graph")
+
+  def test_verify_tpu_fsdp_cpu_offload_no_pin_memory(self):
+    good_model = _build_sharded_model(
+        self.mesh, _ToyFSDPModel().state_dict()
+    )
+    verify_tpu_fsdp_cpu_offload_no_pin_memory([good_model])
+
+    # Simulate a parallelize module calling fully_shard with stock
+    # CPUOffloadPolicy(pin_memory=True) on a meta-device model before to_empty.
+    with torch.device("meta"):
+      bad_model = _ToyFSDPModel()
+    fully_shard(
+        bad_model,
+        mesh=self.mesh,
+        offload_policy=CPUOffloadPolicy(pin_memory=True),
+    )
+    with self.assertRaisesRegex(RuntimeError, "pin_memory=True"):
+      verify_tpu_fsdp_cpu_offload_no_pin_memory([bad_model])
+
+  def test_compiled_grad_norm_logs_once_under_cpu_offload(self):
+    tpu_train = _get_tpu_train_module()
+    dummy_model = nn.Linear(4, 4, bias=False)
+    dummy_model.weight.grad = torch.ones_like(dummy_model.weight)
+    fake_compiled = mock.Mock()
+    trainer = object.__new__(tpu_train.TPUTrainer)
+    trainer._compiled_grad_norm = fake_compiled  # pylint: disable=protected-access
+    trainer._logged_cpu_offload_grad_norm_fallback = False  # pylint: disable=protected-access
+    trainer.model_parts = [dummy_model]
+    trainer.device = torch.device("cpu")
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(enable_cpu_offload=True, max_norm=1.0)
+    )
+    with (
+        mock.patch.object(offload_mod.logger, "info"),
+        mock.patch.object(tpu_train.logger, "info") as mock_train_info,
+        mock.patch(
+            "torchtitan.train.Trainer._clip_grad_norm",
+            return_value=torch.tensor(1.5),
+        ),
+    ):
+      norm1 = trainer._clip_grad_norm()  # pylint: disable=protected-access
+      norm2 = trainer._clip_grad_norm()  # pylint: disable=protected-access
+    self.assertEqual(float(norm1.item()), 1.5)
+    self.assertEqual(float(norm2.item()), 1.5)
+    fake_compiled.clip_grad_norm_.assert_not_called()
+    self.assertEqual(mock_train_info.call_count, 1)
+
+  def test_missing_cast_and_view_falls_back_gracefully_with_warning(self):
     from torch.distributed.fsdp._fully_shard import (  # pylint: disable=g-import-not-at-top
         _fsdp_collectives as fc,
     )
-    import torchtitan.experiments.tpu.distributed.fsdp_cpu_offload as offload_mod  # pylint: disable=g-import-not-at-top
 
     torch.manual_seed(404)
     init_state = {
@@ -466,7 +695,7 @@ class FSDPCPUOffloadTest(absltest.TestCase):
 
     uninstall_tpu_fsdp_cpu_offload()
     ref_model = _build_sharded_model(self.mesh, init_state)
-    ref_opt = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
+    ref_opt = torch.optim.AdamW(ref_model.parameters(), lr=3e-2)
     for step_batches in batches:
       ref_opt.zero_grad()
       for x, y in step_batches:
@@ -474,35 +703,29 @@ class FSDPCPUOffloadTest(absltest.TestCase):
       ref_opt.step()
     ref_params = {k: p.to_local().clone() for k, p in ref_model.named_parameters()}
 
-    # Simulate PyTorch < 2.15 by hiding _cast_and_view_sharded_grads during
-    # install_tpu_fsdp_cpu_offload while keeping a closure reference if needed.
     orig_cav = getattr(fc, "_cast_and_view_sharded_grads", None)
-    orig_fr = fc.foreach_reduce
-    if orig_cav is not None:
-
-      def _fr_with_bound_cav(*args: Any, **kwargs: Any) -> Any:
-        setattr(fc, "_cast_and_view_sharded_grads", orig_cav)
-        try:
-          return orig_fr(*args, **kwargs)
-        finally:
-          delattr(fc, "_cast_and_view_sharded_grads")
-
-      fc.foreach_reduce = _fr_with_bound_cav  # type: ignore[assignment]
-      delattr(fc, "_cast_and_view_sharded_grads")
-
     try:
-      install_tpu_fsdp_cpu_offload()
-      self.assertIsNotNone(offload_mod._ORIG_FOREACH_REDUCE_COLLECTIVES)  # pylint: disable=protected-access
+      if orig_cav is not None:
+        delattr(fc, "_cast_and_view_sharded_grads")
+      with mock.patch.object(offload_mod.logger, "warning") as mock_warn:
+        install_tpu_fsdp_cpu_offload(
+            enable_param_cache=True,
+            enable_device_grad_accum=True,
+        )
+      if orig_cav is not None:
+        setattr(fc, "_cast_and_view_sharded_grads", orig_cav)
+      mock_warn.assert_called_once()
+      self.assertFalse(offload_mod._DEVICE_GRAD_ACCUM_ENABLED)  # pylint: disable=protected-access
       reset_cpu_offload_stats()
       opt_model = _build_sharded_model(self.mesh, init_state)
-      opt_opt = torch.optim.AdamW(opt_model.parameters(), lr=3e-3)
+      opt_opt = torch.optim.AdamW(opt_model.parameters(), lr=3e-2)
       wire_trainer_cpu_offload(opt_opt)
       for step_batches in batches:
         opt_opt.zero_grad()
         for x, y in step_batches:
           (torch.nn.functional.mse_loss(opt_model(x).float(), y) / 3).backward()
         opt_opt.step()
-      self.assertEqual(get_cpu_offload_stats().d2h_sync_calls, len(batches))
+      self.assertEqual(get_cpu_offload_stats().d2h_sync_calls, 0)
       opt_params = {
           k: p.to_local().clone() for k, p in opt_model.named_parameters()
       }
@@ -510,26 +733,24 @@ class FSDPCPUOffloadTest(absltest.TestCase):
         self.assertTrue(torch.equal(opt_params[name], ref_params[name]), name)
     finally:
       uninstall_tpu_fsdp_cpu_offload()
-      fc.foreach_reduce = orig_fr
       if orig_cav is not None:
         setattr(fc, "_cast_and_view_sharded_grads", orig_cav)
 
-  def test_four_arg_cast_and_view_signature_compatibility(self):
-    import torchtitan.experiments.tpu.distributed.fsdp_cpu_offload as offload_mod  # pylint: disable=g-import-not-at-top
-
+  def test_per_param_foreach_add_fallback_without_cat_and_four_arg_stub(self):
     model = _build_sharded_model(self.mesh, _ToyFSDPModel().state_dict())
-    x = torch.randn(4, 32)
-    y = torch.randn(4, 32)
-    install_tpu_fsdp_cpu_offload()
+    install_tpu_fsdp_cpu_offload(
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
     reset_cpu_offload_stats()
 
-    # Verify _patched_cast_and_view_sharded_grads forwards arbitrary positional
-    # signatures (e.g. 4-arg PyTorch nightly vs 5-arg PyTorch 2.15).
     called_with_four_args = False
     orig_hook = offload_mod._ORIG_CAST_AND_VIEW_SHARDED_GRADS  # pylint: disable=protected-access
     try:
-
-      def _four_arg_stub(
+      # Return mixed-dtype sharded grads with bfloat16 reduce_output so
+      # _accumulate_sharded_grads_on_device exercises _PerParamGradAccum +
+      # torch._foreach_add_ across multiple microbatches without torch.cat.
+      def _four_arg_mixed_dtype_stub(
           reduce_output: torch.Tensor,
           fsdp_params: list[Any],
           padded_sharded_numels: list[int],
@@ -540,34 +761,50 @@ class FSDPCPUOffloadTest(absltest.TestCase):
         called_with_four_args = True
         out: list[torch.Tensor] = []
         offset = 0
-        for p, span in zip(fsdp_params, padded_sharded_numels):
+        for idx, (p, span) in enumerate(
+            zip(fsdp_params, padded_sharded_numels)
+        ):
           numel = p.sharded_size.numel()
-          out.append(reduce_output.narrow(0, offset, numel).view(p.sharded_size))
+          target_dtype = torch.float32 if idx % 2 == 0 else torch.bfloat16
+          out.append(
+              reduce_output.narrow(0, offset, numel)
+              .to(target_dtype)
+              .view(p.sharded_size)
+          )
           offset += span
         return out
 
-      offload_mod._ORIG_CAST_AND_VIEW_SHARDED_GRADS = _four_arg_stub  # pylint: disable=protected-access
+      offload_mod._ORIG_CAST_AND_VIEW_SHARDED_GRADS = (  # pylint: disable=protected-access
+          _four_arg_mixed_dtype_stub
+      )
       fsdp_state = model._get_fsdp_state()  # pylint: disable=protected-access
       fsdp_params = fsdp_state._fsdp_param_group.fsdp_params  # pylint: disable=protected-access
+      for idx, p in enumerate(fsdp_params):
+        if idx % 2 == 1 and hasattr(p.sharded_param, "grad_dtype"):
+          p.sharded_param.grad_dtype = torch.bfloat16
       numels = [p._sharded_param_data.numel() for p in fsdp_params]  # pylint: disable=protected-access
-      fake_reduce = torch.ones(sum(numels), dtype=torch.float32)
-      ret = offload_mod._patched_cast_and_view_sharded_grads(  # pylint: disable=protected-access
-          fake_reduce, fsdp_params, numels, None
-      )
-      self.assertEqual(ret, [])
+      fake_reduce = torch.ones(sum(numels), dtype=torch.bfloat16)
+
+      with mock.patch("torch.cat", side_effect=AssertionError("unexpected cat")):
+        for _ in range(3):
+          ret = offload_mod._patched_cast_and_view_sharded_grads(  # pylint: disable=protected-access
+              fake_reduce, fsdp_params, numels, None
+          )
+          self.assertEqual(ret, [])
+
       self.assertTrue(called_with_four_args)
       materialize_host_grads()
-      for p in fsdp_params:
+      for idx, p in enumerate(fsdp_params):
+        expected_dtype = torch.float32 if idx % 2 == 0 else torch.bfloat16
         self.assertIsNotNone(p.sharded_param.grad)
         self.assertTrue(
             torch.equal(
                 p.sharded_param.grad.to_local(),
-                torch.ones(p.sharded_size, dtype=torch.float32),
+                torch.full(p.sharded_size, 3.0, dtype=expected_dtype),
             )
         )
     finally:
       offload_mod._ORIG_CAST_AND_VIEW_SHARDED_GRADS = orig_hook  # pylint: disable=protected-access
-      del x, y
 
 
 if __name__ == "__main__":

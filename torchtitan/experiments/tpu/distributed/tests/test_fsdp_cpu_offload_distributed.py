@@ -29,6 +29,7 @@ from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (
     materialize_host_grads,
     reset_cpu_offload_stats,
     uninstall_tpu_fsdp_cpu_offload,
+    verify_tpu_fsdp_cpu_offload_no_pin_memory,
     wire_trainer_cpu_offload,
 )
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
@@ -69,6 +70,10 @@ def _init_dual_backend_pg(
   if dist.is_initialized():
     return
   os.environ.setdefault("TEST_TARGET", "1")
+  # Match dist_utils.init_distributed / init_single_rank_process_group setup;
+  # disabling multithreaded autograd is required for FSDP2 hooks on torch_tpu.
+  dist_utils.enable_fp32_matmul_emulation_with_bf16x9()
+  torch.autograd.set_multithreading_enabled(False)
   if device.type == "tpu":
     backend = "tpu:tpu_dist,cpu:gloo"
   elif device.type == "cuda":
@@ -78,11 +83,102 @@ def _init_dual_backend_pg(
   dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
 
+def _compute_cpu_math_reference(
+    init_state: dict[str, torch.Tensor],
+    world_size: int,
+    num_steps: int,
+    grad_accum: int,
+    lr: float,
+    eps: float,
+) -> list[dict[str, Any]]:
+  """Exact unsharded bf16-compute / fp32-master+reduce multi-rank reference."""
+  rank_mbs: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
+  for r in range(world_size):
+    gen = torch.Generator().manual_seed(5000 + r * 37)
+    rank_mbs.append(
+        [
+            (
+                torch.randn(8, 64, dtype=torch.bfloat16, generator=gen),
+                torch.randn(8, 64, dtype=torch.float32, generator=gen),
+            )
+            for _ in range(grad_accum)
+        ]
+    )
+
+  master_model = _DistributedOffloadNet(world_size=world_size).float()
+  master_model.load_state_dict(init_state)
+  opt = torch.optim.AdamW(master_model.parameters(), lr=lr, eps=eps)
+  bf16_model = _DistributedOffloadNet(world_size=world_size).bfloat16()
+
+  records: list[dict[str, Any]] = []
+  for _ in range(num_steps):
+    opt.zero_grad(set_to_none=True)
+    with torch.no_grad():
+      for (_, mp_p), (_, bp_p) in zip(
+          master_model.named_parameters(), bf16_model.named_parameters()
+      ):
+        bp_p.copy_(mp_p.to(torch.bfloat16))
+
+    accum_grads = {
+        k: torch.zeros_like(p, dtype=torch.float32)
+        for k, p in master_model.named_parameters()
+    }
+    mb_losses_by_rank: list[list[torch.Tensor]] = [
+        [] for _ in range(world_size)
+    ]
+
+    for mb_idx in range(grad_accum):
+      for r in range(world_size):
+        bf16_model.zero_grad(set_to_none=True)
+        x_r, tgt_r = rank_mbs[r][mb_idx]
+        pred_r = bf16_model(x_r)
+        loss_r = (
+            torch.nn.functional.mse_loss(pred_r.float(), tgt_r) / grad_accum
+        )
+        mb_losses_by_rank[r].append(loss_r.detach().clone())
+        loss_r.backward()
+        for k, bp_p in bf16_model.named_parameters():
+          assert bp_p.grad is not None
+          accum_grads[k].add_(bp_p.grad.float() / world_size)
+
+    for k, mp_p in master_model.named_parameters():
+      mp_p.grad = accum_grads[k].clone()
+
+    full_grads = {k: v.clone() for k, v in accum_grads.items()}
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        master_model.parameters(), max_norm=1.0, foreach=True
+    )
+    opt.step()
+    full_params = {
+        k: p.detach().clone() for k, p in master_model.named_parameters()
+    }
+    records.append(
+        {
+            "mb_losses_by_rank": mb_losses_by_rank,
+            "grad_norm": total_norm.detach().clone(),
+            "full_grads": full_grads,
+            "full_params": full_params,
+        }
+    )
+  return records
+
+
+def _local_chunk_for_rank(
+    full_tensor: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+  chunks = torch.chunk(full_tensor, world_size, dim=0)
+  return chunks[rank] if rank < len(chunks) else full_tensor[:0]
+
+
 def _run_distributed_fsdp_cpu_offload_parity(
     device: torch.device,
     rank: int,
     world_size: int,
 ) -> None:
+  # Cap per-rank OpenMP threads so 8 spawned workers do not oversubscribe host CPUs.
+  torch.set_num_threads(4)
   _init_dual_backend_pg(device, rank, world_size)
   mesh = DeviceMesh(device.type, list(range(world_size)))
 
@@ -93,8 +189,11 @@ def _run_distributed_fsdp_cpu_offload_parity(
 
   num_steps = 10
   grad_accum = 2
-  # Per-rank deterministic microbatches repeated across steps to verify both
-  # multi-rank reduce-scatter parity and monotone multi-step convergence.
+  # Use lr=5e-2 (25x larger than atol=2e-3) so any missed parameter update or
+  # stale cached shard across steps diverges immediately by >> atol, while
+  # eps=1e-2 avoids near-zero coordinate sign flips from 1-ulp bf16 fusion.
+  lr = 5e-2
+  eps = 1e-2
   gen = torch.Generator().manual_seed(5000 + rank * 37)
   microbatches = [
       (
@@ -104,11 +203,16 @@ def _run_distributed_fsdp_cpu_offload_parity(
       for _ in range(grad_accum)
   ]
 
-  def _sync() -> None:
-    if device.type != "cpu" and torch.accelerator.is_available():
-      torch.accelerator.synchronize()
+  cpu_math_records = _compute_cpu_math_reference(
+      init_state=init_state,
+      world_size=world_size,
+      num_steps=num_steps,
+      grad_accum=grad_accum,
+      lr=lr,
+      eps=eps,
+  )
 
-  def _shard_model(*, nested_layers: bool = True) -> _DistributedOffloadNet:
+  def _shard_model() -> _DistributedOffloadNet:
     model = _DistributedOffloadNet(world_size=world_size)
     model.load_state_dict(init_state)
     mp_policy = MixedPrecisionPolicy(
@@ -116,15 +220,14 @@ def _run_distributed_fsdp_cpu_offload_parity(
         reduce_dtype=torch.float32,
     )
     offload_policy = CPUOffloadPolicy(pin_memory=False)
-    if nested_layers:
-      for layer in model.layers:
-        fully_shard(
-            layer,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=True,
-        )
+    for layer in model.layers:
+      fully_shard(
+          layer,
+          mesh=mesh,
+          mp_policy=mp_policy,
+          offload_policy=offload_policy,
+          reshard_after_forward=True,
+      )
     fully_shard(
         model,
         mesh=mesh,
@@ -134,89 +237,40 @@ def _run_distributed_fsdp_cpu_offload_parity(
     )
     return model
 
-  def _run_synced_single_group_step(*, use_optimized: bool) -> dict[str, Any]:
-    if use_optimized:
-      install_tpu_fsdp_cpu_offload(
-          enable_param_cache=True,
-          enable_device_grad_accum=True,
-      )
-    else:
-      uninstall_tpu_fsdp_cpu_offload()
-    reset_cpu_offload_stats()
-
-    model = _shard_model(nested_layers=False)
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
-    if use_optimized:
-      wire_trainer_cpu_offload(opt)
-
-    opt.zero_grad(set_to_none=True)
-    mb_losses: list[torch.Tensor] = []
-    for x, target in microbatches:
-      pred = model(x)
-      loss = torch.nn.functional.mse_loss(pred.float(), target) / grad_accum
-      mb_losses.append(loss.detach().cpu())
-      _sync()
-      loss.backward()
-      _sync()
-
-    if use_optimized:
-      materialize_host_grads()
-    grads = {
-        k: p.grad.to_local().detach().cpu().clone()
-        for k, p in model.named_parameters()
-        if p.grad is not None
-    }
-    grad_norm = dist_utils.clip_grad_norm_(
-        model.parameters(),
-        max_norm=1.0,
-        foreach=True,
-    )
-    norm_cpu = grad_norm.detach().cpu().clone()
-    opt.step()
-    params = {
-        k: p.to_local().detach().cpu().clone()
-        for k, p in model.named_parameters()
-    }
-    return {
-        "mb_losses": mb_losses,
-        "grads": grads,
-        "grad_norm": norm_cpu,
-        "params": params,
-    }
-
   def _run(
-      *, use_optimized: bool
-  ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
-    if use_optimized:
+      *,
+      installed: bool,
+      enable_param_cache: bool = False,
+      enable_device_grad_accum: bool = False,
+  ) -> list[dict[str, Any]]:
+    if installed:
       install_tpu_fsdp_cpu_offload(
-          enable_param_cache=True,
-          enable_device_grad_accum=True,
+          enable_param_cache=enable_param_cache,
+          enable_device_grad_accum=enable_device_grad_accum,
       )
     else:
       uninstall_tpu_fsdp_cpu_offload()
     reset_cpu_offload_stats()
 
-    model = _shard_model(nested_layers=True)
+    model = _shard_model()
+    verify_tpu_fsdp_cpu_offload_no_pin_memory([model])
     for p in model.parameters():
       assert p.to_local().device.type == "cpu"
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
-    if use_optimized:
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, eps=eps)
+    if installed:
       wire_trainer_cpu_offload(opt)
 
-    first_fwd_loss: torch.Tensor | None = None
     records: list[dict[str, Any]] = []
-    for step_idx in range(num_steps):
+    for _ in range(num_steps):
       opt.zero_grad(set_to_none=True)
       mb_losses: list[torch.Tensor] = []
-      for mb_idx, (x, target) in enumerate(microbatches):
+      for x, target in microbatches:
         pred = model(x)
         loss = torch.nn.functional.mse_loss(pred.float(), target) / grad_accum
-        if step_idx == 0 and mb_idx == 0:
-          first_fwd_loss = loss.detach().cpu()
         loss.backward()
         mb_losses.append(loss.detach().cpu())
 
-      if use_optimized:
+      if installed:
         materialize_host_grads()
       grads = {
           k: p.grad.to_local().detach().cpu().clone()
@@ -242,106 +296,173 @@ def _run_distributed_fsdp_cpu_offload_parity(
               "params": params,
           }
       )
-    assert first_fwd_loss is not None
-    return first_fwd_loss, records
+    if device.type != "cpu" and torch.accelerator.is_available():
+      torch.accelerator.synchronize()
+    return records
 
   try:
-    # 1) Single-group synchronized step: bit-for-bit exact across all ranks
-    # (including uneven dim-0 shards) on both CPU and TPU.
-    sync_ref = _run_synced_single_group_step(use_optimized=False)
-    dist.barrier()
-    sync_opt = _run_synced_single_group_step(use_optimized=True)
-    for mb in range(grad_accum):
-      assert torch.equal(
-          sync_opt["mb_losses"][mb], sync_ref["mb_losses"][mb]
-      ), f"Rank {rank} synced mb {mb} loss mismatch"
-    assert torch.equal(
-        sync_opt["grad_norm"], sync_ref["grad_norm"]
-    ), f"Rank {rank} synced grad_norm mismatch"
-    for name in sync_ref["grads"]:
-      assert torch.equal(
-          sync_opt["grads"][name], sync_ref["grads"][name]
-      ), f"Rank {rank} synced grad mismatch on {name}"
-    for name in sync_ref["params"]:
-      assert torch.equal(
-          sync_opt["params"][name], sync_ref["params"][name]
-      ), f"Rank {rank} synced param mismatch on {name}"
+    # Stock unpatched FSDP2 uses `non_blocking=True` H2D on `all_gather_copy_in_stream`,
+    # which races on multi-rank `torch_tpu`; run `installed=False` on CPU/Gloo to
+    # assert bitwise identity against stock PyTorch, while on TPU compare both
+    # default (`enable_param_cache=False, enable_device_grad_accum=False`) and
+    # full opt-in (`True, True`) modes against `_compute_cpu_math_reference` and
+    # against each other.
+    ref_records: list[dict[str, Any]] | None = None
+    if device.type == "cpu":
+      ref_records = _run(installed=False)
+      dist.barrier()
+
+    # Default opt-in-off mode (TPUCPUOffloadPolicy + non_blocking=False H2D, cache & accum off).
+    default_records = _run(
+        installed=True,
+        enable_param_cache=False,
+        enable_device_grad_accum=False,
+    )
+    default_stats = get_cpu_offload_stats()
+    assert default_stats.param_cache_misses == 0
+    assert default_stats.param_cache_hits == 0
+    assert default_stats.d2h_sync_calls == 0
     dist.barrier()
 
-    # 2) Full multi-step nested FSDP2 training loop with gradient accumulation.
-    ref_fwd0, ref_records = _run(use_optimized=False)
-    dist.barrier()
-    opt_fwd0, opt_records = _run(use_optimized=True)
+    # Full opt-in mode (both device param cache and device grad accum enabled).
+    opt_records = _run(
+        installed=True,
+        enable_param_cache=True,
+        enable_device_grad_accum=True,
+    )
     stats = get_cpu_offload_stats()
 
-    if device.type == "cpu":
-      assert torch.equal(
-          opt_fwd0, ref_fwd0
-      ), f"Rank {rank} step 0 mb 0 pre-backward forward loss mismatch"
-    else:
-      # Holding cached bf16 shards alive across nested multi-rank FSDP2
-      # all_gather_copy_in marks them as live LazyTensor outputs in XLA,
-      # shifting HLO fusion boundaries slightly on nested forward.
-      torch.testing.assert_close(
-          opt_fwd0,
-          ref_fwd0,
-          rtol=2e-3,
-          atol=2e-3,
-      )
     assert stats.param_cache_misses == num_params * num_steps, (
         f"Rank {rank}: expected {num_params * num_steps} misses, got"
         f" {stats.param_cache_misses}"
     )
-    assert stats.param_cache_hits > 0
+    assert stats.param_cache_hits >= num_params * num_steps * (
+        2 * grad_accum - 1
+    )
     assert stats.d2h_sync_calls == num_steps
+
+    init_local_chunks = {
+        k: _local_chunk_for_rank(v, rank, world_size)
+        for k, v in init_state.items()
+    }
+    step0_max_delta = max(
+        float(
+            (opt_records[0]["params"][k] - init_local_chunks[k])
+            .abs()
+            .max()
+            .item()
+        )
+        for k in opt_records[0]["params"]
+        if opt_records[0]["params"][k].numel() > 0
+    )
+    assert step0_max_delta > 1e-2, (
+        f"Rank {rank}: step-0 param update {step0_max_delta} too small to"
+        " separate from tolerance"
+    )
 
     step_losses: list[float] = []
     for step in range(num_steps):
-      ref_r = ref_records[step]
+      def_r = default_records[step]
       opt_r = opt_records[step]
+      cpu_r = cpu_math_records[step]
       if device.type == "cpu":
+        assert ref_records is not None
+        ref_r = ref_records[step]
         for mb in range(grad_accum):
+          assert torch.equal(
+              def_r["mb_losses"][mb], ref_r["mb_losses"][mb]
+          ), f"Rank {rank} default step {step} mb {mb} loss mismatch"
           assert torch.equal(
               opt_r["mb_losses"][mb], ref_r["mb_losses"][mb]
           ), f"Rank {rank} step {step} mb {mb} loss mismatch"
+          torch.testing.assert_close(
+              opt_r["mb_losses"][mb],
+              cpu_r["mb_losses_by_rank"][rank][mb],
+              rtol=2e-3,
+              atol=2e-3,
+          )
+        assert torch.equal(
+            def_r["grad_norm"], ref_r["grad_norm"]
+        ), f"Rank {rank} default step {step} grad_norm mismatch"
         assert torch.equal(
             opt_r["grad_norm"], ref_r["grad_norm"]
         ), f"Rank {rank} step {step} grad_norm mismatch"
+        torch.testing.assert_close(
+            opt_r["grad_norm"], cpu_r["grad_norm"], rtol=2e-3, atol=2e-3
+        )
         for name in ref_r["grads"]:
+          assert torch.equal(
+              def_r["grads"][name], ref_r["grads"][name]
+          ), f"Rank {rank} default step {step} grad mismatch on {name}"
           assert torch.equal(
               opt_r["grads"][name], ref_r["grads"][name]
           ), f"Rank {rank} step {step} grad mismatch on {name}"
         for name in ref_r["params"]:
           assert torch.equal(
+              def_r["params"][name], ref_r["params"][name]
+          ), f"Rank {rank} default step {step} param mismatch on {name}"
+          assert torch.equal(
               opt_r["params"][name], ref_r["params"][name]
           ), f"Rank {rank} step {step} param mismatch on {name}"
       else:
+        for candidate_r in (def_r, opt_r):
+          for mb in range(grad_accum):
+            torch.testing.assert_close(
+                candidate_r["mb_losses"][mb],
+                cpu_r["mb_losses_by_rank"][rank][mb],
+                rtol=2e-3,
+                atol=2e-3,
+            )
+          torch.testing.assert_close(
+              candidate_r["grad_norm"],
+              cpu_r["grad_norm"],
+              rtol=2e-3,
+              atol=2e-3,
+          )
+          for name in def_r["grads"]:
+            torch.testing.assert_close(
+                candidate_r["grads"][name],
+                _local_chunk_for_rank(
+                    cpu_r["full_grads"][name], rank, world_size
+                ),
+                rtol=2e-3,
+                atol=2e-3,
+            )
+          for name in def_r["params"]:
+            torch.testing.assert_close(
+                candidate_r["params"][name],
+                _local_chunk_for_rank(
+                    cpu_r["full_params"][name], rank, world_size
+                ),
+                rtol=2e-3,
+                atol=2e-3,
+            )
         for mb in range(grad_accum):
           torch.testing.assert_close(
               opt_r["mb_losses"][mb],
-              ref_r["mb_losses"][mb],
+              def_r["mb_losses"][mb],
               rtol=2e-3,
               atol=2e-3,
           )
         torch.testing.assert_close(
             opt_r["grad_norm"],
-            ref_r["grad_norm"],
-            rtol=5e-3,
-            atol=5e-3,
+            def_r["grad_norm"],
+            rtol=2e-3,
+            atol=2e-3,
         )
-        for name in ref_r["grads"]:
+        for name in def_r["grads"]:
           torch.testing.assert_close(
               opt_r["grads"][name],
-              ref_r["grads"][name],
-              rtol=5e-3,
-              atol=5e-3,
+              def_r["grads"][name],
+              rtol=2e-3,
+              atol=2e-3,
           )
-        for name in ref_r["params"]:
+        for name in def_r["params"]:
           torch.testing.assert_close(
               opt_r["params"][name],
-              ref_r["params"][name],
-              rtol=5e-3,
-              atol=5e-3,
+              def_r["params"][name],
+              rtol=2e-3,
+              atol=2e-3,
           )
 
       step_loss = sum(float(t.item()) for t in opt_r["mb_losses"])

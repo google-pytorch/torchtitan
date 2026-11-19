@@ -12,40 +12,51 @@ incompatibilities on TPU:
 1. ``CPUOffloadPolicy()`` defaults to ``pin_memory=True``, which fails without a
    CUDA/host-pinned allocator and can deadlock non-blocking transfers against
    compiled activation-checkpointed blocks on ``torch_tpu`` (see ``b/499075866``).
-   :class:`TPUCPUOffloadPolicy` defaults ``pin_memory=False``.
+   In addition, stock ``FSDPParam.all_gather_inputs`` issues
+   ``sharded_param_data.to(device, non_blocking=True)`` on
+   ``all_gather_copy_in_stream``, which is not ordered by
+   ``all_gather_stream.wait_stream(...)`` on multi-rank ``torch_tpu`` and can
+   read uninitialized HBM (`Inf`/`NaN`). :class:`TPUCPUOffloadPolicy` defaults
+   ``pin_memory=False``, and ``_patched_all_gather_inputs`` performs synchronous
+   ``non_blocking=False`` host-to-device staging regardless of whether shard
+   caching is enabled.
 2. ``FSDPParam.all_gather_inputs`` copies each FSDP unit's fp32 master shard
    from CPU to device and casts it to ``param_dtype`` on *every* microbatch
    forward and post-reshard backward unshard, even though master weights only
-   change on ``optimizer.step()``. Caching the cast device shard per
-   ``FSDPParam`` (invalidated on ``optimizer.step()``, checkpoint load, and
-   ``reset_sharded_param()``) reduces H2D shard transfers to once per step.
-3. ``foreach_reduce`` copies each parameter's reduce-scattered fp32 gradient
-   synchronously from device to CPU on *every* microbatch. Accumulating the
-   cast/viewed sharded gradients in fp32 on device across microbatches and
-   copying once per optimizer step into persistent pageable host buffers removes
-   per-microbatch D2H stalls while preserving IEEE-754 addition order
-   (``max_abs == 0.0`` bit-identical parity with stock FSDP2 CPU offload).
+   change on ``optimizer.step()``. Opting into
+   ``tpu_config.enable_cpu_offload_param_cache`` caches the cast device shard per
+   ``FSDPParam`` (invalidated on ``optimizer.step()``, ``optimizer.zero_grad()``,
+   checkpoint load, and ``reset_sharded_param()``), reducing H2D shard transfers
+   to once per step at persistent HBM cost
+   ``~sharded_param_numel * sizeof(param_dtype)``.
+3. ``foreach_reduce`` copies each parameter's reduce-scattered gradient
+   synchronously from device to CPU on *every* microbatch. Opting into
+   ``tpu_config.enable_cpu_offload_device_grad_accum`` accumulates the
+   cast/viewed sharded gradients on device across microbatches and copies once
+   per optimizer step into persistent pageable host buffers, removing
+   per-microbatch D2H stalls at persistent HBM cost
+   ``~sharded_param_numel * sizeof(reduce_dtype)``.
 4. Under ``torchrun`` (which sets ``OMP_NUM_THREADS=1`` when unset), host-side
    ``clip_grad_norm_`` and ``AdamW.step()`` run single-threaded over offloaded
-   master weights unless ``torch.set_num_threads`` is configured.
+   master weights unless ``torch.set_num_threads`` is configured via
+   ``tpu_config.cpu_offload_num_threads``.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 import dataclasses
 import functools
 import sys
-import threading
 from typing import Any
 import weakref
 
 import torch
+from torch import nn
+from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.fsdp import CPUOffloadPolicy
 from torch.distributed.fsdp._fully_shard import _fsdp_collectives as fsdp_collectives
-from torch.distributed.fsdp._fully_shard import _fsdp_param_group as fsdp_param_group
 from torch.distributed.fsdp._fully_shard._fsdp_param import (
     FSDPParam,
     ShardedState,
-    _to_dtype_if_needed,
 )
 
 from torchtitan.tools import utils as tool_utils
@@ -70,7 +81,7 @@ class FSDPCPUOffloadStats:
 
 @dataclasses.dataclass
 class _ParamViewSpec:
-  """Metadata locating one parameter's sharded gradient inside a flat run."""
+  """Metadata locating one parameter's sharded gradient inside a flat buffer."""
 
   fsdp_param: Any
   rel_offset: int
@@ -79,21 +90,27 @@ class _ParamViewSpec:
 
 
 @dataclasses.dataclass
-class _DeviceGradRun:
-  """Contiguous 1D device buffer accumulating sharded gradients for a run."""
+class _FlatGradAccum:
+  """Contiguous 1D device buffer accumulating uniform unpadded sharded grads."""
 
   flat_accum: torch.Tensor
   specs: list[_ParamViewSpec]
 
 
+@dataclasses.dataclass
+class _PerParamGradAccum:
+  """Per-parameter device buffers accumulated via ``torch._foreach_add_``."""
+
+  fsdp_params: list[Any]
+  grad_accums: list[torch.Tensor]
+
+
+_GradAccumState = _FlatGradAccum | _PerParamGradAccum
+
 _ORIG_CPU_OFFLOAD_POLICIES: dict[str, Any] = {}
 _ORIG_ALL_GATHER_INPUTS: property | None = None
 _ORIG_RESET_SHARDED_PARAM: Callable[..., Any] | None = None
 _ORIG_CAST_AND_VIEW_SHARDED_GRADS: Callable[..., Any] | None = None
-_ORIG_FOREACH_REDUCE_COLLECTIVES: Callable[..., Any] | None = None
-_ORIG_FOREACH_REDUCE_PARAM_GROUP: Callable[..., Any] | None = None
-_ORIG_COLLECTIVES_TO_DTYPE: Callable[..., Any] | None = None
-_LEGACY_REDUCE_TLS = threading.local()
 
 _POLICY_PATCH_MODULES: tuple[str, ...] = (
     "torchtitan.distributed.fsdp",
@@ -106,7 +123,7 @@ _PARAM_CACHE_ENABLED: bool = False
 _DEVICE_GRAD_ACCUM_ENABLED: bool = False
 _PARAM_CACHE_VERSION: int = 0
 _CACHED_FSDP_PARAMS: weakref.WeakSet[Any] = weakref.WeakSet()
-_ACTIVE_GROUP_GRADS: dict[tuple[int, ...], list[_DeviceGradRun]] = {}
+_ACTIVE_GROUP_GRADS: dict[tuple[int, ...], _GradAccumState] = {}
 _STATS = FSDPCPUOffloadStats()
 
 
@@ -155,6 +172,33 @@ def uninstall_tpu_cpu_offload_policy() -> None:
   _ORIG_CPU_OFFLOAD_POLICIES.clear()
 
 
+def verify_tpu_fsdp_cpu_offload_no_pin_memory(
+    model_parts: Iterable[nn.Module],
+) -> None:
+  """Raises ``RuntimeError`` if any offloaded ``FSDPParam`` has ``pin_memory=True``.
+
+  Guards against parallelize modules that import PyTorch's ``CPUOffloadPolicy``
+  directly without going through ``TPUCPUOffloadPolicy(pin_memory=False)``.
+  """
+  for part in model_parts:
+    for mod in part.modules():
+      if not isinstance(mod, FSDPModule):
+        continue
+      fsdp_state = mod._get_fsdp_state()  # pylint: disable=protected-access
+      param_group = getattr(fsdp_state, "_fsdp_param_group", None)
+      if param_group is None:
+        continue
+      for fsdp_param in param_group.fsdp_params:
+        if fsdp_param.offload_to_cpu and fsdp_param.pin_memory:
+          fqn = getattr(fsdp_param, "_param_fqn", "<unknown>")
+          raise RuntimeError(
+              f"FSDPParam {fqn!r} on {type(mod).__name__} was initialized with"
+              " CPUOffloadPolicy(pin_memory=True) on TPU, which is unsupported"
+              " (b/499075866). Use TPUCPUOffloadPolicy(pin_memory=False) or"
+              " configure_tpu_fsdp_cpu_offload_from_job_config()."
+          )
+
+
 def invalidate_param_cache() -> None:
   """Invalidates and frees all cached device-resident parameter shards."""
   global _PARAM_CACHE_VERSION
@@ -169,17 +213,40 @@ def clear_device_grads() -> None:
   _ACTIVE_GROUP_GRADS.clear()
 
 
+def _copy_and_cast_offloaded_shard(self: FSDPParam) -> list[torch.Tensor]:
+  """Stages ``_sharded_param_data`` to ``self.device`` with ``non_blocking=False``.
+
+  Stock ``FSDPParam.all_gather_inputs`` uses ``non_blocking=True`` inside
+  ``foreach_all_gather``'s ``all_gather_copy_in_stream``. On multi-rank
+  ``torch_tpu``, ``all_gather_stream.wait_stream(all_gather_copy_in_stream)``
+  does not synchronize async host-to-device DMA from pageable host memory,
+  corrupting unsharded weights with ``Inf``/``NaN``. Synchronous H2D staging
+  avoids that cross-stream race in both default and shard-cached modes.
+  """
+  sharded_param_data = self._sharded_param_data.to(  # pylint: disable=protected-access
+      self.device, non_blocking=False
+  )
+  if (
+      self.param_dtype is not None
+      and sharded_param_data.dtype != self.param_dtype
+  ):
+    sharded_param_data = sharded_param_data.to(dtype=self.param_dtype)
+  return [sharded_param_data]
+
+
 def _patched_all_gather_inputs(self: FSDPParam) -> list[torch.Tensor]:
   assert _ORIG_ALL_GATHER_INPUTS is not None
   orig_fget = _ORIG_ALL_GATHER_INPUTS.fget
   assert orig_fget is not None
   if (
-      not _PARAM_CACHE_ENABLED
-      or not self.offload_to_cpu
+      not self.offload_to_cpu
       or self.sharded_state != ShardedState.SHARDED
       or hasattr(self._sharded_local_tensor, "fsdp_pre_all_gather")  # pylint: disable=protected-access
   ):
     return orig_fget(self)
+
+  if not _PARAM_CACHE_ENABLED:
+    return _copy_and_cast_offloaded_shard(self)
 
   cached_entry: tuple[int, list[torch.Tensor]] | None = getattr(
       self, "_tpu_offload_param_cache", None
@@ -194,15 +261,15 @@ def _patched_all_gather_inputs(self: FSDPParam) -> list[torch.Tensor]:
       _STATS.param_cache_hits += 1
       return list(cached_inputs)
 
-  orig_inputs = orig_fget(self)
+  ag_inputs = _copy_and_cast_offloaded_shard(self)
   setattr(
       self,
       "_tpu_offload_param_cache",
-      (_PARAM_CACHE_VERSION, list(orig_inputs)),
+      (_PARAM_CACHE_VERSION, list(ag_inputs)),
   )
   _CACHED_FSDP_PARAMS.add(self)
   _STATS.param_cache_misses += 1
-  return list(orig_inputs)
+  return list(ag_inputs)
 
 
 def _patched_reset_sharded_param(self: FSDPParam) -> None:
@@ -211,26 +278,66 @@ def _patched_reset_sharded_param(self: FSDPParam) -> None:
   _ORIG_RESET_SHARDED_PARAM(self)
 
 
-def _pack_sharded_grads_into_runs(
+def _is_device_grad_accum_eligible(fsdp_params: list[FSDPParam]) -> bool:
+  return bool(
+      _DEVICE_GRAD_ACCUM_ENABLED
+      and fsdp_params
+      and all(p.offload_to_cpu for p in fsdp_params)
+      and not any(
+          getattr(p.sharded_param, "_post_accumulate_grad_hooks", None)
+          for p in fsdp_params
+      )
+  )
+
+
+def _foreach_add_by_dtype(
+    accums: list[torch.Tensor],
+    grads: list[torch.Tensor],
+) -> None:
+  """Accumulates ``grads`` into ``accums`` in-place without ``torch.cat``."""
+  buckets: dict[torch.dtype, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+  for acc, grad in zip(accums, grads):
+    bucket = buckets.get(acc.dtype)
+    if bucket is None:
+      bucket = ([], [])
+      buckets[acc.dtype] = bucket
+    bucket[0].append(acc)
+    bucket[1].append(grad)
+  for bucket_accums, bucket_grads in buckets.values():
+    torch._foreach_add_(bucket_accums, bucket_grads)
+
+
+def _accumulate_sharded_grads_on_device(
     reduce_output: torch.Tensor,
     fsdp_params: list[FSDPParam],
     sharded_grads: list[torch.Tensor],
-) -> list[tuple[torch.Tensor, list[_ParamViewSpec]]]:
-  """Packs ``sharded_grads`` into contiguous 1D device buffers grouped by dtype."""
+) -> None:
   if not fsdp_params:
-    return []
+    return
 
+  group_key = tuple(id(p) for p in fsdp_params)
   first_dtype = sharded_grads[0].dtype
   total_grad_numel = sum(g.numel() for g in sharded_grads)
   can_view_reduce_output_directly = (
-      total_grad_numel == reduce_output.numel()
+      reduce_output.dtype == first_dtype
+      and total_grad_numel == reduce_output.numel()
       and all(g.dtype == first_dtype for g in sharded_grads)
       and not any(
           getattr(p, "needs_nonzero_dim_padding", False) for p in fsdp_params
       )
   )
+
+  existing = _ACTIVE_GROUP_GRADS.get(group_key)
   if can_view_reduce_output_directly:
-    flat_view = _to_dtype_if_needed(reduce_output, first_dtype).reshape(-1)
+    flat_view = reduce_output.reshape(-1)
+    if isinstance(existing, _FlatGradAccum) and (
+        existing.flat_accum.numel() == flat_view.numel()
+        and existing.flat_accum.dtype == flat_view.dtype
+    ):
+      existing.flat_accum.add_(flat_view)
+      return
+    if existing is not None:
+      materialize_host_grads()
     specs: list[_ParamViewSpec] = []
     offset = 0
     for fsdp_param, grad in zip(fsdp_params, sharded_grads):
@@ -244,79 +351,28 @@ def _pack_sharded_grads_into_runs(
           )
       )
       offset += numel
-    return [(flat_view, specs)]
-
-  runs: list[tuple[torch.Tensor, list[_ParamViewSpec]]] = []
-  idx = 0
-  num_params = len(fsdp_params)
-  while idx < num_params:
-    dtype = sharded_grads[idx].dtype
-    run_flat_grads: list[torch.Tensor] = []
-    specs = []
-    offset = 0
-    while idx < num_params and sharded_grads[idx].dtype == dtype:
-      grad = sharded_grads[idx]
-      numel = grad.numel()
-      run_flat_grads.append(grad.contiguous().reshape(-1))
-      specs.append(
-          _ParamViewSpec(
-              fsdp_param=fsdp_params[idx],
-              rel_offset=offset,
-              numel=numel,
-              shape=grad.shape,
-          )
-      )
-      offset += numel
-      idx += 1
-    flat_grad = (
-        run_flat_grads[0]
-        if len(run_flat_grads) == 1
-        else torch.cat(run_flat_grads, dim=0)
+    _ACTIVE_GROUP_GRADS[group_key] = _FlatGradAccum(
+        flat_accum=flat_view.clone(),
+        specs=specs,
     )
-    runs.append((flat_grad, specs))
-  return runs
+    return
 
-
-def _is_device_grad_accum_eligible(
-    fsdp_params: list[FSDPParam],
-    *,
-    legacy_path: bool = False,
-) -> bool:
-  if not (
-      _DEVICE_GRAD_ACCUM_ENABLED
-      and fsdp_params
-      and all(p.offload_to_cpu for p in fsdp_params)
-      and not any(
-          getattr(p.sharded_param, "_post_accumulate_grad_hooks", None)
-          for p in fsdp_params
+  if isinstance(existing, _PerParamGradAccum) and (
+      len(existing.grad_accums) == len(sharded_grads)
+      and all(
+          a.shape == g.shape and a.dtype == g.dtype
+          for a, g in zip(existing.grad_accums, sharded_grads)
       )
   ):
-    return False
-  if legacy_path and any(
-      getattr(p, "needs_nonzero_dim_padding", False) for p in fsdp_params
-  ):
-    return False
-  return True
+    _foreach_add_by_dtype(existing.grad_accums, sharded_grads)
+    return
 
-
-def _accumulate_runs_on_device(
-    fsdp_params: list[FSDPParam],
-    runs: list[tuple[torch.Tensor, list[_ParamViewSpec]]],
-) -> None:
-  group_key = tuple(id(p) for p in fsdp_params)
-  existing = _ACTIVE_GROUP_GRADS.get(group_key)
-  if existing is None or len(existing) != len(runs):
-    if existing is not None:
-      # Fallback if run layout ever changes mid-step: flush prior runs first.
-      materialize_host_grads()
-    new_runs: list[_DeviceGradRun] = [
-        _DeviceGradRun(flat_accum=flat_view.clone(), specs=specs)
-        for flat_view, specs in runs
-    ]
-    _ACTIVE_GROUP_GRADS[group_key] = new_runs
-  else:
-    for run_state, (flat_view, _specs) in zip(existing, runs):
-      run_state.flat_accum.add_(flat_view)
+  if existing is not None:
+    materialize_host_grads()
+  _ACTIVE_GROUP_GRADS[group_key] = _PerParamGradAccum(
+      fsdp_params=list(fsdp_params),
+      grad_accums=[g.detach().clone() for g in sharded_grads],
+  )
 
 
 def _patched_cast_and_view_sharded_grads(
@@ -334,8 +390,7 @@ def _patched_cast_and_view_sharded_grads(
   sharded_grads = _ORIG_CAST_AND_VIEW_SHARDED_GRADS(
       reduce_output, fsdp_params, *args, **kwargs
   )
-  runs = _pack_sharded_grads_into_runs(reduce_output, fsdp_params, sharded_grads)
-  _accumulate_runs_on_device(fsdp_params, runs)
+  _accumulate_sharded_grads_on_device(reduce_output, fsdp_params, sharded_grads)
 
   # Returning an empty list makes foreach_reduce's non-strict
   # `zip(fsdp_params, sharded_grads)` skip the per-microbatch D2H copy loop
@@ -343,80 +398,10 @@ def _patched_cast_and_view_sharded_grads(
   return []
 
 
-def _patched_foreach_reduce_legacy(
-    fsdp_params: list[FSDPParam],
-    unsharded_grads: list[torch.Tensor],
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
-  """Pure-Python fallback hook for PyTorch < 2.15 lacking _cast_and_view_sharded_grads."""
-  assert _ORIG_FOREACH_REDUCE_COLLECTIVES is not None
-  if not _is_device_grad_accum_eligible(fsdp_params, legacy_path=True):
-    return _ORIG_FOREACH_REDUCE_COLLECTIVES(
-        fsdp_params, unsharded_grads, *args, **kwargs
-    )
-
-  orig_params = list(fsdp_params)
-  mutable_params = list(fsdp_params)
-  padded_sharded_numels = [
-      p._sharded_param_data.numel()  # pylint: disable=protected-access
-      for p in orig_params
-  ]
-  prev_ctx = getattr(_LEGACY_REDUCE_TLS, "ctx", None)
-  _LEGACY_REDUCE_TLS.ctx = (
-      orig_params,
-      mutable_params,
-      unsharded_grads,
-      padded_sharded_numels,
-  )
-  try:
-    return _ORIG_FOREACH_REDUCE_COLLECTIVES(
-        mutable_params, unsharded_grads, *args, **kwargs
-    )
-  finally:
-    _LEGACY_REDUCE_TLS.ctx = prev_ctx
-
-
-def _patched_to_dtype_if_needed_legacy(
-    tensor: torch.Tensor,
-    dtype: torch.dtype | None,
-) -> torch.Tensor:
-  assert _ORIG_COLLECTIVES_TO_DTYPE is not None
-  cast_output = _ORIG_COLLECTIVES_TO_DTYPE(tensor, dtype)
-  ctx = getattr(_LEGACY_REDUCE_TLS, "ctx", None)
-  if ctx is not None:
-    orig_params, mutable_params, unsharded_grads, padded_sharded_numels = ctx
-    total_numel = sum(padded_sharded_numels)
-    if (
-        len(unsharded_grads) == 0
-        and cast_output.ndim == 1
-        and cast_output.numel() == total_numel
-    ):
-      _LEGACY_REDUCE_TLS.ctx = None
-      specs: list[_ParamViewSpec] = []
-      offset = 0
-      for fsdp_param, span in zip(orig_params, padded_sharded_numels):
-        specs.append(
-            _ParamViewSpec(
-                fsdp_param=fsdp_param,
-                rel_offset=offset,
-                numel=fsdp_param.sharded_size.numel(),
-                shape=fsdp_param.sharded_size,
-            )
-        )
-        offset += span
-      flat_view = cast_output.reshape(-1)
-      _accumulate_runs_on_device(orig_params, [(flat_view, specs)])
-      # Clearing mutable_params makes foreach_reduce's subsequent non-strict
-      # `zip(fsdp_params, padded_unsharded_sizes)` skip per-microbatch D2H.
-      mutable_params.clear()
-  return cast_output
-
-
 def _get_or_alloc_host_buffer(
     anchor_param: Any,
-    run_idx: int,
-    numel: int,
+    buf_key: int,
+    shape: torch.Size | tuple[int, ...],
     dtype: torch.dtype,
 ) -> torch.Tensor:
   """Returns a persistent pageable CPU buffer owned by ``anchor_param``."""
@@ -426,11 +411,18 @@ def _get_or_alloc_host_buffer(
   if buf_map is None:
     buf_map = {}
     setattr(anchor_param, "_tpu_offload_host_grad_buffers", buf_map)
-  buf = buf_map.get(run_idx)
-  if buf is None or buf.numel() != numel or buf.dtype != dtype:
-    buf = torch.empty((numel,), dtype=dtype, device="cpu", pin_memory=False)
-    buf_map[run_idx] = buf
+  target_shape = torch.Size(shape)
+  buf = buf_map.get(buf_key)
+  if buf is None or buf.shape != target_shape or buf.dtype != dtype:
+    buf = torch.empty(target_shape, dtype=dtype, device="cpu", pin_memory=False)
+    buf_map[buf_key] = buf
   return buf
+
+
+def _state_uses_accelerator(state: _GradAccumState) -> bool:
+  if isinstance(state, _FlatGradAccum):
+    return state.flat_accum.device.type != "cpu"
+  return any(t.device.type != "cpu" for t in state.grad_accums)
 
 
 def materialize_host_grads() -> None:
@@ -439,27 +431,25 @@ def materialize_host_grads() -> None:
     return
 
   needs_accel_sync = any(
-      run.flat_accum.device.type != "cpu"
-      for runs in _ACTIVE_GROUP_GRADS.values()
-      for run in runs
+      _state_uses_accelerator(state) for state in _ACTIVE_GROUP_GRADS.values()
   )
   if needs_accel_sync and torch.accelerator.is_available():
     torch.accelerator.synchronize()
 
-  for runs in _ACTIVE_GROUP_GRADS.values():
-    for run_idx, run in enumerate(runs):
+  for state in _ACTIVE_GROUP_GRADS.values():
+    if isinstance(state, _FlatGradAccum):
       any_existing_grad = any(
-          spec.fsdp_param.sharded_param.grad is not None for spec in run.specs
+          spec.fsdp_param.sharded_param.grad is not None for spec in state.specs
       )
       if not any_existing_grad:
         host_flat = _get_or_alloc_host_buffer(
-            run.specs[0].fsdp_param,
-            run_idx,
-            run.flat_accum.numel(),
-            run.flat_accum.dtype,
+            state.specs[0].fsdp_param,
+            0,
+            (state.flat_accum.numel(),),
+            state.flat_accum.dtype,
         )
-        host_flat.copy_(run.flat_accum, non_blocking=False)
-        for spec in run.specs:
+        host_flat.copy_(state.flat_accum, non_blocking=False)
+        for spec in state.specs:
           grad_view = host_flat.narrow(
               0, spec.rel_offset, spec.numel
           ).view(spec.shape)
@@ -467,8 +457,8 @@ def materialize_host_grads() -> None:
               spec.fsdp_param.to_sharded_dtensor(grad_view)
           )
       else:
-        cpu_flat = run.flat_accum.to(device="cpu", non_blocking=False)
-        for spec in run.specs:
+        cpu_flat = state.flat_accum.to(device="cpu", non_blocking=False)
+        for spec in state.specs:
           grad_view = cpu_flat.narrow(
               0, spec.rel_offset, spec.numel
           ).view(spec.shape)
@@ -477,6 +467,21 @@ def materialize_host_grads() -> None:
             sharded_param.grad = spec.fsdp_param.to_sharded_dtensor(grad_view)
           else:
             sharded_param.grad._local_tensor.add_(grad_view)  # pylint: disable=protected-access
+    else:
+      for fsdp_param, dev_grad in zip(state.fsdp_params, state.grad_accums):
+        sharded_param = fsdp_param.sharded_param
+        if sharded_param.grad is None:
+          host_buf = _get_or_alloc_host_buffer(
+              fsdp_param,
+              1,
+              dev_grad.shape,
+              dev_grad.dtype,
+          )
+          host_buf.copy_(dev_grad, non_blocking=False)
+          sharded_param.grad = fsdp_param.to_sharded_dtensor(host_buf)
+        else:
+          cpu_grad = dev_grad.to(device="cpu", non_blocking=False)
+          sharded_param.grad._local_tensor.add_(cpu_grad)  # pylint: disable=protected-access
 
   _ACTIVE_GROUP_GRADS.clear()
   _STATS.d2h_sync_calls += 1
@@ -484,16 +489,14 @@ def materialize_host_grads() -> None:
 
 def install_tpu_fsdp_cpu_offload(
     *,
-    enable_param_cache: bool = True,
-    enable_device_grad_accum: bool = True,
+    enable_param_cache: bool = False,
+    enable_device_grad_accum: bool = False,
     cpu_offload_num_threads: int = 0,
     force_policy: bool = True,
 ) -> None:
   """Installs TPU FSDP2 CPU offload policy and runtime hooks (idempotent)."""
   global _ORIG_ALL_GATHER_INPUTS, _ORIG_RESET_SHARDED_PARAM
-  global _ORIG_CAST_AND_VIEW_SHARDED_GRADS
-  global _ORIG_FOREACH_REDUCE_COLLECTIVES, _ORIG_FOREACH_REDUCE_PARAM_GROUP
-  global _ORIG_COLLECTIVES_TO_DTYPE, _RUNTIME_INSTALLED
+  global _ORIG_CAST_AND_VIEW_SHARDED_GRADS, _RUNTIME_INSTALLED
   global _PARAM_CACHE_ENABLED, _DEVICE_GRAD_ACCUM_ENABLED
 
   install_tpu_cpu_offload_policy(force=force_policy)
@@ -529,32 +532,24 @@ def install_tpu_fsdp_cpu_offload(
       fsdp_collectives._cast_and_view_sharded_grads = (  # pylint: disable=protected-access
           _patched_cast_and_view_sharded_grads
       )
-    elif hasattr(fsdp_collectives, "foreach_reduce") and hasattr(
-        fsdp_collectives, "_to_dtype_if_needed"
-    ):
-      _ORIG_FOREACH_REDUCE_COLLECTIVES = fsdp_collectives.foreach_reduce
-      _ORIG_COLLECTIVES_TO_DTYPE = (
-          fsdp_collectives._to_dtype_if_needed  # pylint: disable=protected-access
-      )
-      fsdp_collectives.foreach_reduce = _patched_foreach_reduce_legacy  # type: ignore[assignment]
-      fsdp_collectives._to_dtype_if_needed = (  # pylint: disable=protected-access
-          _patched_to_dtype_if_needed_legacy
-      )
-      if hasattr(fsdp_param_group, "foreach_reduce"):
-        _ORIG_FOREACH_REDUCE_PARAM_GROUP = fsdp_param_group.foreach_reduce
-        fsdp_param_group.foreach_reduce = _patched_foreach_reduce_legacy  # type: ignore[assignment]
     else:
       logger.warning(
-          "Unsupported torch.distributed.fsdp._fully_shard._fsdp_collectives"
-          " layout; leaving per-microbatch D2H gradient offload on stock FSDP2."
+          "torch.distributed.fsdp._fully_shard._fsdp_collectives lacks"
+          " _cast_and_view_sharded_grads; leaving per-microbatch D2H gradient"
+          " offload on stock FSDP2."
       )
       _DEVICE_GRAD_ACCUM_ENABLED = False
 
     _RUNTIME_INSTALLED = True
+  else:
+    if _ORIG_ALL_GATHER_INPUTS is None:
+      _PARAM_CACHE_ENABLED = False
+    if _ORIG_CAST_AND_VIEW_SHARDED_GRADS is None:
+      _DEVICE_GRAD_ACCUM_ENABLED = False
 
-  if not enable_param_cache:
+  if not _PARAM_CACHE_ENABLED:
     invalidate_param_cache()
-  if not enable_device_grad_accum:
+  if not _DEVICE_GRAD_ACCUM_ENABLED:
     clear_device_grads()
 
 
@@ -562,8 +557,6 @@ def uninstall_tpu_fsdp_cpu_offload() -> None:
   """Restores stock PyTorch FSDP2 methods and clears cached state."""
   global _ORIG_ALL_GATHER_INPUTS, _ORIG_RESET_SHARDED_PARAM
   global _ORIG_CAST_AND_VIEW_SHARDED_GRADS
-  global _ORIG_FOREACH_REDUCE_COLLECTIVES, _ORIG_FOREACH_REDUCE_PARAM_GROUP
-  global _ORIG_COLLECTIVES_TO_DTYPE
   global _RUNTIME_INSTALLED, _PARAM_CACHE_ENABLED, _DEVICE_GRAD_ACCUM_ENABLED
 
   clear_device_grads()
@@ -582,17 +575,6 @@ def uninstall_tpu_fsdp_cpu_offload() -> None:
           _ORIG_CAST_AND_VIEW_SHARDED_GRADS
       )
       _ORIG_CAST_AND_VIEW_SHARDED_GRADS = None
-    if _ORIG_FOREACH_REDUCE_COLLECTIVES is not None:
-      fsdp_collectives.foreach_reduce = _ORIG_FOREACH_REDUCE_COLLECTIVES
-      _ORIG_FOREACH_REDUCE_COLLECTIVES = None
-    if _ORIG_FOREACH_REDUCE_PARAM_GROUP is not None:
-      fsdp_param_group.foreach_reduce = _ORIG_FOREACH_REDUCE_PARAM_GROUP
-      _ORIG_FOREACH_REDUCE_PARAM_GROUP = None
-    if _ORIG_COLLECTIVES_TO_DTYPE is not None:
-      fsdp_collectives._to_dtype_if_needed = (  # pylint: disable=protected-access
-          _ORIG_COLLECTIVES_TO_DTYPE
-      )
-      _ORIG_COLLECTIVES_TO_DTYPE = None
     _RUNTIME_INSTALLED = False
 
   _PARAM_CACHE_ENABLED = False
@@ -630,14 +612,14 @@ def configure_tpu_fsdp_cpu_offload_from_job_config(job_config: Any) -> bool:
     return False
 
   enable_param_cache = (
-      getattr(tpu_config, "enable_cpu_offload_param_cache", True)
+      getattr(tpu_config, "enable_cpu_offload_param_cache", False)
       if tpu_config is not None
-      else True
+      else False
   )
   enable_device_grad_accum = (
-      getattr(tpu_config, "enable_cpu_offload_device_grad_accum", True)
+      getattr(tpu_config, "enable_cpu_offload_device_grad_accum", False)
       if tpu_config is not None
-      else True
+      else False
   )
   cpu_offload_num_threads = (
       getattr(tpu_config, "cpu_offload_num_threads", 0)
@@ -659,7 +641,9 @@ def wire_trainer_cpu_offload(
 ) -> None:
   """Idempotently hooks ``optimizers`` and ``checkpointer`` lifecycle methods.
 
-  * ``optimizers.zero_grad`` clears any unmaterialized device gradients.
+  * ``optimizers.zero_grad`` clears any unmaterialized device gradients and
+    defensively invalidates cached parameter shards so stale shards can never
+    persist across steps even if an inner optimizer was stepped directly.
   * ``optimizers.step`` materializes device gradients to CPU beforehand (no-op
     if already materialized by ``_clip_grad_norm``) and invalidates the device
     parameter shard cache afterwards.
@@ -675,6 +659,7 @@ def wire_trainer_cpu_offload(
     @functools.wraps(orig_zero_grad)
     def _wrapped_zero_grad(*args: Any, **kwargs: Any) -> Any:
       clear_device_grads()
+      invalidate_param_cache()
       return orig_zero_grad(*args, **kwargs)
 
     @functools.wraps(orig_step)

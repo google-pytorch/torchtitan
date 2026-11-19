@@ -192,11 +192,19 @@ def qwen38_2_4t_a95b_proxy_tpu7x_pallas_gmm() -> TPUTrainerConfig:
   (dim 8192, hidden 2048) needs 64.9 MB of scoped VMEM, above the 63.9 MB
   that TPU7x accepts (first TPU7x smoke run). The lane's Pallas grouped
   matmul tiles explicitly. The paired variant needs EP=1, so this uses the
-  plain one.
+  plain one. Its default tiles load whole K x N weight panels (tile_k =
+  tile_n = 0), 8192 x 2048 for W1/W3, which needed 108-120 MB of VMEM on
+  TPU7x (second smoke run); 512 x 2048 x 1024 tiles keep every buffer at a
+  few MB. On TPU v6e these tiles match `torch._grouped_mm` at the per-rank
+  shapes (8 experts, empty leading experts included) to a relative error of
+  about 1e-4 in the output and every gradient.
   """
   cfg = qwen38_2_4t_a95b_proxy_tpu7x()
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 512
+    experts.pallas_grouped_mm_tile_k = 2048
+    experts.pallas_grouped_mm_tile_n = 1024
   return cfg
 
 

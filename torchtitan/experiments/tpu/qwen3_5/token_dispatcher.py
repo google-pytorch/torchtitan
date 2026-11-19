@@ -200,6 +200,7 @@ def _ragged_all_to_all_impl(
 
   if (
       ep_mesh is not None
+      and not torch.compiler.is_compiling()
       and get_proxy_mode() is None
       and not isinstance(src, torch._subclasses.FakeTensor)
   ):
@@ -491,9 +492,11 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
       bwd_recv_sizes: torch.Tensor,
       pg,
   ) -> torch.Tensor:
-    return _RaggedAllToAll.apply(
-        operand,
-        output_rows,
+    # The combine sizes reuse the dispatch ones (e.g. comb_recv_sizes is
+    # disp_send_sizes). torch.compile rejects an autograd.Function that gets
+    # the same tensor object twice ("autograd.Function.apply: duplicate tensor
+    # input"), so clone repeats; they are tiny int32 size/offset vectors.
+    size_args = [
         fwd_input_offsets,
         fwd_send_sizes,
         fwd_output_offsets,
@@ -502,6 +505,16 @@ class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
         bwd_send_sizes,
         bwd_output_offsets,
         bwd_recv_sizes,
+    ]
+    seen: set[int] = {id(operand)}
+    for i, t in enumerate(size_args):
+      if id(t) in seen:
+        size_args[i] = t.clone()
+      seen.add(id(size_args[i]))
+    return _RaggedAllToAll.apply(
+        operand,
+        output_rows,
+        *size_args,
         self.ep_mesh,
         pg,
     )
@@ -1007,7 +1020,8 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
           if num_tokens % d == 0
       )
       if (
-          get_proxy_mode() is None
+          not torch.compiler.is_compiling()
+          and get_proxy_mode() is None
           and not isinstance(x_TD, torch._subclasses.FakeTensor)
           and (num_tokens, num_chunks) not in self._warned_chunk_snap
       ):

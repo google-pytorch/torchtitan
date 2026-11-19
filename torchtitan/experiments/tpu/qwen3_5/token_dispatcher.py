@@ -200,6 +200,7 @@ def _ragged_all_to_all_impl(
 
   if (
       ep_mesh is not None
+      and not torch.compiler.is_compiling()
       and get_proxy_mode() is None
       and not isinstance(src, torch._subclasses.FakeTensor)
   ):
@@ -1007,7 +1008,8 @@ class TpuQwen35RoutedExperts(TpuRoutedExperts):
           if num_tokens % d == 0
       )
       if (
-          get_proxy_mode() is None
+          not torch.compiler.is_compiling()
+          and get_proxy_mode() is None
           and not isinstance(x_TD, torch._subclasses.FakeTensor)
           and (num_tokens, num_chunks) not in self._warned_chunk_snap
       ):

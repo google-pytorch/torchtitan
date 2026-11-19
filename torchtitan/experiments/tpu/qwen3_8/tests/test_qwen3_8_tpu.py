@@ -1,12 +1,14 @@
 """Tests for Qwen3.8 (text-only) on CPU and TPU devices.
 
-Covers HuggingFace reference parity (``Qwen3_5MoeForCausalLM``, the architecture
-of the Qwen3.8 checkpoints) through ``Qwen35StateDictAdapter`` at the
-2.4T-A95B head and expert ratios, which the Qwen3.5 tests do not reach:
-8 GatedDeltaNet value heads per key head, 16 query heads per KV head,
-top-10 routing over more experts plus the shared expert, 1/4 partial
-rotary with ``mrope_section`` in the 2.4T's proportions. Forward logits,
-loss and every parameter gradient, with negative controls.
+Covers:
+1. HuggingFace reference parity (``Qwen3_5MoeForCausalLM``, the architecture
+   of the Qwen3.8 checkpoints) through ``Qwen35StateDictAdapter`` at the
+   2.4T-A95B head and expert ratios, which the Qwen3.5 tests do not reach:
+   8 GatedDeltaNet value heads per key head, 16 query heads per KV head,
+   top-10 routing over more experts plus the shared expert, 1/4 partial
+   rotary with ``mrope_section`` in the 2.4T's proportions. Forward logits,
+   loss and every parameter gradient, with negative controls.
+2. ``scaled_down`` and the 2.4T-A95B flavor's shapes and parameter counts.
 """
 
 import copy
@@ -19,11 +21,13 @@ import torch.nn.functional as F
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.qwen3_5 import use_tpu_modules
+import torchtitan.experiments.tpu.qwen3_8 as qwen3_8_tpu
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common import Embedding, Linear
+from torchtitan.models.common.moe import MoE
 # pylint: disable-next=g-bad-import-order
 from torchtitan.models.qwen3_5 import (  # pylint: disable=protected-access
     _build_qwen35_moe_layers,
@@ -338,6 +342,48 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
         grad_rel_bound=6e-2,
     )
     print(f"measured: {measured}")
+
+  def test_scaled_down(self):
+    """`scaled_down` keeps the width and sets every expert count."""
+    spec = qwen3_8_tpu.model_registry(
+        "2.4T-A95B", seq_len=4096, num_layers=4, num_experts=64
+    )
+    model = spec.model
+    self.assertEqual(len(model.layers), 4)
+    self.assertEqual(
+        [layer.attention is not None for layer in model.layers],
+        [False, False, False, True],
+    )
+    self.assertEqual(model.dim, 8192)
+    moes = [moe for _, moe, _, _ in model.traverse(MoE.Config)]
+    self.assertLen(moes, 4)
+    for moe in moes:
+      self.assertEqual(moe.num_experts, 64)
+      self.assertEqual(moe.router.num_experts, 64)
+      self.assertEqual(moe.router.top_k, 10)
+      self.assertEqual(moe.router.gate.out_features, 64)
+      self.assertEqual(moe.routed_experts.inner_experts.num_experts, 64)
+      self.assertEqual(moe.routed_experts.token_dispatcher.num_experts, 64)
+      self.assertEqual(moe.routed_experts.inner_experts.hidden_dim, 2048)
+    with self.assertRaisesRegex(ValueError, "below top_k"):
+      qwen3_8_tpu.model_registry("2.4T-A95B", seq_len=4096, num_experts=8)
+    with self.assertRaisesRegex(ValueError, "num_layers"):
+      qwen3_8_tpu.model_registry("2.4T-A95B", seq_len=4096, num_layers=93)
+
+  def test_2_4t_a95b_flavor(self):
+    """2.4T-A95B shapes and parameter counts, built on the meta device."""
+    spec = qwen3_8_tpu.model_registry("2.4T-A95B", seq_len=4096)
+    self.assertEqual(spec.name, "qwen3_8")
+    config = spec.model
+    self.assertIsNone(config.vision_encoder)
+    self.assertLen(config.layers, 92)
+    self.assertEqual(sum(l.attention is not None for l in config.layers), 23)
+    self.assertEqual(config.vocab_size, 248320)
+    with torch.device("meta"):
+      model = config.build()
+    nparams, _ = config.get_nparams_and_flops(model, 4096)
+    # 26.25B per layer (25.77B routed experts) x 92 + 4.07B embeddings/head.
+    self.assertBetween(nparams, 2.40e12, 2.44e12)
 
 if __name__ == "__main__":
   absltest.main()

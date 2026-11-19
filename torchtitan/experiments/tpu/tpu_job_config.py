@@ -35,6 +35,16 @@ class TPUConfig:
       "DEFER_NEVER",
       "DEFER_NEVER_AND_LAUNCH_BLOCKING",
   ] = ""
+  # FSDP2 CPU offload optimizations (active when training.enable_cpu_offload is
+  # True and parallelism.use_simple_fsdp is False):
+  # - Cache cast device parameter shards across microbatches within a step.
+  # - Accumulate reduce-scattered fp32 gradients on device across microbatches
+  #   and copy to CPU once per optimizer step.
+  # - Optionally size host OpenMP threads (> 0 calls torch.set_num_threads) for
+  #   CPU-side clip_grad_norm_ and AdamW updates.
+  enable_cpu_offload_param_cache: bool = True
+  enable_cpu_offload_device_grad_accum: bool = True
+  cpu_offload_num_threads: int = 0
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]

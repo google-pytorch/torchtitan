@@ -262,13 +262,31 @@ class TrainerMinimal:
           dump_folder=job_config.dump_folder,
       )
 
+    cpu_offload_active = (
+        job_config.training.enable_cpu_offload and self.world_size > 1
+    )
+    init_device: torch.device | str = (
+        "cpu" if cpu_offload_active else self.device
+    )
+    buffer_device: torch.device | None = (
+        self.device if cpu_offload_active else None
+    )
     logger.info(
         f"Moving model {self.model_spec.name}"
-        f" {self.model_spec.flavor} to device {self.device}"
+        f" {self.model_spec.flavor} to device {init_device}"
     )
-    self.model = model.to_empty(device=self.device)
+    self.model = model.to_empty(device=init_device)
     with torch.no_grad():
-      self.model.init_weights()
+      import inspect  # pylint: disable=g-import-not-at-top
+
+      if (
+          buffer_device is not None
+          and "buffer_device"
+          in inspect.signature(self.model.init_weights).parameters
+      ):
+        self.model.init_weights(buffer_device=buffer_device)
+      else:
+        self.model.init_weights()
     from torchtitan.components.loss import ChunkedLossWrapper
     if isinstance(self.loss_fn, ChunkedLossWrapper):
       lm_head = self.model.lm_head
@@ -282,6 +300,12 @@ class TrainerMinimal:
     ), ("TODO b/45811390 - Fused optimizer not supported on TPU."
         "You can disable this by setting --optimizer.implementation=foreach")
     self.optimizers = job_config.optimizer.build(model_parts=[self.model])
+    if cpu_offload_active:
+      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+          wire_trainer_cpu_offload,
+      )
+
+      wire_trainer_cpu_offload(self.optimizers)
 
     # get_spmd_context sets the process-wide SPMD mesh the spmd_types
     # collectives read, so components such as ChunkedLossWrapper support loss

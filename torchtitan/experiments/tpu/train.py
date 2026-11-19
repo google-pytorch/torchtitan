@@ -73,7 +73,23 @@ class TPUTrainer(torchtitan.train.Trainer):
               model_spec.post_optimizer_build_fn
           ),
       )
+    if getattr(getattr(job_config, "training", None), "enable_cpu_offload", False):
+      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+          configure_tpu_fsdp_cpu_offload_from_job_config,
+      )
+
+      configure_tpu_fsdp_cpu_offload_from_job_config(job_config)
+
     super().__init__(job_config)
+
+    if getattr(getattr(self.config, "training", None), "enable_cpu_offload", False):
+      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+          wire_trainer_cpu_offload,
+      )
+
+      wire_trainer_cpu_offload(
+          self.optimizers, getattr(self, "checkpointer", None)
+      )
 
     self._compiled_grad_norm: CompiledGradNorm | None = None
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
@@ -90,6 +106,16 @@ class TPUTrainer(torchtitan.train.Trainer):
         apply_compiled_optimizer(self)
 
   def _clip_grad_norm(self) -> torch.Tensor:
+    if getattr(getattr(self.config, "training", None), "enable_cpu_offload", False):
+      from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+          materialize_host_grads,
+      )
+
+      materialize_host_grads()
+      total_norm = super()._clip_grad_norm()
+      if total_norm.device != self.device:
+        total_norm = total_norm.to(self.device)
+      return total_norm
     if self._compiled_grad_norm is None:
       return super()._clip_grad_norm()
     parameters = [p for m in self.model_parts for p in m.parameters()]

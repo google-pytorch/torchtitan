@@ -424,30 +424,25 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "full_and_scan_offload"):
       self._qwen3_graph_config(config)
 
-  @parameterized.parameters("tpu_selective", "tpu_selective_and_offload")
+  @parameterized.parameters(
+      ("tpu_selective", ("attention.inner_attention",), {}),
+      ("tpu_selective_and_offload", ("attention.inner_attention",), {}),
+      ("tpu_selective_and_offload", (), {"attention.inner_attention": 4}),
+  )
   def test_scanning_passes_save_regions_to_the_scan_body(
-      self, memory_policy: str
+      self, memory_policy: str, save_regions: tuple, last_n_layers: dict
   ) -> None:
     config = qwen3_8b()
     config.compile.use_scan_layers = True
     config.compile.memory_policy = memory_policy
-    config.compile.save_regions = ("attention.inner_attention",)
+    config.compile.save_regions = save_regions
+    config.compile.save_last_n_layers = last_n_layers
 
     with torch.device("meta"):
       model = self._qwen3_graph_config(config).model_spec.model.build()
-    self.assertEqual(model.layers.save_regions, ("attention.inner_attention",))
-
-  def test_scanning_passes_last_n_layers_to_the_scan_body(self) -> None:
-    config = qwen3_8b()
-    config.compile.use_scan_layers = True
-    config.compile.memory_policy = "tpu_selective_and_offload"
-    config.compile.save_last_n_layers = {"attention.inner_attention": 4}
-
-    with torch.device("meta"):
-      model = self._qwen3_graph_config(config).model_spec.model.build()
-    self.assertEqual(model.layers.save_regions, ())
+    self.assertEqual(model.layers.save_regions, save_regions)
     self.assertEqual(
-        model.layers.save_last_n_layers, (("attention.inner_attention", 4),)
+        model.layers.save_last_n_layers, tuple(last_n_layers.items())
     )
 
   @parameterized.parameters(

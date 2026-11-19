@@ -23,7 +23,6 @@ from torchtitan.experiments.tpu.testing import base_distributed_device_test
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
-    LAYER_INPUT,
     REMAT_REGION,
 )
 import torchtitan.experiments.tpu.train
@@ -84,8 +83,11 @@ def _check_offload_engaged(gm):
   offloads = [n for n in fwd_body.nodes if n.target is _OFFLOAD]
   assert len(offloads) == 1, f"{len(offloads)} offloads in the forward body"
   offload_node = offloads[0]
-  tag = (offload_node.args[0].meta.get("custom") or {}).get(REMAT_REGION)
-  assert tag == LAYER_INPUT, f"offloaded a value tagged {tag!r}"
+  saved = offload_node.args[0]
+  carry = fwd_body.find_nodes(op="placeholder")[0]
+  assert saved.target is torch.ops.aten.clone.default and saved.args[0] is carry, (
+      f"offloaded {saved.format_node()}, not the carry's clone"
+  )
   assert _ao_targets(bwd_body).count(_RELOAD) == 1, "expected one reload"
 
   # Around the loop rather than inside it means every row lands on device at

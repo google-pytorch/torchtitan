@@ -2,26 +2,26 @@
 
 `_pair()` builds the graph the joint-graph tracer produces for scanned layers:
 
-    fwd body: (carry, x) -> (out, clone(carry) [layer_input], attn)
+    fwd body: (carry, x) -> (out, clone(carry), attn)
     layer_stack = getitem(fwd_scan, 1)   # [6, 2, 512, 256]
     attn_stack  = getitem(fwd_scan, 2)   # [6, 2, 1024, 256], larger
     bwd_scan(init=[grad], xs=[counter], additional_inputs=[layer_stack, attn_stack])
 
-`RealScanTest` traces a real `scan` instead, to check the tag survives the
-split. The real llama3 case is in test_tpu_host_offload_distributed.py.
+`RealScanTest` traces a real `scan` instead, to check the pass finds the
+saved carry after the split. The real llama3 case is in test_tpu_host_offload_distributed.py.
 """
 
 import operator
 from unittest import mock
 
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 import torch
 from torch._higher_order_ops.scan import scan
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
 from torchtitan.experiments.tpu.components import scan_backward_patch
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
-    scan_body_remat_window,
+    scan_with_remat_policy,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import (
     offload_scan_activations,
@@ -29,7 +29,6 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import (
 from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
     ATTENTION_INNER_ATTENTION,
-    LAYER_INPUT,
     REMAT_REGION,
 )
 
@@ -65,15 +64,15 @@ def _mm(graph, src, shape, **kwargs):
     return _op(graph, torch.ops.aten.mm.default, src, shape, **kwargs)
 
 
-def _fwd_body(tag):
+def _fwd_body(saves_carry):
     g = torch.fx.Graph()
     for name in ("carry", "x"):
         g.placeholder(name).meta["val"] = torch.empty(4, 4)
-    carry = next(iter(g.nodes))
-    saved = g.call_function(torch.ops.aten.clone.default, args=(carry,))
+    carry, x = g.nodes
+    saved = g.call_function(
+        torch.ops.aten.clone.default, args=(carry if saves_carry else x,)
+    )
     saved.meta["val"] = torch.empty(_STACK[1:])
-    if tag:
-        saved.meta["custom"] = {REMAT_REGION: LAYER_INPUT}
     attn = _mm(g, carry, _ATTN[1:], region=ATTENTION_INNER_ATTENTION)
     g.output((_mm(g, carry, (4, 4)), saved, attn))
     return g
@@ -103,7 +102,7 @@ def _bwd_body(reads):
     return g
 
 
-class ScanOffloadTest(absltest.TestCase):
+class ScanOffloadTest(parameterized.TestCase):
 
     def setUp(self):
         super().setUp()
@@ -121,12 +120,12 @@ class ScanOffloadTest(absltest.TestCase):
         self.root.add_module(name, torch.fx.GraphModule(torch.nn.Module(), body))
         return self.graph.get_attr(name)
 
-    def _pair(self, reads="row", tag=True):
+    def _pair(self, reads="row", saves_carry=True):
         g = self.graph
         carry = _mm(g, self.x, (4, 4), name="carry_init")
         xs = _mm(g, self.x, (6, 4, 4), name="xs_in")
         fwd = g.call_function(
-            _SCAN, args=(self._attach(_fwd_body(tag)), [carry], [xs], ())
+            _SCAN, args=(self._attach(_fwd_body(saves_carry)), [carry], [xs], ())
         )
         fwd.meta["autograd_backward"] = False
         stacks = []
@@ -147,11 +146,7 @@ class ScanOffloadTest(absltest.TestCase):
         bwd.meta["autograd_backward"] = True
         return fwd, stacks[0], bwd
 
-    def _assert_untouched(self, gm, fwd, bwd):
-        self.assertEqual(_ao_targets(_body_of(gm, fwd).graph), [])
-        self.assertEqual(_ao_targets(_body_of(gm, bwd).graph), [])
-
-    def test_only_the_tagged_layer_input_goes_to_host(self):
+    def test_only_the_saved_carry_goes_to_host(self):
         fwd, stack, bwd = self._pair()
         self.graph.output(bwd)
 
@@ -161,7 +156,7 @@ class ScanOffloadTest(absltest.TestCase):
         fwd_body = _body_of(gm, fwd).graph
         bwd_body = _body_of(gm, bwd).graph
         self.assertEqual(_ao_targets(gm.graph), [])
-        # One offload, on the tagged clone; the larger attention save stays.
+        # One offload, on the carry's clone; the larger attention save stays.
         (offload,) = [n for n in fwd_body.nodes if n.target is _OFFLOAD]
         self.assertIs(offload.args[0].target, torch.ops.aten.clone.default)
         self.assertEqual(stack.meta["val"].device.type, "cpu")
@@ -184,46 +179,24 @@ class ScanOffloadTest(absltest.TestCase):
         self.assertIn(_OFFLOAD, _ao_targets(_body_of(gm, fwd).graph))
         self.assertIn(_RELOAD, _ao_targets(_body_of(gm, bwd).graph))
 
-    def test_a_live_second_reader_raises(self):
+    @parameterized.named_parameters(
         # It would silently read host memory.
-        fwd, stack, bwd = self._pair()
-        self.graph.output((bwd, _mm(self.graph, stack, _STACK)))
-
-        gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "outside the backward scan"):
-            offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
-
-    def test_the_graph_output_reading_the_stack_raises(self):
+        ("a_live_second_reader", {}, lambda g, s: [_mm(g, s, _STACK)], "outside"),
         # The output node has no users, but it is not a dead reader.
-        fwd, stack, bwd = self._pair()
-        self.graph.output((bwd, stack))
-
-        gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "outside the backward scan"):
-            offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
-
-    def test_a_body_that_reads_the_stack_whole_raises(self):
+        ("the_graph_output", {}, lambda g, s: [s], "outside the backward scan"),
         # Reloading the whole stack every iteration is worse than no offload.
-        fwd, _, bwd = self._pair(reads="whole")
-        self.graph.output(bwd)
+        ("a_whole_stack_read", {"reads": "whole"}, lambda g, s: [], "whole"),
+        ("no_saved_carry", {"saves_carry": False}, lambda g, s: [], "none saves"),
+    )
+    def test_raises_and_leaves_the_bodies_untouched(self, pair, outputs, error):
+        fwd, stack, bwd = self._pair(**pair)
+        self.graph.output((bwd, *outputs(self.graph, stack)))
 
         gm = self._gm()
-        with self.assertRaisesRegex(RuntimeError, "whole"):
+        with self.assertRaisesRegex(RuntimeError, error):
             offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
-
-    def test_an_untagged_save_raises_rather_than_guessing(self):
-        fwd, _, bwd = self._pair(tag=False)
-        self.graph.output(bwd)
-
-        gm = self._gm()
-        with self.assertRaisesRegex(
-            RuntimeError, "1 forward scans, none saves a tagged layer_input"
-        ):
-            offload_scan_activations(gm)
-        self._assert_untouched(gm, fwd, bwd)
+        self.assertEqual(_ao_targets(_body_of(gm, fwd).graph), [])
+        self.assertEqual(_ao_targets(_body_of(gm, bwd).graph), [])
 
     def test_a_graph_with_no_scan_raises(self):
         big = _mm(self.graph, self.x, (4096, 2048), name="log_softmax")
@@ -247,13 +220,14 @@ def _attention_layer(h, w):
     return torch.tanh(h + a[:, :_DIM] * a[:, _DIM:])
 
 
-class RealScanTest(absltest.TestCase):
-    """The ``layer_input`` tag on the carry survives ``scan``'s split."""
+class RealScanTest(parameterized.TestCase):
+    """The pass finds the saved carry, ``clone(carry)``, after ``scan``'s split."""
 
     def _trace(self, layer, save_regions):
         def step(h, w):
-            with scan_body_remat_window(save_regions):
-                out, _ = scan(lambda c, ww: (layer(c, ww), c.new_zeros(())), h, w)
+            out, _ = scan_with_remat_policy(
+                lambda c, ww: (layer(c, ww), c.new_zeros(())), h, w, save_regions
+            )
             return torch.autograd.grad(out.square().sum(), (h, w))
 
         self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
@@ -269,35 +243,36 @@ class RealScanTest(absltest.TestCase):
         ]
         return gm, fwd
 
-    def _regions(self, gm, fwd):
-        outs = list(_body_of(gm, fwd).graph.find_nodes(op="output")[0].args[0])
-        return {
-            (o.meta.get("custom") or {}).get(REMAT_REGION): o for o in outs
-        }
+    def _outputs(self, gm, fwd):
+        return list(_body_of(gm, fwd).graph.find_nodes(op="output")[0].args[0])
 
-    def test_the_layer_input_tag_reaches_the_forward_body(self):
-        gm, fwd = self._trace(_plain_layer, frozenset())
-        saved = self._regions(gm, fwd)[LAYER_INPUT]
-        self.assertIs(saved.target, torch.ops.aten.clone.default)
+    def _saved_carry(self, gm, fwd):
+        carry = _body_of(gm, fwd).graph.find_nodes(op="placeholder")[0]
+        (saved,) = [
+            o
+            for o in self._outputs(gm, fwd)
+            if o.target is torch.ops.aten.clone.default and o.args[0] is carry
+        ]
+        return saved
+
+    @parameterized.named_parameters(
+        ("plain_layer", _plain_layer, frozenset()),
+        ("saved_attention", _attention_layer, {ATTENTION_INNER_ATTENTION}),
+    )
+    def test_only_the_saved_carry_goes_to_host(self, layer, save_regions):
+        gm, fwd = self._trace(layer, save_regions)
+        saved = self._saved_carry(gm, fwd)
+        regions = [
+            (o.meta.get("custom") or {}).get(REMAT_REGION)
+            for o in self._outputs(gm, fwd)
+        ]
+        self.assertEqual(ATTENTION_INNER_ATTENTION in regions, bool(save_regions))
 
         offload_scan_activations(gm)
         (offload,) = [
             n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
         ]
         self.assertIs(offload.args[0], saved)
-
-    def test_a_saved_region_keeps_its_tag_next_to_the_layer_input(self):
-        gm, fwd = self._trace(_attention_layer, {ATTENTION_INNER_ATTENTION})
-        regions = self._regions(gm, fwd)
-        self.assertIs(regions[LAYER_INPUT].target, torch.ops.aten.clone.default)
-        self.assertIn(ATTENTION_INNER_ATTENTION, regions)
-
-        offload_scan_activations(gm)
-        # Only the layer input goes to host.
-        (offload,) = [
-            n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
-        ]
-        self.assertIs(offload.args[0], regions[LAYER_INPUT])
 
 
 if __name__ == "__main__":

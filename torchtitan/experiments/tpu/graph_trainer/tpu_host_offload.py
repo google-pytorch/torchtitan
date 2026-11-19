@@ -11,8 +11,8 @@ row at a time:
       saved = ao.offload(clone(x))      s     = ao.reload(s)            # device
       return (out, saved, ...)          use(s)
 
-The saved copy is the one ``scan_remat_policy`` tags ``layer_input``. Other
-saved values (attention output, MoE counts) stay in HBM.
+The saved copy is the body output ``clone(x)``, where ``x`` is the carry
+placeholder. Other saved values (attention output, MoE counts) stay in HBM.
 
 ``cpu_offload.apply_cpu_offload_pass`` can't do this: it reloads before the
 first backward user, which is the backward scan node, so all rows would land
@@ -35,10 +35,6 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     _full_memory_policy_pass,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
-from torchtitan.experiments.tpu.components.remat_regions import (
-    LAYER_INPUT,
-    REMAT_REGION,
-)
 from torchtitan.tools.logging import logger
 
 _SCAN_HOP = torch.ops.higher_order.scan
@@ -57,9 +53,13 @@ def _placeholder(body: torch.fx.GraphModule, index: int) -> Node:
     return body.graph.find_nodes(op="placeholder")[index]
 
 
-def _is_layer_input(node: object) -> bool:
-    custom = node.meta.get("custom") if isinstance(node, Node) else None
-    return (custom or {}).get(REMAT_REGION) == LAYER_INPUT
+def _is_saved_carry(body: torch.fx.GraphModule, node: object) -> bool:
+    # How scan returns a body input that min-cut saved; the carry is input 0.
+    return (
+        isinstance(node, Node)
+        and node.target is torch.ops.aten.clone.default
+        and node.args[0] is _placeholder(body, 0)
+    )
 
 
 def _only_read_by(node: Node, scan: Node) -> bool:
@@ -200,7 +200,7 @@ def _offload_one(gm: torch.fx.GraphModule, fwd_scan: Node, index: int) -> None:
 
 
 def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-    """Move each forward scan's saved ``layer_input`` to host, inside the loops.
+    """Move each forward scan's saved layer input to host, inside the loops.
 
     Raises if there is none: asking for the offload and silently not getting
     it gives a correct run at the wrong memory.
@@ -210,11 +210,12 @@ def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         if _is_backward_node(node):
             continue
         forward_scans += 1
-        outs = _outputs(_scan_body(gm, node))
-        tagged = [i for i, out in enumerate(outs) if _is_layer_input(out)]
-        if len(tagged) > 1:
+        body = _scan_body(gm, node)
+        outs = _outputs(body)
+        saved = [i for i, out in enumerate(outs) if _is_saved_carry(body, out)]
+        if len(saved) > 1:
             raise RuntimeError(f"scan offload: {node.name} saves its carry twice")
-        for index in tagged:
+        for index in saved:
             _offload_one(gm, node, index)
             found += 1
     if not forward_scans:
@@ -224,8 +225,8 @@ def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         )
     if not found:
         raise RuntimeError(
-            f"scan offload: {forward_scans} forward scans, none saves a tagged "
-            "layer_input (did scan's re-trace drop node meta?)"
+            f"scan offload: {forward_scans} forward scans, none saves its "
+            "carry (is the layer input recomputed instead of saved?)"
         )
     return gm
 

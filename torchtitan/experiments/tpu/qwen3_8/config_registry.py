@@ -3,9 +3,9 @@
 Recipe helpers come from the Qwen3.5 TPU registry: Qwen3.8 is the same
 architecture (see the package docstring).
 
-Generation portability: the debug and proxy recipes set no libtpu flags and
-run on TPU v6e and TPU7x alike. Only ``qwen38_2_4t_a95b``, which targets TPU7x,
-adds TPU7x flags (``_TPU7X_FLAGS``).
+Generation portability: the debug recipes and `qwen38_2_4t_a95b_proxy` set no
+libtpu flags and run on TPU v6e and TPU7x alike. The `*_tpu7x` proxies and
+``qwen38_2_4t_a95b``, which target TPU7x, add TPU7x flags (``_TPU7X_FLAGS``).
 """
 
 from torchtitan.components.optimizer.optimizer import default_adamw
@@ -87,32 +87,36 @@ def qwen38_moe_debugmodel_ep8() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
-  """Real-per-rank-shape proxy of Qwen3.8-2.4T-A95B for one TPU v6e-8 host.
+def _real_shape_proxy(
+    *,
+    num_layers: int,
+    num_experts: int,
+    expert_parallel_degree: int,
+    seq_len: int,
+) -> TPUTrainerConfig:
+  """A Qwen3.8-2.4T-A95B proxy: full width, fewer layers and experts.
 
   The full width (dim 8192, 64 query / 4 KV heads of 256, GatedDeltaNet 16
-  key / 128 value heads, expert hidden size 2048, vocab 248320), the first 4
-  layers (3 GatedDeltaNet + 1 full attention, one period of the layer
-  pattern) and 64 routed experts, so EP=8 holds 8 experts per rank as EP=64
-  does on the full model's 512. bf16 parameters and optimizer state
+  key / 128 value heads, expert hidden size 2048, vocab 248320), the first
+  `num_layers` layers and `num_experts` routed experts. With
+  `num_experts / expert_parallel_degree == 8` every rank holds 8 experts, as
+  EP=64 does on the full model's 512. bf16 parameters and optimizer state
   (`training.dtype`), full activation checkpointing, plain SDPA and the
-  reference GatedDeltaNet: rung 1, for shapes and numerics, not speed.
-
-  2K tokens per rank: the ragged EP transport's worst-case receive buffer is
-  `ep * T * top_k` rows (8 * 4096 * 10 x 8192 bf16 = 5.4 GB at 4K, which ran
-  out of HBM on v6e). The `qwen35_moe_35b` LR schedule (200 warmup steps,
-  clamped to `training.steps` in short runs): the debug recipe's 2-step
-  warmup to 3e-4 spiked the loss (10.2 -> 14.0 at step 5, grad_norm 69).
+  reference GatedDeltaNet: rung 1, for shapes, memory and numerics, not
+  speed. One sequence of `seq_len` tokens per rank: the ragged EP transport's
+  receive buffer is sized for the worst case, `expert_parallel_degree * T *
+  top_k` rows of dim 8192, which bounds the tokens per rank. The
+  `qwen35_moe_35b` LR schedule (200 warmup steps, clamped to
+  `training.steps` in short runs); a 2-step warmup to 3e-4 spiked the loss.
   """
   cfg = qwen38_moe_debugmodel()
-  seq_len = 2048
   cfg.hf_assets_path = "./tests/assets/tokenizer"
   cfg.model_spec = model_registry(
       "2.4T-A95B",
       seq_len=seq_len,
       converters=_TPU_MOE_CONVERTERS,
-      num_layers=4,
-      num_experts=64,
+      num_layers=num_layers,
+      num_experts=num_experts,
   )
   cfg.dataloader = c4_test_dataloader()
   cfg.training.max_context_length = seq_len
@@ -120,7 +124,7 @@ def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
   cfg.training.dtype = "bfloat16"
   cfg.parallelism = ParallelismConfig(
       data_parallel_shard_degree=-1,
-      expert_parallel_degree=8,
+      expert_parallel_degree=expert_parallel_degree,
       fsdp_reshard_after_forward="always",
       use_simple_fsdp=True,
   )
@@ -129,6 +133,54 @@ def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
   cfg.optimizer = default_adamw(lr=3e-4, implementation="foreach")
   cfg.lr_scheduler = qwen35_recipes.qwen35_moe_35b().lr_scheduler
   cfg.checkpoint.enable = False
+  return cfg
+
+
+def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
+  """2.4T-A95B proxy for one TPU v6e-8 host: 4 layers, 64 experts, EP=8.
+
+  4 layers are one period of the 3:1 GatedDeltaNet / attention pattern. 2K
+  tokens per rank: at 4K the ragged EP buffer (8 * 4096 * 10 x 8192 bf16 =
+  5.4 GB) ran out of HBM on v6e. See `_real_shape_proxy`.
+  """
+  return _real_shape_proxy(
+      num_layers=4, num_experts=64, expert_parallel_degree=8, seq_len=2048
+  )
+
+
+def qwen38_2_4t_a95b_proxy_tpu7x() -> TPUTrainerConfig:
+  """2.4T-A95B proxy for one TPU7x 4x4x4 slice: 4 layers, 512 experts, EP=64.
+
+  The full model's 512 experts at its EP degree (8 experts per rank) on 64
+  chips / 128 ranks, with the TPU7x libtpu flags. 1K tokens per rank: the
+  ragged EP receive buffer is 64 * T * 10 rows of dim 8192, 10.7 GB bf16 at
+  T = 1024 and 21.5 GB at 2048, and the dispatch, the combine and their
+  gradients each hold one. Raise `--training.max_context_length` and
+  `--training.num_tokens_per_microbatch_per_dp_rank` together to sweep it.
+  See `_real_shape_proxy` and
+  `recipes/ironwood/qwen3.8-2.4t-a95b/tpu7x-4x4x4/README.md`.
+  """
+  cfg = _real_shape_proxy(
+      num_layers=4, num_experts=512, expert_parallel_degree=64, seq_len=1024
+  )
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, _TPU7X_FLAGS
+  )
+  return cfg
+
+
+def qwen38_2_4t_a95b_proxy_tpu7x_8l() -> TPUTrainerConfig:
+  """`qwen38_2_4t_a95b_proxy_tpu7x` with 8 layers (two pattern periods).
+
+  The second point of the layer sweep, from which per-layer memory and step
+  time extrapolate to 92 layers.
+  """
+  cfg = _real_shape_proxy(
+      num_layers=8, num_experts=512, expert_parallel_degree=64, seq_len=1024
+  )
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, _TPU7X_FLAGS
+  )
   return cfg
 
 

@@ -395,6 +395,8 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       "qwen38_moe_debugmodel",
       "qwen38_moe_debugmodel_ep8",
       "qwen38_2_4t_a95b_proxy",
+      "qwen38_2_4t_a95b_proxy_tpu7x",
+      "qwen38_2_4t_a95b_proxy_tpu7x_8l",
       "qwen38_2_4t_a95b",
   )
   def test_recipe_parses(self, config_name: str):
@@ -450,6 +452,22 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       resolved = dispatcher._resolve_ep_transport(2, x_TD)
       self.assertEqual(resolved, "ragged_all_to_all")
 
+
+  @parameterized.parameters(
+      "qwen38_2_4t_a95b_proxy",
+      "qwen38_2_4t_a95b_proxy_tpu7x",
+      "qwen38_2_4t_a95b_proxy_tpu7x_8l",
+  )
+  def test_proxies_hold_the_full_models_experts_per_rank(self, config_name):
+    """Proxies keep 8 routed experts per EP rank, as EP=64 on 512 experts."""
+    cfg = getattr(config_registry, config_name)()
+    moes = [m for _, m, _, _ in cfg.model_spec.model.traverse(MoE.Config)]
+    self.assertNotEmpty(moes)
+    for moe in moes:
+      self.assertEqual(
+          moe.num_experts // cfg.parallelism.expert_parallel_degree, 8
+      )
+      self.assertEqual(moe.router.gate.out_features, moe.num_experts)
 
 if __name__ == "__main__":
   absltest.main()

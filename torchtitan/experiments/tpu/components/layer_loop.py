@@ -38,9 +38,9 @@ class TpuLayerLoop(ModuleDict):
     unaffected.
     """
 
-    def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         for layer in self.values():
-            h = layer(h, *args)
+            h = layer(h, *args, **kwargs)
         return h
 
 
@@ -49,6 +49,8 @@ def _forward(
     tokens: torch.Tensor,
     positions: torch.Tensor | None = None,
     attention_masks: AttentionMasksType | None = None,
+    *,
+    padding_mask: torch.Tensor | None = None,
 ):
     """Runs the decoder: embeddings, the layers, the final norm, the LM head.
 
@@ -71,10 +73,14 @@ def _forward(
     # A TpuLayerLoop itself cannot be split across pipeline stages.
     # TODO: support pipeline parallelism.
     if isinstance(self.layers, TpuLayerLoop):
-        h = self.layers(h, attention_masks, positions, segment_ids)
+        h = self.layers(
+            h, attention_masks, positions, segment_ids, padding_mask=padding_mask
+        )
     else:
         for layer in self.layers.values():
-            h = layer(h, attention_masks, positions, segment_ids)
+            h = layer(
+                h, attention_masks, positions, segment_ids, padding_mask=padding_mask
+            )
 
     h = self.norm(h) if self.norm is not None else h
 

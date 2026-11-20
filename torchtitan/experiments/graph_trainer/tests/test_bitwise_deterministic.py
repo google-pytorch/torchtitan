@@ -356,8 +356,8 @@ class BitwiseDeterministicBase(unittest.TestCase):
                 global_valid_tokens,
                 extra_kwargs,
             )
-            loss = outputs[0]
-            grads = outputs[1:]
+            loss = outputs.loss
+            grads = outputs.grads
             params = [
                 p
                 for _, p in model.named_parameters(remove_duplicate=False)

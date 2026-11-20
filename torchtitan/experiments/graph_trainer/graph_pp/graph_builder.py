@@ -947,7 +947,8 @@ def _build_stage_graphs(
 
         def stage_step(stage_args, stage_kwargs, target, loss_kwargs):
             pred = stage.submod(*stage_args, **stage_kwargs)
-            loss = compute_annotated_loss(
+            # GraphPP does not return the loss metrics yet.
+            loss, _ = compute_annotated_loss(
                 loss_fn,
                 pred,
                 target,

@@ -260,6 +260,15 @@ class TpuGroupedExperts(GroupedExperts):
             and parallel_dims.get_optional_mesh("ep") is not None
         ):
             raise ValueError("Paired grouped matmul requires EP=1 exact-row dispatch")
+        # The FP8 path pads by growing the last expert's group, which assumes
+        # the routed rows fill the buffer. Under EP the receive buffer's tail
+        # past sum(num_tokens_per_expert_E) holds stale rows, and the FP8 GMM
+        # leaves output tiles past that sum uninitialized.
+        if (
+            self.use_fp8_grouped_mm
+            and parallel_dims.get_optional_mesh("ep") is not None
+        ):
+            raise ValueError("FP8 grouped matmul requires EP=1 exact-row dispatch")
         super().parallelize(parallel_dims)
 
     @staticmethod
@@ -365,7 +374,16 @@ class TpuGroupedExperts(GroupedExperts):
         # group over them instead would also pull in any rows between that sum
         # and num_rows, such as the stale tail of a static-size EP receive
         # buffer. A no-op for aligned batches.
-        row_tiles = (tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0]))
+        if self.use_fp8_grouped_mm:
+            # The FP8 path runs none of the BF16 kernels; it needs the rows
+            # divisible by the M tile of each of its own forward, dInput and
+            # dWeight GEMMs (the W1/W3 dWeight tile is 1024 by default).
+            row_tiles = tuple(
+                max(1, tiling[0])
+                for tiling in (*self.fp8_w13_tilings, *self.fp8_w2_tilings)
+            )
+        else:
+            row_tiles = (tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0]))
         row_align = math.lcm(*row_tiles)
         # M tiles that divide each other, like powers of two, need only the
         # largest tile. Others can need a large multiple of it, all zero rows,
@@ -395,9 +413,10 @@ class TpuGroupedExperts(GroupedExperts):
                     " (scale_before_down_proj=False)"
                 )
             # The FP8 kernels still need the pad rows inside the last expert's
-            # group: unlike the BF16 kernels above, they don't zero-initialize
-            # output tiles past sum(num_tokens_per_expert_E). The pad rows are
-            # zeros, so this adds nothing at EP=1.
+            # group: unlike the BF16 kernels below, they don't zero-initialize
+            # output tiles past sum(num_tokens_per_expert_E). `parallelize`
+            # rejects EP for FP8, so the routed rows fill x_RD and the pad rows
+            # are zeros that add nothing.
             fp8_tokens_per_expert_E = num_tokens_per_expert_E
             if pad_rows:
                 fp8_tokens_per_expert_E = torch.cat(

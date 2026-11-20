@@ -22,13 +22,16 @@ _TPU_MOE_CONVERTERS = qwen35_recipes._TPU_MOE_CONVERTERS + [
 
 
 def _use_ragged_ep_transport(cfg: TPUTrainerConfig) -> None:
-  """Selects the dropless static-shape `ragged_all_to_all` EP transport.
+  """Selects the dropless `ragged_all_to_all` EP transport, bounded.
 
   torch_tpu's `all_to_all` rejects asymmetric output buffers, which
   upstream's variable-size EP transport produces. The ragged transport's
-  receive buffer is sized for the worst case (`ep_size * T * top_k` rows per
-  rank), which bounds it to small per-rank token counts until the bounded
-  capacity form exists.
+  receive buffer would otherwise be sized for the worst case (`ep_size * T *
+  top_k` rows per rank: about 60 of the 91 GiB peak per rank of the TPU7x
+  proxy, and 64x the routed rows at EP=64). `ep_capacity_factor=2.0` with
+  `ep_capacity_overflow="grow"` sizes it at twice this rank's routed rows,
+  doubling as needed so that no route is dropped (the default "drop" would
+  drop the routes past the cap).
   """
   assert cfg.model_spec is not None
   dispatchers = list(
@@ -38,6 +41,8 @@ def _use_ragged_ep_transport(cfg: TPUTrainerConfig) -> None:
     raise ValueError("Expected TpuAllToAllTokenDispatcher (_TPU_MOE_CONVERTERS)")
   for _, dispatcher, _, _ in dispatchers:
     dispatcher.ep_transport = "ragged_all_to_all"
+    dispatcher.ep_capacity_factor = 2.0
+    dispatcher.ep_capacity_overflow = "grow"
 
 
 def qwen38_debugmodel() -> TPUTrainerConfig:

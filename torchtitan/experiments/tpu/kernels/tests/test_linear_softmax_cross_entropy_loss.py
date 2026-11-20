@@ -9,6 +9,7 @@ from unittest import mock
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax
 import jax.numpy as jnp
 import numpy
 import torch
@@ -93,19 +94,22 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
     lse = torch.logsumexp(logits.detach(), dim=-1)
 
     to_jax = lambda t: jnp.asarray(t.numpy())
-    # pylint: disable=protected-access
-    grad_x, grad_w = linear_softmax_cross_entropy_loss._my_bwd(
-        to_jax(dout),
-        to_jax(lse),
-        to_jax(x),
-        to_jax(labels.to(torch.int32)),
-        to_jax(weights),
-        "none",
-        "xla",
-        rows,
-        hidden,
-        vocab,
-    )
+    # On a TPU host JAX runs on the TPU, whose default matmul precision is
+    # bf16; compare against the FP32 autograd reference in FP32.
+    with jax.default_matmul_precision("float32"):
+      # pylint: disable=protected-access
+      grad_x, grad_w = linear_softmax_cross_entropy_loss._my_bwd(
+          to_jax(dout),
+          to_jax(lse),
+          to_jax(x),
+          to_jax(labels.to(torch.int32)),
+          to_jax(weights),
+          "none",
+          "xla",
+          rows,
+          hidden,
+          vocab,
+      )
     torch.testing.assert_close(
         torch.from_numpy(numpy.asarray(grad_x)), xr.grad, rtol=1e-4, atol=1e-5
     )
@@ -336,8 +340,10 @@ class LinearSoftmaxCrossEntropyLossTest(
   @parameterized.parameters(
       (torch.float32, "mosaic_tpu", 1e-4, 1e-5, 1e-2, 1e-2),
       (torch.float32, "xla", 1e-4, 1e-5, 1e-2, 1e-2),
-      (torch.bfloat16, "mosaic_tpu", 1.6e-2, 1e-2, 5e-2, 5e-2),
-      (torch.bfloat16, "xla", 1.6e-2, 1e-2, 5e-2, 5e-2),
+      # bf16 grad tolerances as in test_gradient_new's bf16 cases: the
+      # reference computes the logits in bf16 too.
+      (torch.bfloat16, "mosaic_tpu", 1.6e-2, 1e-2, 5e-2, 0.5),
+      (torch.bfloat16, "xla", 1.6e-2, 1e-2, 5e-2, 0.5),
   )
   def test_gradient_reduction_none(
       self, dtype, implementation, loss_rtol, loss_atol, grad_rtol, grad_atol

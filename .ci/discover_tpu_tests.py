@@ -124,6 +124,9 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_deepseek_v4_mtp",
     "tests.unit_tests.cpu.test_deepseek_v4_flops",
     "tests.unit_tests.cpu.test_deepseek_v4_compressor",
+    "tests.unit_tests.cpu.test_deepseek_v4_dsa",
+    "tests.unit_tests.cpu.test_deepseek_v4_moe",
+    "tests.unit_tests.cpu.test_state_dict_adapter",
     # Missing optional dependency torchvision
     "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
     "tests.unit_tests.cpu.components.data.test_qwen_multimodal_data",
@@ -177,8 +180,11 @@ DESELECTED_TESTS = (
     # so the exact-call assertion fails.
     "tests/unit_tests/cpu/components/data/test_grain_data.py::test_hf_explicit_fields_are_passed_to_load_dataset",
     # Fork keeps EP-disabled routed experts as replicated DTensors (spmd FSDP
-    # rejects plain tensors); upstream asserts no sharding config there.
+    # rejects plain tensors); upstream asserts no sharding config there, and
+    # (#4908) that a sharding config is present iff EP > 1.
     "tests/unit_tests/cpu/test_moe.py::TestMoE::test_moe_without_ep_keeps_routed_weights_replicated",
+    "tests/unit_tests/cpu/test_expert_parallel.py::TestExpertParallelConfigValidation::test_model_sharding_is_resolved_from_parallelism",
+    "tests/unit_tests/cpu/test_expert_parallel.py::TestExpertParallelConfigValidation::test_resolved_model_sharding_must_match_parallelism",
 )
 
 

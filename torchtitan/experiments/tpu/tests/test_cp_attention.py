@@ -167,17 +167,18 @@ def _emulated_cp_group(ranks: _Ranks, traced: bool):
             cp_attention, "spmd_mesh_group", lambda axis: ranks.group()
         )
     )
+    # Functional collectives also run eagerly (e.g. cp_reduce_scatter).
+    for name, fn in (
+        ("all_to_all_single", all_to_all_single),
+        ("all_gather_tensor", all_gather_tensor),
+        ("reduce_scatter_tensor", reduce_scatter_tensor),
+    ):
+      stack.enter_context(mock.patch.object(funcol, name, fn))
     if traced:
       # The branch the CP attentions take under torch.compile.
       stack.enter_context(
           mock.patch.object(cp_attention, "_tracing", lambda: True)
       )
-      for name, fn in (
-          ("all_to_all_single", all_to_all_single),
-          ("all_gather_tensor", all_gather_tensor),
-          ("reduce_scatter_tensor", reduce_scatter_tensor),
-      ):
-        stack.enter_context(mock.patch.object(funcol, name, fn))
     else:
       stack.enter_context(mock.patch.object(spmd, "redistribute", redistribute))
     yield

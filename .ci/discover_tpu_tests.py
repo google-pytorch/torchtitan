@@ -182,7 +182,7 @@ DESELECTED_TESTS = (
     # Fork keeps EP-disabled routed experts as replicated DTensors (spmd FSDP
     # rejects plain tensors); upstream asserts no sharding config there, and
     # (#4908) that a sharding config is present iff EP > 1.
-    "tests/unit_tests/cpu/test_moe.py::TestMoE::test_moe_without_ep_keeps_routed_weights_replicated",
+    "tests/unit_tests/cpu/test_moe.py::TestMoE::test_moe_without_ep_leaves_routed_weights_unsharded",
     "tests/unit_tests/cpu/test_expert_parallel.py::TestExpertParallelConfigValidation::test_model_sharding_is_resolved_from_parallelism",
     "tests/unit_tests/cpu/test_expert_parallel.py::TestExpertParallelConfigValidation::test_resolved_model_sharding_must_match_parallelism",
 )

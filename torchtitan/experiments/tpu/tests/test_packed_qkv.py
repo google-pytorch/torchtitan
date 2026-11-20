@@ -144,3 +144,57 @@ def test_packed_qkv_backward_concatenates_one_gradient():
   assert targets.count(torch.ops.aten.split_with_sizes.default) == 1
   assert targets.count(torch.ops.aten.cat.default) == 1
   assert not any("slice_backward" in str(target) for target in targets)
+
+
+def test_packed_qkv_supports_k_eq_v():
+  from torchtitan.experiments.tpu.examples.gemma4.model import (
+      QKVLinearKeqV,
+      fused_qk_param_init,
+  )
+  from torchtitan.models.common.linear import Linear
+
+  init = {"weight": torch.nn.init.normal_}
+  out_features = (N_HEADS + N_KV_HEADS) * HEAD_DIM
+  config = QKVLinearKeqV.Config(
+      head_dim=HEAD_DIM,
+      n_heads=N_HEADS,
+      n_kv_heads=N_KV_HEADS,
+      wqkv=Linear.Config(
+          in_features=DIM,
+          out_features=out_features,
+          param_init=fused_qk_param_init(
+              init, n_heads=N_HEADS, n_kv_heads=N_KV_HEADS, head_dim=HEAD_DIM
+          ),
+      ),
+  )
+  converter = TpuPackedQKVConverter.Config().build()
+  converted = converter.convert(copy.deepcopy(config))
+  assert isinstance(converted, TpuPackedQKVLinear.Config)
+  assert converted.k_eq_v is True
+
+  fused = config.build()
+  packed = converted.build()
+  for module in (fused, packed):
+    torch.manual_seed(1234)
+    module.init_states()
+
+  fused_state = fused.state_dict()
+  packed_state = packed.state_dict()
+  assert set(packed_state) == {"wq.weight", "wk.weight"}
+  _assert_state_equal(packed_state, fused_state)
+  packed.load_state_dict(fused_state)
+  fused.load_state_dict(packed.state_dict())
+
+  fused_input = torch.randn(6, DIM, requires_grad=True)
+  packed_input = fused_input.detach().clone().requires_grad_()
+  fq, fk, fv = fused(fused_input)
+  pq, pk, pv = packed(packed_input)
+  assert fk is fv and pk is pv
+  assert pq.is_contiguous() and pk.is_contiguous()
+  torch.testing.assert_close(pq, fq)
+  torch.testing.assert_close(pk, fk)
+
+  gq, gk = torch.randn_like(fq), torch.randn_like(fk)
+  torch.autograd.backward((fq, fk), (gq, gk))
+  torch.autograd.backward((pq, pk), (gq, gk))
+  torch.testing.assert_close(packed_input.grad, fused_input.grad)

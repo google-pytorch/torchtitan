@@ -59,7 +59,15 @@ logger = logging.getLogger(__name__)
 
 def _is_gathered_expert_weight(node: torch.fx.Node) -> bool:
     """A gathered expert weight: TorchTPU's dim-d all-gather, or a funcol wait."""
-    if node.op != "call_function" or ".moe." not in _get_module_fqn(node) + ".":
+    fqn = _get_module_fqn(node) + "."
+    if (
+        node.op != "call_function"
+        or ".moe." not in fqn
+        or ".token_dispatcher." in fqn
+    ):
+        return False
+    val = node.meta.get("val")
+    if isinstance(val, torch.Tensor) and not val.is_floating_point():
         return False
     if is_wait_tensor(node):
         return isinstance(node.args[0], torch.fx.Node) and is_all_gather_into_tensor(

@@ -1,5 +1,4 @@
 {
-  "tests.unit_tests.test_tpu_packed_qkv_distributed": 26,
   "tests/unit_tests/observability/test_structured_logging.py": 2,
   "tests/unit_tests/test_activation_checkpoint.py": 6,
   "tests/unit_tests/test_chat_dataset.py": 23,
@@ -43,8 +42,6 @@
   "tests/unit_tests/test_state_dict_keys.py": 6,
   "tests/unit_tests/test_tools_utils.py": 2,
   "tests/unit_tests/test_tp_kv_heads_validation.py": 2,
-  "tests/unit_tests/test_tpu_grouped_experts.py": 8,
-  "tests/unit_tests/test_tpu_packed_qkv.py": 5,
   "tests/unit_tests/test_train_spec.py": 4,
   "tests/unit_tests/test_weight_tying.py": 6,
   "torchtitan.experiments.graph_trainer.tests.test_bitwise_deterministic": 6,
@@ -101,6 +98,7 @@
   "torchtitan.experiments.tpu.tests.test_layer_loop": 5,
   "torchtitan.experiments.tpu.tests.test_mfu_flops": 7,
   "torchtitan.experiments.tpu.tests.test_model_distributed": 130,
+  "torchtitan.experiments.tpu.tests.test_packed_qkv_distributed": 26,
   "torchtitan.experiments.tpu.tests.test_real_rope_tpu": 7,
   "torchtitan.experiments.tpu.tests.test_scan_backward_patch": 12,
   "torchtitan.experiments.tpu.tests.test_tpu_flags": 4,
@@ -111,5 +109,7 @@
   "torchtitan/experiments/rl/tests/test_inter_generator_router.py": 2,
   "torchtitan/experiments/rl/tests/test_intra_generator_router.py": 2,
   "torchtitan/experiments/rl/tests/test_metrics.py": 4,
+  "torchtitan/experiments/tpu/tests/test_grouped_experts.py": 8,
+  "torchtitan/experiments/tpu/tests/test_packed_qkv.py": 5,
   "torchtitan/experiments/tpu/tests/test_token_dispatcher.py": 10
 }

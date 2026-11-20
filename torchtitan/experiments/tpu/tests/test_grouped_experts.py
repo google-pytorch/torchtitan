@@ -353,6 +353,146 @@ def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired, transposed):
     assert w2_call["tgmm_tiling"] == (w2_transposed if transposed else w2_own)
 
 
+@pytest.mark.parametrize(
+    "tgmm_tiling, w2_tgmm_tiling, transposed, padded_rows",
+    [
+        # The W1/W3 dWeight M tile is larger than tile_m.
+        ((256, 0, 0), None, False, 512),
+        # So is W2's own...
+        ((128, 0, 0), (512, 0, 0), False, 512),
+        # ...unless the transposed-RHS tiling replaces it.
+        ((128, 0, 0), (512, 0, 0), True, 384),
+    ],
+)
+@pytest.mark.parametrize("paired", [False, True])
+def test_pallas_padding_keeps_unrouted_tail_rows_out_of_the_last_expert(
+    paired, tgmm_tiling, w2_tgmm_tiling, transposed, padded_rows
+):
+    """Every kernel gets the counts unchanged and rows padded to every M tile.
+
+    The last 10 of 300 rows are not routed, like the stale tail of a static-size
+    EP receive buffer, and hold NaN. Growing the last expert's group over the
+    padding would sweep them into its forward and dWeight, so the experts must
+    pass the counts as given and the routed rows' outputs and every gradient
+    must equal a run on the 290 routed rows alone.
+    """
+    experts = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=paired,
+        pallas_grouped_mm_tile_m=128,
+        pallas_grouped_mm_tgmm_tiling=tgmm_tiling,
+        pallas_grouped_mm_w2_tgmm_tiling=w2_tgmm_tiling,
+        pallas_grouped_mm_w2_transposed_tgmm_tiling=(384, 0, 0),
+    ).build()
+    experts._use_transposed_w2_rhs = transposed
+    for param in experts.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    counts = torch.tensor([120, 170], dtype=torch.int32)
+    routed = int(counts.sum())
+    x = torch.randn(routed, 16)
+    row_scale = torch.rand(routed)
+    grad_out = torch.randn(routed, 16)
+    kernel_calls = []
+
+    def grouped_mm(x, weight, counts, **kwargs):
+        kernel_calls.append((x.shape[0], counts.clone()))
+        if kwargs.get("transpose_rhs"):
+            weight = weight.transpose(-2, -1)
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    def paired_grouped_mm(x, w1, w3, counts, **kwargs):
+        del kwargs
+        return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
+
+    def run(unrouted_rows):
+        kernel_calls.clear()
+        x_leaf = x.clone().requires_grad_()
+        scale_leaf = row_scale.clone().requires_grad_()
+        nan = float("nan")
+        x_rows = torch.cat([x_leaf, torch.full((unrouted_rows, 16), nan)])
+        scale_rows = torch.cat([scale_leaf, torch.full((unrouted_rows,), nan)])
+        with patch(
+            "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
+            side_effect=grouped_mm,
+        ), patch(
+            "torchtitan.experiments.tpu.components.grouped_experts.paired_segment_matmul_pallas_2d",
+            side_effect=paired_grouped_mm,
+        ):
+            out = experts.forward(x_rows, counts, scale_rows)[:routed]
+        inputs = (x_leaf, *experts.parameters(), scale_leaf)
+        return out, torch.autograd.grad(out, inputs, grad_out), list(kernel_calls)
+
+    out, grads, calls = run(10)
+    want_out, want_grads, _ = run(0)
+
+    assert len(calls) == 3
+    for rows, kernel_counts in calls:
+        assert rows == padded_rows
+        assert torch.equal(kernel_counts, counts)
+    torch.testing.assert_close(out, want_out, rtol=0, atol=0)
+    for grad, want in zip(grads, want_grads, strict=True):
+        assert torch.isfinite(grad).all()
+        torch.testing.assert_close(grad, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "tile_m, tgmm_m, w2_tgmm_m, padded_rows",
+    [
+        # M tiles that divide each other pad to the largest one.
+        (128, 512, 256, 512),
+        # Twice the largest tile is still allowed: lcm(256, 384) = 768.
+        (256, 384, 384, 768),
+        # lcm(384, 512) = 1536 is three times the largest tile.
+        (384, 512, 512, None),
+    ],
+)
+def test_pallas_row_alignment_is_capped_at_twice_the_largest_m_tile(
+    tile_m, tgmm_m, w2_tgmm_m, padded_rows
+):
+    """The rows are padded to the lcm of the M tiles, at most twice the largest.
+
+    Tiles that divide each other, like the power-of-two tiles every recipe
+    uses, need only the largest tile. Others can need a large multiple of it,
+    all zero rows, so the experts refuse them before calling a kernel.
+    """
+    experts = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        pallas_grouped_mm_tile_m=tile_m,
+        pallas_grouped_mm_tgmm_tiling=(tgmm_m, 0, 0),
+        pallas_grouped_mm_w2_tgmm_tiling=(w2_tgmm_m, 0, 0),
+    ).build()
+    for param in experts.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    x = torch.randn(7, 16)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+    kernel_rows = []
+
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        kernel_rows.append(x.shape[0])
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    with patch(
+        "torchtitan.experiments.tpu.components.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ):
+        if padded_rows is None:
+            with pytest.raises(ValueError, match="lcm, 1536, more than twice"):
+                experts.forward(x, counts)
+        else:
+            experts.forward(x, counts)
+
+    assert kernel_rows == ([] if padded_rows is None else [padded_rows] * 3)
+
+
 def test_kernel_native_layout_preserves_initialization_and_state_dict():
     param_init = {
         "w1_EFD": lambda x: torch.nn.init.normal_(x, std=0.02),

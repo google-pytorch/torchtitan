@@ -11,6 +11,7 @@ from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import model_registry as graph_trainer_model_registry
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
@@ -134,6 +135,10 @@ def graph_trainer_muse_glimmer_debugmodel() -> TpuGraphTrainer.Config:
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       muse_glimmer_debugmodel(), graph_trainer_model_registry
   )
+  assert config.model_spec is not None
+  config.model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(config.model_spec.model)
+  )
   config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       components=["model"],
@@ -151,7 +156,11 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
   """
   from torchtitan.experiments.tpu.muse_glimmer import model_registry  # pylint: disable=g-import-not-at-top
 
-  model_spec = model_registry("30B", seq_len=_30B_CONTEXT_LENGTH)
+  model_spec = model_registry(
+      "30B",
+      seq_len=_30B_CONTEXT_LENGTH,
+      converters=[TpuPackedQKVConverter.Config()],
+  )
   config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       # Test tokenizer, like the other TPU recipes; pass the Muse Glimmer

@@ -27,11 +27,13 @@ class _PackedQKVInit:
       n_heads: int,
       n_kv_heads: int,
       head_dim: int,
+      k_eq_v: bool = False,
   ) -> None:
     self.interleaved_init = interleaved_init
     self.n_heads = n_heads
     self.n_kv_heads = n_kv_heads
     self.head_dim = head_dim
+    self.k_eq_v = k_eq_v
 
   def __call__(self, parameter: torch.Tensor) -> None:
     interleaved = parameter.new_empty(parameter.shape)
@@ -42,24 +44,25 @@ class _PackedQKVInit:
           [Replicate()] * interleaved.device_mesh.ndim,
       )
     heads_per_kv = self.n_heads // self.n_kv_heads
-    r_dim = heads_per_kv + 2
+    r_dim = heads_per_kv + (1 if self.k_eq_v else 2)
     tail = interleaved.shape[1:]
     interleaved = interleaved.reshape(
         self.n_kv_heads, r_dim, self.head_dim, *tail
     )
-    packed = torch.cat(
-        (
-            interleaved[:, :heads_per_kv].reshape(-1, *tail),
-            interleaved[:, heads_per_kv].reshape(-1, *tail),
-            interleaved[:, heads_per_kv + 1].reshape(-1, *tail),
-        ),
-        dim=0,
-    )
+    slices = [
+        interleaved[:, :heads_per_kv].reshape(-1, *tail),
+        interleaved[:, heads_per_kv].reshape(-1, *tail),
+    ]
+    if not self.k_eq_v:
+      slices.append(interleaved[:, heads_per_kv + 1].reshape(-1, *tail))
+    packed = torch.cat(tuple(slices), dim=0)
     with torch.no_grad():
       parameter.copy_(packed)
 
 
-def _packed_param_init(config: QKVLinear.Config) -> dict[str, Callable]:
+def _packed_param_init(
+    config: QKVLinear.Config, *, k_eq_v: bool = False
+) -> dict[str, Callable]:
   param_init = config.wqkv.param_init
   if param_init is None:
     raise ValueError("Packed QKV requires the fused QKV parameter initializer")
@@ -69,23 +72,26 @@ def _packed_param_init(config: QKVLinear.Config) -> dict[str, Callable]:
           n_heads=config.n_heads,
           n_kv_heads=config.n_kv_heads,
           head_dim=config.head_dim,
+          k_eq_v=k_eq_v,
       )
       for name, initializer in param_init.items()
   }
 
 
 class TpuPackedQKVLinear(Module):
-  """Run three contiguous Q/K/V projections from one FSDP parameter.
+  """Run contiguous Q/K/V (or Q/K for K=V) projections from one FSDP parameter.
 
-  The physical parameter stores ``[all Q rows; all K rows; all V rows]``.
+  The physical parameter stores ``[all Q rows; all K rows; all V rows]`` (or
+  ``[all Q rows; all K rows]`` when ``k_eq_v=True``).
   This removes the fused projection's interleaved output materialization while
   preserving a single FSDP all-gather and gradient reduce-scatter. Model
-  checkpoints continue to expose canonical ``wq``/``wk``/``wv`` keys.
+  checkpoints continue to expose canonical ``wq``/``wk``/``wv`` (or
+  ``wq``/``wk``) keys.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(QKVLinear.Config):
-    pass
+    k_eq_v: bool = False
 
   def __init__(self, config: Config):
     super().__init__()
@@ -98,18 +104,24 @@ class TpuPackedQKVLinear(Module):
     self.n_heads = config.n_heads
     self.n_kv_heads = config.n_kv_heads
     self.heads_per_kv = config.n_heads // config.n_kv_heads
-    self.r_dim = self.heads_per_kv + 2
+    self.k_eq_v = config.k_eq_v
+    self.r_dim = self.heads_per_kv + (1 if self.k_eq_v else 2)
     self.q_rows = config.n_heads * config.head_dim
     self.kv_rows = config.n_kv_heads * config.head_dim
-    expected_rows = self.q_rows + 2 * self.kv_rows
+    expected_rows = self.q_rows + (1 if self.k_eq_v else 2) * self.kv_rows
     if config.wqkv.out_features != expected_rows:
+      expected_expr = (
+          "(n_heads + n_kv_heads) * head_dim"
+          if self.k_eq_v
+          else "(n_heads + 2 * n_kv_heads) * head_dim"
+      )
       raise ValueError(
           f"wqkv.out_features ({config.wqkv.out_features}) must equal "
-          f"(n_heads + 2 * n_kv_heads) * head_dim ({expected_rows})"
+          f"{expected_expr} ({expected_rows})"
       )
     self.wqkv_packed = replace(
         config.wqkv,
-        param_init=_packed_param_init(config),
+        param_init=_packed_param_init(config, k_eq_v=self.k_eq_v),
     ).build()
     self.register_state_dict_post_hook(self._split_qkv_on_save)
     self.register_load_state_dict_pre_hook(self._merge_qkv_on_load)
@@ -138,6 +150,25 @@ class TpuPackedQKVLinear(Module):
     num_tokens = x_TD.shape[0]
     weight = self.wqkv_packed.weight
     bias = self.wqkv_packed.bias
+    if self.k_eq_v:
+      split_sizes = (self.q_rows, self.kv_rows)
+      q_weight, k_weight = torch.split(weight, split_sizes, dim=0)
+      if bias is None:
+        q_bias = k_bias = None
+      else:
+        q_bias, k_bias = torch.split(bias, split_sizes, dim=0)
+      q_THK = F.linear(
+          x_TD,
+          q_weight,
+          q_bias,
+      ).view(num_tokens, -1, self.head_dim)
+      k_THK = F.linear(
+          x_TD,
+          k_weight,
+          k_bias,
+      ).view(num_tokens, -1, self.head_dim)
+      return q_THK, k_THK, k_THK
+
     split_sizes = (self.q_rows, self.kv_rows, self.kv_rows)
     # Split once so autograd concatenates Q/K/V gradients into the packed
     # parameter. Three independent slices create three full-size
@@ -180,21 +211,25 @@ class TpuPackedQKVLinear(Module):
         )
       state_dict[f"{prefix}wq.{param}"] = tensor[:q_end].contiguous()
       state_dict[f"{prefix}wk.{param}"] = tensor[q_end:k_end].contiguous()
-      state_dict[f"{prefix}wv.{param}"] = tensor[k_end:].contiguous()
+      if not module.k_eq_v:
+        state_dict[f"{prefix}wv.{param}"] = tensor[k_end:].contiguous()
 
   @staticmethod
   def _merge_qkv_on_load(module, state_dict, prefix, *_args) -> None:
+    names = ("wq", "wk") if module.k_eq_v else ("wq", "wk", "wv")
     for param in ("weight", "bias"):
-      keys = [f"{prefix}{name}.{param}" for name in ("wq", "wk", "wv")]
+      keys = [f"{prefix}{name}.{param}" for name in names]
       if not all(key in state_dict for key in keys):
         continue
-      q, k, v = (state_dict.pop(key) for key in keys)
-      if isinstance(q, DTensor):
-        placements = [Replicate()] * q.device_mesh.ndim
-        q = q.redistribute(q.device_mesh, placements)
-        k = k.redistribute(k.device_mesh, placements)
-        v = v.redistribute(v.device_mesh, placements)
-      state_dict[f"{prefix}wqkv_packed.{param}"] = torch.cat((q, k, v), dim=0)
+      tensors = [state_dict.pop(key) for key in keys]
+      if isinstance(tensors[0], DTensor):
+        placements = [Replicate()] * tensors[0].device_mesh.ndim
+        tensors = [
+            t.redistribute(t.device_mesh, placements) for t in tensors
+        ]
+      state_dict[f"{prefix}wqkv_packed.{param}"] = torch.cat(
+          tuple(tensors), dim=0
+      )
 
 
 class TpuPackedQKVConverter(ModelConfigConverter):
@@ -212,14 +247,15 @@ class TpuPackedQKVConverter(ModelConfigConverter):
     for _, config, parent, field_name in matches:
       if isinstance(config, TpuPackedQKVLinear.Config):
         continue
-      if type(config) is not QKVLinear.Config:
+      k_eq_v = bool(getattr(config, "k_eq_v", False))
+      if type(config) is not QKVLinear.Config and not k_eq_v:
         continue
       if config.wqkv.param_init is None:
         raise ValueError(
             "TpuPackedQKVConverter requires an explicit fused QKV "
             "parameter initializer"
         )
-      replacement = derive(config, TpuPackedQKVLinear.Config)
+      replacement = derive(config, TpuPackedQKVLinear.Config, k_eq_v=k_eq_v)
       if parent is None:
         model_config = replacement
       elif isinstance(parent, list):

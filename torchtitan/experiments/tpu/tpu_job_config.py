@@ -122,6 +122,17 @@ class SplashAttentionKernelConfig:
   # Tokamax skips tiles with no same-document pair, but a vmapped call must keep
   # every tile that any example in the batch needs.
   use_batch_loop_fwd: bool = False
+  # Tokamax only. Compute the backward with the transposed Splash kernel
+  # (kernels/splash_tbwd.py: one call for the whole batch, dK/dV produced
+  # transposed so P and dS fill the MXU) instead of Tokamax's dkv kernel; the
+  # forward is unchanged. Takes precedence over use_vmap_bwd. Supports causal
+  # self-attention (optional packed-document segment ids), bf16, 2-16 query
+  # heads per KV head, head_dim a multiple of 32 and >= 64, seq_len a multiple
+  # of 128, within a VMEM / SMEM estimate (see "Supported shapes" in
+  # splash_tbwd.py); no window and no context parallelism. Anything else
+  # (and 1 query head per KV head, where Tokamax is faster) warns and uses the
+  # Tokamax backward.
+  use_transposed_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512
@@ -284,7 +295,10 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
           or self.parallelism.pipeline_parallel_degree > 1
       ):
         raise ValueError(
-            "compile.compile_grad_norm currently requires EP1 and PP1"
+            "compile.compile_grad_norm currently requires EP1 and PP1; pass"
+            " --compile.no-compile_grad_norm with"
+            " --parallelism.expert_parallel_degree > 1 or"
+            " --parallelism.pipeline_parallel_degree > 1"
         )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.

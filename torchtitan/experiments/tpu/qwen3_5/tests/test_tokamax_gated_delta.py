@@ -14,6 +14,7 @@ from torchtitan.experiments.tpu.testing import base_device_test
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
+from torchtitan.experiments.tpu.components import activation_checkpoint
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import segment_ids_from_positions
 
@@ -676,6 +677,13 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         with_grad.detach().float().cpu(),
         atol=1e-2,
         rtol=1e-2,
+    )
+
+  def test_kda_fwd_ops_match_the_selective_ac_set(self):
+    """Tests that ``TPUSelectiveAC.save_kda_residuals`` saves these ops."""
+    self.assertEqual(
+        set(tokamax_gated_delta.KDA_FWD_OPS),
+        activation_checkpoint._KDA_FWD_OPS,  # pylint: disable=protected-access
     )
 
   @parameterized.named_parameters(

@@ -23,9 +23,15 @@ def apply_compile(
     model: nn.Module,
     *,
     compile_config: GraphTrainerCompileConfig,
-    parallelism_context: ParallelismContext,
+    parallelism_context: ParallelismContext | None = None,
+    parallel_dims: ParallelismContext | None = None,
+    **kwargs,
 ) -> nn.Module:
     """Configure tracing and leave whole-step capture to ``GraphRuntime``."""
+    del kwargs
+    if parallelism_context is None:
+        assert parallel_dims is not None
+        parallelism_context = parallel_dims
     _maybe_enable_async_tp(
         compile_config,
         parallelism_context.get_dense_tp_mesh()

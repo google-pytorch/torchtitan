@@ -71,7 +71,10 @@ def linear_param_shard_placements(
                 continue
         elif not isinstance(child, nn.Linear) or getattr(child, "num_linears", 1) == 1:
             continue
-        weight = cast(nn.Parameter, child.weight)
+        weight = getattr(child, "weight", None)
+        if weight is None:
+            continue
+        weight = cast(nn.Parameter, weight)
         placements[weight] = Shard(weight.ndim - 2)
         if (bias := getattr(child, "bias", None)) is not None:
             placements[bias] = Shard(bias.ndim - 1)

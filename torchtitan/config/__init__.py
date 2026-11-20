@@ -12,6 +12,8 @@ TORCH_DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
 }
 
+from typing import TYPE_CHECKING
+
 from .configs import CommConfig, CompileConfig, DebugConfig, TrainingConfig
 from .configurable import Configurable
 from .function import Function
@@ -24,7 +26,17 @@ from .override import (
     override,
     OverrideConfig,
 )
-from .parallelism import ParallelismConfig
+
+if TYPE_CHECKING:
+    from .parallelism import ParallelismConfig
+
+
+def __getattr__(name: str):
+    if name == "ParallelismConfig":
+        from .parallelism import ParallelismConfig
+
+        return ParallelismConfig
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ConfigManager",

@@ -18,7 +18,12 @@ from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_token_dispatcher_config,
 )
-from torchtitan.models.common.linear import Linear, RouterGateLinear
+from torchtitan.models.common.linear import (
+    ColumnParallelLinear,
+    Linear,
+    RouterGateLinear,
+    RowParallelLinear,
+)
 from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import skip_param_init
@@ -221,7 +226,7 @@ def _build_gemma4_layers(
             n_heads=n_heads,
             n_kv_heads=layer_n_kv_heads,
             head_dim=layer_head_dim,
-            wqkv=Linear.Config(
+            wqkv=ColumnParallelLinear.Config(
                 in_features=dim,
                 out_features=qkv_out_features,
                 param_init=qkv_param_init(
@@ -255,7 +260,7 @@ def _build_gemma4_layers(
                         eps=norm_eps,
                         elementwise_affine=False,
                     ),
-                    wo=Linear.Config(
+                    wo=RowParallelLinear.Config(
                         in_features=n_heads * layer_head_dim,
                         out_features=dim,
                         param_init=p["linear_out"],
@@ -270,7 +275,7 @@ def _build_gemma4_layers(
                     ),
                 ),
                 feed_forward=Gemma4FeedForward.Config(
-                    w13=Linear.Config(
+                    w13=ColumnParallelLinear.Config(
                         in_features=dim,
                         out_features=hidden_dim,
                         num_linears=2,
@@ -280,7 +285,7 @@ def _build_gemma4_layers(
                             p["linear_in"], p["linear_out"]
                         ),
                     ),
-                    w2=Linear.Config(
+                    w2=RowParallelLinear.Config(
                         in_features=hidden_dim,
                         out_features=dim,
                         param_init=p["linear_out"],

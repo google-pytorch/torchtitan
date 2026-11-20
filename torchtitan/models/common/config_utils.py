@@ -221,6 +221,22 @@ def fused_gate_up_param_init(
     return {"weight": _make_fused_linear_init(gate_init, up_init)}
 
 
+class _FusedGroupedGateUpInit:
+    """Initializer for a stacked ``[E, 2, F, D]`` grouped gate/up linear weight.
+
+    A top-level class instead of a closure so that model configs carrying it
+    can be pickled (as `_FusedQKVInit` and `_FusedLinearInit`).
+    """
+
+    def __init__(self, w1_init: Callable, w3_init: Callable) -> None:
+        self.w1_init = w1_init
+        self.w3_init = w3_init
+
+    def __call__(self, weight_E2FD: torch.Tensor) -> None:
+        self.w1_init(weight_E2FD[:, 0])
+        self.w3_init(weight_E2FD[:, 1])
+
+
 def fused_grouped_gate_up_param_init(
     param_init: dict[str, Callable],
 ) -> dict[str, Callable]:
@@ -229,11 +245,11 @@ def fused_grouped_gate_up_param_init(
     if missing:
         raise ValueError(f"Missing routed-expert initializers: {sorted(missing)}")
 
-    def init(weight_E2FD: torch.Tensor) -> None:
-        param_init["w1_EFD"](weight_E2FD[:, 0])
-        param_init["w3_EFD"](weight_E2FD[:, 1])
-
-    return {"weight": init}
+    return {
+        "weight": _FusedGroupedGateUpInit(
+            param_init["w1_EFD"], param_init["w3_EFD"]
+        )
+    }
 
 
 def make_gqa_config(

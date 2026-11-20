@@ -757,8 +757,11 @@ def get_spmd_context(
     parallelism_context: ParallelismContext | None = None,
     parallel_dims: ParallelismContext | None = None,
     typechecking: bool = False,
+    spmd_typechecking: bool | None = None,
 ):
     ctx = parallelism_context if parallelism_context is not None else parallel_dims
     assert ctx is not None, "Either parallelism_context or parallel_dims must be provided"
+    if spmd_typechecking is not None:
+        typechecking = spmd_typechecking
     return ctx.activate_spmd(typechecking=typechecking)
 

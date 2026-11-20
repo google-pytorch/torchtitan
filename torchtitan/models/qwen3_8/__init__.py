@@ -36,7 +36,7 @@ def _qwen3_8_2_4t_a95b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int,
 ) -> Qwen35Model.Config:
     """Qwen3.8-2.4T-A95B text-only MoE config."""
@@ -100,7 +100,7 @@ qwen3_8_configs = {
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,

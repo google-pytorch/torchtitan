@@ -498,7 +498,7 @@ kimi_k2_5_configs = {
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str = "standard",

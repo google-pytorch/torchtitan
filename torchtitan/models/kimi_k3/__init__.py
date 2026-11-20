@@ -584,7 +584,7 @@ def model_registry(
     converters: list[ModelConfigConverter.Config] | None = None,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int | None = None,
 ) -> KimiK3Model.Config:
     get_config, max_context_len = kimi_k3_configs[flavor]

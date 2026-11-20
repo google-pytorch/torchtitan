@@ -27,9 +27,18 @@ The command-line surface is frozen either way, so annotate a new field with
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
-from .parallelism import ParallelismConfig
+if TYPE_CHECKING:
+    from .parallelism import FSDPSymmMemScope, ParallelismConfig
+
+
+def __getattr__(name: str):
+    if name in ("ParallelismConfig", "FSDPSymmMemScope"):
+        from . import parallelism
+
+        return getattr(parallelism, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @dataclass(kw_only=True, slots=True)

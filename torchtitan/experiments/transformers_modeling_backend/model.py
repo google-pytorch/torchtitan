@@ -200,7 +200,22 @@ def _uses_dsa(config) -> bool:
 
 
 class HFTransformerModel(BaseModel):
-    parallelize = parallelize_hf_transformers
+    def parallelize(
+        self,
+        *,
+        parallelism_context: ParallelismContext | None = None,
+        parallel_dims: ParallelismContext | None = None,
+        **kwargs,
+    ):
+        if parallelism_context is None:
+            assert parallel_dims is not None
+            parallelism_context = parallel_dims
+        return parallelize_hf_transformers(
+            self,
+            parallelism_context=parallelism_context,
+            **kwargs,
+        )
+
     pipeline = pipeline_hf_transformers
 
     @classmethod
@@ -1270,13 +1285,17 @@ class HFTransformerModel(BaseModel):
         self,
         input_dict: dict[str, Any],
         *,
-        parallelism_context: ParallelismContext,
+        parallelism_context: ParallelismContext | None = None,
+        parallel_dims: ParallelismContext | None = None,
         parallelism: ParallelismConfig,
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build the attention mask (when positions are present), CP-shard, return."""
         del max_num_documents, max_context_length
+        if parallelism_context is None:
+            assert parallel_dims is not None
+            parallelism_context = parallel_dims
         # Function-local import avoids a circular import.
         from torchtitan.distributed import context_parallel
         from torchtitan.distributed.spmd_types import annotate_input_spmd_types

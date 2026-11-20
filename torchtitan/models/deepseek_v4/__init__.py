@@ -1034,7 +1034,7 @@ deepseek_v4_configs = {
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int | None = None,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,

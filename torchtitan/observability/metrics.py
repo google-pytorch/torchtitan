@@ -362,7 +362,8 @@ class MetricsProcessor(Configurable):
         self,
         config: Config,
         *,
-        parallelism_context: ParallelismContext,
+        parallelism_context: ParallelismContext | None = None,
+        parallel_dims: ParallelismContext | None = None,
         device_memory_monitor: DeviceMemoryMonitor,
         dump_folder: str = "./outputs",
         pp_schedule: str = "1F1B",
@@ -372,6 +373,9 @@ class MetricsProcessor(Configurable):
         tag: str | None = None,
         has_quantization: bool = False,
     ):
+        if parallelism_context is None:
+            assert parallel_dims is not None
+            parallelism_context = parallel_dims
         self.logger = self._build_metric_logger(
             config=config,
             parallelism_context=parallelism_context,
@@ -403,6 +407,14 @@ class MetricsProcessor(Configurable):
         self.num_flops_per_token = -1
         self.optimizers = None
         self.model_parts = None
+
+    @property
+    def parallel_dims(self) -> ParallelismContext:
+        return self.parallelism_context
+
+    @parallel_dims.setter
+    def parallel_dims(self, value: ParallelismContext) -> None:
+        self.parallelism_context = value
 
     def should_log(self, step: int) -> bool:
         if self.step_last_log is None:

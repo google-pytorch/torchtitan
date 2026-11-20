@@ -84,12 +84,14 @@ def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
 def parallelize_hf_transformers(
     model: nn.Module,
     *,
-    parallelism_context: ParallelismContext,
+    parallelism_context: ParallelismContext | None = None,
+    parallel_dims: ParallelismContext | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
 
@@ -110,6 +112,9 @@ def parallelize_hf_transformers(
     # group_size" from the balancer -- this is a CP+ptrr constraint, independent
     # of PP.
 
+    if parallelism_context is None:
+        assert parallel_dims is not None
+        parallelism_context = parallel_dims
     # 0. Un-tie embedding/lm_head weights for FSDP compatibility.
     # Some models (Gemma4) share the embedding and lm_head weight
     # (tie_word_embeddings=True). FSDP2 cannot handle parameters shared
@@ -186,11 +191,12 @@ def parallelize_hf_transformers(
             parallelism_context=parallelism_context,
         )
 
-    model._apply_fsdp(
-        parallelism_context=parallelism_context,
-        training=training,
-        parallelism=parallelism,
-    )
+    if not skip_dp:
+        model._apply_fsdp(
+            parallelism_context=parallelism_context,
+            training=training,
+            parallelism=parallelism,
+        )
 
     if training.enable_cpu_offload:
         logger.info("Applied CPU Offloading to the model")

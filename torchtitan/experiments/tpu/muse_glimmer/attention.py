@@ -32,9 +32,15 @@ Tokamax patches turn ``positions`` into ``segment_ids``.
 
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import (
+    spmd_dense_sp_enabled,
+    spmd_mesh_group,
+)
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.attention import ScaledDotProductInnerAttention
 from torchtitan.models.common.attention import segment_ids_from_positions
@@ -235,6 +241,18 @@ class TpuMuseGlimmerAttention(Attention):
       attention_masks: AttentionMasksType | None,
       positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    tp_group = spmd_mesh_group(MeshAxisName.TP)
+    if tp_group is not None:
+      # qkv and the output gate both consume x, so gather once at their
+      # common attention boundary.
+      x_TD = spmd.redistribute(
+          x_TD,
+          tp_group,
+          src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
+          dst=spmd.R,
+          backward_options={"op_dtype": x_TD.dtype},
+      )
+
     num_tokens = x_TD.shape[0]
     xq, xk, xv = self.qkv_linear(x_TD)
 

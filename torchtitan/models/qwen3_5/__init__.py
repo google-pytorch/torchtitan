@@ -386,7 +386,7 @@ def _build_qwen35_moe_layers(
     *,
     n_layers: int,
     dim: int,
-    enable_sp: bool,
+    enable_sp: bool = True,
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
@@ -475,7 +475,7 @@ def _build_qwen35_moe_layers(
 
 
 def _debugmodel(
-    attn_backend: str, *, enable_sp: bool, seq_len: int
+    attn_backend: str, *, enable_sp: bool = True, seq_len: int
 ) -> Qwen35Model.Config:
     """Debug config for Qwen3.5 with vision encoder."""
     dim = 256
@@ -540,7 +540,7 @@ def _debugmodel_moe(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int,
 ) -> Qwen35Model.Config:
     """Debug MoE config for Qwen3.5 with shared expert."""
@@ -604,7 +604,7 @@ def _debugmodel_moe(
     )
 
 
-def _0_8b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Config:
+def _0_8b(attn_backend: str, *, enable_sp: bool = True, seq_len: int) -> Qwen35Model.Config:
     """Qwen3.5-0.8B dense config with vision encoder.
 
     NOTE: HF config has tie_word_embeddings=true. Torchtitan doesn't support
@@ -666,7 +666,7 @@ def _0_8b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Co
     )
 
 
-def _2b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Config:
+def _2b(attn_backend: str, *, enable_sp: bool = True, seq_len: int) -> Qwen35Model.Config:
     """Qwen3.5-2B dense config with vision encoder.
 
     NOTE: HF config has tie_word_embeddings=true. Torchtitan doesn't support
@@ -728,7 +728,7 @@ def _2b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Conf
     )
 
 
-def _4b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Config:
+def _4b(attn_backend: str, *, enable_sp: bool = True, seq_len: int) -> Qwen35Model.Config:
     """Qwen3.5-4B dense config with vision encoder.
 
     NOTE: HF config has tie_word_embeddings=true. Torchtitan doesn't support
@@ -789,7 +789,7 @@ def _4b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Conf
     )
 
 
-def _9b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Config:
+def _9b(attn_backend: str, *, enable_sp: bool = True, seq_len: int) -> Qwen35Model.Config:
     """Qwen3.5-9B dense config with vision encoder."""
     dim = 4096
     head_dim = 256
@@ -846,7 +846,7 @@ def _9b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Conf
     )
 
 
-def _27b(attn_backend: str, *, enable_sp: bool, seq_len: int) -> Qwen35Model.Config:
+def _27b(attn_backend: str, *, enable_sp: bool = True, seq_len: int) -> Qwen35Model.Config:
     """Qwen3.5-27B dense config with vision encoder."""
     dim = 5120
     head_dim = 256
@@ -907,7 +907,7 @@ def _35b_a3b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int,
 ) -> Qwen35Model.Config:
     """Qwen3.5-35B-A3B MoE config with vision encoder."""
@@ -975,7 +975,7 @@ def _122b_a10b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int,
 ) -> Qwen35Model.Config:
     """Qwen3.5-122B-A10B MoE config with vision encoder."""
@@ -1043,7 +1043,7 @@ def _397b_a17b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int,
 ) -> Qwen35Model.Config:
     """Qwen3.5-397B-A17B MoE config with vision encoder."""
@@ -1124,7 +1124,7 @@ qwen3_5_configs = {
 def model_registry(
     flavor: str,
     *,
-    enable_sp: bool,
+    enable_sp: bool = True,
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,

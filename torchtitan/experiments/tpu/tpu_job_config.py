@@ -35,6 +35,24 @@ class TPUConfig:
       "DEFER_NEVER",
       "DEFER_NEVER_AND_LAUNCH_BLOCKING",
   ] = ""
+  # FSDP2 CPU offload optimizations (opt-in when training.enable_cpu_offload is
+  # True and parallelism.use_simple_fsdp is False; TPUCPUOffloadPolicy with
+  # pin_memory=False is always installed on TPU when enable_cpu_offload=True):
+  # - enable_cpu_offload_param_cache: caches cast device parameter shards across
+  #   microbatches within a step. Persistent HBM cost:
+  #   ~sharded_param_numel * sizeof(param_dtype) (e.g. ~17.3 GB/rank for a 35B
+  #   model at dp_shard=4 in bfloat16), retained on device until
+  #   optimizers.step().
+  # - enable_cpu_offload_device_grad_accum: accumulates reduce-scattered
+  #   gradients on device across microbatches and copies to CPU once per step.
+  #   Persistent HBM cost: ~sharded_param_numel * sizeof(reduce_dtype) (e.g.
+  #   ~34.7 GB/rank for a 35B model at dp_shard=4 in float32), retained on
+  #   device until materialize_host_grads() / optimizers.step().
+  # - cpu_offload_num_threads: > 0 calls torch.set_num_threads for host-side
+  #   clip_grad_norm_ and AdamW updates.
+  enable_cpu_offload_param_cache: bool = False
+  enable_cpu_offload_device_grad_accum: bool = False
+  cpu_offload_num_threads: int = 0
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]
@@ -300,6 +318,18 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
             " --parallelism.expert_parallel_degree > 1 or"
             " --parallelism.pipeline_parallel_degree > 1"
         )
+    if (
+        self.training.enable_cpu_offload
+        and not (
+            self.parallelism.use_simple_fsdp or self.tpu_config.use_simple_fsdp
+        )
+        and self.compile.optimizer_compile == "separate_graph"
+    ):
+      raise ValueError(
+          "training.enable_cpu_offload is incompatible with"
+          " compile.optimizer_compile='separate_graph' because FSDP2 CPU"
+          " offload keeps master parameters and optimizer state on CPU."
+      )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.
     if not self.dump_folder:

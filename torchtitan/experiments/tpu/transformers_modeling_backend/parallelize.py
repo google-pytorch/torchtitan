@@ -82,11 +82,9 @@ def parallelize_hf_transformers_tpu(
     **kwargs,
 ) -> nn.Module:
   """Apply TP/AC/compile via the backend, then SimpleFSDP data parallelism."""
-  # TODO b/499075866: re-enable CPU offload for TPU torchtitan run.
-  if training.enable_cpu_offload:
+  if training.enable_cpu_offload and parallelism.use_simple_fsdp:
     logger.warning(
-        "CPU offload is not supported for TPU torchtitan run, setting it to"
-        " False."
+        "CPU offload is not supported with SimpleFSDP; setting it to False."
     )
     training.enable_cpu_offload = False
 

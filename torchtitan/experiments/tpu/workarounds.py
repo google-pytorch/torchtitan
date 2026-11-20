@@ -721,6 +721,13 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   # Enable CPU safe histc workaround.
   use_cpu_safe_histc_patch()
 
+  if getattr(getattr(job_config, "training", None), "enable_cpu_offload", False):
+    from torchtitan.experiments.tpu.distributed.fsdp_cpu_offload import (  # pylint: disable=g-import-not-at-top
+        configure_tpu_fsdp_cpu_offload_from_job_config,
+    )
+
+    configure_tpu_fsdp_cpu_offload_from_job_config(job_config)
+
   if job_config.parallelism.context_parallel_degree > 1:
     from torchtitan.experiments.tpu.distributed.cp_attention import install_tpu_cp_patches  # pylint: disable=g-import-not-at-top
 

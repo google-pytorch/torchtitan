@@ -94,6 +94,7 @@ def _real_shape_proxy(
     num_experts: int,
     expert_parallel_degree: int,
     seq_len: int,
+    max_seq_len: int | None = None,
 ) -> TPUTrainerConfig:
   """A Qwen3.8-2.4T-A95B proxy: full width, fewer layers and experts.
 
@@ -109,12 +110,14 @@ def _real_shape_proxy(
   top_k` rows of dim 8192, which bounds the tokens per rank. The
   `qwen35_moe_35b` LR schedule (200 warmup steps, clamped to
   `training.steps` in short runs); a 2-step warmup to 3e-4 spiked the loss.
+  `max_seq_len` (default `seq_len`) sizes the model's RoPE table, the upper
+  bound for `--training.max_context_length` overrides.
   """
   cfg = qwen38_moe_debugmodel()
   cfg.hf_assets_path = "./tests/assets/tokenizer"
   cfg.model_spec = model_registry(
       "2.4T-A95B",
-      seq_len=seq_len,
+      seq_len=max_seq_len or seq_len,
       converters=_TPU_MOE_CONVERTERS,
       num_layers=num_layers,
       num_experts=num_experts,
@@ -177,12 +180,17 @@ def qwen38_2_4t_a95b_proxy_tpu7x() -> TPUTrainerConfig:
   ragged EP receive buffer is 64 * T * 10 rows of dim 8192, 10.7 GB bf16 at
   T = 1024 and 21.5 GB at 2048, and the dispatch, the combine and their
   gradients each hold one. Raise `--training.max_context_length` and
-  `--training.num_tokens_per_microbatch_per_dp_rank` together to sweep it.
+  `--training.num_tokens_per_microbatch_per_dp_rank` together to sweep it, up
+  to 8192 (the RoPE table's length).
   See `_real_shape_proxy` and
   `recipes/ironwood/qwen3.8-2.4t-a95b/tpu7x-4x4x4/README.md`.
   """
   cfg = _real_shape_proxy(
-      num_layers=4, num_experts=512, expert_parallel_degree=64, seq_len=1024
+      num_layers=4,
+      num_experts=512,
+      expert_parallel_degree=64,
+      seq_len=1024,
+      max_seq_len=8192,
   )
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, _TPU7X_FLAGS
@@ -198,7 +206,11 @@ def qwen38_2_4t_a95b_proxy_tpu7x_8l() -> TPUTrainerConfig:
   time extrapolate to 92 layers.
   """
   cfg = _real_shape_proxy(
-      num_layers=8, num_experts=512, expert_parallel_degree=64, seq_len=1024
+      num_layers=8,
+      num_experts=512,
+      expert_parallel_degree=64,
+      seq_len=1024,
+      max_seq_len=8192,
   )
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags, _TPU7X_FLAGS

@@ -521,6 +521,11 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
         cfg.training.num_tokens_per_microbatch_per_dp_rank,
         cfg.training.max_context_length,
     )
+    # A --training.max_context_length override does not resize the model's
+    # RoPE table; positions past it fail at run time.
+    self.assertGreaterEqual(
+        cfg.model_spec.max_context_length, cfg.training.max_context_length
+    )
     self.assertIn("xla_tpu_scoped_vmem_limit_kib", cfg.libtpu_init_flags)
     # The XLA grouped matmul overflows TPU7x VMEM at these shapes.
     for _, experts, _, _ in cfg.model_spec.model.traverse(

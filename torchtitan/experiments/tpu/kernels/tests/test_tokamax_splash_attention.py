@@ -132,6 +132,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("qwen3_235b", (16, 4096, 64, 4, 128)),
       ("group1_dim64", (2, 4096, 16, 16, 64)),
       ("group16_seq10240", (1, 10240, 32, 2, 128)),
+      ("muse_glimmer_seq16384", (1, 16384, 32, 2, 128)),
       ("tile256", (1, 4352, 8, 2, 128)),
       ("dim512_group1", (1, 4096, 4, 4, 512)),
   )
@@ -147,13 +148,26 @@ class SplashTbwdSupportTest(parameterized.TestCase):
       ("dim48", (2, 4096, 16, 1, 48), "bfloat16", "head_dim"),
       ("seq4100", (2, 4100, 16, 1, 128), "bfloat16", "multiple of 128"),
       ("vmem_dim256_group16", (2, 4096, 16, 1, 256), "bfloat16", "VMEM"),
-      ("vmem_seq12288", (1, 12288, 32, 2, 128), "bfloat16", "VMEM"),
+      ("vmem_seq17920", (1, 17920, 32, 2, 128), "bfloat16", "VMEM"),
       ("smem_batch64_seq16384", (64, 16384, 4, 4, 64), "bfloat16", "SMEM"),
   )
   def test_unsupported(self, shape, dtype, expected):
     b, s, h, n, d = shape
     reason = splash_tbwd.unsupported_reason((b, s, h, d), (b, s, n, d), (b, s, n, d), jnp.dtype(dtype))
     self.assertIn(expected, reason or "")
+
+  @parameterized.named_parameters(
+      # (B, S, H, N, D), expected (stream_kv, single_buffer_kv)
+      ("qwen3_235b", (16, 4096, 64, 4, 128), (False, False)),
+      ("group16_seq10240", (1, 10240, 32, 2, 128), (False, True)),
+      ("muse_glimmer_seq16384", (1, 16384, 32, 2, 128), (True, True)),
+      ("group16_dim64_seq32768", (1, 32768, 32, 2, 64), (True, False)),
+  )
+  def test_kv_modes(self, shape, expected):
+    """K / V stay resident (the old, slightly faster layout) unless only streaming them fits."""
+    b, s, h, n, d = shape
+    block = splash_tbwd.block_size(s)
+    self.assertEqual(splash_tbwd._kv_modes(d, h // n, s, block, None), expected)  # pylint: disable=protected-access
 
   @parameterized.named_parameters(("v_dim64", 64), ("v_dim256", 256))
   def test_v_head_dim_must_match(self, v_head_dim):
@@ -164,7 +178,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
 
   def test_limits_follow_tpu_info(self):
     """The VMEM / SMEM limits are the attached core's capacities less fixed headroom."""
-    # Needs ~56 MiB of VMEM (fits TPU7x's 60 MiB limit) and a 6.6 KiB schedule.
+    # Needs ~49 MiB of VMEM streamed (fits TPU7x's 60 MiB limit, not a 44 MiB one) and a 6.6 KiB schedule.
     shape = ((1, 10240, 32, 128), (1, 10240, 2, 128), (1, 10240, 2, 128), jnp.dtype(jnp.bfloat16))
     for info, expected in (
         (_fake_tpu_info(), None),
@@ -207,7 +221,7 @@ class SplashTbwdSupportTest(parameterized.TestCase):
     v = jax.ShapeDtypeStruct((1, 256, 1, v_head_dim), jnp.bfloat16)
     with mock.patch.object(splash_tbwd, "_tpu_info", return_value=info):
       reason = tokamax_splash_attention._transposed_bwd_unsupported_reason(  # pylint: disable=protected-access
-          q, k, v, is_causal=True, local_window_size=None
+          q, k, v, is_causal=True
       )
     if expected is None:
       self.assertIsNone(reason)
@@ -227,7 +241,7 @@ class SplashTbwdScheduleTest(parameterized.TestCase):
   """splash_tbwd.build_schedule against a brute-force tile list (no device)."""
 
   @staticmethod
-  def _reference(seg, block):
+  def _reference(seg, block, window=None):
     """Active tiles in (b, qi, kj) order, their kinds and accumulator bounds."""
     num_b, s = seg.shape
     nb = s // block
@@ -239,10 +253,16 @@ class SplashTbwdScheduleTest(parameterized.TestCase):
           q_ids, kv_ids = blocks[b, qi], blocks[b, kj]
           if q_ids.max() < kv_ids.min() or kv_ids.max() < q_ids.min():
             continue
+          # q - k over the tile, from qi * block - (kj * block + block - 1) to its maximum.
+          min_dist = qi * block - (kj * block + block - 1)
+          max_dist = qi * block + block - 1 - kj * block
+          if window is not None and min_dist > window:
+            continue
           single_doc = (
               q_ids.min() == q_ids.max() == kv_ids.min() == kv_ids.max()
           )
-          tiles.append((b, qi, kj, 1 if kj < qi and single_doc else 2))
+          full = kj < qi and single_doc and (window is None or max_dist <= window)
+          tiles.append((b, qi, kj, 1 if full else 2))
     bounds = {}
     for name, run in (("q", lambda t: t[:2]), ("b", lambda t: t[0])):
       runs = [run(t) for t in tiles]
@@ -260,8 +280,11 @@ class SplashTbwdScheduleTest(parameterized.TestCase):
       ("packed_256", ((300, 517, 77, 898), (1000, 48, 744)), 256),
       ("one_document", ((2048,), (2048,)), 512),
       ("unsorted_ids", None, 128),
+      ("window_200_block128", _DOCUMENTS, 128, 200),
+      ("window_1023_block256", ((2048,), (2048,)), 256, 1023),
+      ("window_511_block512", _DOCUMENTS, 512, 511),
   )
-  def test_matches_brute_force(self, documents, block):
+  def test_matches_brute_force(self, documents, block, window=None):
     if documents is None:
       # Ids that repeat out of order: the [min, max] test stays conservative.
       seg = np.array([[0] * 128 + [1] * 128 + [0] * 128 + [2] * 128], np.int32)
@@ -269,9 +292,9 @@ class SplashTbwdScheduleTest(parameterized.TestCase):
       seg = _packed_segment_ids(documents).numpy()
     sched = {
         k: np.asarray(v)
-        for k, v in splash_tbwd.build_schedule(jnp.asarray(seg), block).items()
+        for k, v in splash_tbwd.build_schedule(jnp.asarray(seg), block, window).items()
     }
-    tiles, bounds = self._reference(seg, block)
+    tiles, bounds = self._reference(seg, block, window)
     n = len(tiles)
     num_b, s = seg.shape
     self.assertEqual(int(sched["num_active"]), n)
@@ -750,9 +773,21 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
            documents=((300, 517, 77, 898), (1000, 48, 744)), block=256),
       dict(testcase_name="tile128_dim96", n_heads=4, n_kv_heads=2, head_dim=96,
            documents=((300, 517, 77, 1026), (1000, 48, 872)), block=128),
+      # Sliding windows: inside a tile, one tile, several tiles (Muse Glimmer: 2047, Gemma 4: 1023).
+      dict(testcase_name="window200", n_heads=16, n_kv_heads=2, head_dim=128, window=200),
+      dict(testcase_name="window511_no_segment_ids", n_heads=16, n_kv_heads=1, head_dim=128, packed=False,
+           window=511),
+      dict(testcase_name="window1023", n_heads=8, n_kv_heads=4, head_dim=128, window=1023),
+      # A window across 256-token tiles; Gemma 4's sliding layers (head_dim 256, softmax scale 1.0, so the
+      # non-default-scale q rounding, window 1023).
+      dict(testcase_name="window300_tile256", n_heads=8, n_kv_heads=2, head_dim=128,
+           documents=((300, 517, 77, 898), (1000, 48, 744)), block=256, window=300),
+      dict(testcase_name="gemma4_window1023_dim256_scale1", n_heads=4, n_kv_heads=2, head_dim=256, scale=1.0,
+           window=1023),
   )
   def test_transposed_bwd_matches_reference(
-      self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, block=None, scale=None
+      self, n_heads, n_kv_heads, head_dim, packed=True, documents=_DOCUMENTS, block=None, scale=None,
+      window=None,
   ):
     """use_transposed_bwd (splash_tbwd) gradients match dense f32 attention and Tokamax's backward.
 
@@ -772,6 +807,8 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
 
     # Dense f32 reference, [B, H, S, D]: causal and same-document.
     mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+    if window is not None:
+      mask = mask & ~torch.ones(seq_len, seq_len, dtype=torch.bool).tril(-window - 1)
     if packed:
       mask = (segment_ids[:, :, None] == segment_ids[:, None, :]) & mask
     else:
@@ -788,7 +825,7 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     dense = [x.grad.transpose(1, 2) for x in ref]
 
     segment_ids = segment_ids.to(self.accelerator_device) if packed else None
-    self._check_transposed_bwd(q, k, v, grad_out, segment_ids, dense, scale=scale)
+    self._check_transposed_bwd(q, k, v, grad_out, segment_ids, dense, scale=scale, local_window_size=window)
 
   def _dense_causal_grads(self, q, k, v, grad_out, scale=None):
     """dq, dk, dv of dense f32 causal attention (one document), [B, S, heads, D]."""
@@ -811,18 +848,20 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
       self.skipTest(f"splash_tbwd does not run here: {hardware_reason}")
     as_jax = lambda x: types.SimpleNamespace(shape=tuple(x.shape), dtype=jnp.dtype(jnp.bfloat16))
     reason = tokamax_splash_attention._transposed_bwd_unsupported_reason(  # pylint: disable=protected-access
-        as_jax(q), as_jax(k), as_jax(v), is_causal=True, local_window_size=None
+        as_jax(q), as_jax(k), as_jax(v), is_causal=True
     )
     self.assertIsNone(reason)
 
   def _check_transposed_bwd(
-      self, q, k, v, grad_out, segment_ids, dense, scale=None, max_error_ratio=1.05, max_norm_bias=1e-3
+      self, q, k, v, grad_out, segment_ids, dense, scale=None, max_error_ratio=1.05, max_norm_bias=1e-3,
+      local_window_size=None,
   ):
     """splash_tbwd's gradients are no further from `dense` than Tokamax's backward is, with no scale bias."""
-    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
+    attn = dict(scale=scale, local_window_size=local_window_size)
+    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
     self._assert_runs_transposed_bwd(q, k, v)
     self._set_tokamax_config(use_transposed_bwd=True)
-    got = self._packed_grads(q, k, v, grad_out, segment_ids, scale=scale)
+    got = self._packed_grads(q, k, v, grad_out, segment_ids, **attn)
     for name, g, d, t in zip(("dq", "dk", "dv"), got, dense, tokamax):
       # Both kernels round P / dS to bf16 for the MXU (~3-5e-3 off dense f32, growing with head_dim), so bound
       # splash_tbwd's error by Tokamax's own on the same inputs: no worse than Tokamax, with 5% slack so a small
@@ -835,6 +874,47 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         # No systematic scale difference from Tokamax's backward (TPU7x: <= 3.1e-4 here). A log2(e) or scale ratio
         # that did not match the forward's bf16 rounding biased every gradient by 1-2e-3.
         self.assertLess(abs((g.norm() / t.norm()).item() - 1), max_norm_bias, name)
+
+  @parameterized.named_parameters(
+      ("causal", None, 2048), ("window300", 300, 2048), ("window300_tile256", 300, 2304)
+  )
+  def test_transposed_bwd_stream_kv_matches_resident(self, window, s):
+    """Streaming K / V one kv block per step gives bit-identical gradients to keeping them resident."""
+    reason = splash_tbwd.hardware_unsupported_reason()
+    if reason is not None:
+      self.skipTest(reason)
+    b, h, n, d = 2, 8, 2, 128
+    keys = jax.random.split(jax.random.key(3), 5)
+    q, out, do = (jax.random.normal(kk, (b, s, h, d), jnp.bfloat16) for kk in keys[:3])
+    k, v = (jax.random.normal(kk, (b, s, n, d), jnp.bfloat16) for kk in keys[3:])
+    lse2 = jnp.full((b, h, s), 12.0, jnp.float32)
+    seg = jnp.asarray(np.repeat(np.arange(8), s // 8)[None].repeat(b, 0), jnp.int32)
+    grads = {
+        stream: jax.jit(
+            functools.partial(
+                splash_tbwd.transposed_attention_bwd, q_scale=d**-0.5, window=window, stream_kv=stream
+            )
+        )(q, k, v, out, lse2, do, seg)
+        for stream in (False, True)
+    }
+    for name, resident, streamed in zip(("dq", "dk", "dv"), grads[False], grads[True]):
+      np.testing.assert_array_equal(np.asarray(resident), np.asarray(streamed), err_msg=name)
+
+  @parameterized.named_parameters(("global", None), ("window2047", 2047))
+  def test_transposed_bwd_long_sequence(self, window):
+    """At Muse Glimmer's 16k tokens, 32 q / 2 kv heads (fits only with K / V streamed), splash_tbwd matches Tokamax."""
+    torch.manual_seed(7)
+    segment_ids = _packed_segment_ids(((5000, 3000, 8384),))
+    q, grad_out = (torch.randn(1, 16384, 32, 128, dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(1, 16384, 2, 128, dtype=torch.bfloat16) for _ in range(2))
+    self._assert_runs_transposed_bwd(q, k, v)
+    segment_ids = segment_ids.to(self.accelerator_device)
+    tokamax = self._packed_grads(q, k, v, grad_out, segment_ids, local_window_size=window)
+    self._set_tokamax_config(use_transposed_bwd=True)
+    got = self._packed_grads(q, k, v, grad_out, segment_ids, local_window_size=window)
+    for name, g, t in zip(("dq", "dk", "dv"), got, tokamax):
+      # Both round P / dS to bf16 for the MXU (~3-5e-3 off dense f32 each).
+      self.assertLess(((g - t).norm() / t.norm()).item(), 1e-2, name)
 
   @parameterized.named_parameters(
       dict(testcase_name="logit_std8", logit_std=8.0),
@@ -907,7 +987,6 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
 
   @parameterized.named_parameters(
       ("non_causal", dict(is_causal=False)),
-      ("window", dict(local_window_size=128)),
       ("group32", dict(n_heads=32)),
       ("group1", dict(n_kv_heads=16)),
   )

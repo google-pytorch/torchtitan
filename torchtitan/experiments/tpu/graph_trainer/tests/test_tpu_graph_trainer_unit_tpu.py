@@ -116,6 +116,7 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
   )(inputs, labels, torch.tensor(1.0, device=device), {})
   trainer.train_context = contextlib.nullcontext
   trainer._collect_moe_routing_metrics = False
+  trainer._ep_drop_stats_enabled = False
   return trainer
 
 
@@ -427,6 +428,7 @@ class GradAccumulationTest(BaseAcceleratorDeviceTest):
 
     def fake_init(trainer, config):
       del config
+      trainer.model_parts = []
       trainer.optimizers = SimpleNamespace(optimizers=[])
       trainer.gradient_accumulation_steps = steps
 

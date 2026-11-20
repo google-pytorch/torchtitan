@@ -10,12 +10,14 @@ the CUDA converter. The model swap (`convert`) is inherited, so the resulting
 """
 
 import dataclasses
+import logging
 from functools import partial
 
 from torchao.float8.config import Float8LinearConfig
 from torchtitan.components.quantization.float8 import Float8LinearConverter
 from torchtitan.components.quantization.utils import module_filter_fn
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class TpuFloat8LinearConverter(Float8LinearConverter):

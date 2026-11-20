@@ -1,5 +1,6 @@
 """TPU-local SimpleFSDP support for native non-leading collectives."""
 
+import logging
 from typing import Any
 
 import torch
@@ -9,7 +10,8 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _all_gather_on_dim(shard: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:

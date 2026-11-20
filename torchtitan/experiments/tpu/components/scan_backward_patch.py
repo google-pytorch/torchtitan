@@ -37,6 +37,7 @@ google-pytorch/torchtitan#26.
 
 import contextlib
 import inspect
+import logging
 import sys
 
 import torch
@@ -45,8 +46,7 @@ from torch._higher_order_ops.utils import first_slice_copy, materialize_as_graph
 from torch.fx.traceback import annotate
 from torch_tpu._internal.compile.scan import SCAN_REVERSE_ANNOTATION
 
-from torchtitan.tools.logging import logger
-
+logger = logging.getLogger(__name__)
 
 _UPSTREAM_CALL_BACKWARD = ScanAutogradImpl.call_backward
 

@@ -1,6 +1,7 @@
 """Tests for TPU dataset selection in `experiments/tpu/components/datasets.py`."""
 
 import json
+import logging
 import os
 import pickle
 import tempfile
@@ -11,7 +12,8 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.experiments.tpu.components import datasets
 from torchtitan.hf_datasets.text_datasets import DATASETS
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class TextDatasetTest(absltest.TestCase):
@@ -168,7 +170,9 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
         self.assertEqual(trained[: len(answer)], answer)
 
   def test_chat_options_warn_for_text_datasets(self) -> None:
-    with self.assertLogs(logger, level="WARNING") as logs:
+    with self.assertLogs(
+        "torchtitan.experiments.tpu.components.datasets", level="WARNING"
+    ) as logs:
       self._build(dataset="c4_test", prompt_field="question")
     self.assertIn("only apply to chat datasets", "\n".join(logs.output))
 

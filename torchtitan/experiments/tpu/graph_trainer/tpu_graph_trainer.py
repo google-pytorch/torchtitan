@@ -20,7 +20,7 @@ Note there are 2 ways of compiling the optimizer graph on TPU:
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 import logging
 import os
@@ -462,35 +462,10 @@ class TpuGraphTrainer(GraphTrainer):
                 [model], list(outputs[1 + len(params) :])
             )
 
-        # A tied weight is listed once per name, each time with its full
-        # gradient, so add it only once.
-        seen: set[int] = set()
-        new_params, new_grads = [], []
-        assigned: set[int] = set()
-        # Keyed by grad type: one foreach call cannot mix DTensor and Tensor.
-        to_add: dict[type, tuple[list, list]] = {}
-        for param, grad in zip(params, grads, strict=True):
-            if not param.requires_grad or grad is None or id(param) in seen:
-                continue
-            seen.add(id(param))
-            if param.grad is None:
-                # The graph can return one tensor as two params' grads; each
-                # param needs its own, or the next add lands in both.
-                if id(grad) in assigned:
-                    grad = grad.clone()
-                assigned.add(id(grad))
-                new_params.append(param)
-                new_grads.append(grad)
-            else:
-                dsts, srcs = to_add.setdefault(type(param.grad), ([], []))
-                dsts.append(param.grad)
-                srcs.append(grad)
         # Sum, not assign, so gradient accumulation keeps every microbatch.
         # Each microbatch loss is divided by the whole step's token count, so
         # the sum is the full-batch mean.
-        accumulate_param_grads_(new_params, new_grads)
-        for dsts, srcs in to_add.values():
-            torch._foreach_add_(dsts, srcs)
+        accumulate_param_grads_(*_unique_param_grads(params, grads))
 
         return loss
 
@@ -614,6 +589,31 @@ class TpuGraphTrainer(GraphTrainer):
         )
 
         return loss
+
+
+def _unique_param_grads(
+    params: Sequence[torch.Tensor], grads: Sequence[torch.Tensor | None]
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Pairs each trainable param once with a grad tensor it does not share.
+
+    A tied weight is listed once per name, each time with its full gradient,
+    so it is kept only once. The graph can also return one tensor as two
+    params' grads; the second gets a copy, or the next microbatch's in-place
+    add would land in both.
+    """
+    seen_params: set[int] = set()
+    seen_grads: set[int] = set()
+    unique_params, unique_grads = [], []
+    for param, grad in zip(params, grads, strict=True):
+        if not param.requires_grad or grad is None or id(param) in seen_params:
+            continue
+        seen_params.add(id(param))
+        if id(grad) in seen_grads:
+            grad = grad.clone()
+        seen_grads.add(id(grad))
+        unique_params.append(param)
+        unique_grads.append(grad)
+    return unique_params, unique_grads
 
 
 def _check_in_graph_optimizer_grad_accum(

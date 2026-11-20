@@ -21,7 +21,7 @@ from jax import profiler as jax_profiler
 import torch
 import torch.nn.functional as F
 import torchtitan.observability.logging
-from torchtitan.components import metrics
+from torchtitan.observability import metrics
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
@@ -34,7 +34,7 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
 from torchtitan.tools import utils
 import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 ParallelDims = torchtitan.distributed.ParallelDims

@@ -13,7 +13,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from torch import nn
 from torch.nn import functional as F
 
-from torchtitan.components.metrics import TensorBoardLogger
+from torchtitan.observability.metrics import TensorBoardLogger
 from torchtitan.components.optimizer.optimizer import (
     collect_moe_routing_metric_tensors,
     configure_moe_routing_metrics,

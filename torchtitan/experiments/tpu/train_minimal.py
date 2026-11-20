@@ -34,7 +34,7 @@ import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
 import torchtitan.experiments.tpu.workarounds as workarounds
 from torchtitan.tools import utils
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 import torchtitan.trainer
 # import torchtitan.tools.profiling  # Deprecated upstream
 

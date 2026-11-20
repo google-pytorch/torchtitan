@@ -14,8 +14,8 @@ import logging
 from functools import partial
 
 from torchao.float8.config import Float8LinearConfig
-from torchtitan.components.quantization.float8 import Float8LinearConverter
-from torchtitan.components.quantization.utils import module_filter_fn
+from torchtitan.config.transform import Float8LinearConverter
+from torchtitan.quantization.utils import module_filter_fn
 
 logger = logging.getLogger(__name__)
 

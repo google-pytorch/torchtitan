@@ -10,7 +10,7 @@ from typing import Literal, cast
 from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
@@ -64,7 +64,7 @@ from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 
 
 # Upstream d771abb0 identifies an override by the import path of its decorated

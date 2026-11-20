@@ -5,7 +5,7 @@ from typing import Any, Optional
 import torch
 
 
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 
 logger = logging.getLogger(__name__)
 

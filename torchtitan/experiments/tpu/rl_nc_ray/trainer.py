@@ -21,7 +21,7 @@ from torchtitan.experiments.tpu.rl_nc_ray.padding_packing_utils import (
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools import utils

@@ -59,7 +59,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.utils import has_cuda_capability
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig

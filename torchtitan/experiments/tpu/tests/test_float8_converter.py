@@ -5,8 +5,8 @@ import torch
 from torch.nn import functional as F
 from torchao.float8.config import Float8LinearConfig
 from torchao.float8.config import ScalingGranularity
-from torchtitan.components.quantization.float8 import Float8Linear
-from torchtitan.components.quantization.float8 import Float8LinearConverter
+from torchtitan.quantization.float8 import Float8Linear
+from torchtitan.config.transform import Float8LinearConverter
 from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter
 from torchtitan.experiments.tpu.llama3 import config_registry
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama

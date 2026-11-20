@@ -16,7 +16,7 @@ from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.components.optimizer import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.config.configs import (
     ParallelismConfig,

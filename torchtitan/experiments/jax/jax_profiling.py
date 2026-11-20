@@ -18,9 +18,9 @@ import os
 
 import jax
 
-import torchtitan.tools.profiler
+import torchtitan.observability.profiler
 
-ProfilingConfig = torchtitan.tools.profiler.Profiler.Config
+ProfilingConfig = torchtitan.observability.profiler.Profiler.Config
 logger = logging.getLogger(__name__)
 
 

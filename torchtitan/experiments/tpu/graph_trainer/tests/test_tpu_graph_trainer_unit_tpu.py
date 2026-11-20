@@ -19,10 +19,10 @@ from torchtitan.experiments.graph_trainer import make_fx_tracer
 from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,
 )
-from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
+from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_graph_trainer_model_registry,
@@ -102,11 +102,12 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
     params = [p for _, p in model.named_parameters(remove_duplicate=False)]
     return [loss, *torch.autograd.grad(loss, params)]
 
-  example = torch.randint(0, 128, (batch_size, 16), device=device)
+  inputs = torch.randint(0, 128, (batch_size, 16), device=device)
+  labels = torch.randint(0, 128, (batch_size, 16), device=device)
   trainer = object.__new__(tpu_graph_trainer.TpuGraphTrainer)
   trainer._traced_step = make_fx_tracer.minimal_fx_tracer(
       fwd_bwd, module=model
-  )(example, example, torch.tensor(1.0, device=device), {})
+  )(inputs, labels, torch.tensor(1.0, device=device), {})
   trainer.train_context = contextlib.nullcontext
   trainer._collect_moe_routing_metrics = False
   return trainer
@@ -372,7 +373,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
 
 
 class GradAccumulationTest(BaseAcceleratorDeviceTest):
-  """Each fwd+bwd call adds its grads to param.grad; the step's sum is the full-batch grad."""
+  """Grads add up over a step's fwd+bwd calls to the full-batch grad."""
 
   @parameterized.named_parameters(
       ("ga1", "tied", 1, True),

@@ -10,10 +10,6 @@ from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
-from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import (
-    fp8_paired_segment_matmul_pallas_2d,
-    fp8_swiglu_segment_matmul_pallas_2d,
-)
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
 )
@@ -487,6 +483,13 @@ class TpuGroupedExperts(GroupedExperts):
         num_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
         """SwiGLU experts with every GEMM on FP8 operands (BF16 in and out)."""
+        # Imported lazily: the FP8 kernels pull in tokamax and register custom
+        # ops, which costs host memory in every process that imports this
+        # module even when FP8 is off.
+        from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import (
+            fp8_paired_segment_matmul_pallas_2d,
+            fp8_swiglu_segment_matmul_pallas_2d,
+        )
 
         fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w13_tilings
         gate_up_RF2 = fp8_paired_segment_matmul_pallas_2d(

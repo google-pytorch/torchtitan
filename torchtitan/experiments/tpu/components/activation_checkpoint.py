@@ -61,8 +61,10 @@ class TPUSelectiveAC(SelectiveAC):
     (output + logsumexp, matched by name as in ``AttentionSavingSelectiveAC``),
     so backward does not re-run the forward kernel.
 
-  Saving or recomputing an op runs the same op on the same inputs, so the
-  values do not change.
+  Saving or recomputing an op runs the same op on the same inputs. On CPU the
+  values are bit-identical; on TPU a recomputed op is compiled into the
+  backward program, where XLA may fuse it differently, so results can differ
+  by rounding.
   """
 
   @dataclass(kw_only=True, slots=True)

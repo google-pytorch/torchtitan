@@ -303,13 +303,16 @@ class TestTpuFsdpRematSchedule(unittest.TestCase):
         _, comms = _collect_bucketed_fsdp_comms(gm, n_layers=3)
         order = {node: index for index, node in enumerate(gm.graph.nodes)}
         # Each region's first backward AG consumes every RS wait launched since
-        # the preceding region's first AG.
+        # the preceding region's first AG. The dense-region pass hoists
+        # annotated AG launch chains ahead of the previous layer's RS launches,
+        # so AG bundles are ordered by their wait, which stays at the layer's
+        # first parameter use.
         pending_rs_waits: list[torch.fx.Node] = []
         seen_regions: set[int] = set()
         expected_deadlines: dict[int, tuple[torch.fx.Node, ...]] = {}
         for comm in sorted(
             (comm for comm in comms if comm.direction == "bwd"),
-            key=lambda comm: order[comm.launch],
+            key=lambda comm: order[comm.wait if comm.kind == "ag" else comm.launch],
         ):
             if comm.kind == "rs":
                 pending_rs_waits.append(comm.wait)
@@ -326,6 +329,17 @@ class TestTpuFsdpRematSchedule(unittest.TestCase):
                     pending_rs_waits.clear()
 
         self.assertEqual(set(expected_deadlines), {0, 1})
+        # Region i's AG bundle waits for the RSs of layer i + 1, the layer whose
+        # backward just finished, regardless of where the dense-region pass
+        # left the hoisted AG launches.
+        rs_layers = {
+            comm.wait: comm.logical_index
+            for comm in comms
+            if comm.direction == "bwd" and comm.kind == "rs"
+        }
+        self.assertEqual({rs_layers[w] for w in expected_deadlines[1]}, {2})
+        self.assertIn(1, {rs_layers[w] for w in expected_deadlines[0]})
+        self.assertNotIn(2, {rs_layers[w] for w in expected_deadlines[0]})
         early_wait = expected_deadlines[1][0]
         with gm.graph.inserting_after(early_wait):
             early_user = gm.graph.call_function(

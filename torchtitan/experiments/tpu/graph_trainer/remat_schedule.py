@@ -669,7 +669,15 @@ def _collect_rs_wait_deadlines(
     *,
     n_layers: int,
 ) -> dict[torch.fx.Node, tuple[torch.fx.Node, ...]]:
-    """Assign RS waits to the next transformer-layer AG bundle in FX order."""
+    """Assign RS waits to the next transformer-layer AG bundle in FX order.
+
+    RS launches are ordered by their launch position. AG bundles are ordered by
+    their wait, which ``schedule_fsdp_comms_to_dense_regions_pass`` leaves at
+    the layer's first parameter use; that pass hoists annotated AG launch
+    chains into the previous layer's dense backward region, so the launch no
+    longer marks where the layer's recomputation begins. On TPU the AG barrier,
+    not the FX launch position, decides when the AG starts.
+    """
     # The TPU pipeline does not currently combine parameters into larger
     # collective buckets. This shared helper also recognizes those unbucketed
     # collectives through its legacy metadata fallback.
@@ -677,7 +685,7 @@ def _collect_rs_wait_deadlines(
     order = {node: index for index, node in enumerate(gm.graph.nodes)}
     backward_comms = sorted(
         (comm for comm in all_comms if comm.direction == "bwd"),
-        key=lambda comm: order[comm.launch],
+        key=lambda comm: order[comm.wait if comm.kind == "ag" else comm.launch],
     )
 
     pending_rs_waits: list[torch.fx.Node] = []
@@ -726,8 +734,8 @@ def apply_tpu_fsdp_rs_deadline_schedule(
     ``schedule_fsdp_comms_to_dense_regions_pass`` places alternating backward
     AG/RS launches in FX order, but FX order is not an XLA dependency. TPU LHS
     can therefore regroup all AGs ahead of all RSs. This pass adds the RS waits
-    since the previous layer's AG bundle to the existing AG barrier. No third
-    barrier is created.
+    launched before each layer's AG bundle is consumed, since the previous
+    layer's bundle, to the existing AG barrier. No third barrier is created.
 
     An ordinary tensor dependency orders RS completion, not only RS launch. This
     is a deliberate prototype constraint, but may overconstrain hardware that

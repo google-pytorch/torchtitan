@@ -524,13 +524,6 @@ class RoutedExperts(Module):
             dim=0,
             dtype=torch.int32,
         )
-        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
-            for axis in ("dp", "cp"):
-                # Without EP, grouped_mm otherwise sees input:R, weight:V, and
-                # offsets:P in local SPMD type checking. spmd.P cannot currently
-                # mix with spmd.V, so expose offsets as replicated here.
-                # TODO(pianpwk): Relax this restriction in spmd_types.
-                spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
         with maybe_set_sparse_mesh():
             gate_up_R2F = remat.region(
@@ -580,7 +573,6 @@ class TokenChoiceTopKRouter(Module):
         directly, skipping that scatter, which is slow on TPU. The map is still
         built when ``aux_loss`` consumes it: any aux loss except the batch-wise
         MoELoadBalanceAuxLoss, which counts the top-k ids itself."""
-        _debug_force_load_balance: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
@@ -593,7 +585,6 @@ class TokenChoiceTopKRouter(Module):
         self.route_scale = config.route_scale
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
         self.token_count_impl = config.token_count_impl
-        self._debug_force_load_balance = config._debug_force_load_balance
         # tokens_per_expert_E will be used to track expert usage and to update the expert bias for load balancing
         self.register_buffer(
             "tokens_per_expert_E",
@@ -625,25 +616,6 @@ class TokenChoiceTopKRouter(Module):
             dtype=torch.float32,
             device=buffer_device,
         )
-
-    def _debug_force_load_balance_routing(
-        self, scores_TE: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Balanced round-robin expert assignment.
-        Returns expert IDs and scores with shape ``(T, K)``.
-        """
-        num_tokens = scores_TE.shape[0]
-        # Round-robin indices with exact balance
-        topk_expert_ids_TK = (
-            torch.arange(
-                num_tokens * self.top_k,
-                device=scores_TE.device,
-                dtype=torch.int64,
-            ).reshape(num_tokens, self.top_k)
-            % self.num_experts
-        )
-        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
-        return topk_expert_ids_TK, topk_scores_TK
 
     def _select_experts(
         self,
@@ -695,28 +667,20 @@ class TokenChoiceTopKRouter(Module):
                     f"{tuple(scores_TE.shape)}."
                 )
 
-        if self._debug_force_load_balance:
-            topk_expert_ids_TK, topk_scores_TK = remat.region(
-                self._debug_force_load_balance_routing,
-                "routing_decision",
-                recompute=False,
-            )(scores_TE)
-            remat.recompute_needs_tensor(topk_expert_ids_TK, topk_scores_TK)
-        else:
-            topk_expert_ids_TK = remat.region(
-                self._select_experts,
-                "routing_decision",
-                recompute=False,
-            )(
-                scores_TE,
-                expert_bias_E,
-                padding_mask_T=padding_mask_T,
-                **router_kwargs,
-            )
-            remat.recompute_needs_tensor(topk_expert_ids_TK)
-            # The expert bias is only used for routing. The gating value is
-            # still derived from the original scores.
-            topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
+        topk_expert_ids_TK = remat.region(
+            self._select_experts,
+            "routing_decision",
+            recompute=False,
+        )(
+            scores_TE,
+            expert_bias_E,
+            padding_mask_T=padding_mask_T,
+            **router_kwargs,
+        )
+        remat.recompute_needs_tensor(topk_expert_ids_TK)
+        # The expert bias is only used for routing. The gating value is
+        # still derived from the original scores.
+        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
 
         if self.route_norm:
             denominator_T1 = (
@@ -781,6 +745,31 @@ class TokenChoiceTopKRouter(Module):
         )
 
 
+class RoundRobinTokenChoiceTopKRouter(TokenChoiceTopKRouter):
+    """Route token-expert assignments round-robin with exact balance."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TokenChoiceTopKRouter.Config):
+        pass
+
+    def _select_experts(
+        self,
+        scores_TE: torch.Tensor,
+        expert_bias_E: torch.Tensor | None = None,
+        **router_kwargs,
+    ) -> torch.Tensor:
+        del expert_bias_E, router_kwargs
+        num_tokens = scores_TE.shape[0]
+        return (
+            torch.arange(
+                num_tokens * self.top_k,
+                device=scores_TE.device,
+                dtype=torch.int64,
+            ).reshape(num_tokens, self.top_k)
+            % self.num_experts
+        )
+
+
 class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
     """Top-k router that uses a biased Top-(k+1) cutoff during training."""
 
@@ -792,10 +781,6 @@ class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
         super().__init__(config)
         if not isinstance(self.score_func, Sigmoid):
             raise ValueError("Quantile balancing requires sigmoid router scores.")
-        if self._debug_force_load_balance:
-            raise ValueError(
-                "Quantile balancing does not support forced debug load balancing."
-            )
         self.quantile_balancer = QuantileBalancer.Config(
             num_experts=self.num_experts,
             top_k=self.top_k,

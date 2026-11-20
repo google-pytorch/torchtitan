@@ -18,11 +18,10 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import Shard
 
-from torchtitan.config import CompileConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import FSDPSymmMemScope, ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     enable_fsdp_symm_mem,
@@ -88,10 +87,10 @@ def parallelize_hf_transformers(
     parallel_dims: ParallelismContext | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     skip_dp: bool = False,
+    **kwargs: Any,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
 
@@ -100,7 +99,7 @@ def parallelize_hf_transformers(
     2. Convert all remaining HF nn.Modules to Module protocol via __class__ swap
     3. Set ShardingConfig on every module based on its role
     4. Single model._parallelize(parallelism_context) call -- shards states, wraps forward
-    5. Apply AC, compile, FSDP as usual
+    5. Apply AC and FSDP
     """
     # Flex attention supports FSDP, TP, CP, and PP (in any combination). Under CP
     # the flex kernel's local SPMD boundary redistributes
@@ -173,23 +172,8 @@ def parallelize_hf_transformers(
     # 4. Single parallelize call -- handles TP, EP, MoE, everything
     model._parallelize(parallelism_context)
 
-    model_compile_enabled = (
-        compile_config is not None and "model" in compile_config.components
-    )
-
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
-
-    # Compile after AC wrapping and before FSDP. Compile the whole transformer
-    # block (including Titan MoE) via the shared core helper — the previous
-    # MoE-only ``apply_compile_sparse`` workaround is obsolete now that
-    # whole-block MoE compile works (pytorch/torchtitan#3409 fixed upstream).
-    if model_compile_enabled:
-        apply_compile(
-            model,
-            compile_config=compile_config,
-            parallelism_context=parallelism_context,
-        )
 
     if not skip_dp:
         model._apply_fsdp(

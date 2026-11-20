@@ -11,11 +11,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.common.config_utils import (
-    moe_load_balance_aux_loss_configs,
-    update_moe_aux_loss_configs,
-)
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
@@ -98,49 +95,6 @@ class Qwen3Model(Decoder):
         dim: int = 1024
         vocab_size: int = 151936
 
-        def update_from_config(
-            self,
-            *,
-            config,
-            **kwargs,
-        ) -> None:
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
-            parallelism = config.parallelism
-            # MoELoadBalanceAuxLoss weights each forward by
-            # B / global_batch_size, in samples. Only callers that know the
-            # resolved DP degree can compute these (data_parallel_shard_degree
-            # may be -1 until the mesh is built), so require them rather than
-            # guess: a per-rank fallback silently makes the aux gradient
-            # dp-times too large. Trainer passes both.
-            if moe_load_balance_aux_loss_configs(self.layers):
-                missing = [
-                    name
-                    for name in ("local_global_batch_size", "global_batch_size")
-                    if kwargs.get(name) is None
-                ]
-                if missing:
-                    raise ValueError(
-                        "MoELoadBalanceAuxLoss is configured, so "
-                        "update_from_config needs "
-                        f"{' and '.join(missing)} (in samples, as Trainer "
-                        "passes them)."
-                    )
-                update_moe_aux_loss_configs(
-                    self.layers,
-                    pp_enabled=parallelism.pipeline_parallel_degree > 1,
-                    local_global_batch_size=kwargs["local_global_batch_size"],
-                    global_batch_size=kwargs["global_batch_size"],
-                    seq_len=config.training.max_context_length,
-                )
-
-            from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
-
-            set_qwen3_sharding_config(
-                self,
-                enable_sp=parallelism.enable_sequence_parallel,
-                enable_ep=parallelism.expert_parallel_degree > 1,
-            )
-
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
@@ -160,3 +114,15 @@ class Qwen3Model(Decoder):
                     seq_len=seq_len,
                 )
             return nparams, 6 * active_nparams + attention_op_flops
+
+        def set_sharding_(self, parallelism: ParallelismConfig) -> None:
+            from .sharding import set_qwen3_sharding_config
+
+            set_qwen3_sharding_config(
+                self,
+                enable_sp=parallelism.enable_sequence_parallel,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+            )
+
+    def __init__(self, config: Config):
+        super().__init__(config)

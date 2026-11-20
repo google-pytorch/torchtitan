@@ -12,14 +12,15 @@ from typing import Any, ClassVar, Self, TYPE_CHECKING
 
 import torch
 
-from torchtitan.config import CompileConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 
 from .module import Module
 
 if TYPE_CHECKING:
-    from torchtitan.components.optimizer import OptimizersContainer
+    from torchtitan.components.optim import OptimizersContainer
     from torchtitan.distributed.activation_checkpoint import (
         ActivationCheckpointingConfig,
     )
@@ -87,16 +88,8 @@ class BaseModel(Module, ABC):
         Subclasses define model-specific hyperparameters.
         """
 
-        # TODO: This function violates encapsulation;
-        # maybe replace it with config passes from outside.
-        @abstractmethod
-        def update_from_config(
-            self,
-            *,
-            config,
-            **kwargs,
-        ) -> None:
-            pass
+        def set_sharding_(self, parallelism: ParallelismConfig) -> None:
+            """Set model-specific sharding in place for one runtime consumer."""
 
         @abstractmethod
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
@@ -139,7 +132,7 @@ class BaseModel(Module, ABC):
         parallel_dims: ParallelismContext | None = None,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
-        compile_config: CompileConfig | None,
+        compile_config: LocalCompileConfig,
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
         skip_dp: bool = False,
@@ -148,6 +141,8 @@ class BaseModel(Module, ABC):
         if parallelism_context is None:
             assert parallel_dims is not None
             parallelism_context = parallel_dims
+        # Bind local implementations early; torch.compile traces on first use.
+        compile_config.apply_local_compile()
         with parallelism_context.activate_spmd():
             self._parallelize(parallelism_context)
             from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
@@ -155,18 +150,6 @@ class BaseModel(Module, ABC):
             configure_moe_aux_loss_reduction(self, parallelism_context)
             if ac_config is not None:
                 ac_config.build(dump_folder=dump_folder).apply(self)
-            if (
-                compile_config is not None
-                and getattr(compile_config, "enable", True)
-                and "model" in compile_config.components
-            ):
-                from torchtitan.distributed.compile import apply_compile
-
-                apply_compile(
-                    self,
-                    compile_config=compile_config,
-                    parallelism_context=parallelism_context,
-                )
             if not skip_dp:
                 self._apply_fsdp(
                     parallelism_context=parallelism_context,

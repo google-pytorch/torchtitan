@@ -324,11 +324,7 @@ class MoELoadBalanceAuxLoss(AuxLoss):
             scores_TE = scores_TE * ~padding_mask_T.unsqueeze(-1)
         local_counts_E = None
         if routing_map_TE is None:
-            ids_TK = (
-                expert_ids_TK
-                if padding_mask_T is None
-                else expert_ids_TK[~padding_mask_T]
-            )
+            ids_TK = _mask_padded_expert_ids(expert_ids_TK, padding_mask_T)
             local_counts_E = _tokens_per_expert(ids_TK, num_experts)
         # This rank's share of the global batch, B / global_batch_size, counted
         # in tokens so the batch-wise loss never regroups tokens into sequences.
@@ -437,6 +433,19 @@ def _tokens_per_expert(
         min=0,
         max=num_experts,
     ).to(torch.int64)
+
+
+def _mask_padded_expert_ids(
+    topk_expert_ids_TK: torch.Tensor, padding_mask_T: torch.Tensor | None
+) -> torch.Tensor:
+    """Send padded tokens' ids to -1, which ``_tokens_per_expert`` ignores.
+
+    Keeps the shape static (no boolean indexing / ``nonzero``), so the count
+    compiles on TPU/XLA.
+    """
+    if padding_mask_T is None:
+        return topk_expert_ids_TK
+    return topk_expert_ids_TK.masked_fill(padding_mask_T.unsqueeze(-1), -1)
 
 
 class GroupedExperts(Module):
@@ -606,15 +615,7 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm_epsilon = config.route_norm_epsilon
         self.route_scale = config.route_scale
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
-        # MoELoadBalanceAuxLoss's batch-wise form counts the top-k ids itself;
-        # other aux losses consume the map.
-        aux_loss_needs_map = self.aux_loss is not None and not (
-            isinstance(self.aux_loss, MoELoadBalanceAuxLoss)
-            and self.aux_loss.type == "batch_wise"
-        )
-        self.build_routing_map = (
-            config.token_count_impl == "routing_map" or aux_loss_needs_map
-        )
+        self.token_count_impl = config.token_count_impl
         self._debug_force_load_balance = config._debug_force_load_balance
         # tokens_per_expert_E will be used to track expert usage and to update the expert bias for load balancing
         self.register_buffer(
@@ -622,6 +623,21 @@ class TokenChoiceTopKRouter(Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
         )
+
+    @property
+    def build_routing_map(self) -> bool:
+        """Whether forward materializes the ``[T, E]`` routing map.
+
+        ``token_count_impl="histc"`` skips it, unless an aux loss needs it:
+        MoELoadBalanceAuxLoss's batch-wise form counts the top-k ids itself;
+        other aux losses consume the map. Evaluated per forward so an
+        ``aux_loss`` assigned after construction is honored.
+        """
+        aux_loss_needs_map = self.aux_loss is not None and not (
+            isinstance(self.aux_loss, MoELoadBalanceAuxLoss)
+            and self.aux_loss.type == "batch_wise"
+        )
+        return self.token_count_impl == "routing_map" or aux_loss_needs_map
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is None:
@@ -753,11 +769,7 @@ class TokenChoiceTopKRouter(Module):
         if self.training:
             if routing_map_TE is None:
                 masked_routing_map_TE = None
-                ids_TK = (
-                    topk_expert_ids_TK
-                    if padding_mask_T is None
-                    else topk_expert_ids_TK[~padding_mask_T]
-                )
+                ids_TK = _mask_padded_expert_ids(topk_expert_ids_TK, padding_mask_T)
                 masked_counts_E = _tokens_per_expert(ids_TK, self.num_experts)
             else:
                 masked_routing_map_TE = (

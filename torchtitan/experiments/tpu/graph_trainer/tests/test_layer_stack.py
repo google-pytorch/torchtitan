@@ -130,6 +130,7 @@ def _build(
     device: str | torch.device = "cpu",
     world_size: int = 1,
     flatten: bool = False,
+    period: int = 1,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
@@ -158,7 +159,9 @@ def _build(
         mixed_precision_param=param_dtype, mixed_precision_reduce="float32"
     )
     if stacked or scan:
-        convert = functools.partial(with_tpu_stacked_layers, use_scan=scan)
+        convert = functools.partial(
+            with_tpu_stacked_layers, use_scan=scan, period=period
+        )
     else:
         convert = _layer_loop
     with torch.device("meta"):
@@ -457,6 +460,70 @@ class TestLayerStack(unittest.TestCase):
         stacked.load_state_dict(checkpoint)
         torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
 
+    # The llama3 debug model has 6 layers: period 4 is one cycle plus two
+    # unrolled layers, period 2 is three cycles.
+
+    def test_period_stacks_one_set_per_position(self):
+        model = _build(stacked=True, period=4)
+        holder = getattr(model, STACK_ATTR)
+        plain_layer = dict(_build(stacked=False).layers["0"].named_parameters())
+        stacks = dict(holder.named_parameters(recurse=False))
+        self.assertEqual(
+            set(stacks),
+            {f"p{pos}__{n.replace('.', '__')}" for pos in range(4) for n in plain_layer},
+        )
+        for name, stack in stacks.items():
+            self.assertEqual(stack.shape[0], 1, name)  # 6 // 4 cycles
+        # The two leftover layers keep their own parameters; the stacked ones
+        # keep none.
+        for i in range(6):
+            own = list(model.layers[str(i)].parameters())
+            self.assertEqual(bool(own), i >= 4, f"layer {i}")
+
+    def test_period_state_dict_is_identical(self):
+        """Init writes each layer's row of its own position's stack."""
+        plain = _build(stacked=False).state_dict()
+        stacked = _build(stacked=True, period=4).state_dict()
+
+        self.assertEqual(set(stacked), set(plain))
+        for key, want in plain.items():
+            torch.testing.assert_close(
+                stacked[key].to_local(), want.to_local(), rtol=0, atol=0, msg=key
+            )
+
+    def test_period_loads_an_unrolled_checkpoint_and_matches_it(self):
+        """A row/position mix-up would run the wrong weights with no error."""
+        plain = _build(stacked=False)
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
+        with torch.no_grad():
+            for p in plain.parameters():
+                p.add_(torch.randn_like(p))
+        checkpoint = copy.deepcopy(plain.state_dict())
+        for period in (2, 4):
+            with self.subTest(period=period):
+                stacked = _build(stacked=True, period=period)
+                stacked.load_state_dict(checkpoint)
+                torch.testing.assert_close(
+                    stacked(tokens), plain(tokens), rtol=0, atol=0
+                )
+
+    def test_period_scan_forward_matches_the_loop(self):
+        plain = _build(stacked=False)
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
+        for period in (2, 4):
+            with self.subTest(period=period):
+                torch._dynamo.reset()
+                scanned = _build(stacked=True, scan=True, period=period)
+                # Same tolerance as `test_scan_forward_matches_the_loop`.
+                torch.testing.assert_close(
+                    scanned(tokens), plain(tokens), rtol=1e-5, atol=1e-6
+                )
+
+    def test_period_must_fit_the_layers(self):
+        for period in (0, 7):
+            with self.subTest(period=period), self.assertRaises(ValueError):
+                _build(stacked=True, period=period)
+
     def test_refuses_load_state_dict_with_assign(self):
         """``assign=True`` would load into a tensor the stack never sees.
 
@@ -592,6 +659,14 @@ class TestStackable(unittest.TestCase):
             layer.moe.load_balance_coeff = load_balance_coeff
         with torch.device("meta"):
             return config.build()
+
+    def test_a_mismatch_names_the_real_layer_numbers(self):
+        # One position's layers, as `unregister_and_allocate` passes them with
+        # period 4: layer 7 differs from layer 3.
+        layers = {"3": _toy_layer(), "7": _toy_layer(out=6)}
+        with self.assertRaises(ValueError) as caught:
+            check_layers_are_stackable(layers)
+        self.assertIn("layer 7 does not match layer 3", str(caught.exception))
 
     def test_moe_layers_are_refused(self):
         """An MoE's load-balancing buffers are per-layer, and buffers aren't

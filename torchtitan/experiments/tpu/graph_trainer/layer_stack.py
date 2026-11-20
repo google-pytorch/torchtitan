@@ -103,8 +103,14 @@ def _stack_key(position: int, name: str, period: int) -> str:
     return _mangle(name) if period == 1 else f"p{position}__{_mangle(name)}"
 
 
-def check_layers_are_stackable(layers: nn.ModuleDict | list[nn.Module]) -> None:
-    """Every layer must match layer 0, or they cannot share a stack.
+def check_layers_are_stackable(
+    layers: nn.ModuleDict | dict[str, nn.Module],
+) -> None:
+    """Every layer must match the first, or they cannot share a stack.
+
+    ``layers`` maps each layer's number (as a string) to the layer, so errors
+    name the real layer; with ``period > 1`` it holds one position's layers.
+    Below, "layer 0" means the first of them.
 
     Parameters become rows of one tensor, so they have to agree on name, shape,
     dtype and ``requires_grad``. Dtype matters because the stack is allocated
@@ -122,10 +128,9 @@ def check_layers_are_stackable(layers: nn.ModuleDict | list[nn.Module]) -> None:
         named = [*layer.named_parameters(), *layer.named_buffers()]
         return {n: (tuple(t.shape), t.dtype, t.requires_grad) for n, t in named}
 
-    if isinstance(layers, nn.ModuleDict):
-        layers = list(layers.values())
-    template, zero_buffers = spec(layers[0]), dict(layers[0].named_buffers())
-    for i, layer in enumerate(layers):
+    (first, layer0), *_ = layers.items()
+    template, zero_buffers = spec(layer0), dict(layer0.named_buffers())
+    for i, layer in layers.items():
         # Load balancing keeps its state in buffers, and buffers aren't stacked,
         # so every layer would route off layer 0's. The value check above misses
         # it: the buffers start equal and only diverge during training. With no
@@ -157,7 +162,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict | list[nn.Module]) -> None:
             ]
         if differences:
             raise ValueError(
-                f"layer {i} does not match layer 0, so their weights cannot "
+                f"layer {i} does not match layer {first}, so their weights cannot "
                 f"share a stack: {differences}. Stacking needs identical "
                 "layers "
                 "(https://github.com/google-pytorch/torchtitan/issues/24)."
@@ -486,12 +491,12 @@ class LayerStack:
         """
         assert not self._unregistered, "unregister_and_allocate() ran twice"
         for pos in range(self.period):
-            group = [
-                self.layers[str(i)]
+            group = {
+                str(i): self.layers[str(i)]
                 for i in range(pos, self.n_stacked, self.period)
-            ]
+            }
             check_layers_are_stackable(group)
-            for name, p in group[0].named_parameters():
+            for name, p in group[str(pos)].named_parameters():
                 key = _stack_key(pos, name, self.period)
                 self.keys[pos].append((name, key))
                 self.holder.register_parameter(
@@ -660,10 +665,11 @@ class LayerStack:
     def run(self, h: torch.Tensor, *args, use_scan: bool):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
-        Both paths run the same ``body``. Layer 0 acts as the template:
-        ``functional_call`` runs its ``forward`` with another layer's weights.
-        The layers' own buffers (the RoPE cache) are identical across layers, so
-        the template's are correct on every iteration.
+        Both paths run the same ``body``. Layers ``0..period-1`` act as the
+        templates, one per position in the cycle: ``functional_call`` runs a
+        template's ``forward`` with another layer's weights. The layers' own
+        buffers (the RoPE cache) are identical across the layers of a position,
+        so the template's are correct on every iteration.
 
         One difference is who slices the stacks. The loop indexes them itself;
         ``scan`` takes them as its ``xs``, slicing along their leading layer
@@ -813,8 +819,9 @@ def _apply_stacked_layers(
       them itself, which means its config went through ``tpu_model_class``.
       Stacking works by swapping that container for one that runs the layers out
       of the stacks.
-    * The layers are homogeneous, and no layer is an MoE with load balancing
-      on. Both checked, by :func:`check_layers_are_stackable`.
+    * The layers are homogeneous -- with ``period > 1``, the layers at the
+      same position in each cycle -- and no layer is an MoE with load
+      balancing on. Both checked, by :func:`check_layers_are_stackable`.
     * The layer signature is ``(h, *args)``, where ``h`` is the hidden state and
       layer ``i`` takes layer ``i-1``'s output. ``h`` is the only argument that
       changes between layers; ``*args`` (RoPE cache, attention masks) has to be

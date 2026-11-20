@@ -106,6 +106,10 @@ DISABLED_TESTS = {
     # Requires optional dependency fla from requirements-vlm.txt
     "tests.unit_tests.cpu.test_rope",
     "tests.unit_tests.cpu.test_qwen3_5",
+    # attn-gym (CUDA/Triton kernels) is left out of the TPU image; these import
+    # torchtitan.models.qwen3_5 directly, without the TPU lane's attn_gym_stub.
+    "tests.unit_tests.cpu.test_model_td_layout",
+    "tests.unit_tests.cpu.test_triton_offset_rmsnorm_override",
     # Missing optional dependency torchvision
     "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
     "tests.unit_tests.cpu.components.data.test_qwen_multimodal_data",

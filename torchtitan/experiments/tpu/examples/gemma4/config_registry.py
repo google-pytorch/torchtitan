@@ -34,6 +34,7 @@ from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
@@ -250,11 +251,23 @@ def gemma4_moe_debug_pallas() -> TPUTrainerConfig:
   return cfg
 
 
+def _to_gemma4_graph_trainer_config(
+    base_cfg: TPUTrainerConfig,
+) -> TpuGraphTrainer.Config:
+  """Convert a base Gemma 4 TPU config to GraphTrainer and pack QKV projections."""
+  cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
+      base_cfg, graph_trainer_model_registry
+  )
+  assert cfg.model_spec is not None
+  cfg.model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  )
+  return cfg
+
+
 def graph_trainer_gemma4_debugmodel() -> TpuGraphTrainer.Config:
   """Gemma4 dense debug model configuration using TPU GraphTrainer."""
-  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
-      gemma4_debugmodel(), graph_trainer_model_registry
-  )
+  config = _to_gemma4_graph_trainer_config(gemma4_debugmodel())
   # Match gemma4_debugmodel's FullAC on the joint graph.
   config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
@@ -266,9 +279,7 @@ def graph_trainer_gemma4_debugmodel() -> TpuGraphTrainer.Config:
 
 def graph_trainer_gemma4_moe_debug() -> TpuGraphTrainer.Config:
   """Gemma4 MoE debug model configuration using TPU GraphTrainer."""
-  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
-      gemma4_moe_debug(), graph_trainer_model_registry
-  )
+  config = _to_gemma4_graph_trainer_config(gemma4_moe_debug())
   config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       components=["model"],
@@ -280,7 +291,10 @@ def graph_trainer_gemma4_moe_debug() -> TpuGraphTrainer.Config:
 def gemma4_31b() -> TPUTrainerConfig:
   """Gemma4 31B dense model configuration for TPU."""
   model_spec = model_registry(
-      "31B", attn_backend="sdpa", enable_weight_tying=False
+      "31B",
+      attn_backend="sdpa",
+      converters=[TpuPackedQKVConverter.Config()],
+      enable_weight_tying=False,
   )
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
@@ -344,6 +358,7 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
       "26B-A4B",
       attn_backend="sdpa",
       converters=[
+          TpuPackedQKVConverter.Config(),
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
       ],
@@ -364,9 +379,7 @@ def _configure_graph_trainer_full_ac(
     base_cfg: TPUTrainerConfig,
 ) -> TpuGraphTrainer.Config:
   """Configure unsplit GraphTrainer ZeRO-3 with full activation checkpointing."""
-  cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
-      base_cfg, graph_trainer_model_registry
-  )
+  cfg = _to_gemma4_graph_trainer_config(base_cfg)
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
@@ -382,9 +395,7 @@ def _configure_graph_split(
     base_cfg: TPUTrainerConfig, *, offload: bool = False
 ) -> TpuGraphTrainer.Config:
   """Configure per-layer GraphTrainer splitting with full or host-offload AC."""
-  cfg = TpuGraphTrainer.Config.from_tpu_trainer_config(
-      base_cfg, graph_trainer_model_registry
-  )
+  cfg = _to_gemma4_graph_trainer_config(base_cfg)
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,

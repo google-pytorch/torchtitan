@@ -1795,6 +1795,35 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
       graph_config.model_spec.model.build()
 
   @parameterized.parameters(
+      (graph_trainer_gemma4_debugmodel, 6, 1),
+      (graph_trainer_gemma4_moe_debug, 6, 1),
+      (gemma4_31b, 60, 10),
+      (gemma4_31b_graph_trainer, 60, 10),
+      (gemma4_31b_graph_split, 60, 10),
+      (gemma4_31b_graph_split_offload, 60, 10),
+      (gemma4_26b_a4b, 30, 5),
+      (gemma4_26b_a4b_graph_trainer, 30, 5),
+      (gemma4_26b_a4b_graph_split, 30, 5),
+      (gemma4_26b_a4b_graph_split_offload, 30, 5),
+  )
+  def test_graph_trainer_recipes_use_packed_qkv(
+      self, recipe, expected_packed_layers: int, expected_keqv_layers: int
+  ) -> None:
+    """Production and GraphTrainer Gemma 4 recipes convert all layers (sliding and global K=V) to TpuPackedQKVLinear."""
+    config = recipe()
+    assert config.model_spec is not None
+    packed_cfgs = [
+        cfg
+        for _, cfg, _, _ in config.model_spec.model.traverse(
+            TpuPackedQKVLinear.Config
+        )
+    ]
+    self.assertLen(packed_cfgs, expected_packed_layers)
+    self.assertEqual(
+        sum(1 for cfg in packed_cfgs if cfg.k_eq_v), expected_keqv_layers
+    )
+
+  @parameterized.parameters(
       gemma4_debugmodel,
       gemma4_moe_debug,
       gemma4_moe_testmodel,
@@ -1988,6 +2017,27 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     ])
     self.assertEqual(pipeline_cfg.compile.graph_split.pipeline_kinds, ("rs",))
     apply_tpu_graph_trainer_model_transforms(pipeline_cfg)
+
+  def test_ep_rejects_fsdp_pipeline_and_allows_by_layer(self) -> None:
+    ep_pipeline_cfg = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+    ])
+    with self.assertRaisesRegex(
+        ValueError, "backward_partition_mode=by_layer"
+    ):
+      apply_tpu_graph_trainer_model_transforms(ep_pipeline_cfg)
+
+    ep_by_layer_cfg = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+        "--compile.graph_split.backward_partition_mode=by_layer",
+    ])
+    apply_tpu_graph_trainer_model_transforms(ep_by_layer_cfg)
 
 
 if __name__ == "__main__":

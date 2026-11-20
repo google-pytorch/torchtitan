@@ -22,6 +22,7 @@ EP = 1 case is the baseline for TPU-vs-CPU numerics with the same tolerances.
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 
@@ -31,9 +32,22 @@ _CPU_CONFIG_FN = (
 )
 
 
+# Routing weights before W2 pass per-row scales, which only the Pallas grouped
+# matmuls take, so those cases select them explicitly.
+_PALLAS_GMM_CONFIG = "--config=qwen35_moe_debugmodel_pallas_gmm"
+
+
 def cpu_reference_config(cfg):
-  """Single-device CPU reference: EP = 1 (the device run's EP is kept in args)."""
+  """Single-device CPU reference: EP = 1 (the device run's EP is kept in args).
+
+  Also runs the experts on native ``torch._grouped_mm``: the Pallas grouped
+  matmuls are TPU-only.
+  """
   cfg.parallelism.expert_parallel_degree = 1
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_pallas_grouped_mm = False
   return cfg
 
 
@@ -42,20 +56,59 @@ class EpParityDistributedTest(
 ):
 
   @parameterized.named_parameters(
-      ("_ep1", 1),
-      ("_ep2", 2),
-      ("_ep4", 4),
-      ("_ep8", 8),
+      ("_ep1", 1, []),
+      # Under `auto` on debugmodel_moe (top_k=2): EP=2 uses Ring-of-Experts;
+      # EP=4 and EP=8 use ragged_all_to_all.
+      ("_ep2_auto_roe", 2, []),
+      ("_ep4_auto_ragged", 4, []),
+      ("_ep8_auto_ragged", 8, []),
+      # Explicit Ring-of-Experts at EP=4 and EP=8 (ep_size > top_k).
+      ("_ep4_roe", 4, ["--tpu_config.ep_transport=ring_of_experts"]),
+      ("_ep8_roe", 8, ["--tpu_config.ep_transport=ring_of_experts"]),
+      # Routing weights applied before W2 (`scale_before_down_proj`) under both
+      # Ring-of-Experts (EP=2 via auto) and ragged_all_to_all (EP=4 via auto).
+      (
+          "_ep2_scale_before_w2",
+          2,
+          [_PALLAS_GMM_CONFIG, "--tpu_config.ep_scale_before_down_proj=True"],
+      ),
+      (
+          "_ep4_scale_before_w2",
+          4,
+          [_PALLAS_GMM_CONFIG, "--tpu_config.ep_scale_before_down_proj=True"],
+      ),
+      # Bounded expert buffer below the EP=4 worst case (4 * 512 = 2048 rows)
+      # on ragged_all_to_all (via auto; 3.0 -> 1536 rows) and Ring-of-Experts
+      # (2.0 -> 1024 rows; it rounds capped buffers up to a multiple of 1024,
+      # so 3.0 would round up to the worst case).
+      ("_ep4_cap3_ragged", 4, ["--tpu_config.ep_capacity_factor=3.0"]),
+      (
+          "_ep4_cap2_roe",
+          4,
+          [
+              _PALLAS_GMM_CONFIG,
+              "--tpu_config.ep_transport=ring_of_experts",
+              "--tpu_config.ep_scale_before_down_proj=True",
+              "--tpu_config.ep_capacity_factor=2.0",
+          ],
+      ),
   )
-  def test_qwen3_5_moe_ep_matches_single_device(self, ep_degree: int):
+  def test_qwen3_5_moe_ep_matches_single_device(
+      self, ep_degree: int, extra_args: list[str]
+  ):
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
-      self.skipTest("Runs the real TPU ragged_all_to_all.")
+      self.skipTest("Runs the real TPU EP collectives and Pallas kernels.")
     if self.num_devices % ep_degree:
       self.skipTest(f"EP={ep_degree} needs a multiple of {ep_degree} chips.")
+    config = next(
+        (arg for arg in extra_args if arg.startswith("--config=")),
+        "--config=qwen35_moe_debugmodel",
+    )
+    extra_args = [arg for arg in extra_args if not arg.startswith("--config=")]
     self._run_trainer_distributed_parity_test(
         config_args=[
             "--module=torchtitan.experiments.tpu.qwen3_5",
-            "--config=qwen35_moe_debugmodel",
+            config,
             # TrainerMinimal (used by the parity harness) builds the optimizer
             # without the model's per-mesh param-group split, and foreach
             # AdamW can't mix the dense (fsdp) and expert (efsdp, ep) meshes
@@ -71,6 +124,7 @@ class EpParityDistributedTest(
             "--training.num_tokens_per_microbatch_per_dp_rank=256",
             "--parallelism.use_simple_fsdp",
             f"--parallelism.expert_parallel_degree={ep_degree}",
+            *extra_args,
         ],
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,

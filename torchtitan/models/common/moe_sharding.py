@@ -185,8 +185,14 @@ def _routed_experts_sharding_configs(
         experts_input_layout = dense_sequence_parallel_placement()
     else:
         experts_input_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
-        w13_config = None
-        w2_config = None
+        # Fork: replicated DTensors rather than plain tensors (see
+        # ``_expert_param_placement_dense_replicated``), as for ``inner_experts``.
+        w13_config = ShardingConfig(
+            state_shardings={"weight": _expert_param_placement_dense_replicated()}
+        )
+        w2_config = ShardingConfig(
+            state_shardings={"weight": _expert_param_placement_dense_replicated()}
+        )
 
     tokens_per_expert_layout = _tokens_per_expert_placement(enable_ep=enable_ep)
 

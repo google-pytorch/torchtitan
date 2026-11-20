@@ -418,7 +418,16 @@ class TpuGroupedExpertsConverter(ModelConfigConverter):
             param_init = {}
             if w13.param_init and "weight" in w13.param_init:
                 w13_init = w13.param_init["weight"]
-                if hasattr(w13_init, "__closure__") and w13_init.__closure__:
+                # `fused_grouped_gate_up_param_init` wraps the per-weight
+                # initializers in a picklable `_FusedGroupedGateUpInit` object
+                # carrying `w1_init` / `w3_init`; older versions used a closure
+                # over the original `param_init` dict.
+                w1_init = getattr(w13_init, "w1_init", None)
+                w3_init = getattr(w13_init, "w3_init", None)
+                if w1_init is not None and w3_init is not None:
+                    param_init["w1_EFD"] = w1_init
+                    param_init["w3_EFD"] = w3_init
+                elif getattr(w13_init, "__closure__", None):
                     for cell in w13_init.__closure__:
                         val = cell.cell_contents
                         if isinstance(val, dict) and {"w1_EFD", "w3_EFD"} <= val.keys():

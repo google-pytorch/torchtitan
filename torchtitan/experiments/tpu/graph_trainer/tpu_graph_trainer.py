@@ -28,6 +28,7 @@ from typing import Any, cast
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer.optimizer import (
@@ -591,6 +592,12 @@ class TpuGraphTrainer(GraphTrainer):
         return loss
 
 
+def _data_id(t: torch.Tensor) -> int:
+    # run_traced wraps each DTensor output on its own, so two DTensor grads
+    # can share one local tensor behind different wrappers.
+    return id(t._local_tensor if isinstance(t, DTensor) else t)
+
+
 def _unique_param_grads(
     params: Sequence[torch.Tensor], grads: Sequence[torch.Tensor | None]
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -608,9 +615,9 @@ def _unique_param_grads(
         if not param.requires_grad or grad is None or id(param) in seen_params:
             continue
         seen_params.add(id(param))
-        if id(grad) in seen_grads:
+        if _data_id(grad) in seen_grads:
             grad = grad.clone()
-        seen_grads.add(id(grad))
+        seen_grads.add(_data_id(grad))
         unique_params.append(param)
         unique_grads.append(grad)
     return unique_params, unique_grads

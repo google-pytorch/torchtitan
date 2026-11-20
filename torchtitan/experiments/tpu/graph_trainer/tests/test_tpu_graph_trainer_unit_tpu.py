@@ -74,17 +74,23 @@ class _SharedGradModel(nn.Module):
 
 
 class _ShardedModel(nn.Module):
-  """DTensor params gathered in forward, as SimpleFSDP does, plus a plain one."""
+  """DTensor params gathered in forward, as SimpleFSDP does, plus a plain one.
+
+  a and b get one grad tensor back, which run_traced wraps once per param.
+  """
 
   def __init__(self, mesh) -> None:
     super().__init__()
-    self.embed = nn.Parameter(
+    self.a = nn.Parameter(
+        distribute_tensor(torch.randn(128, 32), mesh, [Shard(0)])
+    )
+    self.b = nn.Parameter(
         distribute_tensor(torch.randn(128, 32), mesh, [Shard(0)])
     )
     self.scale = nn.Parameter(torch.ones(32))
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    embed = self.embed.redistribute(placements=[Replicate()]).to_local()
+    embed = (self.a + self.b).redistribute(placements=[Replicate()]).to_local()
     return (F.embedding(x, embed) * self.scale) @ embed.T
 
 

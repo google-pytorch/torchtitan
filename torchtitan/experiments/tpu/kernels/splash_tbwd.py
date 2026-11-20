@@ -302,7 +302,7 @@ def _kernel(
     qseg_QL_ref: jax.Ref,
     kvseg_8S_ref: jax.Ref,
     # outputs (VMEM blocks)
-    dq_GQD_ref: jax.Ref,
+    dq_GDQ_ref: jax.Ref,
     dkt_DS_ref: jax.Ref,
     dvt_DS_ref: jax.Ref,
     # scratch (VMEM, f32)
@@ -435,7 +435,10 @@ def _kernel(
 
   @pl.when(should_write_dq)
   def _():
-    dq_GQD_ref[...] = (dq_GQD_acc[...] * q_scale).astype(dq_GQD_ref.dtype)
+    # dq leaves sequence-minor, like dk^T / dv^T; see transposed_attention_bwd.
+    for g in range(dq_GQD_acc.shape[0]):
+      # Round to bf16 before the transpose: half the XLU work of an f32 one.
+      dq_GDQ_ref[g] = (dq_GQD_acc[g] * q_scale).astype(dq_GDQ_ref.dtype).T
 
   @pl.when(should_write_dkv)
   def _():
@@ -476,7 +479,7 @@ def splash_tbwd_call(
       q_scale / q_ratio and rounded again); 1.0 at the default scale.
 
   Returns:
-    dq [B, H, S, D], dk^T and dv^T [B, N, D, S], in the input dtype.
+    dq^T [B, H, D, S], dk^T and dv^T [B, N, D, S], in the input dtype.
   """
   num_b, num_h, d, s = q_BHDS.shape
   num_kv = k_BNDS.shape[1]
@@ -486,11 +489,6 @@ def splash_tbwd_call(
       h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
   ) -> _BlockIndex:
     return (b[t], h, 0, qi[t])
-
-  def q_head_dim_minor(
-      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
-  ) -> _BlockIndex:
-    return (b[t], h, qi[t], 0)
 
   def per_kv_head(
       h: jax.Array, t: jax.Array, b: jax.Ref, *_: jax.Ref
@@ -525,12 +523,12 @@ def splash_tbwd_call(
       pl.BlockSpec((None, 8, s), kv_segments, **resident),
   ]
   out_specs = [
-      pl.BlockSpec((None, g, block, d), q_head_dim_minor),
+      pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
       pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
   ]
   out_shape = [
-      jax.ShapeDtypeStruct((num_b, num_h, s, d), q_BHDS.dtype),
+      jax.ShapeDtypeStruct((num_b, num_h, d, s), q_BHDS.dtype),
       jax.ShapeDtypeStruct((num_b, num_kv, d, s), k_BNDS.dtype),
       jax.ShapeDtypeStruct((num_b, num_kv, d, s), v_BNDS.dtype),
   ]
@@ -765,8 +763,13 @@ def transposed_attention_bwd(
   sched = build_schedule(segment_ids_BS, block)
   seg_BS = segment_ids_BS.astype(jnp.int32)
   # The transposes to sequence-minor lower to bitcasts in the model graph,
-  # where XLA already keeps q / k / v sequence-minor.
-  dq_BHSD, dkt_BNDS, dvt_BNDS = splash_tbwd_call(
+  # where XLA already keeps q / k / v sequence-minor. All three gradients also
+  # come back sequence-minor: a head-dim-minor dq made XLA pick head-dim-minor
+  # layouts for the RoPE tables shared by every layer, and with them for each
+  # layer's RoPE in the forward too, where interleaved RoPE's stride-2 head-dim
+  # slices are ~6x slower (8-layer Muse Glimmer with its sliding-window layers
+  # on splash_tbwd: 1.11 -> 0.98 s per step).
+  dqt_BHDS, dkt_BNDS, dvt_BNDS = splash_tbwd_call(
       sched,
       jnp.transpose(q_BSHD, (0, 2, 3, 1)),
       jnp.transpose(do_BSHD, (0, 2, 3, 1)),
@@ -783,7 +786,7 @@ def transposed_attention_bwd(
       q_ratio=q_ratio,
   )
   return (
-      jnp.swapaxes(dq_BHSD, 1, 2),
+      jnp.transpose(dqt_BHDS, (0, 3, 1, 2)),
       jnp.transpose(dkt_BNDS, (0, 3, 1, 2)),
       jnp.transpose(dvt_BNDS, (0, 3, 1, 2)),
   )

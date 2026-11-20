@@ -99,6 +99,19 @@ def register_layer_loop_forward(model_cls: type, forward) -> None:
     _LAYER_LOOP_FORWARDS[model_cls] = forward
 
 
+def _registered_forward(model_cls: type):
+    """The registered copy of ``model_cls.forward``, or None.
+
+    Matched on the ``forward`` function, not the class, so a subclass that
+    keeps the registered model's ``forward`` (a recipe's FLOP-accounting
+    config class, say) is rewritten too.
+    """
+    for cls, forward in _LAYER_LOOP_FORWARDS.items():
+        if model_cls.forward is cls.forward:
+            return forward
+    return None
+
+
 def _is_loop_forward(forward) -> bool:
     return forward is _forward or forward in _LAYER_LOOP_FORWARDS.values()
 
@@ -159,12 +172,9 @@ def tpu_model_class(config_cls: type) -> type:
     model_cls = config_cls._owner
     if _is_loop_forward(model_cls.forward):
         return model_cls  # already rewritten
-    if model_cls in _LAYER_LOOP_FORWARDS:
+    if (forward := _registered_forward(model_cls)) is not None:
         return model_subclass(
-            model_cls,
-            config_cls,
-            f"Tpu{model_cls.__name__}",
-            forward=_LAYER_LOOP_FORWARDS[model_cls],
+            model_cls, config_cls, f"Tpu{model_cls.__name__}", forward=forward
         )
     if not issubclass(model_cls, Decoder) or model_cls.forward is not Decoder.forward:
         raise TypeError(

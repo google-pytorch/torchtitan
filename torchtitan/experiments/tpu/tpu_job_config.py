@@ -50,6 +50,8 @@ class TPUConfig:
   ] | None = None
   ep_scale_before_down_proj: bool | None = None
   ep_capacity_factor: float | None = None
+  ep_token_chunks: int | None = None
+  ep_max_inflight_chunks: int | None = None
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]

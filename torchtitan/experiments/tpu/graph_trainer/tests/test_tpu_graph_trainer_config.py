@@ -387,6 +387,20 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "require compile.mode"):
       apply_tpu_graph_trainer_model_transforms(config)
 
+  @parameterized.named_parameters(
+      ("without_scan", 4, False, "only applies with"),
+      ("zero", 0, True, "must be >= 1"),
+  )
+  def test_scan_period_is_validated(
+      self, period: int, use_scan: bool, message: str
+  ) -> None:
+    config = graph_trainer_qwen3_debugmodel()
+    config.compile.scan_period = period
+    config.compile.use_scan_layers = use_scan
+
+    with self.assertRaisesRegex(ValueError, message):
+      apply_tpu_graph_trainer_model_transforms(config)
+
   def test_regular_compile_controls_are_cli_addressable(self) -> None:
     config = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3",

@@ -156,6 +156,8 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # With use_scan_layers: layers per scan step, for models whose layer types
   # repeat (Qwen3.5: 4, three GatedDeltaNet then one full attention). Each
   # position in the cycle gets its own stacks; n_layers % period run unrolled.
+  # With period > 1 the stacks are named `p{pos}__...`, so optimizer state
+  # cannot resume across a change of this value either.
   scan_period: int = 1
   # Make each layer's local parameter gradients a dependency of the next
   # layer's recomputation. This prevents XLA from starting the next layer and
@@ -292,6 +294,15 @@ def apply_tpu_graph_trainer_model_transforms(
   compile_config = config.compile
   if compile_config.pass_pipeline != "tpu":
     raise ValueError("TPU GraphTrainer requires compile.pass_pipeline='tpu'")
+  if compile_config.scan_period < 1:
+    raise ValueError(
+        f"compile.scan_period must be >= 1, got {compile_config.scan_period}"
+    )
+  if compile_config.scan_period != 1 and not compile_config.use_scan_layers:
+    # Otherwise the period would be dropped without a word.
+    raise ValueError(
+        "compile.scan_period only applies with --compile.use-scan-layers"
+    )
 
   aot_only_options = []
   if compile_config.use_scan_layers:

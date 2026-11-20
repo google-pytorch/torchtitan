@@ -10,6 +10,7 @@ token layouts (KV all-gather's head-tail and Ulysses' contiguous one).
 
 import contextlib
 import copy
+import unittest
 from unittest import mock
 
 from absl.testing import absltest
@@ -19,20 +20,51 @@ from absl.testing import parameterized
 import torch
 import spmd_types as spmd  # pylint: disable=unused-import
 # pyformat: enable
+import torch.distributed as dist
 import torch.nn.functional as F
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 from torchtitan.experiments.tpu import cp_attention
 from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
 from torchtitan.experiments.tpu.qwen3_5 import config_registry
 from torchtitan.experiments.tpu.qwen3_5 import cp_gated_delta
-from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import CPTpuInnerGatedDeltaNet, GatedDeltaNetContextParallelTransform
-from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, TpuInnerGatedDeltaNet
+from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import CPTpuGatedDeltaNet, CPTpuInnerGatedDeltaNet, GatedDeltaNetContextParallelTransform
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, TpuGatedDeltaNet, TpuInnerGatedDeltaNet
 from torchtitan.experiments.tpu.tests.test_cp_attention import _DOCS, _emulated_cp_group, _packed_positions, _Ranks, _SEQ_LEN, _shard, _unshard
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 
 _STRATEGIES = ("all_gather", "ulysses")
+_GDN_STRATEGIES = ("all_to_all", "allgather_reducescatter")
+
+
+def _set_gated_delta(cfg, **fields):
+  """Sets ``fields`` on every ``TpuGatedDeltaNet`` config of ``cfg``'s model."""
+  for _, delta_net, _, _ in cfg.model_spec.model.traverse(
+      TpuGatedDeltaNet.Config
+  ):
+    for name, value in fields.items():
+      setattr(delta_net, name, value)
+  return cfg
+
+
+@contextlib.contextmanager
+def _forbid_position_all_gathers():
+  """Fails if any layer all-gathers positions (``cp_full_positions`` given)."""
+
+  def fail(*args, **kwargs):
+    raise AssertionError("positions were all-gathered")
+
+  with mock.patch.object(
+      cp_gated_delta, "cp_all_gather", fail
+  ), mock.patch.object(
+      cp_attention, "_full_sequence_segment_ids", fail
+  ), mock.patch.object(
+      cp_attention.KVAllGatherCPInnerAttention,
+      "_full_sequence_segment_ids_all_gather",
+      fail,
+  ):
+    yield
 
 
 @contextlib.contextmanager
@@ -209,9 +241,28 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
     cp_attention._CP_RANK_CACHE.clear()
     self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
 
-  @parameterized.product(strategy=_STRATEGIES, traced=(False, True))
-  def test_debug_model_matches_single_device(self, strategy, traced):
-    """Loss and every parameter gradient match (cp=2, B=2, packed documents)."""
+  @parameterized.product(
+      strategy=_STRATEGIES,
+      traced=(False, True),
+      gated_delta_strategy=_GDN_STRATEGIES,
+      full_positions=(False, True),
+      document_resets=(None, False),
+  )
+  def test_debug_model_matches_single_device(
+      self,
+      strategy,
+      traced,
+      gated_delta_strategy,
+      full_positions,
+      document_resets,
+  ):
+    """Loss and every parameter gradient match (cp=2, B=2, packed documents).
+
+    With ``full_positions``, the model gets ``cp_full_positions`` and no layer
+    all-gathers positions. ``document_resets=False`` passes
+    ``gated_delta_document_resets=False``; the reference disables the
+    GatedDeltaNet document resets in its config instead.
+    """
     cp = 2
     recipe = (
         config_registry.qwen35_debugmodel_allgather_cp2
@@ -219,7 +270,19 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
         else config_registry.qwen35_debugmodel_ulysses_cp2
     )
     cp_cfg = _small_vocab(recipe())
+    if gated_delta_strategy != "all_to_all":
+      cp_cfg = apply_transforms(
+          cp_cfg,
+          [
+              GatedDeltaNetContextParallelTransform(
+                  load_balancer=tpu_cp_load_balancer(strategy),
+                  strategy=gated_delta_strategy,
+              )
+          ],
+      )
     ref_cfg = _small_vocab(config_registry.qwen35_debugmodel())
+    if document_resets is not None:
+      _set_gated_delta(ref_cfg, reset_at_documents=document_resets)
     with torch.device("cpu"):
       ref_model = ref_cfg.model_spec.model.build()
       ref_model.init_states(buffer_device=torch.device("cpu"))
@@ -234,9 +297,13 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
 
     def run_rank(rank):
       model = copy.deepcopy(cp_model)
+      extra = {"cp_full_positions": positions} if full_positions else {}
+      if document_resets is not None:
+        extra["gated_delta_document_resets"] = document_resets
       logits = model(
           _shard(inputs, strategy, cp, rank, _SEQ_LEN),
           positions=_shard(positions, strategy, cp, rank, _SEQ_LEN),
+          **extra,
       )
       loss = F.cross_entropy(
           logits.float(),
@@ -248,7 +315,14 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
           n: p.grad.clone() for n, p in model.named_parameters()
       }
 
-    with set_unflatten_seq_len(_SEQ_LEN), _patched_cp(ranks, traced):
+    # Patched here, not per rank thread: concurrent mock.patch of the same
+    # attribute from several threads would not restore it.
+    forbid = (
+        _forbid_position_all_gathers()
+        if full_positions
+        else contextlib.nullcontext()
+    )
+    with set_unflatten_seq_len(_SEQ_LEN), _patched_cp(ranks, traced), forbid:
       results = ranks.run(run_rank)
 
     with set_unflatten_seq_len(_SEQ_LEN):
@@ -267,6 +341,192 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
           atol=1e-5,
           msg=name,
       )
+
+
+class CompiledCPGatedDeltaNetTest(parameterized.TestCase):
+  """``allgather_reducescatter`` compiles to one graph, one wait per collective.
+
+  Runs on a fake 2-rank process group (as ``test_cp_attention``'s
+  ``CompiledCPCollectivesTest``), so only the graph structure matters.
+  """
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    if dist.is_initialized():
+      raise unittest.SkipTest("a process group is already initialized")
+    from torch.testing._internal.distributed.fake_pg import FakeStore  # pylint: disable=g-import-not-at-top
+
+    dist.init_process_group("fake", rank=0, world_size=2, store=FakeStore())
+
+  @classmethod
+  def tearDownClass(cls):
+    dist.destroy_process_group()
+    super().tearDownClass()
+
+  def setUp(self):
+    super().setUp()
+    torch.manual_seed(0)
+    torch._dynamo.reset()
+    self.addCleanup(torch._dynamo.reset)
+    cp_attention._CP_RANK_CACHE.clear()
+    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    world = lambda axis: dist.group.WORLD
+    self.enter_context(
+        mock.patch.object(cp_attention, "spmd_mesh_group", world)
+    )
+    self.enter_context(
+        mock.patch.object(cp_gated_delta, "spmd_mesh_group", world)
+    )
+
+  @parameterized.product(
+      load_balancer=(None, "headtail"), fuse_input_projections=(False, True)
+  )
+  def test_one_graph_one_wait_per_collective(
+      self, load_balancer, fuse_input_projections
+  ):
+    from functorch.compile import min_cut_rematerialization_partition  # pylint: disable=g-import-not-at-top
+    from torch._dynamo.backends.common import aot_autograd  # pylint: disable=g-import-not-at-top
+
+    model_cfg = GatedDeltaNetContextParallelTransform(
+        load_balancer=load_balancer, strategy="allgather_reducescatter"
+    ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+    _, delta_cfg, _, _ = next(
+        iter(model_cfg.traverse(CPTpuGatedDeltaNet.Config))
+    )
+    delta_cfg.fuse_input_projections = fuse_input_projections
+    with torch.device("cpu"):
+      module = delta_cfg.build()
+    for p in module.parameters():
+      torch.nn.init.normal_(p, std=0.02)
+    tokens = 32
+    x = torch.randn(
+        tokens // 2, module.in_proj_q.in_features, requires_grad=True
+    )
+    full_positions = torch.arange(tokens) % 12
+    # Cache the rank tensor eagerly, as cp_shard does before tracing.
+    cp_attention.cp_rank_tensor(x.device, dist.group.WORLD)
+
+    graphs = []
+
+    def capture(gm, _):
+      graphs.append(gm)
+      return gm
+
+    backend = aot_autograd(
+        fw_compiler=capture,
+        bw_compiler=capture,
+        partition_fn=min_cut_rematerialization_partition,
+    )
+    with mock.patch.object(cp_attention, "_tracing", lambda: True):
+      fn = lambda x: module(x, None, None, full_positions=full_positions)
+      torch.compile(fn, backend=backend, fullgraph=True)(x).sum().backward()
+
+    wait = torch.ops._c10d_functional.wait_tensor.default
+    collectives = {
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
+        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+    }
+    found = set()
+    for gm in graphs:
+      waited = []
+      n_collectives = 0
+      for node in gm.graph.nodes:
+        if node.target is wait:
+          self.assertIn(node.args[0].target, collectives, gm.code)
+          waited.append(node.args[0])
+        elif node.target in collectives:
+          n_collectives += 1
+          found.add(node.target)
+      self.assertLen(set(waited), len(waited), gm.code)
+      self.assertLen(waited, n_collectives, gm.code)
+    # Forward all-gather + reduce-scatter, and their backward duals; no
+    # all-to-all and no positions all-gather beyond x's.
+    self.assertEqual(found, collectives)
+    code = "\n".join(gm.code for gm in graphs)
+    self.assertNotIn("all_to_all", code)
+
+
+class Qwen35LayerInputsTest(parameterized.TestCase):
+  """Single-device ``fuse_input_projections`` and document-reset override."""
+
+  def setUp(self):
+    super().setUp()
+    torch.manual_seed(0)
+
+  def _models(self, **ref_fields):
+    cfg = _small_vocab(config_registry.qwen35_debugmodel())
+    with torch.device("cpu"):
+      model = cfg.model_spec.model.build()
+      model.init_states(buffer_device=torch.device("cpu"))
+    ref_cfg = _set_gated_delta(
+        _small_vocab(config_registry.qwen35_debugmodel()), **ref_fields
+    )
+    with torch.device("cpu"):
+      ref = ref_cfg.model_spec.model.build()
+    ref.load_state_dict(model.state_dict())
+    return model, ref
+
+  def _loss_and_grads(self, model, **kwargs):
+    tokens = _SEQ_LEN * len(_DOCS)
+    gen = torch.Generator().manual_seed(1)
+    inputs = torch.randint(0, 512, (tokens,), generator=gen)
+    labels = torch.randint(0, 512, (tokens,), generator=gen)
+    with set_unflatten_seq_len(_SEQ_LEN):
+      logits = model(inputs, positions=_packed_positions(_DOCS), **kwargs)
+    loss = F.cross_entropy(logits.float(), labels, reduction="sum")
+    loss.backward()
+    return loss.detach(), {
+        n: p.grad.clone() for n, p in model.named_parameters()
+    }
+
+  def test_fused_input_projections_match(self):
+    model, ref = self._models()
+    _set_gated_delta_modules(model, fuse_input_projections=True)
+    got_loss, got_grads = self._loss_and_grads(model)
+    want_loss, want_grads = self._loss_and_grads(ref)
+    torch.testing.assert_close(got_loss, want_loss, rtol=1e-5, atol=1e-4)
+    for name, want in want_grads.items():
+      torch.testing.assert_close(
+          got_grads[name], want, rtol=1e-4, atol=1e-5, msg=name
+      )
+
+  def test_fused_input_projections_reject_bias(self):
+    model, _ = self._models()
+    delta_net = next(
+        m for m in model.modules() if isinstance(m, TpuGatedDeltaNet)
+    )
+    delta_net.fuse_input_projections = True
+    delta_net.in_proj_q.bias = torch.nn.Parameter(
+        torch.zeros(delta_net.in_proj_q.out_features)
+    )
+    with self.assertRaisesRegex(ValueError, "bias-free"):
+      delta_net.input_projections(
+          torch.randn(4, delta_net.in_proj_q.in_features)
+      )
+
+  def test_document_resets_override_matches_config(self):
+    """``gated_delta_document_resets=False`` == ``document_resets.enabled=False``."""
+    model, ref = self._models()
+    _set_gated_delta_modules(ref, reset_at_documents=False)
+    got_loss, got_grads = self._loss_and_grads(
+        model, gated_delta_document_resets=False
+    )
+    want_loss, want_grads = self._loss_and_grads(ref)
+    torch.testing.assert_close(got_loss, want_loss)
+    for name, want in want_grads.items():
+      torch.testing.assert_close(got_grads[name], want, msg=name)
+    # And it does change the result for packed documents.
+    model.zero_grad()
+    default_loss, _ = self._loss_and_grads(model)
+    self.assertFalse(torch.allclose(default_loss, got_loss))
+
+
+def _set_gated_delta_modules(model, **attrs):
+  for module in model.modules():
+    if isinstance(module, TpuGatedDeltaNet):
+      for name, value in attrs.items():
+        setattr(module, name, value)
 
 
 class CPQwen35ConfigTest(parameterized.TestCase):
@@ -398,6 +658,38 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       self.assertIsInstance(inner.kernel, TpuGatedDeltaKernel.Config)
       self.assertEqual(inner.load_balancer, "headtail")
 
+  def test_transform_strategy_converts_gated_delta_nets(self):
+    cfg = config_registry.qwen35_debugmodel()
+    model = cfg.model_spec.model
+    for _ in range(2):
+      model = GatedDeltaNetContextParallelTransform(
+          load_balancer=None,
+          strategy="allgather_reducescatter",
+          reduce_dtype="bfloat16",
+      ).transform(model)
+    delta_nets = list(model.traverse(GatedDeltaNet.Config))
+    self.assertNotEmpty(delta_nets)
+    for _, delta_net, _, _ in delta_nets:
+      self.assertIs(type(delta_net), CPTpuGatedDeltaNet.Config)
+      self.assertEqual(delta_net.cp_strategy, "allgather_reducescatter")
+      self.assertEqual(delta_net.cp_reduce_dtype, "bfloat16")
+      self.assertIs(
+          type(delta_net.inner_gated_delta_net), CPTpuInnerGatedDeltaNet.Config
+      )
+
+  def test_transform_default_strategy_keeps_gated_delta_nets(self):
+    model = GatedDeltaNetContextParallelTransform(load_balancer=None).transform(
+        config_registry.qwen35_debugmodel().model_spec.model
+    )
+    for _, delta_net, _, _ in model.traverse(GatedDeltaNet.Config):
+      self.assertIs(type(delta_net), TpuGatedDeltaNet.Config)
+
+  def test_transform_rejects_unknown_strategy(self):
+    with self.assertRaisesRegex(ValueError, "strategy"):
+      GatedDeltaNetContextParallelTransform(
+          load_balancer=None, strategy="ring"
+      ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+
   def test_tpu_model_cp_shard_uses_inner_attention(self):
     """TpuQwen35Model shards CP inputs through the CP attention's cp_shard."""
     cfg = _small_vocab(config_registry.qwen35_debugmodel_allgather_cp2())
@@ -425,6 +717,8 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     )
     torch.testing.assert_close(inputs, tokens)
     self.assertIn("positions", extra)
+    # The unsharded positions, for the layers' document boundaries.
+    torch.testing.assert_close(extra["cp_full_positions"], tokens % _SEQ_LEN)
 
 
 if __name__ == "__main__":

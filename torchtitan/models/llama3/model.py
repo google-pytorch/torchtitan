@@ -48,7 +48,10 @@ class Llama3TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ):
+        del padding_mask
         h = x + self.attention(
             self.attention_norm(x), attention_masks, positions, segment_ids
         )

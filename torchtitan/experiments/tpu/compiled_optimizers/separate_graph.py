@@ -9,6 +9,7 @@ Used by:
 2. TpuGraphTrainer when `--compile.optimizer-compile=separate_graph`.
 """
 
+import logging
 from typing import Any, Optional
 import torch
 from torch_tpu._internal.compile.compiler import StaticCompiler  # pytype: disable=import-error
@@ -19,7 +20,8 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
 )
 from torchtitan.experiments.tpu.compiled_optimizers.functional import functional_adamw_step
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _tpu_backend_compile_pass(

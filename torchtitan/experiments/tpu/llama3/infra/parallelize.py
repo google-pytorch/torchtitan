@@ -5,6 +5,7 @@ This module is used in distributed training tests configured with
 """
 
 import dataclasses
+import logging
 import torch
 from torch import nn
 import torchtitan.config
@@ -17,7 +18,8 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
 )
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.llama3 import parallelize as dtensor_parallelize
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def parallelize_llama(

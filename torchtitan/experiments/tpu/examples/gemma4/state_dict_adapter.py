@@ -57,7 +57,7 @@ class Gemma4StateDictAdapter(StateDictAdapter):
     ) -> None:
         super().__init__(model_config, hf_assets_path)
 
-        # The fused QKV modules (FusedQKVLinear / FusedQKVLinearKeqV) expose
+        # The fused QKV modules (QKVLinear / QKVLinearKeqV) expose
         # logical ``qkv_linear.wq`` / ``wk`` / ``wv`` keys through state_dict
         # hooks, so the maps below are written against those; K=V layers have
         # no ``wv`` key, matching the missing ``v_proj`` in the HF checkpoint.

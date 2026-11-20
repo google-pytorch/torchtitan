@@ -22,6 +22,7 @@ below (see ``qwen3/config_registry.py``). Two strategies are provided:
 Tensor suffixes: ``T`` tokens, ``H`` heads, ``K`` qk head dim, ``V`` v head dim.
 """
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 import math
@@ -53,7 +54,8 @@ from torchtitan.models.common.attention import (
     segment_ids_from_positions,
 )
 from torchtitan.models.common.cp_attention import CPInnerAttention
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "UlyssesCPInnerAttention",
@@ -854,7 +856,7 @@ class UlyssesCPScaledDotProductInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(ScaledDotProductInnerAttention.Config):
+  class Config(CPInnerAttention.Config, ScaledDotProductInnerAttention.Config):
     pass
 
 
@@ -863,7 +865,7 @@ class UlyssesCPVarlenInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(VarlenInnerAttention.Config):
+  class Config(CPInnerAttention.Config, VarlenInnerAttention.Config):
     pass
 
 
@@ -872,7 +874,7 @@ class KVAllGatherCPScaledDotProductInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(ScaledDotProductInnerAttention.Config):
+  class Config(CPInnerAttention.Config, ScaledDotProductInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_reference_attention: bool = False
     """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""
@@ -883,7 +885,7 @@ class KVAllGatherCPVarlenInnerAttention(
 ):
 
   @dataclass(kw_only=True, slots=True)
-  class Config(VarlenInnerAttention.Config):
+  class Config(CPInnerAttention.Config, VarlenInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_reference_attention: bool = False
     """Run ``local_forward`` on TPU when no kernel is plugged in (tests, tiny models)."""

@@ -16,7 +16,7 @@ from torchtitan.experiments.tpu.components.qkv import (
     TpuPackedQKVConverter,
     TpuPackedQKVLinear,
 )
-from torchtitan.models.common.attention import FusedQKVLinear, ScaledDotProductInnerAttention
+from torchtitan.models.common.attention import QKVLinear, ScaledDotProductInnerAttention
 from torchtitan.models.common.config_utils import make_gqa_config
 from torchtitan.models.common.rope import CosSinRoPE
 
@@ -36,7 +36,6 @@ def _attention_config():
       wqkv_param_init=init,
       wo_param_init=init,
       inner_attention=ScaledDotProductInnerAttention.Config(),
-      fuse_qkv=True,
       rope=CosSinRoPE.Config(dim=HEAD_DIM, max_context_length=16, theta=10000.0),
   )
 
@@ -66,7 +65,7 @@ def _assert_state_equal(actual, expected):
 
 
 def test_converter_validates_supported_config():
-  config = cast(FusedQKVLinear.Config, _attention_config().qkv_linear)
+  config = cast(QKVLinear.Config, _attention_config().qkv_linear)
   converter = TpuPackedQKVConverter.Config().build()
   converted = converter.convert(config)
   assert isinstance(converted, TpuPackedQKVLinear.Config)
@@ -149,14 +148,14 @@ def test_packed_qkv_backward_concatenates_one_gradient():
 
 def test_packed_qkv_supports_k_eq_v():
   from torchtitan.experiments.tpu.examples.gemma4.model import (
-      FusedQKVLinearKeqV,
+      QKVLinearKeqV,
       fused_qk_param_init,
   )
   from torchtitan.models.common.linear import Linear
 
   init = {"weight": torch.nn.init.normal_}
   out_features = (N_HEADS + N_KV_HEADS) * HEAD_DIM
-  config = FusedQKVLinearKeqV.Config(
+  config = QKVLinearKeqV.Config(
       head_dim=HEAD_DIM,
       n_heads=N_HEADS,
       n_kv_heads=N_KV_HEADS,

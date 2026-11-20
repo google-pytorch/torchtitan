@@ -1,6 +1,7 @@
 """Parallelization utilities for Gemma4 models on TPU."""
 
 import dataclasses
+import logging
 import torch
 from torch import nn
 import torchtitan.config
@@ -23,7 +24,8 @@ from torchtitan.models.common.moe import (
     MoE,
     configure_moe_aux_loss_reduction,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_ac_gemma4(
@@ -114,7 +116,7 @@ def _parallelize_gemma4(
       edp_mesh=edp_mesh,
       dp_mesh_dims=dp_mesh_dims,
       edp_mesh_dims=edp_mesh_dims,
-      enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+      symm_mem_scope=parallelism.fsdp_symm_mem_scope,
   )
 
   return model

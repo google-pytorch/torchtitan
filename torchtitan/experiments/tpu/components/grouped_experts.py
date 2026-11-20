@@ -1,3 +1,4 @@
+import logging
 import math
 from dataclasses import dataclass, replace
 
@@ -15,10 +16,10 @@ from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
 )
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform import ModelConfigConverter
 from torchtitan.protocols.sharding import ShardingConfig
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 _CANONICAL_TO_NATIVE_WEIGHT = {
     "w1_EFD": "w1_EDF",

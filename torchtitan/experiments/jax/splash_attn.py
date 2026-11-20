@@ -1,5 +1,6 @@
 """Tokamax Splash Attention kernel setup."""
 
+import logging
 import jax
 
 try:
@@ -8,9 +9,8 @@ try:
 except ImportError:
   from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
   from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask
-import torchtitan.tools.logging
 
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 P = jax.sharding.PartitionSpec
 

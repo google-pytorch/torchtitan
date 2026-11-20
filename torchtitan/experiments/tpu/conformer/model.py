@@ -1,5 +1,6 @@
 """Conformer model for TorchTitan."""
 
+import logging
 from dataclasses import dataclass
 import math
 import einops
@@ -8,7 +9,8 @@ import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.protocols.model import BaseModel
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True)

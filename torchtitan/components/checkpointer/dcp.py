@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import enum
+import logging
 import os as os
 import queue
 import threading
@@ -31,7 +32,6 @@ from torch.distributed.checkpoint.state_dict_saver import (
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
@@ -43,6 +43,9 @@ from .base import (
     OPTIMIZER,
     purge_thread,
 )
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     import torch.nn as nn

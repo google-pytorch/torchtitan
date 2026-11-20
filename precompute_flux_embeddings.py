@@ -24,6 +24,7 @@ Example usage:
         --output_dir=precomputed_embeddings
 """
 
+import logging
 import os
 import sys
 import argparse
@@ -37,8 +38,10 @@ from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
 from torchtitan.models.flux.utils import preprocess_data
 from torchtitan.tools import utils
-from torchtitan.tools.logging import init_logger, logger
+from torchtitan.observability.logging import init_logger
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+
+logger = logging.getLogger(__name__)
 
 
 def main():

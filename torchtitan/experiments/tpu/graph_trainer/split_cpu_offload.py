@@ -6,6 +6,7 @@
 
 """CPU-offload support for independently compiled TPU graph children."""
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +14,8 @@ from typing import Any
 import torch
 
 from torchtitan.experiments.graph_trainer.common_utils import _is_backward_node
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

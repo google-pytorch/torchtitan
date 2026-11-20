@@ -71,6 +71,7 @@ table, a mask. Size then only breaks ties between genuine saves, rather than
 being the thing that separates the layer input from a lookup table.
 """
 
+import logging
 import operator
 
 import torch
@@ -94,7 +95,8 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
 from torchtitan.experiments.graph_trainer.registry import (
     register_memory_policy,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 _SCAN_HOP = torch.ops.higher_order.scan
 _POLICY = "full_and_scan_offload"

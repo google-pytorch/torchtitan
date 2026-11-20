@@ -10,6 +10,7 @@ Training loop:
   4. Inputs sharded on FSDP axis; parameters sharded per sharding_map.
 """
 
+import logging
 import time
 from typing import Any, Callable
 
@@ -26,10 +27,9 @@ from torchtitan.experiments.jax import jax_profiling
 from torchtitan.experiments.jax import metrics as jax_metrics
 from torchtitan.experiments.jax import splash_attn
 from torchtitan.experiments.jax import llama3 as jax_llama3
-import torchtitan.tools.logging
 
 
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 P = jax.sharding.PartitionSpec
 

@@ -6,6 +6,7 @@
 
 import dataclasses
 import json
+import logging
 import os as os
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -28,13 +29,11 @@ from torchtitan.components.checkpointer import BaseCheckpointManager, Checkpoint
 from torchtitan.components.data.collators import TrainerBatch
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
-from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
 from torchtitan.components.optimizer.optimizer import (
     configure_moe_routing_metrics,
     get_moe_load_balancing_metrics,
 )
-from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
@@ -59,15 +58,18 @@ from torchtitan.models.common.aux_loss import AuxLoss, collect_aux_loss_metrics
 from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
-    MinimalAsyncEPTokenDispatcher,
 )
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
+from torchtitan.observability.profiler import Profiler
 from torchtitan.observability.sdc_replayer import ScalarStateAccessor, SDCReplayer
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.quantization.utils import has_quantization
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
-from torchtitan.tools.profiler import Profiler
+
+
+logger = logging.getLogger(__name__)
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
@@ -222,9 +224,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             for _, dispatcher_config, _, _ in self.model_spec.model.traverse(
                 LocalTokenDispatcher.Config
             ):
-                if isinstance(
-                    dispatcher_config, MinimalAsyncEPTokenDispatcher.Config
-                ) or (
+                if (
                     isinstance(dispatcher_config, HybridEPTokenDispatcher.Config)
                     and dispatcher_config.non_blocking_capacity_factor is not None
                 ):
@@ -233,8 +233,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 raise ValueError(
                     "CUDA graphs support only expert parallel token dispatcher "
                     "configurations without CPU synchronization. "
-                    "Set HybridEP non_blocking_capacity_factor, or use "
-                    "MinimalAsyncEP, or set --training.disable_cuda_graphs. "
+                    "Set HybridEP non_blocking_capacity_factor, or set "
+                    "--training.disable_cuda_graphs. "
                     "Unsupported token "
                     f"dispatcher: {type(dispatcher_config).__qualname__}."
                 )
@@ -940,6 +940,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Auxiliary losses normalize by the same per-step token count as the
         # main loss, so their scale is independent of parallelism degrees.
+        # TODO(sdmyzlp): Each MTP depth can have a different valid-token count
+        # after shifting and should use its own auxiliary-loss denominator.
         AuxLoss.set_step_denominator(global_valid_tokens)
 
         # Process each gradient accumulation step, then free its inputs.

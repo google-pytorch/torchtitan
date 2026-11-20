@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 
@@ -8,7 +9,7 @@ from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.model_spec import ParallelizeFunction
 import torchtitan.trainer
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 
 def pipeline_llama(

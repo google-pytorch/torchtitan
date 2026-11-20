@@ -62,7 +62,8 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class TpuGraphTrainer(GraphTrainer):

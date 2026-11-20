@@ -11,6 +11,7 @@ torchrun --nproc_per_node=4 \
   --compile.enable
 """
 
+import logging
 import os
 import time
 import typing
@@ -19,7 +20,8 @@ from typing import Tuple
 from jax import profiler as jax_profiler
 import torch
 import torch.nn.functional as F
-from torchtitan.components import metrics
+import torchtitan.observability.logging
+from torchtitan.observability import metrics
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
@@ -31,13 +33,12 @@ import torchtitan.experiments.tpu.profiling.model_annotator as model_annotator
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
 from torchtitan.tools import utils
-import torchtitan.tools.logging
 import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 ParallelDims = torchtitan.distributed.ParallelDims
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +148,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   world_size = int(os.environ.get("WORLD_SIZE", 1))
 
   if rank == 0:
-    torchtitan.tools.logging.init_logger()
+    torchtitan.observability.logging.init_logger()
     train_config.maybe_log()
 
   device = utils.get_local_device()

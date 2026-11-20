@@ -13,8 +13,9 @@ from torch.distributed.tensor import DTensor, Replicate
 import torch.nn.functional as F
 from torchtitan.config import derive
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.models.common.attention import BaseQKVLinear, FusedQKVLinear
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.models.common.attention import QKVLinear
+from torchtitan.config.transform import ModelConfigConverter
+from torchtitan.protocols.module import Module
 
 
 class _PackedQKVInit:
@@ -60,7 +61,7 @@ class _PackedQKVInit:
 
 
 def _packed_param_init(
-    config: FusedQKVLinear.Config, *, k_eq_v: bool = False
+    config: QKVLinear.Config, *, k_eq_v: bool = False
 ) -> dict[str, Callable]:
   param_init = config.wqkv.param_init
   if param_init is None:
@@ -77,7 +78,7 @@ def _packed_param_init(
   }
 
 
-class TpuPackedQKVLinear(BaseQKVLinear):
+class TpuPackedQKVLinear(Module):
   """Run contiguous Q/K/V (or Q/K for K=V) projections from one FSDP parameter.
 
   The physical parameter stores ``[all Q rows; all K rows; all V rows]`` (or
@@ -89,11 +90,12 @@ class TpuPackedQKVLinear(BaseQKVLinear):
   """
 
   @dataclass(kw_only=True, slots=True)
-  class Config(FusedQKVLinear.Config):
+  class Config(QKVLinear.Config):
     k_eq_v: bool = False
 
   def __init__(self, config: Config):
-    super().__init__(config)
+    super().__init__()
+    self.head_dim = config.head_dim
     if config.n_heads % config.n_kv_heads != 0:
       raise ValueError(
           f"n_heads ({config.n_heads}) must be divisible by "
@@ -241,12 +243,12 @@ class TpuPackedQKVConverter(ModelConfigConverter):
     pass
 
   def convert(self, model_config):
-    matches = list(model_config.traverse(FusedQKVLinear.Config))
+    matches = list(model_config.traverse(QKVLinear.Config))
     for _, config, parent, field_name in matches:
       if isinstance(config, TpuPackedQKVLinear.Config):
         continue
       k_eq_v = bool(getattr(config, "k_eq_v", False))
-      if type(config) is not FusedQKVLinear.Config and not k_eq_v:
+      if type(config) is not QKVLinear.Config and not k_eq_v:
         continue
       if config.wqkv.param_init is None:
         raise ValueError(

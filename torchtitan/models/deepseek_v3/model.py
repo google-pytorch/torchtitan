@@ -188,12 +188,14 @@ class DeepSeekV3TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ):
         x = x + self.attention(
             self.attention_norm(x), attention_masks, positions, segment_ids
         )
         if self.moe_enabled:
-            x = x + self.moe(self.ffn_norm(x))
+            x = x + self.moe(self.ffn_norm(x), padding_mask_T=padding_mask)
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
         return x

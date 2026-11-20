@@ -9,6 +9,7 @@
 import contextlib
 import dataclasses
 import json
+import logging
 from typing import Any, cast
 
 import os
@@ -31,8 +32,10 @@ import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
-from torchtitan.tools.logging import init_logger, logger
+from torchtitan.observability.logging import init_logger
 import torchtitan.train
+
+logger = logging.getLogger(__name__)
 
 
 class TPUTrainer(torchtitan.train.Trainer):

@@ -9,6 +9,7 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
     tpu_discarded_token_counter,
 )
+from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.config_utils import make_aux_loss_config, make_moe_config
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
@@ -37,6 +38,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
       router=TokenChoiceTopKRouter.Config(
           num_experts=_NUM_EXPERTS,
           top_k=_TOP_K,
+          score_func=Softmax.Config(),
           gate=Linear.Config(
               in_features=_DIM, out_features=_NUM_EXPERTS, bias=False
           ),
@@ -78,7 +80,7 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     moe(torch.randn(_TOKENS, _DIM))
 
     expected = _TOKENS * _TOP_K if coeff is not None else 0
-    self.assertEqual(moe.tokens_per_expert_E.sum().item(), expected)
+    self.assertEqual(moe.router.tokens_per_expert_E.sum().item(), expected)
 
   def test_output_matches_the_base_class(self):
     torch.manual_seed(0)

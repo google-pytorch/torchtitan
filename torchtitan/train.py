@@ -5,15 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
-
+import logging
 import os as os
 
 import torch
 
 from torchtitan.config import ConfigManager, ParallelismConfig
 from torchtitan.observability import structured_logger as sl
-from torchtitan.tools.logging import init_logger, logger
+from torchtitan.observability.logging import init_logger
 from torchtitan.trainer import Trainer
+
+
+logger = logging.getLogger(__name__)
 
 
 def _maybe_enable_min_cost_redistribute(

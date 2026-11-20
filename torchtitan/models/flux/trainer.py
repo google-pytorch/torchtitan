@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
@@ -30,7 +31,6 @@ from torchtitan.models.flux.utils import (
     pack_latents,
     preprocess_data,
 )
-from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
@@ -38,6 +38,8 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 # tokenizers when random or precomputed embeddings make text tokenization
 # unnecessary. The path is relative to the repository root.
 _LOCAL_TOKENIZER_PATH = "tests/assets/tokenizer"
+
+logger = logging.getLogger(__name__)
 
 
 class FluxTrainer(Trainer):
@@ -188,7 +190,7 @@ class FluxTrainer(Trainer):
                 clip_model=self.clip_encoder,
                 parallel_dims=self.parallel_dims,
                 training=config.training,
-                enable_symm_mem=config.parallelism.enable_fsdp_symm_mem,
+                symm_mem_scope=config.parallelism.fsdp_symm_mem_scope,
                 parallelism=config.parallelism,
             )
 

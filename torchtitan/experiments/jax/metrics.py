@@ -5,11 +5,13 @@ colorized log line. Torchax's subclass adds ``parallel_dims`` plus a richer
 ``log()`` signature for global-avg/max loss and grad_norm.
 """
 
+import logging
 import time
 from typing import Any
 
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def get_peak_flops(accelerator: str, num_devices, tpu_megacore) -> int:

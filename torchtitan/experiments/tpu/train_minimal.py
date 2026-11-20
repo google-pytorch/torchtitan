@@ -1,6 +1,7 @@
 """Minimal trainer for TorchTitan models."""
 
 import argparse
+import logging
 from collections.abc import Sequence
 import json
 import os
@@ -14,6 +15,7 @@ from absl.flags import argparse_flags
 import torch
 import torch.distributed as dist
 from torch import nn
+import torchtitan.observability.logging
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
@@ -32,8 +34,7 @@ import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
 import torchtitan.experiments.tpu.workarounds as workarounds
 from torchtitan.tools import utils
-import torchtitan.tools.logging
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 import torchtitan.trainer
 # import torchtitan.tools.profiling  # Deprecated upstream
 
@@ -41,7 +42,7 @@ import torchtitan.trainer
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], None]
 
@@ -513,7 +514,7 @@ def start_trainer(config: JobConfig):
   world_size = int(os.environ.get("WORLD_SIZE", 1))
 
   if rank == 0:
-    torchtitan.tools.logging.init_logger()
+    torchtitan.observability.logging.init_logger()
 
   device = utils.get_local_device()
 

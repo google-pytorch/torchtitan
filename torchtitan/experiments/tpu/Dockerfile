@@ -32,7 +32,12 @@ RUN if [ -n "${TORCH_TPU_VERSION}" ]; then \
       pip install ./torch_tpu-*.whl --extra-index-url https://download.pytorch.org/whl/cpu; \
     fi
 
-RUN pip install -r requirements.txt
+# renderers 0.1.11 (upstream's pin) declares Requires-Python <3.14 although it
+# is pure Python and runs on 3.14; upstream relaxes the pin with 0.1.12 later.
+RUN grep -v '^renderers' requirements.txt > requirements-tpu-image.txt \
+    && pip install -r requirements-tpu-image.txt \
+    && pip install --ignore-requires-python "$(grep '^renderers' requirements.txt | tr -d ' ')" \
+    && rm requirements-tpu-image.txt
 COPY .ci/docker/requirements-flux.txt .
 RUN pip install -r requirements-flux.txt
 

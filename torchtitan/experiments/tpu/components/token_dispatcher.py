@@ -50,7 +50,7 @@ from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform import ModelConfigConverter
 
 
 def _wait(tensor: torch.Tensor) -> torch.Tensor:

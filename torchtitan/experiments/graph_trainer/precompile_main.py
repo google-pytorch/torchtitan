@@ -21,6 +21,7 @@ Usage (aot_fx_trace mode):
 """
 
 import contextlib
+import logging
 from typing import Any, cast
 
 import torch
@@ -44,8 +45,11 @@ from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.observability.logging import init_logger
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def _common_setup(config):
@@ -263,6 +267,9 @@ def _precompile_aot_fx_trace(
             % config.training.max_context_length
         )
         extra_kwargs["positions"] = positions
+        extra_kwargs["padding_mask"] = torch.zeros(
+            num_tokens, dtype=torch.bool, device=dummy_inputs.device
+        )
 
         if isinstance(
             inner_attention, (FlexInnerAttention.Config, VarlenInnerAttention.Config)
@@ -366,6 +373,7 @@ def _precompile_aot_fx_trace(
 
 
 def main():
+    init_logger()
     config_manager = ConfigManager()
     config = config_manager.parse_args()
 

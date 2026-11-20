@@ -11,7 +11,7 @@ from absl.testing import absltest
 import jax
 
 import torchtitan.experiments.tpu.testing.base_device_test as base_device_test
-import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.observability.profiler as torchtitan_profiler
 
 
 class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):

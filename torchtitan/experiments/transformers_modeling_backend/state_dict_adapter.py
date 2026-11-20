@@ -24,6 +24,7 @@ Two complementary pieces live here:
 
 import glob
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -36,9 +37,10 @@ from torchtitan.experiments.transformers_modeling_backend.moe_replacement import
     _get_expert_param_info,
 )
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
-from torchtitan.tools.logging import logger
 
 from .model import HFTransformerModel
+
+logger = logging.getLogger(__name__)
 
 # Mapping from titan key -> original HF key for keys where the reverse
 # regex would produce a different result than the original (e.g. a

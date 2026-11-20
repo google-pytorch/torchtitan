@@ -9,9 +9,9 @@ This is the reference for how the mechanism works and how to write overrides.
 
 Torchtitan has a config-driven build system: every component defines a nested
 `Config` dataclass and `config.build()` constructs the owning object. Swapping a
-component (e.g. Float8 quantization, LoRA) currently works via
-`ModelConfigConverter`, which traverses the model config tree and replaces
-`Config` nodes during config construction, inside `config_registry.py` functions.
+component currently works through model config converters and transforms,
+which traverse the model config tree and replace `Config` nodes before model
+construction.
 
 That works well for in-repo, first-class features, but it requires editing the
 repo for *every* alternative implementation. The override mechanism removes that
@@ -77,7 +77,7 @@ tree and replaces matching nodes with the factory's output.
   model.
 - **Minimal surface.** The whole mechanism lives in
   `torchtitan/config/override.py`, reusing the `Configurable.Config.traverse()` +
-  replace pattern that the Float8/LoRA converters already use.
+  replace pattern that the Float8 converter and LoRA transform already use.
 
 ## How It Works
 
@@ -197,15 +197,9 @@ the override package and defeat the no-touch goal.
 ### Activation
 
 ```bash
-# One or more module.function targets, space- or comma-separated. A module that
-# defines several overrides is activated by listing each function:
+# Replace the torch-native SwiGLU activation with the Triton implementation:
 torchtitan_train --module llama3 --config llama3_8b \
     --override.imports torchtitan.overrides.fused_swiglu.fused_swiglu
-
-# The dist-GEMM FFN has a separate exact override so its communication overlap
-# cannot be replaced accidentally by the regular fused implementation:
-torchtitan_train --module llama3 --config llama3_debugmodel_dist_gemm \
-    --override.imports torchtitan.overrides.fused_swiglu.dist_gemm_fused_swiglu
 
 # A target with per-entry kwargs -- attached as target=<json>, quoted as one
 # shell token (my_pkg.triton_rope.triton_rope is a placeholder for your override):
@@ -232,8 +226,8 @@ sharding config on the pre-override modules) and before any component is built:
 6. Log every replacement.
 
 ```
-INFO: [Override] fused_swiglu: model_spec.model.layers.0.feed_forward FeedForward.Config -> FusedSwiGLU.Config
-INFO: [Override] fused_swiglu: model_spec.model.layers.1.feed_forward FeedForward.Config -> FusedSwiGLU.Config
+INFO: [Override] fused_swiglu: model_spec.model.layers.0.feed_forward FeedForward.Config -> FeedForward.Config
+INFO: [Override] fused_swiglu: model_spec.model.layers.1.feed_forward FeedForward.Config -> FeedForward.Config
 ...
 INFO: Applied 32 override(s)
 ```
@@ -372,13 +366,13 @@ config itself is a valid target (whole-model swap), while `ModelSpec` is not —
 `target` must be a `Configurable.Config` subclass, so a plain class like
 `ModelSpec` is rejected at registration.
 
-## Interaction with Converters
+## Interaction with Converters and Transforms
 
-In-repo converters (Float8, LoRA via `ModelConfigConverter`) run *first*, inside
-`model_registry()` during config construction; overrides run later in
-`Trainer.__init__` and see the post-converter tree. The order is deliberate: an
-in-repo converter cannot be expected to understand arbitrary external overrides,
-so it runs against the known core configs, and overrides layer on top.
+In-repo converters such as Float8 run first inside `model_registry()` during
+config construction. Model config transforms such as LoRA run afterward when
+the recipe calls `apply_transforms`. Overrides run later in `Trainer.__init__`
+and see the post-converter, post-transform tree. The order is deliberate:
+in-repo conversions run against known core configs, and overrides layer on top.
 
 Conversely, converter-style transforms *can* be expressed as overrides (a
 factory that rewrites a `Config`), so external code does not need the converter
@@ -388,7 +382,7 @@ machinery.
 |-----------------|------------------------------|-------|
 | RoPE / FeedForward / MoE / RMSNorm / inner attention | No | Converters don't touch these |
 | GroupedExperts.Config | Possibly | `Float8GroupedExpertsConverter` rewrites this |
-| Linear.Config | Yes | Float8/LoRA replace these |
+| Linear.Config | Yes | Float8 and LoRA can replace these |
 
 Where a converter already rewrote a node, target that node by location with
 `fqns` so the override only claims the instances you intend (e.g. specific
@@ -409,9 +403,7 @@ converters, not overrides.
 ## Checkpoint Compatibility
 
 An override that changes a module's parameter layout changes its checkpoint
-FQNs. By default an override checkpoints whatever real parameters it defines, so
-a fused module that stores a `w13` linear would save/load
-`...feed_forward.w13.weight` rather than the stock `w1.weight` / `w3.weight`.
+FQNs. By default an override checkpoints whatever real parameters it defines.
 
 **Bridge layout differences with module-level `state_dict` hooks.** A replacement
 module can present its weights in the *stock* layout by registering two hooks:
@@ -421,13 +413,11 @@ module can present its weights in the *stock* layout by registering two hooks:
 - `register_load_state_dict_pre_hook` to recombine them before the default load,
   so the real parameter is loaded with normal DTensor/`strict` handling.
 
-The fused example (`fused_swiglu.py`) does exactly this: it stores
-`w13.weight` but checkpoints `w1.weight` / `w3.weight`, so its checkpoints are a
-drop-in for the stock `FeedForward` (and for the HF adapter, which targets the
-stock layout), while still accepting the former native `w13` key for
-back-compat. This is the symmetric use of the same hook mechanism the
-activation-checkpoint wrapper uses to strip its `_checkpoint_wrapped_module`
-prefix.
+The default `FeedForward` uses this approach: it stores `w13.weight` but
+checkpoints `w1.weight` / `w3.weight`, so existing checkpoints and HF adapters
+keep their logical layout. This is the symmetric use of the same hook mechanism
+the activation-checkpoint wrapper uses to strip its
+`_checkpoint_wrapped_module` prefix.
 
 For mappings too complex for module hooks, a model-level `BaseStateDictAdapter`
 (the mechanism used for HF conversion, e.g. `Llama3StateDictAdapter`) remains an
@@ -447,11 +437,12 @@ One thing worth stating plainly:
 
 - **Fusion under TP.** Fusing weights can interact subtly with tensor
   parallelism -- the fused tensor's row order must admit a correct shard.
-  `fused_swiglu` stores a standard Linear weight `(2*hidden, dim)` with gate/up
-  rows interleaved. Sharding row axis 0 therefore gives each TP rank matching
-  slices of both projections (the Megatron column-parallel layout). The output
-  unflattens to `(hidden, 2)` to recover gate and up. This composes with FSDP and
-  TP through the ordinary `Linear` `ShardingConfig`; no model-specific code.
+  The default `FeedForward` stores a standard Linear weight `(2*hidden, dim)`
+  with gate/up rows interleaved. Sharding row axis 0 therefore gives each TP
+  rank matching slices of both projections (the Megatron column-parallel
+  layout). The output unflattens to `(hidden, 2)` to recover gate and up. This
+  composes with FSDP and TP through the ordinary `Linear` `ShardingConfig`; no
+  model-specific code.
 
 ## Custom kernels and `torch.compile`
 
@@ -494,12 +485,11 @@ for the full recipe.
 
 ## Worked Examples
 
-- `torchtitan/overrides/fused_swiglu.py` — **the parametrization example.** A
-  fused SwiGLU feed-forward demonstrating custom `__init__` parametrization (one
-  fused `(2*hidden, dim)` `w13` Linear with interleaved gate/up rows, one GEMM),
-  `param_init`, and a `sharding_config` that composes with both FSDP and TP (see
-  "Fusion under TP" above). Needs no prerequisite. See "Checkpoint
-  Compatibility" for how it interoperates with stock checkpoints.
+- `torchtitan/overrides/fused_swiglu.py` -- **the custom Triton activation
+  example.** It replaces the default torch-native SiLU and multiply operations
+  while retaining the core `FeedForward` parameter layout and checkpoint
+  behavior. Because the override targets `SwiGLU.Config`, it also applies to
+  grouped experts and dist-GEMM feed-forwards that use that activation.
 - `torchtitan/overrides/helion_rope.py` — **the custom-kernel example.** Swaps
   `CosSinRoPE` for a fused Helion kernel (forward + backward) wrapped in a
   `torch.library.custom_op` (with `register_fake` / `register_autograd`), the

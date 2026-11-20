@@ -6,6 +6,7 @@ Uses torch_tpu._internal.pallas.custom_jax_kernel() to bridge JAX -> PyTorch.
 
 import functools
 import hashlib
+import logging
 import math
 import os
 import typing
@@ -28,7 +29,8 @@ from torchtitan.experiments.tpu.distributed.headtail import (
     slice_cp_mask_info,
 )
 from torchtitan.models.common.attention import segment_ids_from_positions
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 custom_jax_kernel = pallas.custom_jax_kernel
 

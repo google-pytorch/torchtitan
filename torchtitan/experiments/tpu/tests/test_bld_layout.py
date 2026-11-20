@@ -16,7 +16,7 @@ from torchtitan.experiments.tpu.overrides.real_rope import tpu_real_arithmetic_c
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.examples.gemma4.model import (
-    FusedQKVLinearKeqV,
+    QKVLinearKeqV,
     fused_qk_param_init,
 )
 from torchtitan.models.common import ComplexRoPE
@@ -70,12 +70,10 @@ def _llama3_block(real: bool):
 
 def _packed_qwen3_block():
   return TpuPackedQKVConverter.Config().build().convert(_qwen3_block())
-
-
 def _packed_qwen3_keqv_block():
   block = _qwen3_block()
   qkv = block.attention.qkv_linear
-  block.attention.qkv_linear = FusedQKVLinearKeqV.Config(
+  block.attention.qkv_linear = QKVLinearKeqV.Config(
       n_heads=qkv.n_heads,
       n_kv_heads=qkv.n_kv_heads,
       head_dim=qkv.head_dim,

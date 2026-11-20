@@ -6,6 +6,7 @@
 
 """Compiled gradient-norm helpers for TPU training."""
 
+import logging
 from collections.abc import Callable
 from typing import cast
 
@@ -20,8 +21,8 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_pass,
 )
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 GradSignature = tuple[
     tuple[

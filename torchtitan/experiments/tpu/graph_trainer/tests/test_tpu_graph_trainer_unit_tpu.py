@@ -430,12 +430,7 @@ class GradAccumulationTest(BaseAcceleratorDeviceTest):
       trainer.optimizers = SimpleNamespace(optimizers=[])
       trainer.gradient_accumulation_steps = steps
 
-    with (
-        mock.patch.object(GraphTrainer, "__init__", fake_init),
-        mock.patch.object(
-            tpu_graph_trainer, "_split_optimizers_by_mesh", return_value=False
-        ),
-    ):
+    with mock.patch.object(GraphTrainer, "__init__", fake_init):
       if steps > 1:
         with self.assertRaisesRegex(ValueError, "gradient accumulation"):
           tpu_graph_trainer.TpuGraphTrainer(config)

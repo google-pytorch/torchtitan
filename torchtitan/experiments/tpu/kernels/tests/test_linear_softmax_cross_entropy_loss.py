@@ -436,9 +436,13 @@ class LinearSoftmaxCrossEntropyLossTest(
 
   @parameterized.named_parameters(
       # name, dtype, soft_cap, output_multiplier, loss_rtol, grad_rtol,
-      # grad_atol; tolerances as in test_linear_softmax_ce_softcap.py.
-      ("fp32_cap20_m1", torch.float32, 20.0, 1.0, 1e-4, 1e-2, 1e-2),
-      ("fp32_cap20_m0196", torch.float32, 20.0, 0.196116, 1e-4, 1e-2, 1e-2),
+      # grad_atol. fp32 operands go through the MXU at the TPU's default
+      # (bf16-pass) precision, so each row's loss is off by up to ~0.6% from
+      # the FP32 reference (a summed loss averages this out, hence the 1e-4
+      # of test_linear_softmax_ce_softcap.py). bf16 operands are exact
+      # products in FP32, so the bf16 case stays tight.
+      ("fp32_cap20_m1", torch.float32, 20.0, 1.0, 1e-2, 1e-2, 5e-2),
+      ("fp32_cap20_m0196", torch.float32, 20.0, 0.196116, 1e-2, 1e-2, 5e-2),
       ("bf16_cap20_m1", torch.bfloat16, 20.0, 1.0, 2e-3, 5e-2, 5e-2),
   )
   def test_gradient_reduction_none_soft_cap(

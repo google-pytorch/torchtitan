@@ -31,7 +31,7 @@ from torch import nn
 
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.optimizer.optimizer import (
+from torchtitan.components.optim.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
@@ -44,7 +44,7 @@ from torchtitan.experiments.graph_trainer.trainer import (
     GraphTrainer,
     GraphTrainingEngine,
 )
-from torchtitan.training_engine import TrainingEngine
+from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
@@ -64,7 +64,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_transform_passes,
     register as register_tpu_pipeline,
 )
-from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    align_model_context_length,
+    TPUTrainerConfig,
+)
 from torchtitan.protocols.model import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -80,12 +83,13 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
     2. _make_fx_forward_backward_microbatch (Overridden):
        - Lowers joint fwd+loss+bwd trace applying PASS_PIPELINE_REGISTRY["tpu"]
          graph passes, optionally through GraphSplitter.
-    3. forward_backward_microbatch and optimizer_step (Overridden
-       conditionally):
-       - Delegate to super() when standard tracing is used.
+    3. _preprocess_microbatch_groups / _forward_backward_body / optim_step
+       (Overridden conditionally):
+       - Without PP, run upstream's eager TrainingEngine path (the GraphRuntime
+         is a GPU construct) with the fx trace as the per-microbatch body.
        - Use the fused optimizer path when optimizer_compile='in_graph': the
-         joint graph already applied AdamW, so optimizer_step only advances
-         the LR scheduler and the step counter.
+         joint graph already applied AdamW, so optim_step only advances the LR
+         scheduler and the step counter.
 
     New TPU/PJRT Methods:
     - _register_optimizer_buffers: Registers persistent in-graph optstate buffers.
@@ -146,36 +150,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             )
         return self._trainable_params
 
-    def _prepare_trace_inputs(
-        self,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> None:
-        from torchtitan.experiments.graph_trainer.configs import trace_input_preparer_keys
-        from torchtitan.experiments.graph_trainer.registry import TRACE_INPUT_PREPARERS
-
-        for pass_name in trace_input_preparer_keys(self.config.compile):
-            prepare = TRACE_INPUT_PREPARERS.get(pass_name)
-            if prepare is not None:
-                prepare(self.config.compile, args, kwargs)
-
-    def _prepare_trace_call_inputs(
-        self,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        from torchtitan.experiments.graph_trainer.configs import trace_input_preparer_keys
-        from torchtitan.experiments.graph_trainer.registry import TRACE_CALL_INPUT_PREPARERS
-
-        for pass_name in trace_input_preparer_keys(self.config.compile):
-            prepare = TRACE_CALL_INPUT_PREPARERS.get(pass_name)
-            if prepare is not None:
-                prepared = prepare(self.config.compile, args, kwargs)
-                if prepared is not None:
-                    args, kwargs = prepared
-        return args, kwargs
-
-    def _non_pp_forward_backward_body(
+    def _non_pp_forward_backward_microbatch(
         self,
         *,
         inputs: Any,
@@ -220,76 +195,103 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         if logger.isEnabledFor(logging.DEBUG):
             _dump_weight_stats(self.model_parts)
 
-    def _initialize_optimizer(self) -> None:
-        super()._initialize_optimizer()
-        if _split_optimizers_by_mesh(self.optimizers):
+    def _initialize_optim(self) -> None:
+        super()._initialize_optim()
+        if _split_optimizers_by_mesh(self.optim.optimizers):
             # The param groups changed, so rebuild the per-group schedulers
             # (before the checkpointer captures them).
-            self.lr_schedulers = self.config.lr_scheduler.build(
-                optimizers=self.optimizers,
+            self.optim.lr_schedulers = self.config.optim.lr_scheduler.build(
+                optimizers=self.optim.optimizers,
                 training_steps=self.config.training.steps,
             )
         if self._optimizer_in_graph:
-            for opt in self.optimizers.optimizers:
+            for opt in self.optim.optimizers.optimizers:
                 for group in opt.param_groups:
                     group["capturable"] = True
         if self._optimizer_separate_graph:
             apply_compiled_optimizer(self)
-
-    def forward_backward_microbatch(
-        self,
-        *,
-        microbatch_group: list[TrainingMicrobatch],
-        global_valid_tokens: torch.Tensor,
-        accumulation_index: int = 0,
-    ) -> torch.Tensor:
-        """Include AdamW when the in-graph optimizer mode is selected."""
-        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-
-        with set_unflatten_seq_len(self.config.training.max_context_length):
-            if not self._optimizer_in_graph:
-                if not self.parallelism_context.pp_enabled:
-                    return TrainingEngine.forward_backward_microbatch(
-                        self,
-                        microbatch_group=microbatch_group,
-                        global_valid_tokens=global_valid_tokens,
-                        accumulation_index=accumulation_index,
-                    )
-                return super().forward_backward_microbatch(
-                    microbatch_group=microbatch_group,
-                    global_valid_tokens=global_valid_tokens,
-                    accumulation_index=accumulation_index,
-                )
-            assert len(microbatch_group) == 1, (
-                "optimizer_compile='in_graph' does not support pipeline "
-                "parallelism."
+        if self._compiled_grad_norm is not None:
+            # Upstream's Optim clips in its own ``clip_grad_norm`` hook (fork
+            # addition); route it through the compiled DTensor-aware norm.
+            compiled_grad_norm = self._compiled_grad_norm
+            optim = self.optim
+            optim.clip_grad_norm = lambda: compiled_grad_norm.clip_grad_norm_(
+                optim.parameters, optim.config.max_norm
             )
-            if microbatch_group[0].loss_kwargs():
+
+    def _preprocess_microbatch_groups(
+        self,
+        microbatch_groups: list[list[TrainingMicrobatch]],
+    ) -> list[tuple[Any, ...]]:
+        """Preprocess for the TPU fx path; GraphRuntime inputs only under PP."""
+        if self.parallelism_context.pp_enabled:
+            return super()._preprocess_microbatch_groups(microbatch_groups)
+        if self._optimizer_in_graph:
+            # The joint AdamW graph preprocesses its own microbatch, so hand the
+            # raw microbatches through.
+            if len(microbatch_groups) != 1 or len(microbatch_groups[0]) != 1:
+                raise ValueError(
+                    "optimizer_compile='in_graph' does not support pipeline "
+                    "parallelism or gradient accumulation."
+                )
+            if microbatch_groups[0][0].loss_kwargs():
                 raise ValueError(
                     "TpuGraphTrainingEngine does not support per-microbatch "
                     "loss arguments."
                 )
-            if accumulation_index == 0:
-                # The joint graph reads the learning rate from a model buffer;
-                # refresh it once per optimizer step.
-                self._register_optimizer_buffers()
-                lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
-                self.model_parts[0]._optstate_lr.fill_(lr)
+            return [(microbatch_groups[0][0],)]
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+
+        with set_unflatten_seq_len(self.config.training.max_context_length):
+            return TrainingEngine._preprocess_microbatch_groups(
+                self, microbatch_groups
+            )
+
+    def _forward_backward_body(
+        self,
+        microbatch_groups: list[tuple[Any, ...]],
+        global_valid_tokens: torch.Tensor,
+        *,
+        defer_fsdp_gradient_reduction: bool,
+    ) -> ForwardBackwardResult:
+        """Run the TPU fx trace (optionally with AdamW inside the graph)."""
+        if self.parallelism_context.pp_enabled:
+            return super()._forward_backward_body(
+                microbatch_groups,
+                global_valid_tokens,
+                defer_fsdp_gradient_reduction=defer_fsdp_gradient_reduction,
+            )
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+
+        with set_unflatten_seq_len(self.config.training.max_context_length):
+            if not self._optimizer_in_graph:
+                return TrainingEngine._forward_backward_body(
+                    self,
+                    microbatch_groups,
+                    global_valid_tokens,
+                    defer_fsdp_gradient_reduction=defer_fsdp_gradient_reduction,
+                )
+            (microbatch,) = microbatch_groups[0]
+            # The joint graph reads the learning rate from a model buffer;
+            # refresh it once per optimizer step.
+            self._register_optimizer_buffers()
+            lr = self.optim.lr_schedulers.schedulers[0].get_last_lr()[0]
+            self.model_parts[0]._optstate_lr.fill_(lr)
             loss = self._fwd_bwd_adamw_microbatch(
-                microbatch=microbatch_group[0],
+                microbatch=microbatch,
                 global_valid_tokens=global_valid_tokens,
             )
-            return loss.detach()
+            return ForwardBackwardResult(loss.detach(), [dict(self.loss_metrics)])
 
-    def optimizer_step(self) -> torch.Tensor:
+    def optim_step(self) -> torch.Tensor:
         """Advance the schedule when the joint graph already applied AdamW."""
         if not self._optimizer_in_graph:
-            return super().optimizer_step()
+            return super().optim_step()
         # The gradient norm is clipped inside the joint graph and never
         # materialized; report zero like the previous fused loop did.
         if hasattr(self, "checkpointer"):
             self.checkpointer.maybe_wait_for_staging()
-        self.lr_schedulers.step()
+        self.optim.lr_schedulers.step()
         self.num_completed_steps += 1
         return torch.zeros((), device=self.device)
 
@@ -331,7 +333,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             torch.zeros((), dtype=torch.float32, device=self.device),
             persistent=True,
         )
-        lr0 = float(self.lr_schedulers.schedulers[0].get_last_lr()[0])
+        lr0 = float(self.optim.lr_schedulers.schedulers[0].get_last_lr()[0])
         model.register_buffer(
             "_optstate_lr",
             torch.tensor(lr0, dtype=torch.float32, device=self.device),
@@ -385,8 +387,6 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
-                        prepare_inputs=self._prepare_trace_inputs,
-                        prepare_call_inputs=self._prepare_trace_call_inputs,
                     )(
                         inputs,
                         labels,
@@ -443,15 +443,6 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
 
         return loss
 
-    def _clip_grad_norm(self) -> torch.Tensor:
-        if self._compiled_grad_norm is None:
-            return super()._clip_grad_norm()
-        parameters = [p for m in self.model_parts for p in m.parameters()]
-        return self._compiled_grad_norm.clip_grad_norm_(
-            parameters,
-            self.config.training.max_norm,
-        )
-
     def _fwd_bwd_adamw_microbatch(
         self,
         *,
@@ -488,10 +479,11 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         if self._traced_step is None:
             maybe_register_blockmask_pytree_node()
             param_fqns = list(self._optstate_param_fqns)
-            betas = tuple(self.optimizers.optimizers[0].param_groups[0]["betas"])
-            wd = float(self.optimizers.optimizers[0].param_groups[0]["weight_decay"])
-            eps = float(self.optimizers.optimizers[0].param_groups[0]["eps"])
-            max_norm_val = getattr(self.config.training, "max_norm", None)
+            optimizer = self.optim.optimizers.optimizers[0]
+            betas = tuple(optimizer.param_groups[0]["betas"])
+            wd = float(optimizer.param_groups[0]["weight_decay"])
+            eps = float(optimizer.param_groups[0]["eps"])
+            max_norm_val = getattr(self.config.optim, "max_norm", None)
             max_norm = float(max_norm_val) if max_norm_val is not None else None
 
             fwd_bwd_adamw = _make_fwd_bwd_adamw_fn(
@@ -661,6 +653,9 @@ class TpuGraphTrainer(GraphTrainer):
         from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
 
         set_global_vocab_size(config.loss, config.model)
+        # Recipes may set training.max_context_length or the model after
+        # construction, past the config's own alignment.
+        align_model_context_length(config)
 
         super().__init__(config)
         if not self.engine.parallelism_context.pp_enabled:

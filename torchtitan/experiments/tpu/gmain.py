@@ -10,7 +10,7 @@ from absl import logging
 from absl.flags import argparse_flags
 import torch.multiprocessing as mp
 from torchtitan.experiments.tpu.distributed import distributed_utils as tpu_distributed_utils
-from torchtitan.experiments.tpu import config_manager
+from torchtitan.experiments.tpu import config_manager as tpu_config_manager
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.tools import utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -111,7 +111,7 @@ def _verify_requested_device(requested: str | None) -> None:
 def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
   args, remaining_args = parsed_args
   _verify_requested_device(args.device)
-  config_manager = config_manager.ConfigManager()
+  config_manager = tpu_config_manager.ConfigManager()
   config = typing.cast(
       tpu_job_config_module.TPUTrainerConfig,
       config_manager.parse_args(remaining_args),

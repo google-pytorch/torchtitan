@@ -28,7 +28,7 @@ from torchtitan.experiments.tpu.components.layer_loop import (
 )
 from torchtitan.models.common import Linear
 from torchtitan.models.common.decoder import Decoder
-from torchtitan.models.llama3 import llama3_configs
+from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.protocols.module import ModuleDict
 

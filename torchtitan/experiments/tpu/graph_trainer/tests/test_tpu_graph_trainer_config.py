@@ -15,7 +15,8 @@ from absl.testing import parameterized
 import torch
 from torch import nn
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.config import CompileConfig, apply_overrides
+from torchtitan.config import apply_overrides
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.jax.jax_job_config import JaxJobConfig
@@ -122,9 +123,7 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
 )
 from torchtitan.models.common import ComplexRoPE, Linear
 from torchtitan.models.common.moe import MoE, MoELoadBalanceAuxLoss
-from torchtitan.models.llama3.config_registry import (
-    model_registry as llama3_model_registry,
-)
+from torchtitan.models.llama3 import build_model_config as llama3_model_registry
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -328,29 +327,21 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     config = JaxJobConfig.derive_from(source)
 
-    # Upstream ec953b36: a present generic CompileConfig means enabled.
-    self.assertIs(type(config.compile), CompileConfig)
+    # Upstream #4895: Trainer.Config.compile is a LocalCompileConfig that only
+    # names inductor regions; the TorchTPU block-compile policy and execution
+    # controls stay on the TorchTPU lane.
+    self.assertIs(type(config.compile), LocalCompileConfig)
     self.assertFalse(hasattr(config.compile, "enable"))
-    self.assertEqual(config.compile.components, ["model"])
-    self.assertEqual(config.compile.backend, "tpu")
+    self.assertFalse(hasattr(config.compile, "components"))
+    self.assertEqual(config.compile.regions, [])
     self.assertFalse(
         hasattr(config.compile, "materialize_forward_before_backward")
     )
     self.assertFalse(hasattr(config.compile, "optimizer_compile"))
 
   @parameterized.named_parameters(
-      (
-          "generic",
-          CompileConfig(components=["model"], backend="tpu"),
-      ),
-      (
-          "graph",
-          GraphTrainerCompileConfig(
-              components=["model"],
-              backend="tpu",
-              memory_policy="full",
-          ),
-      ),
+      ("generic", LocalCompileConfig(regions=[])),
+      ("graph", GraphTrainerCompileConfig(memory_policy="full")),
   )
   def test_graph_config_normalizes_upstream_compile_types(
       self, compile_config
@@ -362,9 +353,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     self.assertIsInstance(config.compile, TpuGraphTrainerCompileConfig)
     self.assertTrue(config.compile.enable)
-    self.assertEqual(config.compile.components, ["model"])
+    self.assertIn("model", config.compile.components)
     self.assertEqual(config.compile.backend, "tpu")
     self.assertEqual(config.compile.pass_pipeline, "tpu")
+    if isinstance(compile_config, GraphTrainerCompileConfig):
+      self.assertEqual(config.compile.memory_policy, "full")
 
   @parameterized.parameters("jit", None)
   def test_plain_non_aot_modes_remain_available(self, mode) -> None:
@@ -827,7 +820,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
-    self.assertEqual(config.optimizer.implementation, "fused")
+    self.assertEqual(config.optim.optimizer.implementation, "fused")
     self.assertTrue(
         config.splash_attention_kernel.use_tokamax_splash_attention_kernel
     )
@@ -1202,7 +1195,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         "--optimizer.implementation=fused",
     ])
 
-    self.assertEqual(config.optimizer.implementation, "fused")
+    self.assertEqual(config.optim.optimizer.implementation, "fused")
 
   def test_qwen3_30b_fsdp_profile_explicitly_uses_zero2(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
@@ -1309,7 +1302,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         config.compile.memory_policy, "full_and_scan_offload"
     )
-    self.assertEqual(config.optimizer.implementation, "fused_opt_states_bf16")
+    self.assertEqual(config.optim.optimizer.implementation, "fused_opt_states_bf16")
     self.assertEqual(
         {
             name: config.libtpu_init_flags[name]
@@ -1390,7 +1383,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config
         if isinstance(config, TpuGraphTrainer.Config)
         else TpuGraphTrainer.Config.from_tpu_trainer_config(
-            config, llama3_gt.model_registry
+            config, llama3_gt.build_model_config
         )
     )
 
@@ -1422,7 +1415,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config
         if isinstance(config, TpuGraphTrainer.Config)
         else TpuGraphTrainer.Config.from_tpu_trainer_config(
-            config, module.model_registry
+            config, module.build_model_config
         )
     )
 
@@ -1683,6 +1676,15 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         recipe_model_config._owner._register_optimizer_hooks.__func__,
     )
     for field in dataclasses.fields(recipe_model_config):
+      if field.name == "max_context_length":
+        # The TPU config aligns the model to training.max_context_length
+        # (upstream #4908 requires them equal); the recipe set its training
+        # length after construction, so only the converted config saw it.
+        self.assertEqual(
+            graph_model_config.max_context_length,
+            graph_config.training.max_context_length,
+        )
+        continue
       self.assertIs(
           getattr(graph_model_config, field.name),
           getattr(recipe_model_config, field.name),

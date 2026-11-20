@@ -5,8 +5,8 @@ from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -43,6 +43,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
+from torchtitan.components.optim import Optim
 
 
 # Host-offload copy-insertion flags shared with the Qwen3 235B graph-splitter
@@ -167,12 +168,14 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_config,
-      optimizer=default_adamw(lr=3e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=3e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=4 * 512,
@@ -293,15 +296,17 @@ def gemma4_31b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
       model=model,
-      optimizer=default_adamw(lr=3e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=200,
-          decay_ratio=0.8,
-          decay_type="cosine",
-          min_lr_factor=0.1,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=3e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=200,
+              decay_ratio=0.8,
+              decay_type="cosine",
+              min_lr_factor=0.1,
+          ),
+          max_norm=1.0,
       ),
       training=TrainingConfig(
-          max_norm=1.0,
           num_tokens_per_microbatch_per_dp_rank=2 * 4096,
           max_context_length=4096,
           steps=15,

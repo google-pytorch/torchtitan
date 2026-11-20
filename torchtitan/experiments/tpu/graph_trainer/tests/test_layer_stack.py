@@ -22,7 +22,7 @@ from torch._functorch import config as functorch_config, partitioners
 from torch._higher_order_ops.scan import ScanAutogradImpl
 from torch.distributed.tensor import DTensor, Shard
 
-from torchtitan.components.optimizer.optimizer import (
+from torchtitan.components.optim.optimizer import (
     default_adamw,
     OptimizersContainer,
 )
@@ -43,11 +43,11 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
 from torchtitan.experiments.tpu.components.layer_loop import tpu_model_class
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-from torchtitan.models import qwen3 as qwen3_models
+from torchtitan.models.qwen3 import flavors as qwen3_models
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common.config_utils import make_aux_loss_config
-from torchtitan.models.llama3 import model_registry
-from torchtitan.models.qwen3 import model_registry as qwen3_registry
+from torchtitan.models.llama3 import build_model_config as model_registry
+from torchtitan.models.qwen3 import build_model_config as qwen3_registry
 
 
 SEQ_LEN = 32
@@ -112,7 +112,6 @@ def _moe_config(num_experts: int):
         top_k=2,
         load_balance_coeff=None,
         attn_backend="sdpa",
-        moe_comm_backend="standard",
         rope=CosSinRoPE.Config(
             dim=128, max_context_length=SEQ_LEN, theta=1000000.0
         ),

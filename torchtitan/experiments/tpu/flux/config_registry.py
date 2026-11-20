@@ -16,8 +16,8 @@
 
 import dataclasses
 
-from torchtitan.models.flux.config_registry import flux_debugmodel
-from torchtitan.models.flux.config_registry import model_registry
+from torchtitan.models.flux import build_model_config
+from torchtitan_recipes.tests.models.flux import flux_debugmodel
 from torchtitan.models.flux.trainer import FluxTrainer
 
 _TEST_ASSETS = "tests/assets/"
@@ -35,7 +35,7 @@ def flux_testmodel() -> FluxTrainer.Config:
     The trainer config.
   """
   config = flux_debugmodel()
-  config.model = model_registry("flux-test")
+  config.model = build_model_config("flux-test")
   config.hf_assets_path = f"{_TEST_ASSETS}tokenizer"
   config.tokenizer.test_mode = True
   config.tokenizer.t5_tokenizer_path = f"{_TEST_ASSETS}tokenizer"

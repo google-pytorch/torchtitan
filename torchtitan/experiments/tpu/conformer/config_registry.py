@@ -1,7 +1,7 @@
 import os
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import (
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import (
     default_adamw,
     OptimizersContainer,
 )
@@ -23,6 +23,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 import torchtitan.experiments.tpu.conformer as tpu_conformer
 from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.components.optim import Optim
 
 
 def _conformer_model_config(flavor: str):
@@ -36,8 +37,10 @@ def conformer_test() -> TPUTrainerConfig:
       hf_assets_path="tests/assets/tokenizer",
       dump_folder=os.environ.get("TEST_TMPDIR", ".") + "/outputs",
       model=_conformer_model_config("test"),
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
-      lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+          lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
+      ),
       dataloader=c4_test_dataloader(),
       tokenizer=HuggingFaceTokenizer.Config(),
       validator=Validator.Config(),

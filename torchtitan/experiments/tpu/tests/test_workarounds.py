@@ -251,7 +251,7 @@ class WorkaroundsTest(parameterized.TestCase):
     projection, loading pretrained HF safetensors dies in to_hf with
     KeyError: 'lm_head.original_linear.weight'.
     """
-    from torchtitan.models.llama3 import llama3_configs
+    from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
     from torchtitan.experiments.tpu import workarounds
 
@@ -283,7 +283,7 @@ class WorkaroundsTest(parameterized.TestCase):
     checkpoint load
     overwrites the zeros.
     """
-    from torchtitan.models.llama3 import llama3_configs
+    from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
     from torchtitan.experiments.tpu import workarounds
 
     # Upstream d771abb0 made `llama3_configs[flavor]` a

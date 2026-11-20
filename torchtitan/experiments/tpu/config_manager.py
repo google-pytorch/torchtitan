@@ -344,7 +344,10 @@ def _coerce(value: str, tp: Any, *, current: Any, path: str) -> Any:
   if origin in (list, tuple, set, frozenset):
     args = typing.get_args(tp)
     item_tp = args[0] if args else str
-    items = [v for v in value.split(",") if v != ""]
+    if value.lstrip().startswith("["):
+      items = [str(v) for v in json.loads(value)]
+    else:
+      items = [v for v in value.split(",") if v != ""]
     coerced = [
         _coerce(item, item_tp, current=None, path=path) for item in items
     ]
@@ -398,6 +401,49 @@ def _subcommand_choices(members: tuple[Any, ...]) -> dict[str, Any]:
     owner = qualname.rsplit(".", 1)[0] if qualname.endswith(".Config") else qualname
     choices[owner.lower()] = member
   return choices
+
+
+def _is_subcommand_token(config: Any, token: str) -> bool:
+  """Whether ``token`` is an ``a.b:choice`` selection for a field of ``config``."""
+  if "=" in token or not _SUBCOMMAND_RE.match(token):
+    return False
+  raw_path = token.partition(":")[0]
+  try:
+    parent, name, _ = _resolve_path(config, raw_path)
+  except ConfigError:
+    return False
+  return dataclasses.is_dataclass(parent) and name in _field_names(parent)
+
+
+def _coerce_multi(values: list[str], tp: Any, *, current: Any, path: str) -> Any:
+  """Converts the ``--flag A B C`` token list for a sequence or dict field."""
+  tp = _strip_annotated(tp)
+  origin = typing.get_origin(tp)
+  args = typing.get_args(tp)
+  if origin is dict:
+    if len(values) == 1 and values[0].lstrip().startswith("{"):
+      return _coerce(values[0], tp, current=current, path=path)
+    if len(values) % 2:
+      raise ConfigError(f"--{path}: expected KEY VALUE pairs, got {values}")
+    key_tp = args[0] if args else str
+    value_tp = args[1] if len(args) > 1 else str
+    return {
+        _coerce(k, key_tp, current=None, path=path): _coerce(
+            v, value_tp, current=None, path=path
+        )
+        for k, v in zip(values[::2], values[1::2])
+    }
+  if len(values) == 1:
+    if values[0].lstrip().startswith("["):
+      item_tp = args[0] if args else str
+      return origin(
+          _coerce(str(v), item_tp, current=None, path=path)
+          for v in json.loads(values[0])
+      )
+    # One token: the fork's comma-separated spelling (``--a.b x,y``).
+    return _coerce(values[0], tp, current=current, path=path)
+  item_tp = args[0] if args else str
+  return origin(_coerce(v, item_tp, current=None, path=path) for v in values)
 
 
 def _select_subcommand(config: Any, token: str) -> list[Any] | None:
@@ -503,6 +549,21 @@ def apply_cli_overrides(config: Any, tokens: list[str]) -> Any:
         i += 1
       else:
         new_value = True
+    elif typing.get_origin(tp) in (list, tuple, set, frozenset, dict):
+      # tyro spelled sequences and dicts as ``--flag A B C`` (dicts as
+      # ``--flag K V K V``); take every following plain token.
+      values = []
+      while i < len(tokens) and not _is_flag(tokens[i]):
+        if _is_subcommand_token(config, tokens[i]):
+          break
+        values.append(tokens[i])
+        i += 1
+      if not values:
+        # ``--flag`` with nothing after it empties the collection, as tyro's
+        # ``nargs="*"`` did.
+        new_value = typing.get_origin(tp)()
+      else:
+        new_value = _coerce_multi(values, tp, current=current, path=path)
     else:
       if i >= len(tokens) or _is_flag(tokens[i]):
         raise ConfigError(f"--{key} requires a value")

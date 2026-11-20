@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 import torchtitan.config
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.distributed.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
@@ -42,14 +43,51 @@ TpuTrainerOptimizerCompileMode = Literal["eager", "separate_graph"]
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
-class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
-  """Generic compile policy plus regular-Trainer TorchTPU controls."""
+class TpuCompileConfig(LocalCompileConfig):
+  """The block-level compile policy upstream's ``CompileConfig`` used to carry.
+
+  Upstream #4895 removed ``CompileConfig`` (``components`` / ``backend``) and
+  replaced ``Trainer.Config.compile`` with ``LocalCompileConfig``, which only
+  names inductor-compiled regions (gated RMSNorm, loss). The TPU parallelize
+  paths still compile each transformer block with the ``tpu`` backend, so the
+  fork keeps the old fields on top of upstream's, with ``regions`` empty: the
+  inductor regions have no TPU lowering.
+  """
 
   # Upstream ec953b36 dropped ``CompileConfig.enable`` in favour of
   # ``Trainer.Config.compile`` being ``None``. The TPU compile config also
   # carries execution controls that apply when torch.compile is off, so it is
   # always present and keeps the explicit switch.
   enable: bool = False
+  enable_async_tensor_parallel: bool = False
+  components: list[str] = dataclasses.field(
+      default_factory=lambda: ["model", "loss"]
+  )
+  """Which components to compile block-wise (``model``) or wrap (``loss``)."""
+  backend: str = "inductor"
+  regions: list[str] = dataclasses.field(default_factory=list)
+
+  def __post_init__(self) -> None:
+    allowed = frozenset({"model", "loss"})
+    unknown = [c for c in self.components if c not in allowed]
+    if unknown:
+      raise ValueError(
+          f"Unknown compile.components entries {unknown}; "
+          f"allowed values are {sorted(allowed)}"
+      )
+    if self.enable_async_tensor_parallel and "model" not in self.components:
+      raise ValueError("Async TP requires 'model' in compile.components.")
+    if not self.enable:
+      # Upstream consumers read "<component> in compile.components" (TPU
+      # parallelize fns, the Pallas loss build); keep the fork's explicit
+      # switch and that view consistent.
+      self.components = []
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class TpuTrainerCompileConfig(TpuCompileConfig):
+  """Generic compile policy plus regular-Trainer TorchTPU controls."""
+
   # TPU model families support different subsets: Llama/Qwen use
   # layer/fullgraph, Conformer uses layer/whole, and redacted uses block/whole.
   mode: TpuTrainerCompileMode = "layer"
@@ -64,13 +102,6 @@ class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
   # Compile the DTensor-aware global gradient norm as a separate static graph.
   compile_grad_norm: bool = False
 
-  def __post_init__(self) -> None:
-    super(TpuTrainerCompileConfig, self).__post_init__()
-    if not self.enable:
-      # Upstream consumers read "compile is not None and <component> in
-      # components" (model parallelize fns, config validation, loss build);
-      # keep the fork's explicit switch and upstream's view consistent.
-      self.components = []
 
 
 @dataclasses.dataclass
@@ -161,6 +192,46 @@ class LossKernelConfig:
   enable_pallas_loss_kernel: bool = True
 
 
+def _FluxModelConfigTypes() -> tuple[type, ...]:  # pylint: disable=invalid-name
+  """Flux sizes its context from the image size (``_apply_flux_img_size``)."""
+  from torchtitan.models.flux.model.model import FluxModel  # pylint: disable=g-import-not-at-top
+
+  return (FluxModel.Config,)
+
+
+def align_model_context_length(config) -> None:
+  """Sizes the model config to ``training.max_context_length``.
+
+  Upstream #4908 requires ``model.max_context_length`` to equal
+  ``training.max_context_length`` (its recipes pass ``seq_len`` when building
+  the flavor). The TPU recipes build upstream flavors at the flavor's full
+  context and pick the training length in ``training`` -- including from the
+  command line (``--training.max_context_length=32`` in the tests) -- so
+  align the model here and shrink every RoPE cache to it (pre-d771abb0
+  behaviour; a cache built for the flavor's full context ran llama3-70b on
+  tpu7x-2x2x4 out of program HBM). Caches are never grown.
+  """
+  model_config = config.model
+  max_context_length = config.training.max_context_length
+  if model_config is None or max_context_length <= 0:
+    return
+  if getattr(model_config, "max_context_length", None) is not None:
+    model_config.max_context_length = max_context_length
+  from torchtitan.models.common.rope import RoPE  # pylint: disable=g-import-not-at-top
+
+  traverse = getattr(model_config, "traverse", None)
+  if traverse is None:
+    return
+  for _, rope, parent, attr in traverse(RoPE.Config):
+    if parent is None or rope.max_context_length <= max_context_length:
+      continue
+    new_rope = dataclasses.replace(rope, max_context_length=max_context_length)
+    if isinstance(parent, list):
+      parent[attr] = new_rope
+    else:
+      setattr(parent, attr, new_rope)
+
+
 # Shared base for every TPU-targeted lane (torch_tpu, jax, torchax). Holds the
 # lane-agnostic, TPU-flavored config blocks (splash attention, Pallas loss
 # kernel, LoRA, per-model toggles). The truly lane-specific runtime knobs
@@ -200,6 +271,8 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # graph to capture in this lane, so opt out before the check runs. Must
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
     self.training.disable_cuda_graphs = True
+    if not isinstance(self.model, _FluxModelConfigTypes()):
+      align_model_context_length(self)
     if (
         self.model is not None
         and self.parallelism.context_parallel_degree > 1
@@ -252,41 +325,27 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # Sibling TPU lanes share Trainer's generic compile policy, but TorchTPU's
     # concrete config adds execution controls that JAX and TorchAX must not
     # inherit merely because they reuse a TorchTPU recipe. Reconstruct the
-    # destination's declared/default type and carry only the generic policy.
+    # destination's declared type and carry only the fields it declares.
     if "compile" in values:
       compile_field = dst_fields["compile"]
       if compile_field.default_factory is not dataclasses.MISSING:
         dst_compile = compile_field.default_factory()
       elif compile_field.default is not dataclasses.MISSING:
-        # Upstream ``Trainer.Config.compile`` is ``CompileConfig | None``
-        # (``None`` means no compilation).
         dst_compile = compile_field.default
       else:
         raise TypeError(f"{cls.__name__}.compile must have a default")
       src_compile = values["compile"]
-      if src_compile is None:
-        # The TPU lanes keep a concrete, always-present policy.
+      if src_compile is None or dst_compile is None:
         values["compile"] = dst_compile
-      elif dst_compile is None:
-        # Upstream's optional generic policy: present means enabled.
-        values["compile"] = (
-            torchtitan.config.CompileConfig(
-                components=list(src_compile.components),
-                backend=src_compile.backend,
-            )
-            if getattr(src_compile, "enable", True)
-            else None
-        )
       elif type(src_compile) is not type(dst_compile):
-        kwargs = {
-            "components": list(src_compile.components),
-            "backend": src_compile.backend,
-        }
-        if "enable" in {f.name for f in dataclasses.fields(dst_compile)}:
-          # A plain upstream ``CompileConfig`` has no ``enable``: when it is
-          # present at all, upstream compiles.
-          kwargs["enable"] = getattr(src_compile, "enable", True)
-        values["compile"] = type(dst_compile)(**kwargs)
+        dst_names = {f.name for f in dataclasses.fields(dst_compile)}
+        src_names = {f.name for f in dataclasses.fields(src_compile)}
+        values["compile"] = type(dst_compile)(
+            **{
+                name: getattr(src_compile, name)
+                for name in dst_names & src_names
+            }
+        )
     return cls(
         **values,
         **overrides,
@@ -306,13 +365,18 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
       # Upstream ``Trainer.Config.compile`` is optional; the TPU lane always
       # carries its concrete policy (``enable`` defaults to False).
       self.compile = TpuTrainerCompileConfig()
-    elif type(self.compile) is torchtitan.config.CompileConfig:
-      # ``derive_from`` may receive an upstream Trainer.Config. Preserve its
-      # generic compile policy while restoring the TPU-specific config type.
+    elif type(self.compile) is LocalCompileConfig:
+      # ``derive_from`` may receive an upstream Trainer.Config whose compile
+      # is a plain ``LocalCompileConfig``. Restore the TPU-specific type,
+      # carrying the fields both declare. (The TPU GraphTrainer config runs
+      # this ``__post_init__`` too, with its own compile type already set.)
+      names = {f.name for f in dataclasses.fields(TpuTrainerCompileConfig)}
       self.compile = TpuTrainerCompileConfig(
-          enable=getattr(self.compile, "enable", True),
-          components=list(self.compile.components),
-          backend=self.compile.backend,
+          **{
+              f.name: getattr(self.compile, f.name)
+              for f in dataclasses.fields(self.compile)
+              if f.name in names
+          }
       )
     if self.compile.compile_grad_norm:
       # PP needs an additional reduction across stages, which each own only a

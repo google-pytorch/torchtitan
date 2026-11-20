@@ -133,6 +133,14 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # torch.compile is off; upstream removed ``CompileConfig.enable`` in
   # ec953b36 and uses ``compile is None`` instead.
   enable: bool = False
+  # Upstream #4895 removed ``CompileConfig`` (and with it the ``components``
+  # / ``backend`` fields GraphTrainerCompileConfig inherited); the TPU graph
+  # trainer still keys its compile policy off them.
+  enable_async_tensor_parallel: bool = False
+  components: list[str] = field(default_factory=lambda: ["model", "loss"])
+  # ``LocalCompileConfig.regions`` counterpart: the inductor-compiled regions
+  # (gated RMSNorm, loss) have no TPU lowering, so none are bound.
+  regions: list[str] = field(default_factory=list)
   mode: str = "aot_fx_trace"
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
@@ -182,7 +190,15 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   fsdp_allreduce_slice_max_input_bytes: int = 0
 
   def __post_init__(self) -> None:
-    super(TpuGraphTrainerCompileConfig, self).__post_init__()
+    post_init = getattr(super(TpuGraphTrainerCompileConfig, self), "__post_init__", None)
+    if post_init is not None:
+      post_init()
+    unknown = [c for c in self.components if c not in ("model", "loss")]
+    if unknown:
+      raise ValueError(
+          f"Unknown compile.components entries {unknown}; "
+          "allowed values are ['loss', 'model']"
+      )
     if not self.enable:
       # Upstream consumers read "compile is not None and <component> in
       # components"; keep the fork's explicit switch consistent with that.

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torchtitan.models.flux as native_flux_models
+import torchtitan.models.flux.flavors as native_flux_models
 from torchtitan.experiments.tpu.flux.infra.parallelize import parallelize_flux
 
 __all__ = [
@@ -16,11 +16,12 @@ __all__ = [
 def _upstream_flavor(flavor: str):
   """Builds an upstream flux flavor.
 
-  Upstream d771abb0 changed `native_flux_models.flux_configs[flavor]` from a
+  Upstream d771abb0 changed the flavor table entries (now
+  `flavors.MODEL_FLAVORS`, #4913) from a
   bare callable into a `(builder, max_context_length)` pair. Flux builders take
   no arguments, so only the unpack changes here.
   """
-  build_config = native_flux_models.flux_configs[flavor]
+  build_config = native_flux_models.MODEL_FLAVORS[flavor]
   return build_config()
 
 

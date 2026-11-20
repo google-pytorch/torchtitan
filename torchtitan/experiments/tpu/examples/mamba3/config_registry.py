@@ -6,12 +6,13 @@
 from torchtitan.components import checkpointer as checkpoint
 from torchtitan.components import loss
 from torchtitan.observability import metrics
-from torchtitan.components import optimizer
-from torchtitan.components.optimizer import lr_scheduler
+from torchtitan.components import optim as optimizer
+from torchtitan.components.optim import lr_scheduler
 from torchtitan.config import configs
 from torchtitan.distributed import activation_checkpoint
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
+from torchtitan.components.optim import Optim
 from . import model
 from . import parallelize
 
@@ -54,12 +55,14 @@ def mamba3_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
       model=model_registry("2.7B"),
       dataloader=c4_test_dataloader(),
-      optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
-      lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
-          warmup_steps=100,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
+          lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
+              warmup_steps=100,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 262144,

@@ -12,7 +12,7 @@ import torch.nn as nn
 from torchtitan.config import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3 import (
-    model_registry as graph_trainer_model_registry,
+    build_model_config as graph_trainer_model_registry,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
@@ -117,13 +117,11 @@ def model_registry(
     *,
     seq_len: int | None = None,
     attn_backend: str = "flex",
-    moe_comm_backend: str | None = None,
 ) -> TpuGraphTrainerQwen3Model.Config:
     base = graph_trainer_model_registry(
         flavor,
         seq_len=seq_len,
         attn_backend=attn_backend,
-        moe_comm_backend=moe_comm_backend,
     )
     return TpuGraphTrainerQwen3Model.Config(
         **{

@@ -11,8 +11,8 @@ from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -58,9 +58,10 @@ from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader, T
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.common.moe import MoE
-from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
+from torchtitan_recipes.tests.models.qwen3 import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.observability.profiler import Profiler
+from torchtitan.components.optim import Optim
 
 
 # Upstream d771abb0 identifies an override by the import path of its decorated
@@ -192,12 +193,14 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_config,
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,
@@ -257,15 +260,17 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_config,
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=600,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=600,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
+          max_norm=1.0,
       ),
       training=TrainingConfig(
-          max_norm=1.0,
           num_tokens_per_microbatch_per_dp_rank=1 * 2048,
           max_context_length=2048,
           steps=15,
@@ -317,15 +322,17 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       model=model_config,
       # Keep the established dense optimizer path until native fused AdamW has
       # a dedicated long-convergence validation for this recipe.
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=600,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=600,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
+          max_norm=1.0,
       ),
       training=TrainingConfig(
-          max_norm=1.0,
           num_tokens_per_microbatch_per_dp_rank=6 * 2048,
           max_context_length=2048,
           steps=15,
@@ -461,15 +468,17 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
       model=model_config,
       # Keep the established dense optimizer path until native fused AdamW has
       # a dedicated long-convergence validation for this recipe.
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=600,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=600,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
+          max_norm=1.0,
       ),
       training=TrainingConfig(
-          max_norm=1.0,
           num_tokens_per_microbatch_per_dp_rank=6 * 2048,
           max_context_length=2048,
           steps=15,
@@ -709,7 +718,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
   cfg.training.num_tokens_per_train_step = 768 * 2048
   cfg.training.steps = 8
   cfg.tpu_config = TPUConfig()
-  cfg.optimizer.implementation = "fused"
+  cfg.optim.optimizer.implementation = "fused"
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       backend="tpu",

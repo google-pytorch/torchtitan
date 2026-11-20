@@ -271,7 +271,7 @@ class JaxTrainer:
 
   def setup_optimizer(self, job_config, model):
     # Adapt to OptimizersContainer.Config
-    optim_config = job_config.optimizer
+    optim_config = job_config.optim.optimizer
     if (
         hasattr(optim_config, 'param_groups')
         and len(optim_config.param_groups) > 0

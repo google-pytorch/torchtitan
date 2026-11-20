@@ -212,7 +212,8 @@ class FluxRandomDataloaderTest(absltest.TestCase):
     import datasets as hf_datasets
     from torchtitan.experiments.tpu import train as tpu_train
     from torchtitan.models.flux import trainer as flux_trainer
-    from torchtitan.models.flux.config_registry import flux_dev, model_registry
+    from torchtitan.models.flux import build_model_config as model_registry
+    from torchtitan_recipes.models.flux import flux_dev
     from torchtitan.models.flux.random_loader import RandomDataloader
     from torchtitan.models.flux.tokenizer import FluxTokenizer
     from torchtitan.models.flux.trainer import FluxTrainer

@@ -7,7 +7,7 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.distributed.compile import _maybe_regional_inductor_backend
+from torchtitan.experiments.tpu.components.compile import maybe_regional_inductor_backend
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     resolve_fsdp_mesh,
@@ -19,6 +19,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.moe import (
     GroupedExperts,
     MoE,
@@ -41,7 +42,7 @@ def _apply_ac_gemma4(
 
 
 def _apply_compile_gemma4(
-    model: nn.Module, compile_config: torchtitan.config.CompileConfig
+    model: nn.Module, compile_config: LocalCompileConfig
 ) -> None:
   """Apply torch.compile to each Gemma4TransformerBlock with dynamic=False.
 
@@ -55,7 +56,7 @@ def _apply_compile_gemma4(
   torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = (
       True  # pyrefly: ignore [bad-assignment]
   )
-  backend = _maybe_regional_inductor_backend(model, compile_config.backend)
+  backend = maybe_regional_inductor_backend(model, compile_config.backend)
   # pyrefly: ignore [missing-attribute]
   for _, transformer_block in model.layers.named_children():
     transformer_block.compile(backend=backend, fullgraph=True, dynamic=False)
@@ -70,7 +71,7 @@ def _parallelize_gemma4(
     parallel_dims: torchtitan.distributed.ParallelDims,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
     dump_folder: str,
     skip_dp: bool = False,
@@ -198,7 +199,7 @@ def parallelize_gemma4(
     parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
     dump_folder: str,
     skip_dp: bool = False,

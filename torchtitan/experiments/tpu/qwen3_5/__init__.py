@@ -43,7 +43,8 @@ from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35TransformerBlock
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
-from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
+from torchtitan.models.qwen3_5 import Qwen35Model
+from torchtitan.models.qwen3_5.flavors import MODEL_FLAVORS as qwen3_5_configs
 from torchtitan.config.transform import ModelConfigConverter
 
 __all__ = [
@@ -108,7 +109,7 @@ def model_registry(
         "Qwen3.5 on TPU supports only attn_backend='sdpa', got "
         f"{attn_backend!r}"
     )
-  config = upstream_qwen3_5.model_registry(
+  config = upstream_qwen3_5.build_model_config(
       flavor,
       seq_len=seq_len,
       attn_backend="sdpa",

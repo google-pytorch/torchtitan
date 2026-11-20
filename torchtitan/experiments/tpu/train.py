@@ -173,8 +173,8 @@ class TpuTrainingEngine(TrainingEngine):
 
       self.loss_fn = build_cross_entropy_loss(self.config)
 
-  def _initialize_optimizer(self) -> None:
-    super()._initialize_optimizer()
+  def _initialize_optim(self) -> None:
+    super()._initialize_optim()
     if (
         self._is_tpu_config
         and self.config.compile.optimizer_compile == "separate_graph"
@@ -182,33 +182,30 @@ class TpuTrainingEngine(TrainingEngine):
       from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
 
       apply_compiled_optimizer(self)
+    if self._compiled_grad_norm is not None:
+      # Upstream's Optim clips in its own ``clip_grad_norm`` hook (fork
+      # addition); route it through the compiled DTensor-aware norm.
+      compiled_grad_norm = self._compiled_grad_norm
+      optim = self.optim
+      optim.clip_grad_norm = lambda: compiled_grad_norm.clip_grad_norm_(
+          optim.parameters, optim.config.max_norm
+      )
 
-  def _clip_grad_norm(self) -> torch.Tensor:
-    if self._compiled_grad_norm is None:
-      return super()._clip_grad_norm()
-    parameters = [p for m in self.model_parts for p in m.parameters()]
-    return self._compiled_grad_norm.clip_grad_norm_(
-        parameters,
-        self.config.training.max_norm,
-    )
-
-  def forward_backward_microbatch(
+  def forward_backward(
       self,
       *,
-      microbatch_group: list[TrainingMicrobatch],
-      global_valid_tokens: torch.Tensor,
-      accumulation_index: int = 0,
-  ) -> torch.Tensor:
+      microbatch_groups: list[list[TrainingMicrobatch]],
+      global_valid_tokens: int | torch.Tensor,
+  ):
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
 
     with set_unflatten_seq_len(self.config.training.max_context_length):
-      return super().forward_backward_microbatch(
-          microbatch_group=microbatch_group,
+      return super().forward_backward(
+          microbatch_groups=microbatch_groups,
           global_valid_tokens=global_valid_tokens,
-          accumulation_index=accumulation_index,
       )
 
-  def _non_pp_forward_backward_body(
+  def _non_pp_forward_backward_microbatch(
       self,
       *,
       inputs: torch.Tensor | tuple[torch.Tensor, ...],
@@ -217,7 +214,7 @@ class TpuTrainingEngine(TrainingEngine):
       loss_kwargs: dict[str, Any],
   ) -> torch.Tensor:
     if not self._materialize_forward_before_backward:
-      return super()._non_pp_forward_backward_body(
+      return super()._non_pp_forward_backward_microbatch(
           inputs=inputs,
           labels=labels,
           model_kwargs=model_kwargs,
@@ -273,6 +270,9 @@ class TPUTrainer(torchtitan.trainer.Trainer):
 
       if job_config.model is not None:
         set_global_vocab_size(job_config.loss, job_config.model)
+        # Recipes may set training.max_context_length or the model after
+        # construction, past the config's own alignment.
+        tpu_job_config_module.align_model_context_length(job_config)
     super().__init__(job_config)
 
 
@@ -318,29 +318,6 @@ def _apply_flux_img_size(
   )
 
 
-def _fit_rope_to_context(model_config: Any, max_context_length: int) -> None:
-  """Sizes every RoPE cache to `max_context_length` (pre-d771abb0 behaviour).
-
-  Upstream d771abb0 dropped the resize from `Decoder.Config.update_from_config`
-  and expects callers to pass `seq_len=` to `model_registry`; the TPU configs do
-  not, so caches were built for the flavor's full context (e.g. 131072 for
-  llama3), which ran llama3-70b on tpu7x-2x2x4 out of program HBM.
-  """
-  import dataclasses  # pylint: disable=g-import-not-at-top
-  from torchtitan.models.common.rope import RoPE  # pylint: disable=g-import-not-at-top
-
-  if model_config is None or max_context_length <= 0:
-    return
-  for _, rope, parent, attr in model_config.traverse(RoPE.Config):
-    if parent is None or rope.max_context_length <= max_context_length:
-      continue
-    new_rope = dataclasses.replace(rope, max_context_length=max_context_length)
-    if isinstance(parent, list):
-      parent[attr] = new_rope
-    else:
-      setattr(parent, attr, new_rope)
-
-
 def start_trainer(
     train_config: tpu_job_config_module.TPUTrainerConfig
     | TpuGraphTrainer.Config,
@@ -372,9 +349,9 @@ def start_trainer(
 
   is_flux = isinstance(model_cfg, FluxModel.Config)
   if not is_flux:
-    _fit_rope_to_context(
-        model_cfg, train_config.training.max_context_length
-    )
+    # Also run from BaseTPUTrainerConfig.__post_init__; repeated here for
+    # configs built outside the TPU config classes.
+    tpu_job_config_module.align_model_context_length(train_config)
   is_graph_trainer = isinstance(train_config, TpuGraphTrainer.Config)
   if is_flux:
     # FluxTrainer owns a separate train_step and bypasses the TPU integration.

@@ -38,28 +38,38 @@ from torchtitan.training_engine import TrainingEngine
 logger = logging.getLogger(__name__)
 
 
-def update_moe_aux_loss_batch_sizes(config: "Trainer.Config") -> None:
-    """Fork: give ``MoELoadBalanceAuxLoss`` configs their batch-size denominators.
+def prepare_model_config(
+    config: "Trainer.Config", *, dp_degree: int | None = None
+) -> None:
+    """Fork: run the model config's runtime hooks after ``set_sharding_``.
 
-    The fork's MoE auxiliary-loss normalization (see ``models/common/moe.py``)
-    weights each forward by ``B / global_batch_size`` in samples, which depends
-    on the DP degree. The engine builds the mesh later, so resolve the degrees
-    from the config here (no mesh needed). Upstream removed the
-    ``update_from_config`` hook this used to live in; it now runs right after
-    ``set_sharding_`` on any model config whose layers carry the fork aux loss.
+    Upstream #4908 removed ``Model.Config.update_from_config``; sharding is now
+    set by ``set_sharding_`` and everything else is decided in the recipe. The
+    fork models keep two runtime dependencies on the trainer config:
+
+    * ``MoELoadBalanceAuxLoss`` (see ``models/common/moe.py``) weights each
+      forward by ``B / global_batch_size`` in samples, which depends on the DP
+      degree. The engine builds the mesh later, so resolve the degrees from
+      the config here (no mesh needed).
+    * TPU-lane model configs (Gemma4, the TPU HF backend, Mamba) still expose
+      ``update_from_config(config=..., **batch_sizes)`` for config-time setup
+      that needs the whole trainer config (HF model id, Splash kernel tuning,
+      per-layer validation). It is called with the same batch sizes.
+
+    ``dp_degree`` overrides the DP degree derived from ``WORLD_SIZE`` (the
+    minimal trainers know their batch mesh).
     """
     from torchtitan.models.common.config_utils import (
         moe_load_balance_aux_loss_configs,
         update_moe_aux_loss_configs,
     )
 
-    layers = getattr(config.model, "layers", None)
-    if not layers or not moe_load_balance_aux_loss_configs(layers):
-        return
-    dims = ParallelDims.from_config(
-        config.parallelism, int(os.environ.get("WORLD_SIZE", "1"))
-    )
-    dp_degree = dims.dp_replicate * dims.dp_shard
+    model_config = config.model
+    if dp_degree is None:
+        dims = ParallelDims.from_config(
+            config.parallelism, int(os.environ.get("WORLD_SIZE", "1"))
+        )
+        dp_degree = dims.dp_replicate * dims.dp_shard
     max_context_length = config.training.max_context_length
     local_global_batch_size = (
         config.training.num_tokens_per_microbatch_per_dp_rank // max_context_length
@@ -70,6 +80,18 @@ def update_moe_aux_loss_batch_sizes(config: "Trainer.Config") -> None:
         global_batch_size = local_global_batch_size
     else:
         global_batch_size //= max_context_length
+
+    update_from_config = getattr(model_config, "update_from_config", None)
+    if update_from_config is not None:
+        update_from_config(
+            config=config,
+            local_global_batch_size=local_global_batch_size,
+            global_batch_size=global_batch_size,
+        )
+        return
+    layers = getattr(model_config, "layers", None)
+    if not layers or not moe_load_balance_aux_loss_configs(layers):
+        return
     update_moe_aux_loss_configs(
         layers,
         pp_enabled=config.parallelism.pipeline_parallel_degree > 1,
@@ -77,7 +99,6 @@ def update_moe_aux_loss_batch_sizes(config: "Trainer.Config") -> None:
         global_batch_size=global_batch_size,
         seq_len=max_context_length,
     )
-
 
 
 class Trainer(Configurable):
@@ -197,7 +218,7 @@ class Trainer(Configurable):
         model_config = copy.deepcopy(config.model)
         model_config.set_sharding_(config.parallelism)
         config.model = model_config
-        update_moe_aux_loss_batch_sizes(config)
+        prepare_model_config(config)
         if config.override.imports:
             apply_overrides(config.override, config)
         model_config = config.model

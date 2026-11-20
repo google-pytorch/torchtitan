@@ -5,13 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 """Parallelization strategies for Mamba-2 architecture on TPU."""
 
-from torchtitan.config import CompileConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.config import ParallelismConfig
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.config import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.compile import apply_compile
+from torchtitan.experiments.tpu.components.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.distributed.fsdp import resolve_fsdp_mesh
 from .model import Mamba2LM
@@ -24,7 +24,7 @@ def parallelize_mamba2(
     parallelism_context: ParallelDims | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     skip_dp: bool = False,

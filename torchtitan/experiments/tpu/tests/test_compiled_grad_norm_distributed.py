@@ -34,7 +34,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
   TPUTrainerConfig,
   TpuTrainerCompileConfig,
 )
-from torchtitan.models.llama3.config_registry import model_registry
+from torchtitan.models.llama3 import build_model_config as model_registry
 
 
 class CompiledGradNormUnitTest(absltest.TestCase):

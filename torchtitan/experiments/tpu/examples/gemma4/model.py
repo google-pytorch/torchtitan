@@ -613,7 +613,7 @@ class Gemma4Model(Decoder):
 
     @classmethod
     def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
-        from torchtitan.components.optimizer import register_moe_load_balancing_hook
+        from torchtitan.components.optim import register_moe_load_balancing_hook
 
         register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
@@ -641,7 +641,10 @@ class Gemma4Model(Decoder):
             )
             from torchtitan.models.common import config_utils
 
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            # Upstream #4908 removed ``Decoder.Config.update_from_config``;
+            # ``Trainer`` calls this hook (``prepare_model_config``) right
+            # after ``set_sharding_``. The TP/EP divisibility checks that
+            # used to live in the base now run in ``Decoder.__init__``.
             parallelism = config.parallelism
             max_context_length = config.training.max_context_length
             tp = parallelism.tensor_parallel_degree
@@ -719,14 +722,6 @@ class Gemma4Model(Decoder):
                 ):
                     attn.inner_attention = VarlenInnerAttention.Config(
                         window_size=(attn.sliding_window_size - 1, 0)
-                    )
-                if (
-                    layer.moe is not None
-                    and hasattr(config, "debug")
-                    and hasattr(config.debug, "moe_force_load_balance")
-                ):
-                    layer.moe.router._debug_force_load_balance = (
-                        config.debug.moe_force_load_balance
                     )
 
             if (

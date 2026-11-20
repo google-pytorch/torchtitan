@@ -3,8 +3,8 @@
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.config.configs import (
     CommConfig,
     ParallelismConfig,
@@ -41,6 +41,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
+from torchtitan.components.optim import Optim
 
 _TPU_MOE_CONVERTERS = [
     TpuTokenDispatcherConverter.Config(),
@@ -216,7 +217,7 @@ def _use_graph_split(
   )
   # torch_tpu's fused AdamW updates every parameter in one program, computing
   # in FP32 and storing in each parameter buffer's dtype.
-  cfg.optimizer.implementation = "fused"
+  cfg.optim.optimizer.implementation = "fused"
   return cfg
 
 
@@ -227,12 +228,14 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=MetricsProcessor.Config(log_freq=1),
       model=model_registry("debugmodel", seq_len=256),
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 256,
@@ -319,17 +322,19 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       # dispatch the next step while the current one runs.
       metrics=MetricsProcessor.Config(log_freq=5),
       model=model_registry("35B-A3B", converters=_TPU_MOE_CONVERTERS),
-      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
-      # A 2-step warmup to the peak LR diverged the randomly initialized
-      # 40-layer model (loss 12.77 -> 6.45 -> 8.48 -> NaN at step 4 on
-      # tpu7x-2x2x1). Match the upstream Qwen3-30B-A3B schedule (LR 3e-4, 200
-      # warmup steps); short benchmark runs clamp the warmup to
-      # `training.steps`, as the Qwen3 TPU benchmark recipes do.
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=200,
-          decay_ratio=0.8,
-          decay_type="cosine",
-          min_lr_factor=0.1,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+          # A 2-step warmup to the peak LR diverged the randomly initialized
+          # 40-layer model (loss 12.77 -> 6.45 -> 8.48 -> NaN at step 4 on
+          # tpu7x-2x2x1). Match the upstream Qwen3-30B-A3B schedule (LR 3e-4,
+          # 200 warmup steps); short benchmark runs clamp the warmup to
+          # `training.steps`, as the Qwen3 TPU benchmark recipes do.
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=200,
+              decay_ratio=0.8,
+              decay_type="cosine",
+              min_lr_factor=0.1,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=16 * 2048,

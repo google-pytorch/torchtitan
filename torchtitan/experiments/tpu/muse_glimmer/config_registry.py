@@ -3,8 +3,8 @@
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -19,6 +19,7 @@ from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfi
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.components.optim import Optim
 
 __all__ = [
     "graph_trainer_muse_glimmer_debugmodel",
@@ -92,12 +93,14 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model,
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * _DEBUGMODEL_CONTEXT_LENGTH,
@@ -154,10 +157,12 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
       # tokenizer via --hf_assets_path for meaningful loss values.
       hf_assets_path="./tests/assets/tokenizer",
       model=model,
-      optimizer=default_adamw(lr=3e-4),
-      lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
-      training=TrainingConfig(
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=3e-4),
+          lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
           max_norm=1.0,
+      ),
+      training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * _30B_CONTEXT_LENGTH,
           max_context_length=_30B_CONTEXT_LENGTH,
           steps=30,

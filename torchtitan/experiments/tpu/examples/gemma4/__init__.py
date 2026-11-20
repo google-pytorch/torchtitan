@@ -4,7 +4,7 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.components.optim import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
@@ -16,7 +16,6 @@ from torchtitan.models.common.config_utils import (
     fused_gate_up_param_init,
     fused_qkv_param_init,
     get_attention_config,
-    make_token_dispatcher_config,
 )
 from torchtitan.models.common.linear import (
     ColumnParallelLinear,
@@ -26,6 +25,7 @@ from torchtitan.models.common.linear import (
 )
 from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 from torchtitan.config.transform import (
@@ -121,6 +121,12 @@ def _make_moe_config(
     load_balance_coeff: float | None = None,
     aux_loss_coeff: float = 0.0,
 ) -> Gemma4MoE.Config:
+    if comm_backend != "standard" or non_blocking_capacity_factor is not None:
+        raise ValueError(
+            "Gemma4 on TPU only supports the standard all-to-all token "
+            "dispatcher (upstream #4908 made DeepEP/HybridEP a config "
+            "transform)."
+        )
     return Gemma4MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,
@@ -158,12 +164,13 @@ def _make_moe_config(
                 num_experts=num_experts,
                 param_init=param_init["experts"],
             ),
-            token_dispatcher=make_token_dispatcher_config(
+            # Upstream #4908 made the dispatcher backend a model config
+            # transform (``torchtitan.config.transform.token_dispatcher``) and
+            # removed ``make_token_dispatcher_config``; the TPU lane only runs
+            # the all-to-all dispatcher.
+            token_dispatcher=AllToAllTokenDispatcher.Config(
                 num_experts=num_experts,
                 top_k=top_k,
-                comm_backend=comm_backend,
-                non_blocking_capacity_factor=non_blocking_capacity_factor,
-                hidden_dim=dim,
             ),
         ),
     )

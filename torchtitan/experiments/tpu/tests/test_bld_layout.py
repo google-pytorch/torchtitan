@@ -17,8 +17,8 @@ from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import ComplexRoPE
 from torchtitan.models.common import CosSinRoPE
-from torchtitan.models.llama3 import _build_llama3_layers
-from torchtitan.models.qwen3 import _build_qwen3_layers
+from torchtitan.models.llama3.flavors import _build_llama3_layers
+from torchtitan.models.qwen3.flavors import _build_qwen3_layers
 
 _DIM = 128
 _HEAD_DIM = 32

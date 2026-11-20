@@ -9,7 +9,7 @@ import unittest
 from einops import rearrange
 import torch
 from torch import Tensor
-from torchtitan.models.flux import (
+from torchtitan.models.flux.flavors import (
     _make_double_block_config,
     _make_single_block_config,
 )

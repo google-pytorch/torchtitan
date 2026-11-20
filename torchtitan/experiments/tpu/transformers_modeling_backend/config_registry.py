@@ -15,9 +15,9 @@ lane's existing ones.
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
-from torchtitan.components.optimizer import LRSchedulersContainer
+from torchtitan.components.optim import LRSchedulersContainer
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optim import default_adamw
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -28,10 +28,9 @@ from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
 from torchtitan.experiments.transformers_modeling_backend import (
+    MODEL_FLAVORS as _shared_flavors,
     TitanModelConfig,
     TitanMoeModelConfig,
-    flavors as _shared_flavors,
-    model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TpuTrainerCompileConfig
@@ -40,6 +39,7 @@ from torchtitan.components.validate import Validator
 from torchtitan.experiments.tpu.components.datasets import TPUGrainDataLoader
 from torchtitan.experiments.transformers_modeling_backend.tokenizer import HFBackendTokenizer
 from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.components.optim import Optim
 
 from .job_config import TPUTransformersBackendConfig
 from .model import as_tpu_model_config
@@ -78,14 +78,20 @@ _TPU_FLAVORS = {
 
 
 def _model_registry(flavor: str, *, seq_len: int):
-  """The backend's model_registry, extended with this lane's own flavors."""
-  if flavor in _TPU_FLAVORS and flavor not in _shared_flavors:
-    import copy
+  """The backend's flavor table, extended with this lane's own flavors.
 
+  Upstream's ``build_model_config`` (#4913) also loads the HF config for a
+  fixed ``hf_model``; this lane applies ``--hf_model`` at trainer time (see
+  ``model.py``), so only the flavor copy and context length happen here.
+  """
+  import copy
+
+  if flavor in _TPU_FLAVORS and flavor not in _shared_flavors:
     cfg = copy.deepcopy(_TPU_FLAVORS[flavor])
-    cfg.max_seq_len = seq_len
-    return cfg
-  return model_registry(flavor, seq_len=seq_len)
+  else:
+    cfg = copy.deepcopy(_shared_flavors[flavor])
+  cfg.max_seq_len = seq_len
+  return cfg
 
 def _fused_ce_loss() -> PallasCrossEntropyLoss.Config:
   """The fused-CE loss config with this lane's tuned Mosaic tiles.
@@ -222,12 +228,14 @@ def _tpu_hf_config(
       loss=_fused_ce_loss() if fused_loss else CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_config,
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       # This base states the recipe as a token budget rather than
       # (local_batch_size, seq_len) -- see _set_batch below.
@@ -355,8 +363,8 @@ def hf_sft_full_max() -> TPUTransformersBackendConfig:
       steps=10,
       dataloader=TPUGrainDataLoader.Config(dataset="gsm8k", dataset_split="test"),
   )
-  config.optimizer = default_adamw(lr=1e-5, implementation="foreach")
-  config.lr_scheduler = LRSchedulersContainer.Config(
+  config.optim.optimizer = default_adamw(lr=1e-5, implementation="foreach")
+  config.optim.lr_scheduler = LRSchedulersContainer.Config(
       warmup_steps=10, decay_ratio=0.9, decay_type="cosine", min_lr_factor=0.1
   )
   config.training.steps = 100

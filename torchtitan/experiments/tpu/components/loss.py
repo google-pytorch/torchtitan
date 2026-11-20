@@ -14,6 +14,7 @@ from torchtitan.components import loss as components_loss
 import torchtitan.config
 import torchtitan.trainer
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
+from torchtitan.distributed.local_compile import LocalCompileConfig
 
 
 # Pallas/JAX custom ops carry no spmd_types annotations; CP forces spmd_types.
@@ -140,7 +141,7 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
       self,
       config: Config,
       *,
-      compile_config: torchtitan.config.CompileConfig | None = None
+      compile_config: LocalCompileConfig | None = None
   ):
     self.fn = lambda pred, labels: pallas_cross_entropy_loss(
         pred,

@@ -7,14 +7,19 @@ import typing
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
+from torch import distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.nn import functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import make_fx_tracer
 from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,
 )
+from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
@@ -56,53 +61,80 @@ def _make_dummy_fwd_bwd_step(loss_fn: nn.Module, model: nn.Module):
   return fwd_bwd_fn
 
 
-def _traced_trainer(model: nn.Module, inputs, labels, global_valid_tokens):
-  """A bare TpuGraphTrainer holding one traced fwd+bwd step for these shapes."""
+class _SharedGradModel(nn.Module):
+  """The traced graph returns one tensor as the grad of both a and b."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.a = nn.Parameter(torch.randn(128, 128))
+    self.b = nn.Parameter(torch.randn(128, 128))
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return F.embedding(x, self.a + self.b)
+
+
+class _ShardedModel(nn.Module):
+  """DTensor params gathered in forward, as SimpleFSDP does, plus a plain one."""
+
+  def __init__(self, mesh) -> None:
+    super().__init__()
+    self.embed = nn.Parameter(
+        distribute_tensor(torch.randn(128, 32), mesh, [Shard(0)])
+    )
+    self.scale = nn.Parameter(torch.ones(32))
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    embed = self.embed.redistribute(placements=[Replicate()]).to_local()
+    return (F.embedding(x, embed) * self.scale) @ embed.T
+
+
+def _loss(model: nn.Module, inputs, labels, global_valid_tokens):
+  pred = model(inputs)
+  loss = F.cross_entropy(pred.view(-1, 128), labels.view(-1), reduction="sum")
+  return loss / global_valid_tokens
+
+
+def _traced_trainer(model: nn.Module, batch_size: int, device):
+  """A bare TpuGraphTrainer holding one traced fwd+bwd step on (batch_size, 16)."""
 
   def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
-    pred = model(inputs)
-    loss = F.cross_entropy(
-        pred.view(-1, 128), labels.view(-1), reduction="sum"
-    ) / global_valid_tokens
-    params = [
-        p
-        for _, p in model.named_parameters(remove_duplicate=False)
-        if p.requires_grad
-    ]
+    loss = _loss(model, inputs, labels, global_valid_tokens)
+    params = [p for _, p in model.named_parameters(remove_duplicate=False)]
     return [loss, *torch.autograd.grad(loss, params)]
 
+  example = torch.randint(0, 128, (batch_size, 16), device=device)
   trainer = object.__new__(tpu_graph_trainer.TpuGraphTrainer)
   trainer._traced_step = make_fx_tracer.minimal_fx_tracer(
       fwd_bwd, module=model
-  )(inputs, labels, global_valid_tokens, {})
+  )(example, example, torch.tensor(1.0, device=device), {})
   trainer.train_context = contextlib.nullcontext
   trainer._collect_moe_routing_metrics = False
   return trainer
 
 
-def _eager_grads(model: nn.Module, inputs, labels) -> list[torch.Tensor]:
-  """Eager autograd grads of the full-batch mean loss, on a copy of model."""
-  ref = copy.deepcopy(model)
-  ref.zero_grad(set_to_none=True)
-  loss = F.cross_entropy(
-      ref(inputs).view(-1, 128), labels.view(-1), reduction="sum"
-  )
-  (loss / labels.numel()).backward()
-  return [p.grad for p in ref.parameters()]
-
-
-def _run_grad_accum_step(trainer, model, inputs, labels, num_microbatches):
-  """Runs one training step's fwd+bwd calls, split into microbatches."""
-  params = tuple(
-      p
-      for _, p in model.named_parameters(remove_duplicate=False)
-      if p.requires_grad
-  )
-  tokens = torch.tensor(float(labels.numel()), device=labels.device)
+def _check_grad_accum_step(test, trainer, model, num_microbatches, device):
+  """Runs one batch-4 step as num_microbatches calls; grads must equal eager's."""
+  inputs = torch.randint(0, 128, (4, 16), device=device)
+  labels = torch.randint(0, 128, (4, 16), device=device)
+  tokens = torch.tensor(float(labels.numel()), device=device)
+  params = tuple(p for _, p in model.named_parameters(remove_duplicate=False))
   for x, y in zip(
       inputs.chunk(num_microbatches), labels.chunk(num_microbatches)
   ):
     trainer._make_fx_forward_backward_step(model, x, y, tokens, params, {})
+
+  ref = copy.deepcopy(model)
+  ref.zero_grad(set_to_none=True)
+  _loss(ref, inputs, labels, tokens).backward()
+  for (name, got), want in zip(
+      model.named_parameters(), ref.parameters(), strict=True
+  ):
+    test.assertIs(type(got.grad), type(want.grad), name)
+    if isinstance(want.grad, DTensor):
+      got, want = got.grad.full_tensor(), want.grad.full_tensor()
+    else:
+      got, want = got.grad, want.grad
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6, msg=name)
 
 
 class MfuBenchmarkTest(absltest.TestCase):
@@ -338,63 +370,70 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
     loss = outputs[0]
     self.assertEqual(loss.ndim, 0, "Loss output must be a scalar tensor.")
 
-  def _tied_model(self) -> nn.Module:
-    model = DummyModule(dim=32, vocab_size=128).to(self.accelerator_device)
-    model.lm_head.weight = model.tok_embeddings.weight
-    return model
 
-  def _assert_grads(self, model, expected, msg) -> None:
-    for (name, p), want in zip(model.named_parameters(), expected, strict=True):
-      torch.testing.assert_close(
-          p.grad, want, rtol=1e-5, atol=1e-6, msg=f"{msg} {name}"
-      )
+class GradAccumulationTest(BaseAcceleratorDeviceTest):
+  """Each fwd+bwd call adds its grads to param.grad; the step's sum is the full-batch grad."""
 
-  def test_grad_accumulation_matches_full_batch(self) -> None:
-    """GA=2 at batch 2 matches GA=1 at batch 4, tied weights included."""
+  @parameterized.named_parameters(
+      ("ga1", "tied", 1, True),
+      ("ga2", "tied", 2, True),
+      ("ga2_zeroed_not_none", "tied", 2, False),
+      ("ga2_shared_grad_tensor", "shared_grad", 2, True),
+  )
+  def test_grads_match_full_batch(
+      self, model_kind: str, num_microbatches: int, set_to_none: bool
+  ) -> None:
+    """Two steps, each batch 4 split into microbatches, match eager batch 4."""
     device = self.accelerator_device
-    model = self._tied_model()
-    inputs = torch.randint(0, 128, (4, 16), device=device)
-    labels = torch.randint(0, 128, (4, 16), device=device)
-    expected = _eager_grads(model, inputs, labels)
+    if model_kind == "tied":
+      model = DummyModule(dim=32, vocab_size=128).to(device)
+      # One param under two names: the graph returns its full grad twice.
+      model.lm_head.weight = model.tok_embeddings.weight
+    else:
+      model = _SharedGradModel().to(device)
+    trainer = _traced_trainer(model, 4 // num_microbatches, device)
+    if model_kind == "shared_grad":
+      grad_a, grad_b = trainer._traced_step.gm.graph.output_node().args[0][1:3]
+      self.assertIs(grad_a, grad_b, "the traced graph no longer aliases grads")
+    for _ in range(2):
+      model.zero_grad(set_to_none=set_to_none)
+      _check_grad_accum_step(self, trainer, model, num_microbatches, device)
 
-    for num_microbatches in (1, 2):
-      model.zero_grad(set_to_none=True)
-      trainer = _traced_trainer(
-          model,
-          inputs.chunk(num_microbatches)[0],
-          labels.chunk(num_microbatches)[0],
-          torch.tensor(float(labels.numel()), device=device),
-      )
-      _run_grad_accum_step(trainer, model, inputs, labels, num_microbatches)
-      self._assert_grads(model, expected, f"GA={num_microbatches}")
+  def test_dtensor_grads_match_full_batch(self) -> None:
+    """GA=2 with DTensor and plain params, on CPU (needs a process group)."""
+    dist.init_process_group(
+        "gloo", store=dist.HashStore(), rank=0, world_size=1
+    )
+    self.addCleanup(dist.destroy_process_group)
+    model = _ShardedModel(init_device_mesh("cpu", (1,)))
+    trainer = _traced_trainer(model, 2, "cpu")
+    _check_grad_accum_step(self, trainer, model, 2, "cpu")
 
-  def test_grad_accumulation_resets_between_steps(self) -> None:
-    """Step 2's grads hold only step 2's batch, for both zero_grad modes."""
-    device = self.accelerator_device
-    batches = [
-        (
-            torch.randint(0, 128, (4, 16), device=device),
-            torch.randint(0, 128, (4, 16), device=device),
-        )
-        for _ in range(2)
-    ]
-    # The TPU lane sets grads to None (set_to_none=True); test both modes.
-    for set_to_none in (False, True):
-      model = self._tied_model()
-      trainer = _traced_trainer(
-          model,
-          batches[0][0][:2],
-          batches[0][1][:2],
-          torch.tensor(64.0, device=device),
-      )
-      for step, (inputs, labels) in enumerate(batches, start=1):
-        model.zero_grad(set_to_none=set_to_none)
-        _run_grad_accum_step(trainer, model, inputs, labels, 2)
-        self._assert_grads(
-            model,
-            _eager_grads(model, inputs, labels),
-            f"set_to_none={set_to_none} step {step}",
-        )
+  @parameterized.parameters(1, 2)
+  def test_in_graph_optimizer_rejects_grad_accumulation(self, steps) -> None:
+    """The in-graph step runs AdamW per call, so GA > 1 must raise."""
+    config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3",
+        "--config=graph_trainer_qwen3_debugmodel",
+    ])
+    config.compile.optimizer_compile = "in_graph"
+
+    def fake_init(trainer, config):
+      del config
+      trainer.optimizers = SimpleNamespace(optimizers=[])
+      trainer.gradient_accumulation_steps = steps
+
+    with (
+        mock.patch.object(GraphTrainer, "__init__", fake_init),
+        mock.patch.object(
+            tpu_graph_trainer, "_split_optimizers_by_mesh", return_value=False
+        ),
+    ):
+      if steps > 1:
+        with self.assertRaisesRegex(ValueError, "gradient accumulation"):
+          tpu_graph_trainer.TpuGraphTrainer(config)
+      else:
+        tpu_graph_trainer.TpuGraphTrainer(config)
 
 
 if __name__ == "__main__":

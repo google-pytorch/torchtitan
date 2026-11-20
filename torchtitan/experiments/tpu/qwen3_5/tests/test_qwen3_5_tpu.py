@@ -34,11 +34,13 @@ from torchtitan.config.override import OverrideConfig
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer import qwen3_5 as gt_qwen3_5
 from torchtitan.experiments.tpu.graph_trainer.config import apply_tpu_graph_trainer_model_transforms
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
+from torchtitan.experiments.tpu.components import expert_parallel
 from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -2302,6 +2304,190 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(
         parsed_96k.compile.save_last_n_layers,
         {"attention.inner_attention": 2},
+    )
+
+  def _assert_ep_recipe(self, cfg, *, ep_degree: int, num_token_chunks: int):
+    """Checks a `_use_expert_parallel` recipe and its model config update."""
+    self.assertIsInstance(cfg, TpuGraphTrainer.Config)
+    self.assertEqual(cfg.parallelism.expert_parallel_degree, ep_degree)
+    self.assertTrue(cfg.parallelism.use_simple_fsdp)
+    self.assertTrue(cfg.parallelism.enable_tpu_topo_mesh)
+    self.assertFalse(cfg.compile.compile_grad_norm)
+    self.assertEqual(cfg.tpu_config.eager_mode, "DEFER_AND_FUSE")
+    self.assertEqual(cfg.tpu_config.ep_transport, "auto")
+    self.assertTrue(cfg.tpu_config.ep_scale_before_down_proj)
+    self.assertEqual(cfg.tpu_config.ep_token_chunks, num_token_chunks)
+    graph_split = cfg.compile.graph_split
+    self.assertTrue(graph_split.enabled)
+    self.assertEqual(graph_split.forward_layers_per_executable, 1)
+    self.assertEqual(graph_split.backward_layers_per_executable, 1)
+    self.assertEqual(graph_split.backward_partition_mode, "by_layer")
+    self.assertEqual(cfg.compile.memory_policy, "tpu_selective")
+    self.assertEqual(
+        cfg.compile.save_regions, ("moe.routing", "attention.inner_attention")
+    )
+    ep_flags = tpu_flags.merge_flags(
+        tpu_flags.SPARSECORE_COLLECTIVE_OFFLOAD,
+        tpu_flags.SPARSECORE_REDUCE_SCATTER_V2,
+        tpu_flags.LAYER_SCHEDULER_FOR_DEPENDENT_COLLECTIVES,
+        tpu_flags.EP_GATHER_COPY_ON_TENSORCORE,
+    )
+    for name, value in ep_flags.items():
+      self.assertEqual(cfg.libtpu_init_flags.get(name), value, msg=name)
+    # The split benchmark's own flags survive the merge.
+    self.assertEqual(cfg.libtpu_init_flags["xla_tpu_dvfs_p_state"], "7")
+    self.assertEqual(
+        cfg.libtpu_init_flags["xla_tpu_scoped_vmem_limit_kib"], "65472"
+    )
+    # The graph-split checks accept the recipe (fsdp_pipeline would raise).
+    apply_tpu_graph_trainer_model_transforms(cfg)
+
+    model_config = cfg.model_spec.model
+    model_config.update_from_config(
+        config=cfg, global_batch_size=1, local_global_batch_size=1
+    )
+    num_moe = sum(layer.moe is not None for layer in model_config.layers)
+    routed = [
+        c for _, c, _, _ in model_config.traverse(TpuRoutedExperts.Config)
+    ]
+    dispatchers = [
+        c
+        for _, c, _, _ in model_config.traverse(
+            TpuAllToAllTokenDispatcher.Config
+        )
+    ]
+    grouped = [
+        c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)
+    ]
+    self.assertLen(routed, num_moe)
+    self.assertLen(dispatchers, num_moe)
+    self.assertLen(grouped, num_moe)
+    for experts in routed:
+      self.assertTrue(experts.scale_before_down_proj)
+      self.assertEqual(experts.num_token_chunks, num_token_chunks)
+      self.assertEqual(experts.max_inflight_chunks, 2)
+      self.assertTrue(experts.accumulate_chunk_weight_grads_fp32)
+    for dispatcher in dispatchers:
+      self.assertEqual(dispatcher.ep_transport, "auto")
+      self.assertFalse(dispatcher.fuse_route_score_backward)
+    for experts in grouped:
+      self.assertTrue(experts.use_pallas_grouped_mm)
+      self.assertTrue(experts.use_pallas_paired_grouped_mm)
+    return model_config
+
+  def test_ep_recipes(self):
+    """Tests the 35B-A3B and 397B-A17B expert-parallel recipes."""
+    cfg_35b = config_registry.qwen35_moe_35b_split_tokamax_ep_benchmark()
+    self.assertEqual(cfg_35b.model_spec.flavor, "35B-A3B")
+    self.assertEqual(
+        cfg_35b.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
+    )
+    self.assertEqual(cfg_35b.training.dtype, "float32")
+    self._assert_ep_recipe(
+        cfg_35b,
+        ep_degree=4,
+        num_token_chunks=expert_parallel.default_num_token_chunks(4),
+    )
+
+    cfg_397b = config_registry.qwen35_moe_397b_split_tokamax_ep_benchmark()
+    self.assertEqual(cfg_397b.model_spec.flavor, "397B-A17B")
+    self.assertEqual(cfg_397b.training.dtype, "bfloat16")
+    self.assertEqual(cfg_397b.training.mixed_precision_param, "bfloat16")
+    self.assertEqual(cfg_397b.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(cfg_397b.training.max_context_length, 8192)
+    self.assertEqual(
+        cfg_397b.training.num_tokens_per_microbatch_per_dp_rank, 3 * 8192
+    )
+    self.assertEqual(
+        (
+            cfg_397b.loss.b_block_size,
+            cfg_397b.loss.h_block_size,
+            cfg_397b.loss.v_block_size,
+        ),
+        (1024, 512, 2048),
+    )
+    for _, experts, _, _ in cfg_397b.model_spec.model.traverse(
+        TpuGroupedExperts.Config
+    ):
+      self.assertEqual(experts.pallas_grouped_mm_tile_m, 512)
+      self.assertEqual(experts.pallas_grouped_mm_tgmm_tiling, (512, 1024, 0))
+      self.assertEqual(experts.pallas_grouped_mm_w2_tgmm_tiling, (512, 0, 0))
+      self.assertEqual(
+          experts.pallas_grouped_mm_w2_transposed_tgmm_tiling, (512, 0, 2048)
+      )
+    model_397b = self._assert_ep_recipe(
+        cfg_397b, ep_degree=8, num_token_chunks=12
+    )
+    self.assertLen(model_397b.layers, 60)
+    for _, dispatcher, _, _ in model_397b.traverse(
+        TpuAllToAllTokenDispatcher.Config
+    ):
+      self.assertEqual((dispatcher.num_experts, dispatcher.top_k), (512, 10))
+
+    # EP = 16 from the command line (the ragged all-to-all, above top-k = 10).
+    parsed = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_397b_split_tokamax_ep_benchmark",
+        "--parallelism.expert_parallel_degree=16",
+        "--tpu_config.ep_token_chunks=16",
+    ])
+    self._assert_ep_recipe(parsed, ep_degree=16, num_token_chunks=16)
+
+    # The EP opt-outs: no topology-aware mesh, unpaired expert GMMs, and BF16
+    # cross-chunk dWeight sums.
+    parsed_off = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_397b_split_tokamax_ep_benchmark",
+        "--parallelism.no-enable_tpu_topo_mesh",
+        "--tpu_config.ep_paired_grouped_mm=False",
+        "--tpu_config.ep_chunk_dw_fp32=False",
+    ])
+    self.assertFalse(parsed_off.parallelism.enable_tpu_topo_mesh)
+    apply_tpu_graph_trainer_model_transforms(parsed_off)
+    parsed_off.model_spec.model.update_from_config(
+        config=parsed_off, global_batch_size=1, local_global_batch_size=1
+    )
+    routed_off = [
+        c
+        for _, c, _, _ in parsed_off.model_spec.model.traverse(
+            TpuRoutedExperts.Config
+        )
+    ]
+    grouped_off = [
+        c
+        for _, c, _, _ in parsed_off.model_spec.model.traverse(
+            TpuGroupedExperts.Config
+        )
+    ]
+    num_moe_off = sum(
+        layer.moe is not None for layer in parsed_off.model_spec.model.layers
+    )
+    self.assertGreater(num_moe_off, 0)
+    self.assertLen(routed_off, num_moe_off)
+    self.assertLen(grouped_off, num_moe_off)
+    for experts in routed_off:
+      self.assertFalse(experts.accumulate_chunk_weight_grads_fp32)
+    for experts in grouped_off:
+      self.assertFalse(experts.use_pallas_paired_grouped_mm)
+
+    # EP = 1 keeps the split and leaves the routed experts alone.
+    parsed_ep1 = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=qwen35_moe_35b_split_tokamax_ep_benchmark",
+        "--parallelism.expert_parallel_degree=1",
+        "--parallelism.enable_tpu_topo_mesh",
+        "--compile.compile_grad_norm",
+    ])
+    apply_tpu_graph_trainer_model_transforms(parsed_ep1)
+    parsed_ep1.model_spec.model.update_from_config(
+        config=parsed_ep1, global_batch_size=1, local_global_batch_size=1
+    )
+    self.assertTrue(parsed_ep1.parallelism.enable_tpu_topo_mesh)
+    self.assertFalse(
+        list(parsed_ep1.model_spec.model.traverse(TpuRoutedExperts.Config))
+    )
+    self._assert_uses_tpu_moe_kernels(
+        parsed_ep1.model_spec.model, tile_m=512
     )
 
   def test_tpu_rms_norm_gated_wiring_and_fallback(self):

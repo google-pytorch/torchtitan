@@ -19,7 +19,6 @@ because raising on only some ranks would leave the others waiting.
 
 import json
 import os
-import unittest
 
 from absl import logging
 from absl.testing import absltest
@@ -126,13 +125,6 @@ class TopologyMeshSpmdTest(
 ):
   """spmd_types mesh axes on the TPU topology-aware mesh."""
 
-  # TODO(b/587033846): spmd_types infers mesh axes from global ranks, so
-  # multi-axis meshes fail under the topology-aware rank order. Enable with
-  # the fix.
-  @unittest.skip(
-      "b/587033846: multi-axis meshes fail on spmd_types under"
-      " enable_tpu_topo_mesh"
-  )
   def test_mesh_axes_are_orthogonal(self):
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
       self.skipTest("Needs the TPU topology-aware mesh.")

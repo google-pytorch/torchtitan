@@ -212,15 +212,10 @@ class TpuGroupedExperts(GroupedExperts):
         super()._distribute_states(parallel_dims)
 
     def parallelize(self, parallel_dims) -> None:
-        # The paired GEMM can consume expert-major rows after EP dispatch, but
-        # EP produces a ragged row count that is not generally tile-aligned.
-        # Supporting it requires masked or padded tail rows, removing any
-        # padding before combine, and validating the nested EP/FSDP sharding.
-        if (
-            self.use_pallas_paired_grouped_mm
-            and parallel_dims.get_optional_mesh("ep") is not None
-        ):
-            raise ValueError("Paired grouped matmul requires EP=1 exact-row dispatch")
+        # The paired W1+W3 GEMM is EP-safe: like the unpaired kernels it skips
+        # rows past sum(num_tokens_per_expert_E), and its forward zeroes each
+        # output tile on first visit, so the stale tail of a static-size EP
+        # receive buffer reaches neither the outputs nor the dWeights.
         super().parallelize(parallel_dims)
 
     @staticmethod

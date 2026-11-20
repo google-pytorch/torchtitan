@@ -728,6 +728,9 @@ def test_use_expert_parallel_defaults_to_auto_and_handles_scale_before_down_proj
     assert cfg.routed.token_dispatcher.ep_transport == "auto"
     assert cfg.routed.token_dispatcher.ep_capacity_factor == 1.5
     assert cfg.routed.token_dispatcher.fuse_route_score_backward is False
+    # The paired W1+W3 kernel skips rows past the routed count, so it stays on.
+    assert cfg.routed.inner_experts.use_pallas_paired_grouped_mm is True
+    use_expert_parallel(cfg, ep_degree=2, paired_grouped_mm=False)
     assert cfg.routed.inner_experts.use_pallas_paired_grouped_mm is False
 
     # Explicit non-default transport and capacity factor on dispatcher are

@@ -18,7 +18,8 @@ from torchtitan.models.common.moe import MoE
 def parallelize_qwen3_5(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: torchtitan.config.CompileConfig,
@@ -51,6 +52,9 @@ def parallelize_qwen3_5(
     The parallelized model.
   """
   del kwargs  # Unused.
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
 
   effective_compile_config = compile_config
   if compile_config.enable and hasattr(model, "layers"):

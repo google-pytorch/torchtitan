@@ -393,6 +393,9 @@ class TpuGroupedExpertsConverter(ModelConfigConverter):
         pass
 
     def convert(self, model_config):
+        from torchtitan.models.common.moe import RoutedExperts
+
+        count = 0
         matches = list(model_config.traverse(GroupedExperts.Config))
         for _, config, parent, field_name in matches:
             replacement = derive(config, TpuGroupedExperts.Config)
@@ -404,7 +407,47 @@ class TpuGroupedExpertsConverter(ModelConfigConverter):
             else:
                 assert isinstance(field_name, str)
                 setattr(parent, field_name, replacement)
-        logger.info("Replaced %d GroupedExperts configuration(s) for TPU", len(matches))
+            count += 1
+
+        for _, routed_cfg, _, _ in list(model_config.traverse(RoutedExperts.Config)):
+            if routed_cfg.inner_experts is not None or routed_cfg.w13 is None:
+                continue
+            w13 = routed_cfg.w13
+            w2 = routed_cfg.w2
+            assert w2 is not None
+            param_init = {}
+            if w13.param_init and "weight" in w13.param_init:
+                w13_init = w13.param_init["weight"]
+                # `fused_grouped_gate_up_param_init` wraps the per-weight
+                # initializers in a picklable `_FusedGroupedGateUpInit` object
+                # carrying `w1_init` / `w3_init`; older versions used a closure
+                # over the original `param_init` dict.
+                w1_init = getattr(w13_init, "w1_init", None)
+                w3_init = getattr(w13_init, "w3_init", None)
+                if w1_init is not None and w3_init is not None:
+                    param_init["w1_EFD"] = w1_init
+                    param_init["w3_EFD"] = w3_init
+                elif getattr(w13_init, "__closure__", None):
+                    for cell in w13_init.__closure__:
+                        val = cell.cell_contents
+                        if isinstance(val, dict) and {"w1_EFD", "w3_EFD"} <= val.keys():
+                            param_init["w1_EFD"] = val["w1_EFD"]
+                            param_init["w3_EFD"] = val["w3_EFD"]
+            if w2.param_init and "weight" in w2.param_init:
+                param_init["w2_EDF"] = w2.param_init["weight"]
+            routed_cfg.inner_experts = TpuGroupedExperts.Config(
+                dim=w13.in_features,
+                hidden_dim=w13.out_features,
+                num_experts=w13.group_size,
+                activation_fn=routed_cfg.activation_fn,
+                param_init=param_init or None,
+                sharding_config=w13.sharding_config,
+            )
+            routed_cfg.w13 = None
+            routed_cfg.w2 = None
+            count += 1
+
+        logger.info("Replaced %d GroupedExperts configuration(s) for TPU", count)
         return model_config
 
 

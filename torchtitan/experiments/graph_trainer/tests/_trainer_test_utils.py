@@ -14,11 +14,31 @@ import torch.nn as nn
 
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.config import DebugConfig, TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.experiments.graph_trainer.common_utils import (
+    accumulate_param_grads_,
+    maybe_register_blockmask_pytree_node,
+)
 from torchtitan.experiments.graph_trainer.configs import (
     EpOverlapConfig,
     GraphTrainerCompileConfig,
+    trace_input_preparer_keys,
+)
+from torchtitan.experiments.graph_trainer.graph_builder import make_fwd_bwd_step
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    minimal_fx_tracer,
+    run_traced,
+)
+from torchtitan.experiments.graph_trainer.passes import (
+    apply_graph_passes,
+    construct_default_graph_passes,
+    construct_mandatory_graph_passes,
+)
+from torchtitan.experiments.graph_trainer.registry import (
+    PASS_PIPELINE_REGISTRY,
+    TRACE_CALL_INPUT_PREPARERS,
+    TRACE_INPUT_PREPARERS,
 )
 from torchtitan.experiments.graph_trainer.trainer import (
     GraphTrainer,
@@ -29,7 +49,7 @@ from torchtitan.training_engine import TrainingEngine
 
 
 @contextmanager
-def single_device_parallel_dims() -> Iterator[ParallelDims]:
+def single_device_parallelism_context() -> Iterator[ParallelismContext]:
     """Provide a real rank-1 mesh for tests that exercise model preprocessing."""
     owns_process_group = not dist.is_initialized()
     if owns_process_group:
@@ -41,7 +61,7 @@ def single_device_parallel_dims() -> Iterator[ParallelDims]:
         )
 
     try:
-        parallel_dims = ParallelDims(
+        parallelism_context = ParallelismContext(
             dp_replicate=1,
             dp_shard=1,
             cp=1,
@@ -49,9 +69,10 @@ def single_device_parallel_dims() -> Iterator[ParallelDims]:
             pp=1,
             ep=1,
             world_size=1,
+            enable_sequence_parallel=False,
         )
-        parallel_dims.build_mesh()
-        yield parallel_dims
+        parallelism_context.build_mesh()
+        yield parallelism_context
     finally:
         if owns_process_group:
             dist.destroy_process_group()
@@ -64,7 +85,6 @@ def build_minimal_trainer(
     *,
     activation_checkpoint_mode: str = "none",
     compile_enable_passes: bool = True,
-    compile_enable_inplace_graph_gradient_accumulation: bool = False,
     compile_passes: list[str] | None = None,
     compile_ep_overlap_enabled: bool = False,
     compile_ep_overlap_chunk_dim: str = "batch",
@@ -76,7 +96,7 @@ def build_minimal_trainer(
     compile_numerics_changing_optim: bool = False,
     tokenizer=None,
     fsdp_reshard_after_forward: str = "default",
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
 ) -> Trainer:
     """Build the minimal Trainer/GraphTrainer needed for single-GPU test steps."""
     trainer = object.__new__(trainer_cls)
@@ -84,7 +104,7 @@ def build_minimal_trainer(
     trainer.engine = engine = object.__new__(engine_cls)
     engine.model_parts = [model]
     engine.loss_fn = CrossEntropyLoss.Config().build()
-    engine.parallel_dims = parallel_dims
+    engine.parallelism_context = parallelism_context
     engine.forward_backward_body_fn = engine._non_pp_forward_backward_body
     engine.model_config = model_config
     engine.device = torch.device("cuda")
@@ -99,11 +119,7 @@ def build_minimal_trainer(
     if trainer_cls is GraphTrainer:
         trainer.config = SimpleNamespace(
             compile=GraphTrainerCompileConfig(
-                mode="aot_fx_trace",
                 enable_passes=compile_enable_passes,
-                enable_inplace_graph_gradient_accumulation=(
-                    compile_enable_inplace_graph_gradient_accumulation
-                ),
                 passes=[] if compile_passes is None else list(compile_passes),
                 disable_passes=(
                     []
@@ -132,20 +148,101 @@ def build_minimal_trainer(
             debug=DebugConfig(),
             training=TrainingConfig(),
             parallelism=SimpleNamespace(
+                enable_sequence_parallel=False,
                 pipeline_parallel_degree=1,
                 fsdp_reshard_after_forward=fsdp_reshard_after_forward,
             ),
         )
-        engine._traced_step = None
-        engine._graph_runner = None
-        engine._trainable_params = None
-        engine._graph_gradient_state = None
         engine._pinned_pool_ctx = None
+        engine._traced_step = None
+        engine._test_graph_call = None
+
+        def prepare_trace_inputs(args, kwargs) -> None:
+            for pass_name in trace_input_preparer_keys(trainer.config.compile):
+                prepare = TRACE_INPUT_PREPARERS.get(pass_name)
+                if prepare is not None:
+                    prepare(trainer.config.compile, args, kwargs)
+
+        def prepare_trace_call_inputs(args, kwargs):
+            for pass_name in trace_input_preparer_keys(trainer.config.compile):
+                prepare = TRACE_CALL_INPUT_PREPARERS.get(pass_name)
+                if prepare is not None:
+                    prepared = prepare(trainer.config.compile, args, kwargs)
+                    if prepared is not None:
+                        args, kwargs = prepared
+            return args, kwargs
+
+        def run_direct_graph_step(*, inputs, labels, model_kwargs, loss_kwargs):
+            # This test adapter traces one unsplit joint graph. Unwrap the
+            # runtime's single-microbatch calling convention at its boundary.
+            (input_args,) = inputs
+            (inputs,) = input_args
+            (labels,) = labels
+            (model_kwargs,) = model_kwargs
+
+            if engine._traced_step is None:
+                maybe_register_blockmask_pytree_node()
+                fwd_bwd_fn = make_fwd_bwd_step(model, engine.loss_fn)
+                with parallelism_context.activate_spmd():
+                    engine._traced_step = minimal_fx_tracer(
+                        fwd_bwd_fn,
+                        module=model,
+                        prepare_inputs=prepare_trace_inputs,
+                        prepare_call_inputs=prepare_trace_call_inputs,
+                    )(
+                        inputs,
+                        labels,
+                        loss_kwargs["global_valid_tokens"],
+                        model_kwargs,
+                    )
+                if trainer.config.compile.enable_passes:
+                    pipeline_fn = PASS_PIPELINE_REGISTRY.get(
+                        trainer.config.compile.pass_pipeline,
+                        construct_default_graph_passes,
+                    )
+                    passes = pipeline_fn(
+                        engine._traced_step,
+                        trainer.config,
+                        parallelism_context=engine.parallelism_context,
+                    )
+                else:
+                    passes = construct_mandatory_graph_passes()
+                engine._traced_step.gm = apply_graph_passes(
+                    engine._traced_step.gm,
+                    engine._traced_step.example_inputs,
+                    passes,
+                    compile_config=trainer.config.compile,
+                    respect_disable_passes=trainer.config.compile.enable_passes,
+                )
+                engine._test_graph_call = run_traced(
+                    engine._traced_step,
+                    module=model,
+                )
+
+            outputs = engine._test_graph_call(
+                inputs,
+                labels,
+                loss_kwargs["global_valid_tokens"],
+                model_kwargs,
+            )
+            params = tuple(
+                parameter for parameter in model.parameters() if parameter.requires_grad
+            )
+            accumulate_param_grads_(
+                params,
+                outputs[1:],
+                clone_grads_to_initialize_param_grad=True,
+            )
+            return outputs[0]
+
+        # Compiler component tests inspect the unsplit graph directly.
+        engine.forward_backward_body_fn = run_direct_graph_step
     else:
         trainer.config = SimpleNamespace(
             dataloader=SimpleNamespace(max_num_documents=None),
+            debug=DebugConfig(),
             training=TrainingConfig(),
-            parallelism=SimpleNamespace(),
+            parallelism=SimpleNamespace(enable_sequence_parallel=False),
         )
 
     engine.config = trainer.config

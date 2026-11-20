@@ -42,7 +42,7 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "checkpointer.load_only",
         "checkpointer.load_step",
         "comm.init_timeout_seconds",
-        "comm.mode",
+        "comm.backend",
         "comm.save_traces_file_prefix",
         "comm.save_traces_folder",
         "comm.trace_buf_size",
@@ -106,6 +106,13 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "encoder.clip_encoder",
         "encoder.random_init",
         "encoder.t5_encoder",
+        "ema.buffer_patterns",
+        "ema.decay",
+        "ema.half_life_fraction",
+        "ema.offload_to_cpu",
+        "ema.start_step",
+        "ema.step_bias",
+        "ema.update_every_n_steps",
         "hf_assets_path",
         "inference.img_size",
         "inference.local_batch_size",
@@ -125,33 +132,32 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "lr_scheduler.total_steps",
         "lr_scheduler.warmup_steps",
         "metrics.disable_color_printing",
+        "metrics.enable_moe_routing",
         "metrics.enable_tensorboard",
         "metrics.enable_wandb",
         "metrics.log_freq",
         "metrics.save_for_all_ranks",
         "metrics.save_tb_folder",
         "optimizer.implementation",
-        "optimizer.optimizer_factory_kwargs_by_name",
-        "optimizer.param_groups",
-        "optimizer.param_groups.optimizer_kwargs",
-        "optimizer.param_groups.optimizer_name",
-        "optimizer.param_groups.pattern",
         "override.imports",
         "parallelism.context_parallel_degree",
-        "parallelism.context_parallel_load_balancer",
-        "parallelism.context_parallel_ptrr_mask_key",
         "parallelism.data_parallel_replicate_degree",
         "parallelism.data_parallel_shard_degree",
         "parallelism.enable_fsdp_symm_mem",
+        "parallelism.enable_min_cost_redistribute",
         "parallelism.enable_sequence_parallel",
+        "parallelism.enable_tpu_topo_mesh",
         "parallelism.expert_parallel_degree",
         "parallelism.fsdp_reshard_after_forward",
-        "parallelism.module_fqns_per_model_part",
+        "parallelism.use_simple_fsdp",
         "parallelism.pipeline_parallel_degree",
         "parallelism.pipeline_parallel_first_stage_less_layers",
         "parallelism.pipeline_parallel_last_stage_less_layers",
         "parallelism.pipeline_parallel_layers_per_stage",
+        "parallelism.pipeline_parallel_module_fqns_per_model_part",
         "parallelism.num_pp_microbatches",
+        "parallelism.pp_max_unsharded_active_stages",
+        "parallelism.pp_num_unshard_lookahead_factor",
         "parallelism.pipeline_parallel_schedule",
         "parallelism.pipeline_parallel_schedule_csv",
         "parallelism.tensor_parallel_degree",
@@ -268,7 +274,16 @@ def _cli_options(config, prefix: str = "") -> set[str]:
     # annotations`` stores its field types as strings, which would hide the
     # Suppress annotation. checkpointer.py is one such module.
     hints = typing.get_type_hints(type(config), include_extras=True)
+    core_field_names = {
+        name
+        for b in type(config).__mro__
+        if not b.__module__.startswith(("torchtitan.experiments.", "torchtitan.rl."))
+        and dataclasses.is_dataclass(b)
+        for name in getattr(b, "__annotations__", {})
+    }
     for f in dataclasses.fields(config):
+        if f.name not in core_field_names:
+            continue
         field_type = hints.get(f.name, f.type)
         if _is_suppressed(field_type):
             continue
@@ -296,7 +311,14 @@ def _subclasses(config_cls: type) -> set[type]:
     """
     found = {config_cls}
     for sub in config_cls.__subclasses__():
-        if sub.__module__.startswith(("torchtitan.experiments.", "torchtitan.rl.")):
+        if sub.__module__.startswith(
+            (
+                "torchtitan.experiments.",
+                "torchtitan.rl.",
+                "torchtitan.models.flux.precomputed_loader",
+                "torchtitan.models.flux.random_loader",
+            )
+        ):
             continue
         found |= _subclasses(sub)
     return found
@@ -305,9 +327,8 @@ def _subclasses(config_cls: type) -> set[type]:
 def _config_types(field_type) -> set[type]:
     """The config classes a field may hold, unwrapping Annotated and generics.
 
-    Both unions and containers expand. tyro indexes a ``list[ParamGroupConfig]``
-    per element, so ``--optimizer.param-groups.0.optimizer-kwargs.lr`` is a real
-    option; the index is dropped here and the element's fields are recorded once.
+    Both unions and containers expand. Tyro indexes configurable list elements;
+    the index is dropped here and the element's fields are recorded once.
 
     Subclasses expand too, because a field declared as a component base holds
     whichever implementation the configuration picked -- ``loss.mtp_scale``
@@ -386,10 +407,11 @@ def _guarded_configs():
             registry = importlib.import_module(
                 f"torchtitan.models.{model}.config_registry"
             )
+            config = getattr(registry, config_name)()
         except ImportError as e:
             warnings.warn(f"freeze snapshot skips {model}: {e}", stacklevel=2)
             continue
-        yield getattr(registry, config_name)()
+        yield config
 
 
 class TestCliOptionsFrozen(unittest.TestCase):

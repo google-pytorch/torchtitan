@@ -194,7 +194,8 @@ def configure_gemma4_simple_fsdp_shard_dims(
 def parallelize_gemma4(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: torchtitan.config.CompileConfig,
@@ -205,6 +206,9 @@ def parallelize_gemma4(
     **kwargs,
 ) -> nn.Module:
   """Parallelizes the Gemma4 model, optionally applying Simple FSDP."""
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   if parallel_dims.cp_enabled:
     raise NotImplementedError(
         "Context parallelism is not supported for Gemma4 on TPU yet."

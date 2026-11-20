@@ -75,7 +75,8 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
     for fqn in fp8:
       module = model.get_submodule(fqn)
       self.assertIsInstance(module, Float8Linear)
-      self.assertTrue(module.config.gemm_config_output.use_fast_accum)
+      self.assertEqual(module.recipe_name, "rowwise")
+      self.assertFalse(module.emulate)
 
   def test_emulated_layer_matches_linear(self):
     torch.manual_seed(0)

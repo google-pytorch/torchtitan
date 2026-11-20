@@ -56,7 +56,8 @@ class TpuGraphTrainerGemma4Model(Gemma4Model):
   def parallelize(
       self,
       *,
-      parallel_dims: ParallelDims,
+      parallel_dims: ParallelDims | None = None,
+      parallelism_context: ParallelDims | None = None,
       training: TrainingConfig,
       parallelism: ParallelismConfig,
       compile_config: GraphTrainerCompileConfig,
@@ -66,6 +67,9 @@ class TpuGraphTrainerGemma4Model(Gemma4Model):
   ) -> nn.Module:
     if skip_dp:
       raise ValueError("GraphTrainer models do not support skip_dp=True.")
+    if parallel_dims is None:
+      parallel_dims = parallelism_context
+    assert parallel_dims is not None
     return parallelize_gemma4(
         self,
         parallel_dims=parallel_dims,
@@ -86,7 +90,8 @@ class TpuGraphTrainerGemma4Model(Gemma4Model):
 def parallelize_gemma4(
     model: nn.Module,
     *,
-    parallel_dims: ParallelDims,
+    parallel_dims: ParallelDims | None = None,
+    parallelism_context: ParallelDims | None = None,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
@@ -99,6 +104,9 @@ def parallelize_gemma4(
   graph trainer rematerializes its joint graph with ``compile.memory_policy``
   instead of eager AC wrappers.
   """
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   del ac_config
   unsupported = [
       name

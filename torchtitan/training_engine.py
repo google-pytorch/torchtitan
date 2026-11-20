@@ -13,28 +13,27 @@ import spmd_types as spmd
 import torch
 import torch.distributed.checkpoint.stateful
 import tyro
-from torch.distributed.pipelining.schedules import (
-    _PipelineScheduleRuntime,
-    get_schedule_class,
-    PipelineScheduleMulti,
-)
 
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
-from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
+from torchtitan.components.optimizer import (
+    EMA,
+    LRSchedulersContainer,
+    OptimizersContainer,
+)
 from torchtitan.components.optimizer.optimizer import configure_moe_routing_metrics
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import (
     CommConfig,
     CompileConfig,
     DebugConfig,
-    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan.config.override import OverrideConfig
-from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import ParallelismContext, utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import (
     ActivationCheckpointingConfig,
     SelectiveAC,
@@ -82,6 +81,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         lr_scheduler: LRSchedulersContainer.Config = field(
             default_factory=LRSchedulersContainer.Config
         )
+        ema: EMA.Config | None = None
+        """Online EMA of model weights, e.g. for cheap mid-WSD-training eval
+        without a full LR decay. Unset (None) means EMA is disabled."""
         training: TrainingConfig = field(default_factory=TrainingConfig)
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         checkpointer: Annotated[
@@ -110,22 +112,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     "(--parallelism.pipeline_parallel_degree 1)."
                 )
 
-            if (
-                not self.training.disable_cuda_graphs
-                and cuda_graphs_supported()
-                and self.parallelism.pipeline_parallel_degree > 1
-            ):
-                pp_schedule_class = (
-                    _PipelineScheduleRuntime
-                    if self.parallelism.pipeline_parallel_schedule_csv
-                    else get_schedule_class(self.parallelism.pipeline_parallel_schedule)
-                )
-                if issubclass(pp_schedule_class, PipelineScheduleMulti):
-                    raise ValueError(
-                        "CUDA graphs do not support looped pipeline schedules yet. "
-                        "Use a single-stage pipeline schedule or disable CUDA graphs."
-                    )
-
             if self.parallelism.num_pp_microbatches <= 0:
                 raise ValueError(
                     "parallelism.num_pp_microbatches must be greater than 0."
@@ -137,9 +123,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 else 1
             )
             context_parallel_degree = self.parallelism.context_parallel_degree
-            activation_shard_degree = sequence_parallel_degree * (
-                2 * context_parallel_degree if context_parallel_degree > 1 else 1
-            )
+            activation_shard_degree = sequence_parallel_degree * context_parallel_degree
             if num_tokens % activation_shard_degree != 0:
                 raise ValueError(
                     "The number of tokens per pipeline microbatch "
@@ -167,13 +151,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
 
     config: Config
     device: torch.device
-    parallel_dims: ParallelDims
+    parallelism_context: ParallelismContext
     model_parts: list[BaseModel]
     model_config: BaseModel.Config
     output_dir: str
     loss_fn: BaseLoss
     optimizers: OptimizersContainer
     lr_schedulers: LRSchedulersContainer
+    ema: EMA | None
     checkpointer: BaseCheckpointManager
     pp_has_last_stage: bool
     max_num_documents: int | None
@@ -213,6 +198,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.loss_metrics = {}
         self._initialize_distributed_runtime()
 
+    @property
+    def parallel_dims(self) -> ParallelismContext:
+        return self.parallelism_context
+
     def _initialize_distributed_runtime(self) -> None:
         """Initialize the device, distributed meshes, GC, and deterministic RNGs."""
         device_module, device_type = utils.device_module, utils.device_type
@@ -227,21 +216,24 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         config = self.config
         dist_utils.set_batch_invariance(config.debug.batch_invariant)
         with sl.log_trace_span("torch_distributed_init"):
-            world_size = dist_utils.init_distributed(
+            topology = dist_utils.init_distributed(
                 config.comm,
                 enable_cpu_backend=config.training.enable_cpu_offload,
                 base_folder=self.output_dir,
+                pipeline_parallel_degree=config.parallelism.pipeline_parallel_degree,
             )
-        self.parallel_dims = ParallelDims.from_config(config.parallelism, world_size)
+        self.parallelism_context = ParallelismContext.from_config(
+            config.parallelism, topology
+        )
         self.gc_handler = utils.GarbageCollection(
             gc_freq=config.training.gc_freq,
             debug=config.training.gc_debug,
         )
         dist_utils.set_determinism(
-            self.parallel_dims,
+            self.parallelism_context,
             self.device,
             self.config.debug,
-            distinct_seed_mesh_dims=["pp"],
+            distinct_seed_mesh_axes=["pp"],
         )
         self.device_memory_monitor = build_device_memory_monitor()
 
@@ -309,14 +301,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             model, self.config.training.max_context_length
         )
         config = self.config
-        if self.parallel_dims.pp_enabled:
+        if self.parallelism_context.pp_enabled:
             (
                 self.pp_schedule,
                 self.model_parts,
                 self.pp_has_first_stage,
                 self.pp_has_last_stage,
             ) = model.pipeline(
-                parallel_dims=self.parallel_dims,
+                parallelism_context=self.parallelism_context,
                 training=config.training,
                 parallelism=config.parallelism,
                 compile_config=compile_config,
@@ -330,7 +322,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         else:
             if not create_seed_checkpoint:
                 model = model.parallelize(
-                    parallel_dims=self.parallel_dims,
+                    parallelism_context=self.parallelism_context,
                     training=config.training,
                     parallelism=config.parallelism,
                     compile_config=compile_config,
@@ -341,11 +333,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
 
+        metrics_cfg = getattr(config, "metrics", None)
+        enable_moe_routing = bool(getattr(metrics_cfg, "enable_moe_routing", False))
         self._collect_moe_routing_metrics = configure_moe_routing_metrics(
-            self.model_parts, config.metrics.enable_moe_routing
+            self.model_parts, enable_moe_routing
         )
 
-        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+        with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:
                 model_part.to_empty(device=init_device)
                 with torch.no_grad():
@@ -353,9 +347,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 model_part.train()
 
         if isinstance(self.loss_fn, ChunkedLossWrapper) and (
-            not self.parallel_dims.pp_enabled or self.pp_has_last_stage
+            not self.parallelism_context.pp_enabled or self.pp_has_last_stage
         ):
-            if self.parallel_dims.pp_enabled:
+            if self.parallelism_context.pp_enabled:
                 model = self.model_parts[-1]
                 error_message = "Last PP stage must have lm_head for ChunkedLossWrapper"
             else:
@@ -375,16 +369,21 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         )
 
     def _initialize_optimizer(self) -> None:
-        """Construct optimizers and learning-rate schedulers."""
+        """Construct optimizers, learning-rate schedulers and the weight EMA."""
         self.optimizers = self.config.optimizer.build(model_parts=self.model_parts)
         self.model_cls._register_optimizer_hooks(
             self.optimizers,
             self.model_parts,
-            self.parallel_dims,
+            self.parallelism_context,
         )
         self.lr_schedulers = self.config.lr_scheduler.build(
             optimizers=self.optimizers,
             training_steps=self.config.training.steps,
+        )
+        self.ema = (
+            self.config.ema.build(model_parts=self.model_parts)
+            if self.config.ema is not None
+            else None
         )
 
     def _initialize_checkpointer(
@@ -402,6 +401,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema=self.ema,
             states={"train_state": self},
             sd_adapter=sd_adapter,
             base_folder=self.output_dir,
@@ -424,7 +424,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             )
 
         self._num_optimizer_steps_since_cuda_graph_init = 0
-        if self.parallel_dims.pp_enabled:
+        if self.parallelism_context.pp_enabled:
             self.forward_backward_body_fn = cast(
                 Callable[..., torch.Tensor], self._pp_forward_backward_body
             )
@@ -514,7 +514,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # HSDP replicate all-reduce is a no-op until the last accum group.
         # Do not toggle under CUDA graphs when accum > 1: the graph is
         # captured on the first group and replayed for later groups.
-        if self.parallel_dims.dp_replicate_enabled and (
+        if self.parallelism_context.dp_replicate_enabled and (
             self.num_accumulation_steps == 1 or self.config.training.disable_cuda_graphs
         ):
             is_last = accumulation_index == self.num_accumulation_steps - 1
@@ -523,7 +523,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     part.set_requires_all_reduce(is_last)  # pyrefly: ignore[not-callable]
 
         def forward_backward() -> torch.Tensor:
-            if self.parallel_dims.pp_enabled:
+            if self.parallelism_context.pp_enabled:
                 if any(microbatch.loss_kwargs() for microbatch in microbatch_group):
                     raise ValueError(
                         "Per-microbatch loss arguments are not supported with "
@@ -538,12 +538,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     input_dict = microbatch.to_input_dict(
                         self.device, non_blocking=True
                     )
-                    with sl.log_trace_span("preprocess_inputs"):
+                    with (
+                        sl.log_trace_span("preprocess_inputs"),
+                        self.parallelism_context.activate_spmd(),
+                    ):
                         inputs_mb, labels_mb, extra_kwargs_mb = self.model_parts[
                             0
                         ].preprocess_inputs(
                             input_dict,
-                            parallel_dims=self.parallel_dims,
+                            parallelism_context=self.parallelism_context,
                             parallelism=self.config.parallelism,
                             max_num_documents=self.max_num_documents,
                             max_context_length=(
@@ -558,7 +561,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                         # Flux latent targets. CP shards the logical tokens.
                         self.ntokens_seen += (
                             self.config.training.num_tokens_per_microbatch_per_dp_rank
-                            // self.parallel_dims.cp
+                            // self.parallelism_context.cp
                         )
                     if self.pp_has_first_stage:
                         arg_mbs.append((inputs_mb,))
@@ -576,10 +579,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             assert len(microbatch_group) == 1
             microbatch = microbatch_group[0]
             input_dict = TrainingEngine._to_device(self, microbatch)
-            with sl.log_trace_span("preprocess_inputs"):
+            with (
+                sl.log_trace_span("preprocess_inputs"),
+                self.parallelism_context.activate_spmd(),
+            ):
                 inputs, labels, extra_kwargs = self.model_parts[0].preprocess_inputs(
                     input_dict,
-                    parallel_dims=self.parallel_dims,
+                    parallelism_context=self.parallelism_context,
                     parallelism=self.config.parallelism,
                     max_num_documents=self.max_num_documents,
                     max_context_length=self.config.training.max_context_length,
@@ -590,7 +596,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 # Flux latent targets and MTP label tuples. CP shards the tokens.
                 self.ntokens_seen += (
                     self.config.training.num_tokens_per_microbatch_per_dp_rank
-                    // self.parallel_dims.cp
+                    // self.parallelism_context.cp
                 )
 
             return self.forward_backward_body_fn(
@@ -621,9 +627,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         model_kwargs: dict[str, Any],
         loss_kwargs: dict[str, Any],
     ) -> torch.Tensor:
-        with dist_utils.get_spmd_context(
-            parallel_dims=self.parallel_dims,
-            spmd_typechecking=self.config.debug.spmd_typechecking,
+        with self.parallelism_context.activate_spmd(
+            typechecking=self.config.debug.spmd_typechecking,
         ):
             pred = self.model_parts[0](inputs, **model_kwargs)
             loss, self.loss_metrics = self.loss_fn(
@@ -644,9 +649,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         model_kwargs: list[dict[str, Any]],
         loss_kwargs: dict[str, Any],
     ) -> torch.Tensor:
-        with dist_utils.get_spmd_context(
-            parallel_dims=self.parallel_dims,
-            spmd_typechecking=self.config.debug.spmd_typechecking,
+        with self.parallelism_context.activate_spmd(
+            typechecking=self.config.debug.spmd_typechecking,
         ):
             losses = [] if self.pp_has_last_stage else None
             self.pp_schedule.step(
@@ -670,10 +674,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             [p for model in self.model_parts for p in model.parameters()],
             self.config.training.max_norm,
             foreach=True,
-            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=self.parallel_dims.ep_enabled,
+            pp_mesh=self.parallelism_context.get_optional_mesh("pp"),
+            ep_enabled=self.parallelism_context.ep_enabled,
         )
-
     def _to_device(self, microbatch: TrainingMicrobatch) -> dict[str, Any]:
         """Moves a microbatch's inputs to the device.
 
@@ -703,15 +706,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             if clip_grad_norm is not None
             else TrainingEngine._clip_grad_norm(self)
         )
-        if not self.parallel_dims.pp_enabled or self.pp_has_last_stage:
-            loss_mesh = self.parallel_dims.get_optional_mesh("loss")
+        if not self.parallelism_context.pp_enabled or self.pp_has_last_stage:
+            loss_mesh = self.parallelism_context.get_optional_mesh("loss")
             if loss_mesh is not None:
                 torch.distributed.all_reduce(
                     self.loss_is_finite,
                     op=torch.distributed.ReduceOp.MIN,
                     group=loss_mesh.get_group(),
                 )
-        pp_mesh = self.parallel_dims.get_optional_mesh("pp")
+        pp_mesh = self.parallelism_context.get_optional_mesh("pp")
         if pp_mesh is not None:
             torch.distributed.all_reduce(
                 self.loss_is_finite,
@@ -730,6 +733,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
+        if self.ema is not None:
+            # current_step is the step just optimized, which is what the EMA
+            # schedule's start_step/update_every_n_steps are defined against.
+            self.ema.step(current_step)
         self.num_completed_steps = current_step
         self._num_optimizer_steps_since_cuda_graph_init += 1
         return grad_norm

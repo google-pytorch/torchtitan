@@ -1,116 +1,82 @@
-# Contributing to TorchTitan on TPU
+# Contributing to torchtitan
+We want to make contributing to this project as easy and transparent as
+possible. Contributions should follow the [Contributing Guidelines](#contributing-guidelines) below.
 
-This repository is Google's distribution of [TorchTitan](https://github.com/pytorch/torchtitan),
-adding training on Cloud TPU through [TorchTPU](https://github.com/google-pytorch/torch_tpu). It
-tracks upstream closely, and we intend to keep it that way.
+### Setup
+```
+pip install -r requirements.txt -r requirements-dev.txt
+```
 
-## Issues
+### Pull Requests
+We actively welcome your pull requests.
 
-Bugs and feature requests for TPU support go to
-[this repository's issue tracker](https://github.com/google-pytorch/torchtitan/issues). Problems in
-shared TorchTitan code that also reproduce off TPU belong
-[upstream](https://github.com/pytorch/torchtitan/issues). When in doubt, file here and we will
-redirect it. A clear, well-isolated bug report is itself a valuable contribution, and for anything
-more than a trivial fix, filing an issue first lets us agree on the shape of the solution before
-you write code.
+1. Fork the repo and create your branch from `main`.
+2. If you've added code that should be tested, add tests.
+3. If you've changed APIs, update the documentation.
+4. Ensure the test suite passes.
+5. Make sure your code lints (`pre-commit run --all-files`).
+6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
-A good report carries what happened against what you expected with the full traceback, the recipe
-and exact launch command that reproduces it, and your environment: `torch`, `torch_tpu` and
-`libtpu` versions, TPU generation and topology, and whether the run was single-host or multi-host.
+### Contributor License Agreement ("CLA")
+In order to accept your pull request, we need you to submit a CLA. You only need
+to do this once to work on any of Meta's open source projects.
 
-## Where your change belongs
+Complete your CLA here: <https://code.facebook.com/cla>
 
-**Please keep changes inside `torchtitan/experiments/tpu`.** Everything outside it is upstream code
-that we re-sync from `pytorch/torchtitan`, so an edit there is either reverted by the next sync or
-becomes a conflict that someone resolves by hand.
+### Issues
+We use GitHub issues to track public bugs. Please ensure your description is
+clear and has sufficient instructions to be able to reproduce the issue.
 
-* **TPU recipes, kernels, trainer, overrides and tests**: here, under
-  `torchtitan/experiments/tpu`.
-* **Shared TorchTitan code** (trainer, parallelism, models, components): send it to
-  [pytorch/torchtitan](https://github.com/pytorch/torchtitan); it reaches this repository on the
-  next sync.
-* **Shared code that the TPU lane needs and upstream has not taken yet**: please open an issue here
-  first. A small, device-neutral extension point upstream beats a local fork of the file.
+Meta has a [bounty program](https://www.facebook.com/whitehat/) for the safe
+disclosure of security bugs. In those cases, please go through the process
+outlined on that page and do not file a public issue.
 
-## Before you begin
+### License
+By contributing to `torchtitan`, you agree that your contributions will be licensed
+under the LICENSE file in the root directory of this source tree.
 
-Contributions to this project must be accompanied by a Google Contributor License Agreement (CLA).
-You (or your employer) retain the copyright to your contribution; signing simply gives us
-permission to redistribute your changes. Visit <https://cla.developers.google.com/> to see your
-agreements or to sign a new one. If you have already signed the Google CLA for another open-source
-project, you likely do not need to sign it again. A CLA bot checks pull requests automatically and
-guides you if action is needed.
+---
 
-This project follows
-[Google's Open Source Community Guidelines](https://opensource.google/conduct/).
+## Contributing Guidelines
 
-## Pull requests
+Note: To accelerate contributions to and innovations around `torchtitan`, we are adding a new, experimental folder [`torchtitan/experiments`](torchtitan/experiments/), which has its own [Contributing Guidelines](torchtitan/experiments/README.md#contributing-guidelines). The content below is for the core portions of `torchtitan`.
 
-Small and focused beats large and sprawling.
+### Principles of contribution
 
-Approved pull requests are copied into Google's internal repository by a tool called Copybara. For
-this reason Copybara does not mark a pull request as merged: it closes the pull request and
-separately applies a commit to `main` with the same changes. Your change has landed when that
-commit appears.
+- Apply PyTorch-native training techniques.
+  - The technique should be of general interest for distributed training.
+  - A technique with moderate to large complexity should be sitting in the proper repo (e.g. pytorch/pytorch for a new parallelism, or pytorch/data for a new data loader) instead of `torchtitan`.
+  - The main branch of `torchtitan` should have minimal dependencies on non-PyTorch libraries. Interesting models/techniques that depend on external libraries can be demonstrated in the `experiments` folder, or in forks of `torchtitan`.
+- Aim for minimal (if not zero) code change to the model. For the Llama model in `torchtitan`, if one has to make justifiable model change(s):
+  - After the model change, it should still load the original checkpoint correctly.
+  - Document the reasons for the code change, similar to [composability.md](docs/composability.md).
+- Keep code modularized, especially for [train.py](torchtitan/train.py), so that it remains easy to copy-paste into a minimal code example. If necessary create separate functions/files.
+- The command-line options are frozen: no new `--section.option` flags. A knob that changes the model goes in the model config (dataclass), which is already off the command line. One that belongs to a component goes in that component's config (dataclass), and one with no other owner goes in [configs.py](torchtitan/config/configs.py) after checking with the maintainers. Both need `tyro.conf.Suppress`, since a field there is a command-line option unless you annotate it. See [the configuration doc](torchtitan/config/README.md).
 
-Upstream's [CONTRIBUTING](https://github.com/pytorch/torchtitan/blob/main/CONTRIBUTING.md) covers
-the review standards for TorchTitan code, and we do not restate them here. For a change under
-`torchtitan/experiments/tpu`, please also show:
+### Proof of Value
 
-* **It trains**: at least 10 steps on the relevant recipe, loss decreasing, no NaN or inf, with
-  conclusions drawn from steps past warmup.
-* **Its numerics**: bit-identical (step-1 loss and grad_norm unchanged), rounding-order (fp32
-  round-off from tiling, fused kernels or reduction order), or semantic. A semantic change is a
-  separate, labelled recipe rather than a performance lever.
-* **That the mechanism fired**: kernels verified in the HLO dump, since eager log lines do not
-  print under `torch.compile`.
-* **Performance, and the command behind it**: step time, TPS, MFU and peak HBM on stated hardware
-  and topology.
-* **A recipe, for a new model**: a per-topology config under
-  `torchtitan/experiments/tpu/recipes`, plus a README carrying the launch block.
+It is the contributor’s responsibility to justify the change. The requirements include, but are not limited to
 
-[`torchtitan/experiments/tpu/README.md`](torchtitan/experiments/tpu/README.md) has the setup and
-launch instructions; the
-[TorchTPU optimization guide](torchtitan/experiments/tpu/docs/torch-tpu-optimization-guide.md) has the
-tuning levers.
+#### Loss
 
-## Tests
+- If a change does not impact computation results, one should see identical loss before vs. after, with fixed random seeds (`training.seed`) and deterministic algorithms (`training.deterministic`). An example is activation checkpointing.
+- If a change is expected to impact computation results, loss converging should be verified via end-to-end training on representable datasets (e.g. Llama 3 models on the C4 dataset). Please refer to the recommended practices in [converging.md](docs/converging.md).
 
-Put tests in a `tests/` directory next to the code they cover, and let the file name say what
-hardware the test needs. Both GitHub CI and Google's internal build read the hardware lane from the
-name, so a test that follows the convention runs in both without any CI or build configuration:
+#### Performance
+- Memory and TPS / MFU, which are available from logging, should meet expectations.
+- It is worth noting that performance expectations vary from case to case. For example, there are cases when a technique targeting memory reduction may cause throughput regression but still be acceptable (e.g. activation checkpointing). Again, it is the contributor's job to justify the feature, whether by achieving hypothetical performance, or by comparing with existing well-known implementations, etc.
+- If necessary, verify the numbers on jobs spanning multiple nodes (e.g. on 64 GPUs). Please reach out to the `torchtitan` team for help if you are resource-constrained.
+- When appropriate, one should show profile traces and/or memory snapshots to prove the effectiveness.
 
-| File name                                        | Runs on                                              |
-| ------------------------------------------------ | ---------------------------------------------------- |
-| `test_foo.py`                                    | CPU                                                  |
-| `test_foo_tpu.py`                                | one TPU chip (`--device=tpu`)                        |
-| `test_foo_distributed.py`                        | eight TPU chips, multi-process (`--num_devices=8`)   |
-| `torchtitan/experiments/tpu/kernels/tests/*.py`  | one TPU chip, whatever the suffix (Pallas kernels)   |
+### Best practices
 
-Single-chip tests subclass `BaseAcceleratorDeviceTest`
-([`base_device_test.py`](torchtitan/experiments/tpu/testing/base_device_test.py)) and multi-chip tests
-subclass `BaseDistributedDeviceTest`
-([`base_distributed_device_test.py`](torchtitan/experiments/tpu/testing/base_distributed_device_test.py));
-CI checks that a `BaseDistributedDeviceTest` lives in a `*_distributed.py` file. A test may import a
-sibling test module for shared fixtures. Anything else (an unusual topology, a custom shard count, a
-dependency outside the standard set) is configured by hand on the internal side, so please call it
-out in the pull request.
+When appropriate, one should consider
 
-A test that is temporarily broken is listed, with the reason, in
-[`.ci/discover_tpu_tests.py`](.ci/discover_tpu_tests.py) rather than deleted or skipped inline.
-
-## AI-generated code
-
-Use of AI assistants is neither encouraged nor discouraged, but **the author is fully responsible
-for the code they submit**: you must be able to explain and maintain it, and it must be correct and
-tested. Pull requests that appear to be unreviewed automated output will be closed. AI assistants
-are not co-authors; if one provided meaningful help, you may add an `Assisted-by:` tag in the
-commit message.
-
-## Security
-
-Please report potential security vulnerabilities through <http://g.co/vulnz> rather than in a
-public issue; see [SECURITY.md](SECURITY.md). High memory usage, crashes caused by invalid inputs,
-and numerical divergence from untrusted models are ordinary bugs rather than security
-vulnerabilities: running untrusted model code is equivalent to running untrusted arbitrary Python
-code.
+- Adding CPU/GPU unit/integration tests.
+  - To add a unit test, put it in the [tests](tests/) folder and follow the existing test files.
+  - To add a GPU integration test, add a configuration to the matching module in [torchtitan_recipes/tests](torchtitan_recipes/tests/) and a new `OverrideDefinitions` naming it in [integration_tests](tests/integration_tests/). These suites name a full Trainer configuration per run.
+- Updating [README](README.md) and writing a new note in the [docs](docs/) folder on installation and usage, similar to [Float8](torchtitan/quantization/float8/README.md).
+- Following the tensor shape-suffix naming convention for new model code (e.g. `x_BLD`, `q_BLHK`, `out_THV`), with a per-module legend comment as in [attention.py](torchtitan/models/common/attention.py). Capital suffixes name logical tensor dimensions (not sharding layout) and are scoped per file.
+- Adding a new file with benchmark results in [benchmarks](benchmarks) folder.
+- Creating GitHub issues for things that cannot be addressed at the moment.
+- Writing a post on [PyTorch Forums](https://discuss.pytorch.org/c/distributed/torchtitan/44) and linking to it.

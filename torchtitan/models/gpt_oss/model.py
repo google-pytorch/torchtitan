@@ -15,9 +15,10 @@ import torch._dynamo
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import CompileConfig, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
@@ -112,8 +113,6 @@ class Attention(BaseAttention):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        num_tokens = x.shape[0]
-
         q, k, v = self.qkv_linear(x)
 
         q, k = self.rope(q, k, positions)
@@ -131,7 +130,7 @@ class Attention(BaseAttention):
         )
 
         # Reshape and project output
-        output = output.reshape(num_tokens, -1).contiguous()
+        output = output.reshape(output.shape[0], -1).contiguous()
         return self.wo(output)
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
@@ -203,10 +202,12 @@ class GptOssModel(Decoder):
     state_dict_adapter_cls = GptOssStateDictAdapter
 
     @classmethod
-    def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
-        from torchtitan.components.optimizer import register_moe_load_balancing_hook
+    def _register_optimizer_hooks(
+        cls, optimizers, model_parts, parallelism_context
+    ) -> None:
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
 
-        register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+        register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
 
     """
     GPT-OSS Transformer model with attention and feed-forward layers.
@@ -256,7 +257,7 @@ class GptOssModel(Decoder):
     def parallelize(
         self,
         *,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
         compile_config: CompileConfig | None,
@@ -264,7 +265,7 @@ class GptOssModel(Decoder):
         dump_folder: str,
         skip_dp: bool = False,
     ) -> GptOssModel:
-        if parallel_dims.cp_enabled and isinstance(
+        if parallelism_context.cp_enabled and isinstance(
             self.config.first_full_attention_backend,
             UlyssesCPInnerAttention.Config,
         ):
@@ -274,7 +275,7 @@ class GptOssModel(Decoder):
             )
 
         if compile_config is not None and "model" in compile_config.components:
-            if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+            if parallelism_context.tp_enabled or parallelism_context.ep_enabled:
                 has_sliding_window_attention = any(
                     isinstance(
                         window_size := getattr(module, "window_size", None),
@@ -292,7 +293,7 @@ class GptOssModel(Decoder):
                     min_recompile_limit,
                 )
         return super().parallelize(
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             training=training,
             parallelism=parallelism,
             compile_config=compile_config,

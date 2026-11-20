@@ -12,6 +12,8 @@ import spmd_types as spmd
 import torch
 from torch import nn
 
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
@@ -98,6 +100,19 @@ class Attention(BaseAttention):
         self.inner_attention = config.inner_attention.build()
         self.rope = config.rope.build()
 
+    def _gather_tp_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Gather the shared MLA input before its projection branches."""
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is None:
+            return x
+        return spmd.redistribute(
+            x,
+            tp_group,
+            src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
+            dst=spmd.R,
+            backward_options={"op_dtype": x.dtype},
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -105,6 +120,8 @@ class Attention(BaseAttention):
         positions: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
     ):
+        x = self._gather_tp_input(x)
+
         num_tokens = x.shape[0]
 
         # Query projection
@@ -275,9 +292,11 @@ class DeepSeekV3Model(MTPDecoder):
             return get_deepseek_v3_nparams_and_flops(self, model, seq_len)
 
     @classmethod
-    def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
-        from torchtitan.components.optimizer import register_moe_load_balancing_hook
+    def _register_optimizer_hooks(
+        cls, optimizers, model_parts, parallelism_context
+    ) -> None:
         from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
 
-        register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
-        register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)
+        register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+        register_aux_loss_zero_hook(optimizers, model_parts, parallelism_context)

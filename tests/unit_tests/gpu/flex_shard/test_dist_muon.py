@@ -31,7 +31,6 @@ from torchtitan.components.optimizer.utils import (
 from torchtitan.distributed.flex_shard import (
     BlockShard,
     BucketConfig,
-    build_dist_muon,
     ComputeLayout,
     Owned,
 )
@@ -54,13 +53,18 @@ class TestDistMuon(DTensorTestBase):
     def device_type(self):
         return "cuda"
 
+    @parametrize("block_sizes", [(4,), (4, 2)])
     @with_comms
-    def test_matches_plain_muon_across_flat_checkpoint(self):
+    def test_matches_plain_muon_across_flat_checkpoint(
+        self, block_sizes: tuple[int, ...]
+    ):
         lr = 0.03
-        num_matrices = 3
-        matrix_rows = 4
-        # Two storage shards each own six rows, so their boundary splits the
-        # middle four-row matrix and exercises overshard redistribution.
+        num_repeats = 3
+        matrix_row_sizes = block_sizes * num_repeats
+        num_rows = sum(matrix_row_sizes)
+        # Both cases split a four-row matrix at the storage shard boundary.
+        # Variable blocks give compute owners 10 and 8 rows, with the second
+        # owner starting at the second position of the repeating pattern.
         weight_decay = 0.2
         mesh = init_device_mesh(
             self.device_type,
@@ -81,7 +85,7 @@ class TestDistMuon(DTensorTestBase):
         ):
             redistributed_fqn = "layers.0.redistributed"
             local_blocks_fqn = "layers.0.local_blocks"
-            return build_dist_muon(
+            return DistMuon(
                 [
                     {
                         "params": [redistributed, local_blocks],
@@ -98,7 +102,7 @@ class TestDistMuon(DTensorTestBase):
                         shardings_by_mesh_axis={
                             "dp_shard": BlockShard(
                                 dim=0,
-                                block_size=matrix_rows,
+                                block_sizes=block_sizes,
                             )
                         },
                     ),
@@ -120,8 +124,8 @@ class TestDistMuon(DTensorTestBase):
             torch.arange(12, device=device).reshape(4, 3).float().div_(10).add_(1)
         )
         local_blocks_value = (
-            torch.arange(12, 48, device=device)
-            .reshape(num_matrices * matrix_rows, 3)
+            torch.arange(12, 12 + num_rows * 3, device=device)
+            .reshape(num_rows, 3)
             .float()
             .div_(10)
         )
@@ -135,7 +139,7 @@ class TestDistMuon(DTensorTestBase):
         reference_redistributed = torch.nn.Parameter(redistributed_value.clone())
         reference_local_blocks = tuple(
             torch.nn.Parameter(block.clone())
-            for block in local_blocks_value.view(num_matrices, matrix_rows, 3)
+            for block in local_blocks_value.split(matrix_row_sizes)
         )
         reference_optimizer = torch.optim.Muon(
             [reference_redistributed, *reference_local_blocks],
@@ -166,7 +170,7 @@ class TestDistMuon(DTensorTestBase):
             reference_redistributed.grad = redistributed_grad.clone()
             for parameter, grad in zip(
                 reference_local_blocks,
-                local_blocks_grad.view(num_matrices, matrix_rows, 3),
+                local_blocks_grad.split(matrix_row_sizes),
                 strict=True,
             ):
                 parameter.grad = grad.clone()
@@ -192,15 +196,21 @@ class TestDistMuon(DTensorTestBase):
                 reference_local_blocks_before
             ).chunk(self.world_size)[rank]
             decay = 1 - lr * weight_decay
-            adjusted_lr = _adjust_muon_learning_rate(
-                lr, None, reference_local_blocks[0].shape
-            )
+            adjusted_lrs = torch.cat(
+                tuple(
+                    parameter.new_full(
+                        (parameter.shape[0], 1),
+                        _adjust_muon_learning_rate(lr, None, parameter.shape),
+                    )
+                    for parameter in reference_local_blocks
+                )
+            ).chunk(self.world_size)[rank]
             actual_update = (
                 local_blocks_before * decay - current_local_blocks.to_local()
-            ) / adjusted_lr
+            ) / adjusted_lrs
             expected_update = (
                 expected_local_blocks_before * decay - expected_local_blocks
-            ) / adjusted_lr
+            ) / adjusted_lrs
             # Batched BF16 Newton-Schulz can differ slightly across GEMM schedules.
             torch.testing.assert_close(
                 actual_update,
@@ -213,8 +223,8 @@ class TestDistMuon(DTensorTestBase):
             torch.arange(1, 13, device=device).reshape(4, 3).float().div_(17)
         )
         first_local_blocks_grad = (
-            torch.arange(13, 49, device=device)
-            .reshape(num_matrices * matrix_rows, 3)
+            torch.arange(13, 13 + num_rows * 3, device=device)
+            .reshape(num_rows, 3)
             .float()
             .div_(19)
         )
@@ -286,7 +296,7 @@ class TestDistMuonNativeMatrixBatch(DTensorTestBase):
             distribute_tensor(value.clone(), mesh, storage_placements)
         )
         fqn = "layers.0.feed_forward.w13.weight"
-        optimizer = build_dist_muon(
+        optimizer = DistMuon(
             [{"params": [parameter], "param_names": [fqn]}],
             compute_sharding_by_fqn={
                 fqn: ComputeLayout(
@@ -378,34 +388,34 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
         return "cuda"
 
     @with_comms
-    def test_preserves_ep_shard_during_efsdp_redistribution(self):
+    def test_preserves_ep_shard_during_edp_shard_redistribution(self):
         lr = 0.03
         weight_decay = 0.2
         mesh = init_device_mesh(
             self.device_type,
             (2, 2),
-            mesh_dim_names=("efsdp", "ep"),
+            mesh_dim_names=("edp_shard", "ep"),
         )
         num_experts = 3
         self.assertLess(
             num_experts,
-            mesh["efsdp"].size() * mesh["ep"].size(),
+            mesh["edp_shard"].size() * mesh["ep"].size(),
         )
         device = torch.device(self.device_type, self.rank)
         value = (
-            torch.arange(num_experts * 5 * 3, device=device)
-            .reshape(num_experts, 5, 3)
+            torch.arange(num_experts * 2 * 5 * 3, device=device)
+            .reshape(num_experts, 2, 5, 3)
             .float()
             .div_(13)
         )
-        storage_placements = (Shard(1), Shard(0))
+        storage_placements = (Shard(2), Shard(0))
         parameter = torch.nn.Parameter(
             distribute_tensor(value.clone(), mesh, storage_placements)
         )
-        fqn = "layers.0.routed_experts.inner_experts.w1_EFD"
+        fqn = "layers.0.routed_experts.w13.weight"
 
         def make_optimizer(param, shard_order_by_tensor_dim):
-            return build_dist_muon(
+            return DistMuon(
                 [{"params": [param], "param_names": [fqn]}],
                 lr=lr,
                 weight_decay=weight_decay,
@@ -415,7 +425,7 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
                 compute_sharding_by_fqn={
                     fqn: ComputeLayout(
                         shardings_by_mesh_axis={
-                            "efsdp": Shard(0),
+                            "edp_shard": Shard(0),
                             "ep": Shard(0),
                         },
                         shard_order_by_tensor_dim=shard_order_by_tensor_dim,
@@ -424,13 +434,13 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
                 bucket_configs=[BucketConfig(patterns=(fqn,))],
             )
 
-        expected_shard_order = {0: ("ep", "efsdp")}
-        # The storage-mesh order shards over EFSDP first, which loses the exact
+        expected_shard_order = {0: ("ep", "edp_shard")}
+        # The storage-mesh order shards over edp_shard first, which loses the exact
         # EP-axis ownership that the redistribution has to preserve.
-        for default_order in ({}, {0: ("efsdp", "ep")}):
+        for default_order in ({}, {0: ("edp_shard", "ep")}):
             with self.assertRaisesRegex(
                 ValueError,
-                r"must declare shard_order_by_tensor_dim=\{0: \('ep', 'efsdp'\)\}",
+                r"must declare shard_order_by_tensor_dim=\{0: \('ep', 'edp_shard'\)\}",
             ):
                 make_optimizer(parameter, default_order)
 
@@ -447,22 +457,22 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
 
         mesh_coordinate = mesh.get_coordinate()
         assert mesh_coordinate is not None
-        efsdp_coordinate, ep_coordinate = mesh_coordinate
+        edp_shard_coordinate, ep_coordinate = mesh_coordinate
         ep_num_experts, ep_offset = Shard.local_shard_size_and_offset(
             num_experts,
             mesh["ep"].size(),
             ep_coordinate,
         )
-        efsdp_num_experts, efsdp_offset = Shard.local_shard_size_and_offset(
+        edp_shard_num_experts, edp_shard_offset = Shard.local_shard_size_and_offset(
             ep_num_experts,
-            mesh["efsdp"].size(),
-            efsdp_coordinate,
+            mesh["edp_shard"].size(),
+            edp_shard_coordinate,
         )
-        compute_offset = ep_offset + efsdp_offset
+        compute_offset = ep_offset + edp_shard_offset
         expected_compute = grad.narrow(
             0,
             compute_offset,
-            efsdp_num_experts,
+            edp_shard_num_experts,
         ).contiguous()
         expected_direction = grad.clone().mul_(0.5).add_(0.25)
         expected_parameter = value.clone().mul_(1 - lr * weight_decay)
@@ -506,7 +516,7 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
         compute_ready_local = value.narrow(
             0,
             compute_offset,
-            efsdp_num_experts,
+            edp_shard_num_experts,
         ).contiguous()
         # The compute-ready storage already carries the declared shard order.
         compute_ready_parameter = torch.nn.Parameter(
@@ -525,6 +535,9 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
         )
         compute_ready_layout = compute_ready_optimizer._parameter_compute_layouts[0]
         self.assertTrue(compute_ready_layout.storage_is_compute_ready)
+
+
+instantiate_parametrized_tests(TestDistMuon)
 
 
 if __name__ == "__main__":

@@ -117,6 +117,11 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_model_td_layout",
     "tests.unit_tests.cpu.test_skip_dp",
     "tests.unit_tests.cpu.test_triton_offset_rmsnorm_override",
+    "tests.unit_tests.cpu.test_lora",
+    "tests.unit_tests.cpu.test_kimi_k3_pp_stage",
+    "tests.unit_tests.cpu.test_kimi_k3_pp_block_grads",
+    "tests.unit_tests.cpu.test_kimi_k3_pp_layout",
+    "tests.unit_tests.cpu.test_qwen3_5_moe",
     "tests.unit_tests.rl.test_gdn_graph_metadata",
     # Missing optional dependency torchvision
     "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
@@ -127,6 +132,7 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_mm_dataset_preprocessing",
     "tests.unit_tests.cpu.test_debug_config_defaults",
     "tests.unit_tests.cpu.test_no_new_cli_options",
+    "tests.unit_tests.cpu.test_integration_test_definitions",
     # TPUGrainDataLoader.Config overrides `dataset` as a plain str.
     "tests.unit_tests.cpu.test_dataset_flux",
     # set_gqa_inner_attention_local_spmd also registers the SDPA q_BLHK/k_BLHK/

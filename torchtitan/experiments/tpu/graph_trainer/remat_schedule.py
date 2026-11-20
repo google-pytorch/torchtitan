@@ -38,6 +38,11 @@ _TPU_FSDP_RS_DEADLINE_META = "tpu_fsdp_rs_deadline_waits"
 # Where the routed experts' parameters live in the module tree. Upstream
 # d771abb0 interposed `RoutedExperts`, moving them down from `.moe.experts.`.
 _EXPERT_FQN_INFIX = ".moe.routed_experts.inner_experts."
+_EXPERT_FQN_INFIXES = (
+    ".moe.routed_experts.inner_experts.",
+    ".moe.routed_experts.w13.",
+    ".moe.routed_experts.w2.",
+)
 
 
 def _optimization_barrier(*values: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -121,7 +126,11 @@ def _ordering_gradient(
     # Upstream d771abb0 interposed `RoutedExperts` between the MoE and its
     # grouped experts, moving these parameters to
     # `moe.routed_experts.inner_experts.*`.
-    if not any(_EXPERT_FQN_INFIX in f".{fqn}." for fqn in parameter_fqns):
+    if not any(
+        infix in f".{fqn}."
+        for fqn in parameter_fqns
+        for infix in _EXPERT_FQN_INFIXES
+    ):
         return reduce_grad_input
 
     # Depending on the BF16 local dWeight lets its FP32 cast and reduce-scatter

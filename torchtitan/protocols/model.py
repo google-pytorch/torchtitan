@@ -12,8 +12,9 @@ from typing import Any, ClassVar, Self, TYPE_CHECKING
 
 import torch
 
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
-from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.config import CompileConfig, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
 
 from .module import Module
 
@@ -49,9 +50,9 @@ class BaseModel(Module, ABC):
 
     def preprocess_inputs(
         self,
-        input_dict: dict[str, torch.Tensor],
+        input_dict: dict[str, Any],
         *,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         parallelism: ParallelismConfig,
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
@@ -103,6 +104,7 @@ class BaseModel(Module, ABC):
 
     state_dict_adapter_cls: ClassVar[type[BaseStateDictAdapter] | None] = None
     pipeline_first_stage_module_fqns: ClassVar[tuple[str, ...]] = ()
+    pipeline_last_stage_module_fqns: ClassVar[tuple[str, ...]] = ()
     supports_pipeline_parallel: ClassVar[bool] = True
 
     def pipeline(self, **kwargs: Any) -> tuple[Any, list[BaseModel], bool, bool]:
@@ -114,13 +116,18 @@ class BaseModel(Module, ABC):
 
         from torchtitan.distributed.pipeline_parallel import (
             pipeline_llm,
-            pipeline_with_first_stage_modules,
+            pipeline_with_first_last_stage_modules,
         )
 
-        if self.pipeline_first_stage_module_fqns:
-            return pipeline_with_first_stage_modules(
+        parallelism = kwargs["parallelism"]
+        if parallelism.pipeline_parallel_module_fqns_per_model_part is None and (
+            self.pipeline_first_stage_module_fqns
+            or self.pipeline_last_stage_module_fqns
+        ):
+            return pipeline_with_first_last_stage_modules(
                 self,
                 first_stage_module_fqns=self.pipeline_first_stage_module_fqns,
+                last_stage_module_fqns=self.pipeline_last_stage_module_fqns,
                 **kwargs,
             )
         return pipeline_llm(self, **kwargs)
@@ -128,7 +135,8 @@ class BaseModel(Module, ABC):
     def parallelize(
         self,
         *,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext | None = None,
+        parallel_dims: ParallelismContext | None = None,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
         compile_config: CompileConfig | None,
@@ -137,13 +145,14 @@ class BaseModel(Module, ABC):
         skip_dp: bool = False,
     ) -> Self:
         """Apply the ordered model-level parallelization lifecycle."""
-        from torchtitan.distributed.utils import get_spmd_context
-
-        with get_spmd_context(parallel_dims=parallel_dims):
-            self._parallelize(parallel_dims)
+        if parallelism_context is None:
+            assert parallel_dims is not None
+            parallelism_context = parallel_dims
+        with parallelism_context.activate_spmd():
+            self._parallelize(parallelism_context)
             from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 
-            configure_moe_aux_loss_reduction(self, parallel_dims)
+            configure_moe_aux_loss_reduction(self, parallelism_context)
             if ac_config is not None:
                 ac_config.build(dump_folder=dump_folder).apply(self)
             if (
@@ -156,11 +165,11 @@ class BaseModel(Module, ABC):
                 apply_compile(
                     self,
                     compile_config=compile_config,
-                    parallel_dims=parallel_dims,
+                    parallelism_context=parallelism_context,
                 )
             if not skip_dp:
                 self._apply_fsdp(
-                    parallel_dims=parallel_dims,
+                    parallelism_context=parallelism_context,
                     training=training,
                     parallelism=parallelism,
                 )
@@ -170,7 +179,7 @@ class BaseModel(Module, ABC):
     def _apply_fsdp(
         self,
         *,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
     ) -> None:
@@ -181,6 +190,6 @@ class BaseModel(Module, ABC):
         cls,
         optimizers: OptimizersContainer,
         model_parts: list[BaseModel],
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
     ) -> None:
-        del optimizers, model_parts, parallel_dims
+        del optimizers, model_parts, parallelism_context

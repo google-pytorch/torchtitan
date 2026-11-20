@@ -127,7 +127,8 @@ def _validate_supported(
 def parallelize_muse_glimmer(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: torchtitan.config.CompileConfig,
@@ -156,6 +157,9 @@ def parallelize_muse_glimmer(
     The parallelized model.
   """
   del kwargs  # Unused.
+  if parallel_dims is None:
+    parallel_dims = parallelism_context
+  assert parallel_dims is not None
   _validate_supported(model, parallel_dims)
 
   effective_compile_config = compile_config

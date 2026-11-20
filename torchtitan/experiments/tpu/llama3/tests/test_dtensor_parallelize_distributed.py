@@ -69,6 +69,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
       pp=1,
       ep=1,
       world_size=world_size,
+      enable_sequence_parallel=False,
   )
 
   def apply_tp_wrapper(model):
@@ -118,6 +119,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
       pp=1,
       ep=1,
       world_size=world_size,
+      enable_sequence_parallel=False,
   )
 
   def apply_tp_wrapper(model):

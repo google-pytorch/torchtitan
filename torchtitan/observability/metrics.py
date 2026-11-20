@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelismContext
 from torchtitan.tools import utils
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
 
@@ -230,7 +230,7 @@ class LoggerContainer(BaseLogger):
 
 
 def ensure_pp_loss_visible(
-    *, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor
+    *, parallelism_context: ParallelismContext, pp_schedule: str, color: Color | NoColor
 ) -> None:
     """
     Ensures that the loss is visible on the console for pipeline-parallel training.
@@ -245,8 +245,8 @@ def ensure_pp_loss_visible(
         return
 
     # Calculate the rank where loss is visible (first rank of the last pipeline stage)
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
+    world_size = parallelism_context.world_size
+    pp_size = parallelism_context.pp
     loss_visible_rank = (world_size // pp_size) * (pp_size - 1)
 
     # Check if the loss-visible rank is included in LOG_RANK environment variable
@@ -264,7 +264,7 @@ def ensure_pp_loss_visible(
 
 def _get_metrics_rank(
     *,
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
     pp_schedule: str,
 ) -> int:
     """
@@ -277,7 +277,7 @@ def _get_metrics_rank(
             - The first rank of the last pipeline stage for other pipeline-parallel schedules
     """
     # Early return for non-pipeline-parallel configurations
-    if not parallel_dims.pp_enabled:
+    if not parallelism_context.pp_enabled:
         return 0
 
     # V Block Schedules return loss on rank 0
@@ -285,8 +285,8 @@ def _get_metrics_rank(
         return 0
 
     # Calculate first rank of the last pipeline stage
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
+    world_size = parallelism_context.world_size
+    pp_size = parallelism_context.pp
     return (world_size // pp_size) * (pp_size - 1)
 
 
@@ -298,7 +298,7 @@ class MetricsProcessor(Configurable):
 
     Args:
         config (Config): Metrics configuration.
-        parallel_dims (ParallelDims): Parallel dimensions.
+        parallelism_context (ParallelismContext): Parallel dimensions.
         device_memory_monitor (DeviceMemoryMonitor): Monitor supplied by the
             execution component that owns the device.
         dump_folder (str): Base folder for log output.
@@ -343,7 +343,7 @@ class MetricsProcessor(Configurable):
 
     config: Config
     logger: BaseLogger
-    parallel_dims: ParallelDims
+    parallelism_context: ParallelismContext
     device_memory_monitor: DeviceMemoryMonitor
     color: utils.NoColor | utils.Color
 
@@ -362,7 +362,8 @@ class MetricsProcessor(Configurable):
         self,
         config: Config,
         *,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext | None = None,
+        parallel_dims: ParallelismContext | None = None,
         device_memory_monitor: DeviceMemoryMonitor,
         dump_folder: str = "./outputs",
         pp_schedule: str = "1F1B",
@@ -372,9 +373,12 @@ class MetricsProcessor(Configurable):
         tag: str | None = None,
         has_quantization: bool = False,
     ):
+        if parallelism_context is None:
+            assert parallel_dims is not None
+            parallelism_context = parallel_dims
         self.logger = self._build_metric_logger(
             config=config,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             dump_folder=dump_folder,
             pp_schedule=pp_schedule,
             ft_enable=ft_enable,
@@ -382,7 +386,7 @@ class MetricsProcessor(Configurable):
             config_dict=config_dict,
             tag=tag,
         )
-        self.parallel_dims = parallel_dims
+        self.parallelism_context = parallelism_context
         self.config = config
         self.device_memory_monitor = device_memory_monitor
         # used for colorful printing
@@ -404,6 +408,14 @@ class MetricsProcessor(Configurable):
         self.optimizers = None
         self.model_parts = None
 
+    @property
+    def parallel_dims(self) -> ParallelismContext:
+        return self.parallelism_context
+
+    @parallel_dims.setter
+    def parallel_dims(self, value: ParallelismContext) -> None:
+        self.parallelism_context = value
+
     def should_log(self, step: int) -> bool:
         if self.step_last_log is None:
             self.step_last_log = step - 1
@@ -413,7 +425,7 @@ class MetricsProcessor(Configurable):
         self,
         *,
         config: Config,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         dump_folder: str,
         pp_schedule: str,
         ft_enable: bool = False,
@@ -437,7 +449,7 @@ class MetricsProcessor(Configurable):
         should_log = has_logging_enabled
         if (not config.save_for_all_ranks) and should_log:
             metrics_rank = _get_metrics_rank(
-                parallel_dims=parallel_dims, pp_schedule=pp_schedule
+                parallelism_context=parallelism_context, pp_schedule=pp_schedule
             )
             should_log = torch.distributed.get_rank() == metrics_rank
 
@@ -523,7 +535,7 @@ class MetricsProcessor(Configurable):
         performance = compute_training_performance_metrics(
             num_tokens=self.ntokens_since_last_log,
             elapsed_time=time_delta,
-            non_data_parallel_size=self.parallel_dims.non_data_parallel_size,
+            non_data_parallel_size=self.parallelism_context.non_data_parallel_size,
             num_flops_per_token=self.num_flops_per_token,
             gpu_peak_flops=self.gpu_peak_flops,
             has_quantization=self.has_quantization,
@@ -592,7 +604,7 @@ class MetricsProcessor(Configurable):
 
         # tokens per second per device, abbreviated as tps
         tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
+            time_delta * self.parallelism_context.non_data_parallel_size
         )
 
         metrics = {

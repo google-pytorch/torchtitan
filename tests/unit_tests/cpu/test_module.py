@@ -16,7 +16,7 @@ import spmd_types as spmd
 import torch.nn as nn
 from spmd_types import SpmdType
 
-from torchtitan.distributed.parallel_dims import MeshAxisName, ParallelDims
+from torchtitan.distributed.parallelism_context import MeshAxisName, ParallelismContext
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module, ModuleDict, ModuleList, Sequential
 from torchtitan.protocols.sharding import ShardingConfig
@@ -368,7 +368,7 @@ class TestModuleRedistribution(unittest.TestCase):
                 partition_spec=spmd.PartitionSpec(None, MeshAxisName.TP),
             ),
         )
-        parallel_dims = ParallelDims(
+        parallelism_context = ParallelismContext(
             dp_replicate=1,
             dp_shard=1,
             cp=1,
@@ -376,20 +376,21 @@ class TestModuleRedistribution(unittest.TestCase):
             pp=1,
             ep=1,
             world_size=2,
+            enable_sequence_parallel=False,
         )
 
         with self.assertRaisesRegex(
             ValueError,
             r"WeightModule\.weight.*tensor dimension 1.*mesh axis tp with size 2",
         ):
-            module._parallelize(parallel_dims)
+            module._parallelize(parallelism_context)
 
     def test_rejects_uneven_ep_parameter_sharding(self):
         module = self.WeightModule(
             (3, 4),
             SpmdType({MeshAxisName.EP: spmd.S(0)}),
         )
-        parallel_dims = ParallelDims(
+        parallelism_context = ParallelismContext(
             dp_replicate=1,
             dp_shard=2,
             cp=1,
@@ -397,13 +398,14 @@ class TestModuleRedistribution(unittest.TestCase):
             pp=1,
             ep=2,
             world_size=2,
+            enable_sequence_parallel=False,
         )
 
         with self.assertRaisesRegex(
             ValueError,
             r"WeightModule\.weight.*tensor dimension 0.*mesh axis ep with size 2",
         ):
-            module._parallelize(parallel_dims)
+            module._parallelize(parallelism_context)
 
 
 class TestParallelizeModuleProtocol(unittest.TestCase):

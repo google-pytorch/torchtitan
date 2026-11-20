@@ -19,9 +19,17 @@ class GraphTrainerMuseGlimmerModel(GraphTrainerModel, MuseGlimmerModel):
     def __init__(self, config: Config):
         super().__init__(config)
 
-    def parallelize(self, *, parallel_dims, **kwargs):
-        if parallel_dims.cp_enabled:
+    def parallelize(
+        self,
+        *,
+        parallelism_context=None,
+        parallel_dims=None,
+        **kwargs,
+    ):
+        if parallelism_context is None:
+            parallelism_context = parallel_dims
+        if parallelism_context.cp_enabled:
             raise ValueError(
                 "Context parallelism is not supported for GraphTrainer MuseGlimmer."
             )
-        return super().parallelize(parallel_dims=parallel_dims, **kwargs)
+        return super().parallelize(parallelism_context=parallelism_context, **kwargs)

@@ -28,7 +28,7 @@ from torch.testing._internal.common_utils import TestCase
 from torch.utils.checkpoint import checkpoint, CheckpointPolicy
 
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelismContext
 from torchtitan.experiments.graph_trainer.common_utils import (
     _EP_TOKEN_COUNT_EXCHANGE,
     _EP_TOKEN_COUNT_SYNC,
@@ -73,6 +73,7 @@ from torchtitan.experiments.graph_trainer.ep_overlap_pass import (
     _ScheduledRegion,
 )
 from torchtitan.experiments.graph_trainer.ep_pass_utils import (
+    _chunk_owner,
     CHUNK_SYMBOL_HINTS_META,
     ChunkBody,
     ChunkedRegion,
@@ -140,6 +141,21 @@ from torchtitan.experiments.graph_trainer.tests.test_performance_passes import (
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module, ModuleList
+
+
+@torch.library.custom_op(
+    "torchtitan_graph_trainer_test::ordered_identity", mutates_args=()
+)
+def _ordered_identity(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@_ordered_identity.register_fake
+def _ordered_identity_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+_ordered_identity.register_effect(torch.library.EffectType.ORDERED)
 
 
 class TestDefaultTransformerBlockBuckets(TestCase):
@@ -249,6 +265,44 @@ class TestFSDPUnshardDedupPass(TestCase):
         )
         gm.graph.lint()
 
+    def test_unshard_shared_by_chunks_has_no_chunk_owner(self) -> None:
+        gm = self._duplicate_unshard_graph()
+        fsdp_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.meta.get("custom", {}).get(FSDP_PARAM_FQNS_META)
+        ]
+        self.assertEqual(len(fsdp_nodes), 6)
+        for chunk_id, nodes in enumerate((fsdp_nodes[:3], fsdp_nodes[3:])):
+            for node in nodes:
+                custom = dict(node.meta["custom"])
+                custom.update(
+                    {
+                        "chunk_id": chunk_id,
+                        "chunked_region_fqn": "layers.0.moe",
+                        "chunked_region_role": "body",
+                    }
+                )
+                node.meta["custom"] = custom
+
+        deduplicate_fsdp_unshard_chains_pass(gm)
+
+        all_gathers = [node for node in gm.graph.nodes if is_all_gather(node)]
+        self.assertEqual(len(all_gathers), 1)
+        all_gather = all_gathers[0]
+        self.assertIsNone(_chunk_owner(all_gather))
+
+        self.assertEqual(len(all_gather.users), 1)
+        wait = next(iter(all_gather.users))
+        self.assertIsNone(_chunk_owner(wait))
+        self.assertEqual(
+            {_chunk_owner(node) for node in wait.users},
+            {
+                ChunkOwner("layers.0.moe", False, 0),
+                ChunkOwner("layers.0.moe", False, 1),
+            },
+        )
+
 
 class ToyModel(Module):
     """A small toy model with multiple linear layers and activation
@@ -279,8 +333,8 @@ class TestReassignCollectivePgsPass(FSDPTest):
     """Integration tests: toy model + simple_fsdp + export_joint + reassign_collective_pgs_pass."""
 
     def _setup(self):
-        """Set up ParallelDims and device mesh for FSDP."""
-        self.parallel_dims = ParallelDims(
+        """Set up ParallelismContext and device mesh for FSDP."""
+        self.parallelism_context = ParallelismContext(
             dp_shard=-1,
             dp_replicate=1,
             cp=1,
@@ -288,6 +342,7 @@ class TestReassignCollectivePgsPass(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
     def _make_fsdp_model(self, dim=16, n_layers=3):
@@ -297,7 +352,7 @@ class TestReassignCollectivePgsPass(FSDPTest):
             get_simple_fsdp_mesh,
         )
 
-        fsdp_mesh = get_simple_fsdp_mesh(self.parallel_dims)
+        fsdp_mesh = get_simple_fsdp_mesh(self.parallelism_context)
         model = data_parallel(model, device_mesh=fsdp_mesh, mode="fully_shard")
         return model
 
@@ -307,7 +362,7 @@ class TestReassignCollectivePgsPass(FSDPTest):
             get_simple_fsdp_mesh,
         )
 
-        fsdp_mesh = get_simple_fsdp_mesh(self.parallel_dims)
+        fsdp_mesh = get_simple_fsdp_mesh(self.parallelism_context)
         return fsdp_mesh.get_group().group_name
 
     def _export_and_get_bw_graph(self, model, inputs):
@@ -578,7 +633,10 @@ class TestFsdpDenseSchedulerPass(TestCase):
                     "layers.1.moe.router",
                     "layers.1.moe.shared_experts",
                 ],
-                "layers.1.moe.routed_experts.inner_experts",
+                [
+                    "layers.1.moe.routed_experts.w13",
+                    "layers.1.moe.routed_experts.w2",
+                ],
                 ["norm", "lm_head"],
             ],
             n_layers=2,
@@ -653,7 +711,7 @@ class TestFsdpDenseSchedulerPass(TestCase):
             )
             for plan_fqn in (
                 "layers.1.attention",
-                "layers.1.moe.routed_experts.inner_experts",
+                "layers.1.moe.routed_experts.w13",
             )
         ]
         fwd_dense1 = self._tag_fsdp_schedule_node(
@@ -678,7 +736,7 @@ class TestFsdpDenseSchedulerPass(TestCase):
             )
             for plan_fqn in (
                 "layers.0.attention",
-                "layers.0.moe.routed_experts.inner_experts",
+                "layers.0.moe.routed_experts.w13",
             )
         ]
         bwd_dense0 = self._tag_fsdp_schedule_node(
@@ -778,14 +836,14 @@ class TestFsdpDenseSchedulerPass(TestCase):
             shared_prep,
             [
                 "layers.1.attention",
-                "layers.1.moe.routed_experts.inner_experts",
+                "layers.1.moe.routed_experts.w13",
             ],
             "fwd",
         )
         buckets = []
         for plan_fqn in (
             "layers.1.attention",
-            "layers.1.moe.routed_experts.inner_experts",
+            "layers.1.moe.routed_experts.w13",
         ):
             bucket = graph.call_function(
                 torch.ops.bucketing._pre_bucket_all_gather.default,
@@ -1704,12 +1762,12 @@ class TestFsdpDenseSchedulerPass(TestCase):
                 c10d.all_to_all_single.default,
                 args=(ffn_norm, [], [], "ep_pg"),
             ),
-            "layers.1.moe.routed_experts.inner_experts",
+            "layers.1.moe.routed_experts",
             backward=True,
         )
         moe_dispatch_wait = self._tag_fsdp_schedule_node(
             graph.call_function(c10d.wait_tensor.default, args=(moe_dispatch,)),
-            "layers.1.moe.routed_experts.inner_experts",
+            "layers.1.moe.routed_experts",
             backward=True,
         )
         dense1_attention = self._tag_fsdp_schedule_node(
@@ -1777,7 +1835,7 @@ class TestFsdpDenseSchedulerPass(TestCase):
 
 class TestOverlapPgIsolationPass(FSDPTest):
     def _setup(self):
-        self.parallel_dims = ParallelDims(
+        self.parallelism_context = ParallelismContext(
             dp_shard=-1,
             dp_replicate=1,
             cp=1,
@@ -1785,6 +1843,7 @@ class TestOverlapPgIsolationPass(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
     def _get_fsdp_pg_name(self):
@@ -1792,7 +1851,7 @@ class TestOverlapPgIsolationPass(FSDPTest):
             get_simple_fsdp_mesh,
         )
 
-        fsdp_mesh = get_simple_fsdp_mesh(self.parallel_dims)
+        fsdp_mesh = get_simple_fsdp_mesh(self.parallelism_context)
         return fsdp_mesh.get_group().group_name
 
     def _count_all_ag_nodes(self, gm):
@@ -1936,6 +1995,30 @@ class TestApplySACPass(TestCase):
         """Return all call_function nodes from the graph."""
         return [n for n in gm.graph.nodes if n.op == "call_function"]
 
+    def test_none_policy_disables_activation_rematerialization(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        fwd = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+        bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(fwd, 2))
+        bwd.meta["autograd_backward"] = True
+        graph.output(bwd)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(memory_policy="none")
+        )
+        tag_with_memory_policy_pass(gm, config=config)
+        selective_activation_remat_pass(gm)
+
+        self.assertEqual(fwd.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertFalse(
+            any(
+                node.name.endswith("_recomputed")
+                for node in gm.graph.nodes
+                if node.op == "call_function"
+            )
+        )
+
     def test_non_save_ops_marked_recompute(self):
         """Ops not in the save list should be marked PREFER_RECOMPUTE."""
         gm = self._build_gm(
@@ -1983,6 +2066,29 @@ class TestApplySACPass(TestCase):
         self.assertEqual(
             tags[torch.ops.aten.relu.default], CheckpointPolicy.MUST_RECOMPUTE
         )
+
+    def test_effectful_ops_are_saved_and_not_rematerialized(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        ordered_identity = (
+            torch.ops.torchtitan_graph_trainer_test.ordered_identity.default
+        )
+        effect = graph.call_function(ordered_identity, args=(x,))
+        backward = graph.call_function(torch.ops.aten.mul.Tensor, args=(effect, 2))
+        backward.meta["autograd_backward"] = True
+        graph.output(backward)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+        self.assertEqual(effect.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+
+        selective_activation_remat_pass(gm)
+        effect_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function" and node.target is ordered_identity
+        ]
+        self.assertEqual(effect_nodes, [effect])
 
     def test_getitem_propagates_parent_tags(self):
         """operator.getitem nodes should inherit the parent's recompute tag."""
@@ -2700,7 +2806,7 @@ class TestBucketingPrefetchOrder(FSDPTest):
         )
         from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 
-        parallel_dims = ParallelDims(
+        parallelism_context = ParallelismContext(
             dp_shard=-1,
             dp_replicate=1,
             cp=1,
@@ -2708,6 +2814,7 @@ class TestBucketingPrefetchOrder(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
         model_config = llama3_model_registry("debugmodel")
@@ -2721,7 +2828,7 @@ class TestBucketingPrefetchOrder(FSDPTest):
             get_simple_fsdp_mesh,
         )
 
-        fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
+        fsdp_mesh = get_simple_fsdp_mesh(parallelism_context)
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -2741,7 +2848,7 @@ class TestBucketingPrefetchOrder(FSDPTest):
             GraphTrainer,
             tokenizer=HuggingFaceTokenizer(tokenizer_path="./tests/assets/tokenizer"),
             fsdp_reshard_after_forward=fsdp_reshard_after_forward,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
         )
 
         num_tokens = self.BATCH_SIZE * self.SEQ_LEN
@@ -4418,7 +4525,7 @@ class TestChunkPasses(TestCase):
                     expects_fsdp_schedule,
                 )
 
-    def test_moe_efsdp_bucket_plan_splits_expert_buckets(self):
+    def test_moe_edp_shard_bucket_plan_splits_expert_buckets(self):
         buckets = get_default_transformer_block_buckets(
             3,
             moe_layer_ids=frozenset({1}),
@@ -4435,7 +4542,13 @@ class TestChunkPasses(TestCase):
             ],
             buckets,
         )
-        self.assertIn("layers.1.moe.routed_experts.inner_experts", buckets)
+        self.assertIn(
+            [
+                "layers.1.moe.routed_experts.w13",
+                "layers.1.moe.routed_experts.w2",
+            ],
+            buckets,
+        )
         self.assertNotIn("layers.1", buckets)
 
     def test_prepare_ep_overlap_trace_inputs_marks_batch_dims(self):

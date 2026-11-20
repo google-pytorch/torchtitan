@@ -101,8 +101,8 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
 
     fp8, plain = _converted(config.model_spec.model)
     self.assertEqual(plain, ["lm_head"])
-    # wqkv, wo, w1, w2 and w3 in each of the 80 layers.
-    self.assertLen(fp8, 5 * 80)
+    # wqkv, wo, w13 and w2 in each of the 80 layers.
+    self.assertLen(fp8, 4 * 80)
     self.assertIs(config.model_spec.parallelize_fn, parallelize_llama)
 
 

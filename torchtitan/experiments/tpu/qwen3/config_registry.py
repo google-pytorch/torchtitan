@@ -715,8 +715,7 @@ def qwen3_32b_4x8x8() -> TpuGraphTrainer.Config:
   # and 56 GiB peak HBM.
   cfg.compile.fsdp_barrier_policy = "interleave"
   cfg.compile.fsdp_allreduce_slice_parameter_patterns = (
-      "layers.*.feed_forward.w1.weight",
-      "layers.*.feed_forward.w3.weight",
+      "layers.*.feed_forward.w13.weight",
   )
   cfg.compile.fsdp_allreduce_slice_max_input_bytes = 25600 * 5120 * 4
   return cfg

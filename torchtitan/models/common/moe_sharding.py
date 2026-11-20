@@ -186,8 +186,14 @@ def _routed_experts_sharding_configs(
             state_shardings={"weight": expert_param_placement_sparse()}
         )
     else:
-        w13_config = None
-        w2_config = None
+        # Fork: replicated DTensors rather than plain tensors (see
+        # ``_expert_param_placement_dense_replicated``), as for ``inner_experts``.
+        w13_config = ShardingConfig(
+            state_shardings={"weight": _expert_param_placement_dense_replicated()}
+        )
+        w2_config = ShardingConfig(
+            state_shardings={"weight": _expert_param_placement_dense_replicated()}
+        )
 
     # EP requires dense TP to shard routed tokens. Without EP, validation also
     # requires TP to have size 1, so this TP placement is a runtime no-op.

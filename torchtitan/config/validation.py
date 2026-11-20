@@ -101,24 +101,12 @@ def validate_model_training_config(
                     f"{moe_fqn}.num_experts ({moe.num_experts}) must be "
                     f"divisible by expert_parallel_degree ({ep})."
                 )
-            # Fork: TPU recipes run ``GroupedExperts`` (``inner_experts``)
-            # instead of upstream's ``w13``/``w2`` GroupedLinears, and keep
-            # EP-disabled expert weights as replicated DTensors; only check
-            # upstream's layout.
-            w13 = getattr(moe.routed_experts, "w13", None)
-            routed_weight_sharding = (
-                w13.sharding_config if w13 is not None else None
-            )
-            if (
-                w13 is not None
-                and model.tok_embeddings.sharding_config is not None
-                and (routed_weight_sharding is not None) != (ep > 1)
-            ):
-                raise ValueError(
-                    f"{moe_fqn} routed-expert sharding does not match "
-                    f"expert_parallel_degree ({ep}). Resolve model sharding "
-                    "from the consumer's parallelism config before building it."
-                )
+            # Fork: EP-disabled routed-expert weights keep a replicated
+            # sharding config (spmd_types FSDP needs DTensors; see
+            # moe_sharding._expert_param_placement_dense_replicated) and TPU
+            # recipes may run ``GroupedExperts`` (``inner_experts``) instead
+            # of ``w13``/``w2``, so upstream's "sharding config present iff
+            # EP > 1" check does not apply.
 
         for fqn, dispatcher, _, _ in model.traverse(LocalTokenDispatcher.Config):
             if ep == 1 and isinstance(

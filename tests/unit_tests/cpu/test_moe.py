@@ -640,8 +640,28 @@ class TestMoE(unittest.TestCase):
         )
 
         routed = moe_config.routed_experts
-        self.assertIsNone(routed.w13.sharding_config)
-        self.assertIsNone(routed.w2.sharding_config)
+        assert routed.sharding_config.in_src_shardings is not None
+        self.assertIsNone(routed.sharding_config.in_dst_shardings)
+        for name in ("x_TD", "topk_scores_TK", "topk_expert_ids_TK"):
+            self.assertEqual(
+                tp_type(routed.sharding_config.in_src_shardings[name]), spmd.R
+            )
+        self.assertEqual(
+            tp_type(
+                routed.sharding_config.in_src_shardings["num_local_tokens_per_expert_E"]
+            ),
+            spmd.R,
+        )
+        self.assertEqual(tp_type(routed.sharding_config.out_src_shardings), spmd.R)
+        self.assertIsNone(routed.sharding_config.out_dst_shardings)
+        # Fork: EP-disabled routed experts carry replicated dense placements so
+        # their weights are DTensors under spmd_types FSDP (dp_mesh_dims),
+        # rather than upstream's None (plain tensors).
+        for grouped in (routed.w13, routed.w2):
+            placement = grouped.sharding_config.state_shardings["weight"]
+            self.assertEqual(tp_type(placement), spmd.R)
+            self.assertIsNone(grouped.sharding_config.in_src_shardings)
+            self.assertIsNone(grouped.sharding_config.out_src_shardings)
 
 
 if __name__ == "__main__":

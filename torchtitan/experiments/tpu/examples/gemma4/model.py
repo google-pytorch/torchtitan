@@ -191,10 +191,13 @@ class QKVLinearKeqV(QKVLinear):
     def forward(  # pyrefly: ignore[bad-override]
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_tokens = x.shape[0]
         # [T, n_kv_heads * R * head_dim] -> [T, n_kv_heads, R, head_dim]; -1 for
         # n_kv_heads so TP head sharding is handled automatically.
         qk = self.wqkv(x)
+        # Read T from the projection output, not from ``x``: under TP sequence
+        # parallel ``wqkv`` (a ColumnParallelLinear) all-gathers the
+        # token-sharded input, so ``qk`` has more rows than ``x``.
+        num_tokens = qk.shape[0]
         with spmd.local():
             qk = qk.view(num_tokens, -1, self.r_dim, self.head_dim)
             if spmd.is_type_checking():

@@ -157,11 +157,30 @@ def parallelize_hf_transformers(
 
     convert_hf_to_module(model)
 
-    # 3. Set sharding configs on all non-MoE modules
-    set_hf_sharding_configs(
-        model,
-        enable_sp=parallelism_context.tp_enabled,
+    # 3. Set sharding configs on all non-MoE modules. They assume Llama-style
+    # block names (`self_attn`, `mlp`); with no TP/EP/CP there is nothing to
+    # place, so architectures without those names (e.g. GPT-2's `attn`) skip
+    # this pass and train under data parallelism only. CP needs this pass too:
+    # it attaches the flex kernels that step 3b wraps to all-gather K/V across
+    # the CP axis.
+    needs_sharding_configs = (
+        parallelism_context.tp_enabled
+        or parallelism_context.ep > 1
+        or parallelism_context.cp_enabled
     )
+    llama_style_layers = all(
+        hasattr(layer, "self_attn") for layer in model.layers.values()
+    )
+    if needs_sharding_configs or llama_style_layers:
+        set_hf_sharding_configs(
+            model,
+            enable_sp=parallelism_context.tp_enabled,
+        )
+    else:
+        logger.info(
+            "Skipping HF sharding configs: no TP/EP/CP and the decoder layers "
+            "have no `self_attn` (e.g. GPT-2)."
+        )
 
     # 3b. Under CP, wrap each flex kernel forward to all-gather k/v across
     # the CP axis (on the seq dim). Must run before model._parallelize so the

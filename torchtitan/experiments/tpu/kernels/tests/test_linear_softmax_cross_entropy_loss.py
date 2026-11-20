@@ -436,17 +436,26 @@ class LinearSoftmaxCrossEntropyLossTest(
 
   @parameterized.named_parameters(
       # name, dtype, soft_cap, output_multiplier, loss_rtol, grad_rtol,
-      # grad_atol. fp32 operands go through the MXU at the TPU's default
-      # (bf16-pass) precision, so each row's loss is off by up to ~0.6% from
-      # the FP32 reference (a summed loss averages this out, hence the 1e-4
-      # of test_linear_softmax_ce_softcap.py). bf16 operands are exact
+      # grad_atol, rel_fro. fp32 operands go through the MXU at the TPU's
+      # default (bf16-pass) precision, so each row's loss is off by up to
+      # ~0.6% from the FP32 reference (a summed loss averages this out, hence
+      # the 1e-4 of test_linear_softmax_ce_softcap.py), and a few dW elements
+      # by up to ~0.08 (6 of 131072 at cap 20, multiplier 1); rel_fro bounds
+      # the gradients as a whole, as in that test. bf16 operands are exact
       # products in FP32, so the bf16 case stays tight.
-      ("fp32_cap20_m1", torch.float32, 20.0, 1.0, 1e-2, 1e-2, 5e-2),
-      ("fp32_cap20_m0196", torch.float32, 20.0, 0.196116, 1e-2, 1e-2, 5e-2),
-      ("bf16_cap20_m1", torch.bfloat16, 20.0, 1.0, 2e-3, 5e-2, 5e-2),
+      ("fp32_cap20_m1", torch.float32, 20.0, 1.0, 1e-2, 1e-2, 0.1, 1e-2),
+      ("fp32_cap20_m0196", torch.float32, 20.0, 0.196116, 1e-2, 1e-2, 0.1, 1e-2),
+      ("bf16_cap20_m1", torch.bfloat16, 20.0, 1.0, 2e-3, 5e-2, 5e-2, 2e-2),
   )
   def test_gradient_reduction_none_soft_cap(
-      self, dtype, soft_cap, output_multiplier, loss_rtol, grad_rtol, grad_atol
+      self,
+      dtype,
+      soft_cap,
+      output_multiplier,
+      loss_rtol,
+      grad_rtol,
+      grad_atol,
+      rel_fro,
   ):
     """Per-row loss and backward through the soft-capped kernel."""
     device = self.accelerator_device
@@ -497,12 +506,13 @@ class LinearSoftmaxCrossEntropyLossTest(
         (x_tpu.grad, x_ref.grad),
         (w_tpu.grad, w_ref.grad),
     ):
+      actual_grad = actual_grad.cpu().float()
+      expected_grad = expected_grad.float()
       torch.testing.assert_close(
-          actual_grad.cpu().float(),
-          expected_grad.float(),
-          rtol=grad_rtol,
-          atol=grad_atol,
+          actual_grad, expected_grad, rtol=grad_rtol, atol=grad_atol
       )
+      error = (actual_grad - expected_grad).norm() / expected_grad.norm()
+      self.assertLess(error.item(), rel_fro)
 
   def test_single_hidden_block_non_pow2_vocab_tile_640(self):
     """Tests single-H-block Mosaic LCE with non-power-of-2 v_block_size=640."""

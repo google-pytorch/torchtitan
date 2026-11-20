@@ -120,6 +120,10 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_kimi_k3_pp_block_grads",
     "tests.unit_tests.cpu.test_kimi_k3_pp_layout",
     "tests.unit_tests.cpu.test_qwen3_5_moe",
+    # DeepSeek V4 attention runs through attn_gym.sparse (#4855, #4856).
+    "tests.unit_tests.cpu.test_deepseek_v4_mtp",
+    "tests.unit_tests.cpu.test_deepseek_v4_flops",
+    "tests.unit_tests.cpu.test_deepseek_v4_compressor",
     # Missing optional dependency torchvision
     "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
     "tests.unit_tests.cpu.components.data.test_qwen_multimodal_data",

@@ -196,7 +196,8 @@ def classify_fsdp_roles(
   gradient outputs, directly or through another such chain, is a gradient
   reduction (``"rs"``). Other collectives, such as MoE token exchange or
   tensor/context-parallel activation collectives, depend on compute and map to
-  ``None``.
+  ``None``. Integer collectives (e.g. saved MoE routing ids or counts) are
+  neither parameters nor gradients and always map to ``None``.
   """
   member = {
       node: launch
@@ -206,7 +207,11 @@ def classify_fsdp_roles(
   roles: dict[torch.fx.Node, FsdpRole | None] = {}
   for launch in reversed(list(collective_chains)):
     inputs, users = chain_boundary(collective_chains[launch])
-    if all(n.op in ("placeholder", "get_attr") for n in inputs):
+    val = launch.meta.get("val")
+    is_float = not isinstance(val, torch.Tensor) or val.is_floating_point()
+    if not is_float:
+      roles[launch] = None
+    elif all(n.op in ("placeholder", "get_attr") for n in inputs):
       roles[launch] = "ag"
     elif users and all(
         n.op == "output" or roles.get(member.get(n)) == "rs" for n in users

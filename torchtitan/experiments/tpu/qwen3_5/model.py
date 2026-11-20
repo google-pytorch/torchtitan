@@ -8,9 +8,15 @@ import torch
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.distributed.spmd_types import spmd_local_context
+from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
 from torchtitan.experiments.tpu.components.layer_loop import TpuLayerLoop, register_layer_loop_forward
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
+from torchtitan.models.qwen3_5.model import (
+    Qwen35Attention,
+    Qwen35AttentionMaskDict,
+    Qwen35Model,
+    Qwen35TransformerBlock,
+)
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -162,3 +168,14 @@ def _layer_loop_forward(
 
 
 register_layer_loop_forward(Qwen35Model, _layer_loop_forward)
+
+
+class TpuQwen35Model(Qwen35Model):
+  """``Qwen35Model`` whose config wires TPU EP execution."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Qwen35Model.Config):
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
+      use_expert_parallel(self, ep_degree=config.parallelism.expert_parallel_degree)

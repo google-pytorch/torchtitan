@@ -319,6 +319,7 @@ def revert_gated_delta_context_parallel(model: Any) -> None:
     single = TpuInnerGatedDeltaNet.Config(**{
         f.name: getattr(inner, f.name)
         for f in fields(TpuInnerGatedDeltaNet.Config)
+        if f.init
     })
     if isinstance(parent, list):
       parent[attr] = single

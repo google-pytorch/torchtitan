@@ -1040,6 +1040,7 @@ class GraphSplitTest(absltest.TestCase):
         chains, 4, ("ag", "rs")
     )
     self.assertNotIn(launch, owners)
+    # Restore for the checks below (the cleanup covers a failed assert).
     launch.args = fsdp_args
     with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
       split_backward_graph_by_layer(

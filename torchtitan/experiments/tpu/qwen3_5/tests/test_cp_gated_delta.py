@@ -34,6 +34,8 @@ from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import CPTpuInnerGatedDel
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel, TpuInnerGatedDeltaNet
 from torchtitan.experiments.tpu.tests.test_cp_attention import _DOCS, _emulated_cp_group, _packed_positions, _Ranks, _reset_cp_state, _SEQ_LEN, _shard, _unshard
 from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 
 _STRATEGIES = ("all_gather", "ulysses")
@@ -317,7 +319,8 @@ class CompiledCPGatedDeltaNetTest(parameterized.TestCase):
     self.assertEqual(self._compile_and_run(load_balancer), 1)
 
   def test_uncached_rank_raises_while_compiling(self):
-    with self.assertRaisesRegex(Exception, "not cached while compiling"):
+    # Dynamo re-raises it as a RuntimeError subclass.
+    with self.assertRaisesRegex(RuntimeError, "not cached while compiling"):
       self._compile_and_run("headtail")
 
 
@@ -509,6 +512,14 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "n_key_heads"):
       self._cp_config(gated_delta_lb=None, cp=4)
 
+  def test_rejects_tensor_parallelism(self):
+    cfg = self._cp_config(gated_delta_lb=None)
+    cfg.parallelism.tensor_parallel_degree = 2
+    with self.assertRaisesRegex(NotImplementedError, "tensor parallelism"):
+      cp_gated_delta.validate_gated_delta_context_parallel(
+          cfg.model_spec.model, cfg.parallelism
+      )
+
   def test_transform_is_idempotent_and_keeps_the_kernel(self):
     cfg = config_registry.qwen35_debugmodel()
     model = cfg.model_spec.model
@@ -567,7 +578,14 @@ class CPQwen35ConfigTest(parameterized.TestCase):
         "prepare_context_parallel_input",
         side_effect=lambda d, *args: d,
     ):
-      owner.cp_shard(batch, None, mesh, tpu_cp_load_balancer(strategy), None)
+      # The input sharding TpuQwen35Model.preprocess_inputs passes.
+      owner.cp_shard(
+          batch,
+          {**decoder_input_sharding(), **multimodal_input_sharding()},
+          mesh,
+          tpu_cp_load_balancer(strategy),
+          None,
+      )
     self.assertEqual(cp_attention.cp_input_layout(tokens), want)
     self.assertIsNone(cp_attention.cp_input_layout(tokens + 1))
 

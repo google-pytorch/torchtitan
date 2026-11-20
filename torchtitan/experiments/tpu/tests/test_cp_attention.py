@@ -870,6 +870,26 @@ class CPValidationTest(parameterized.TestCase):
           OtherUlysses,
           KVAllGatherCPScaledDotProductInnerAttention,
       )
+    # The CP versions must subclass the attention and their strategy's mixin.
+    with self.assertRaisesRegex(TypeError, "must subclass"):
+      cp_attention.register_tpu_cp_inner_attention(
+          cp_attention.ScaledDotProductInnerAttention,
+          KVAllGatherCPScaledDotProductInnerAttention,
+          KVAllGatherCPScaledDotProductInnerAttention,
+      )
+
+  def test_cp_rank_tensor_miss_under_non_strict_tracing(self):
+    """A traced miss warns once and returns the rank without caching it."""
+    _reset_cp_state(self)
+    group = mock.Mock()
+    group.rank.return_value = 1
+    with mock.patch.object(cp_attention, "_tracing", return_value=True):
+      with self.assertLogs(cp_attention.logger, level="WARNING") as logs:
+        rank = cp_attention.cp_rank_tensor("cpu", group)
+        cp_attention.cp_rank_tensor("cpu", group)
+    self.assertLen(logs.output, 1)
+    self.assertEqual(rank.tolist(), [1])
+    self.assertEmpty(cp_attention._CP_RANK_CACHE)
 
   def test_rejects_non_causal_kv_all_gather(self):
     config = self._config("all_gather")

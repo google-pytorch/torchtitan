@@ -1,6 +1,6 @@
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
-from typing import Literal
+from typing import Literal, TypeVar
 
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
@@ -487,12 +487,16 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   return cfg
 
 
+# A TPUTrainerConfig or a subclass (e.g. TpuGraphTrainer.Config).
+_TPUConfigT = TypeVar("_TPUConfigT", bound=TPUTrainerConfig)
+
+
 def _qwen35_cp(
-    config: TPUTrainerConfig,
+    config: _TPUConfigT,
     *,
     strategy: Literal["ulysses", "all_gather"],
     cp_degree: int,
-) -> TPUTrainerConfig:
+) -> _TPUConfigT:
   """Enables TPU context parallelism for hybrid Qwen3.5.
 
   As ``qwen3/config_registry.py::_qwen3_cp``, sets the CP degree and the load

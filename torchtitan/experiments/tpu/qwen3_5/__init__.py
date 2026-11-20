@@ -39,7 +39,8 @@ from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScale
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 
-# Registers the GatedDeltaNet CP validator with validate_tpu_context_parallel.
+# Registers the GatedDeltaNet CP validator and reverter
+# (validate_tpu_context_parallel / revert_tpu_context_parallel).
 from torchtitan.experiments.tpu.qwen3_5 import cp_gated_delta  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
     TpuGatedDeltaKernel,

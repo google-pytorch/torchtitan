@@ -173,8 +173,9 @@ class TpuQwen35Model(Qwen35Model):
       )
     positions = batch.get("positions")
     if positions is None:
-      # Not an assert: the KV all-gather cp_shard and the GatedDeltaNet
-      # document resets need positions, also under `python -O`.
+      # Not an assert (stripped under `python -O`): RoPE on each rank's token
+      # shard, the KV all-gather cp_shard and the GatedDeltaNet document
+      # resets all need the global positions.
       raise ValueError(
           "Qwen3.5 context parallelism on TPU needs RoPE positions in the"
           " batch."

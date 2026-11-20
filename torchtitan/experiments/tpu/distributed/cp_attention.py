@@ -147,10 +147,11 @@ def _record_layout_of_input(
 def _normalize_cp_device(device: torch.device | str) -> torch.device:
   """Returns a canonical ``torch.device`` for ``_CP_RANK_CACHE`` keys.
 
-  ``_cache_cp_rank_for_mesh``, ``init_weights`` and ``_get_cp_rank_tensor``
+  ``_cache_cp_rank_for_mesh`` (from ``cp_shard``), ``init_weights`` and
+  ``cp_rank_tensor`` (KV all-gather attention, head-parallel GatedDeltaNet)
   receive the device from different sources (mesh ``device_type``,
-  ``buffer_device``, ``q_THK.device``). Normalizing ``cpu:0`` -> ``cpu`` and
-  filling in a missing accelerator index from the active device module's
+  ``buffer_device``, the activations' device). Normalizing ``cpu:0`` -> ``cpu``
+  and filling in a missing accelerator index from the active device module's
   ``current_device()`` (or 0) keeps all three on the same cache key.
   """
   dev = torch.device(device)
@@ -191,6 +192,9 @@ def cp_rank_tensor(device: torch.device | str, group: Any) -> torch.Tensor:
     The cached rank tensor (cached now on an eager miss). Under non-strict
     tracing, a miss returns an uncached tensor that the trace records as a
     constant.
+
+  Raises:
+    RuntimeError: On a cache miss while Dynamo is compiling.
   """
   r = int(group.rank())
   dev = _normalize_cp_device(device)
@@ -330,8 +334,16 @@ def cp_all_to_all(
 def cp_all_gather(x: torch.Tensor, group: Any, *, dim: int = 0) -> torch.Tensor:
   """All-gathers ``x`` along ``dim`` over the CP ``group``, in rank order.
 
-  Forward only (for integer metadata such as ``positions``): no gradient.
+  Forward only, for metadata such as ``positions``: the traced collective has
+  no gradient, so ``x`` must not require one.
+
+  Raises:
+    ValueError: If ``x`` requires a gradient.
   """
+  if x.requires_grad:
+    raise ValueError(
+        "cp_all_gather is forward-only; reshard activations with cp_all_to_all."
+    )
   if _tracing():
     return _wait(funcol.all_gather_tensor(x, dim, group))
   return spmd.redistribute(x, group, src=spmd.S(dim), dst=spmd.R)
@@ -424,13 +436,9 @@ def _full_sequence_segment_ids(
     positions: torch.Tensor, group: Any
 ) -> torch.Tensor:
   """Fallback packed-document ``segment_ids`` when ``cp_shard`` was not used."""
-  if _tracing():
-    positions = _wait(funcol.all_gather_tensor(positions, _TOKEN_DIM, group))
-  else:
-    positions = spmd.redistribute(
-        positions, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
-    )
-  return _orig_segment_ids_from_positions(positions)
+  return _orig_segment_ids_from_positions(
+      cp_all_gather(positions, group, dim=_TOKEN_DIM)
+  )
 
 
 class _TPUCPInnerAttention(CPInnerAttention):
@@ -1361,6 +1369,7 @@ def revert_tpu_context_parallel(model: Any) -> None:
         attn.inner_attention = single.Config(**{
             f.name: getattr(attn.inner_attention, f.name)
             for f in fields(single.Config)
+            if f.init
         })
   for reverter in _TPU_CP_REVERTERS:
     reverter(model)

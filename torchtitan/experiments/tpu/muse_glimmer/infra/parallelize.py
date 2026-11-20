@@ -17,7 +17,7 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.distributed.compile import apply_compile
+from torchtitan.experiments.tpu.components.compile import apply_compile
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     resolve_fsdp_mesh,
@@ -25,6 +25,7 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
+from torchtitan.distributed.local_compile import LocalCompileConfig
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ def parallelize_muse_glimmer(
     parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointingConfig | None",
     dump_folder: str,
     skip_dp: bool = False,

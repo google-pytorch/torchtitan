@@ -443,8 +443,14 @@ def data_parallel(
     # TODO: Unify this with device_mesh as a global data- and model-parallel mesh.
     non_dp_mesh: DeviceMesh | None = None,
     ignored_params: set[nn.Parameter] | None = None,
+    param_shard_placements: dict[nn.Parameter, Shard] | None = None,
 ) -> nn.Module:
-    """Shard ``model`` and install the data-parallel parametrization."""
+    """Shard ``model`` and install the data-parallel parametrization.
+
+    ``param_shard_placements`` overrides the per-parameter shard placement;
+    parameters it omits use ``Shard(shard_dim)``. It defaults to
+    ``linear_param_shard_placements(model)``.
+    """
     # A dict `shard_dim` names an axis per parameter, for a module whose
     # parameters do not all divide on the same one. It has no single axis to
     # build `param_sharding` from, so the tuples below carry a placeholder:
@@ -460,7 +466,8 @@ def data_parallel(
     elif mode not in ("replicate", "fully_shard"):
         raise ValueError(f"Unsupported mode {mode}")
 
-    param_shard_placements = linear_param_shard_placements(model)
+    if param_shard_placements is None:
+        param_shard_placements = linear_param_shard_placements(model)
 
     def get_param_sharding(param: nn.Parameter) -> tuple[Placement, ...]:
         if mode == "replicate":

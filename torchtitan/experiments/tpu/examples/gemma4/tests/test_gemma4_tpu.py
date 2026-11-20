@@ -154,7 +154,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     ):
       cfg = fn()
       self.assertFalse(cfg.model.enable_weight_tying)
-      self.assertEqual(cfg.optimizer.implementation, "fused")
+      self.assertEqual(cfg.optim.optimizer.implementation, "fused")
 
   def test_build_flavor_config_weight_tying(self):
     tied = _build_flavor_config("testmodel")

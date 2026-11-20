@@ -36,7 +36,9 @@ from torchtitan.experiments.tpu.components import unflatten_shim
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
+from torchtitan.models.common.activation import SiLU, UnaryActivationFn
+from torchtitan.models.common.norm import GatedRMSNorm
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
 
 logger = logging.getLogger(__name__)
 
@@ -567,8 +569,35 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
 
 
+class RMSNormGated(GatedRMSNorm):
+  """Eager SiLU-gated RMSNorm: ``silu(gate) * weight * norm(x)``.
+
+  Upstream e44a045e4 replaced ``qwen3_5.gdn.RMSNormGated`` with the shared
+  ``models.common.norm.GatedRMSNorm`` (gate activation via ``activation_fn``,
+  compiled with inductor by default). This keeps the former defaults and the
+  eager reference the TPU tests compare against.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(GatedRMSNorm.Config):
+    eps: float = 1e-6
+    activation_fn: UnaryActivationFn.Config = field(default_factory=SiLU.Config)
+
+  def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + self.eps)
+    x = self.weight * x.to(input_dtype)
+    return (x.float() * self.activation_fn(gate.float())).to(input_dtype)
+
+
 class TpuRMSNormGated(RMSNormGated):
-  """``RMSNormGated`` that dispatches to Pallas on supported TPU shapes."""
+  """``RMSNormGated`` that dispatches to Pallas on supported TPU shapes.
+
+  The Pallas kernel computes the SiLU-gated form Qwen3.5 uses; other gate
+  activations take the eager path.
+  """
 
   @dataclass(kw_only=True, slots=True)
   class Config(RMSNormGated.Config):
@@ -576,16 +605,13 @@ class TpuRMSNormGated(RMSNormGated):
 
   def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     weight = self.weight
-    if rms_norm_gated is not None and rms_norm_gated.supports(
-        x, gate, weight
+    if (
+        rms_norm_gated is not None
+        and isinstance(self.activation_fn, SiLU)
+        and rms_norm_gated.supports(x, gate, weight)
     ):
       return rms_norm_gated.rms_norm_gated(x, gate, weight, self.eps)
-    input_dtype = x.dtype
-    x = x.to(torch.float32)
-    variance = x.pow(2).mean(-1, keepdim=True)
-    x = x * torch.rsqrt(variance + self.eps)
-    x = weight * x.to(input_dtype)
-    return (x.float() * F.silu(gate.float())).to(input_dtype)
+    return RMSNormGated.forward(self, x, gate)
 
 
 class GatedDeltaDocumentResets(Configurable):

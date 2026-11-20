@@ -92,7 +92,7 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     assert config.model is not None
     assert config.metrics.enable_moe_routing
     assert config.training.mixed_precision_reduce == "float32"
-    assert config.optimizer.param_groups[0].optimizer_kwargs["lr"] == 3e-4
+    assert config.optim.optimizer.param_groups[0].optimizer_kwargs["lr"] == 3e-4
     experts = list(config.model.traverse(TpuGroupedExperts.Config))
     assert len(experts) == 48
     assert all(expert.use_pallas_grouped_mm for _, expert, _, _ in experts)

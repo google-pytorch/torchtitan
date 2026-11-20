@@ -17,6 +17,7 @@ from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
+from torchtitan.distributed.local_compile import LocalCompileConfig
 
 
 def parallelize_qwen3(
@@ -26,7 +27,7 @@ def parallelize_qwen3(
     parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
     dump_folder: str,
     skip_dp: bool = False,

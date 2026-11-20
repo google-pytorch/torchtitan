@@ -32,7 +32,7 @@ import typing
 import torch
 from torch_tpu._internal.sync import synchronize
 
-from torchtitan.config import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 def main():
     init_logger()
 
-    # Extract --output_dir before ConfigManager (tyro) parses sys.argv
+    # Extract --output_dir before ConfigManager parses sys.argv
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--output_dir", default="precomputed_embeddings")
     args, remaining_argv = parser.parse_known_args()

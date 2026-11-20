@@ -4,26 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import tempfile
 import unittest
 from dataclasses import dataclass
-from datetime import timedelta
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from tempfile import TemporaryDirectory
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.device_mesh import init_device_mesh
-from torchtitan.components.optimizer import (
+
+from torchtitan.components.optim import (
     Adam,
     AdamW,
     BaseOptimizer,
     LRSchedulersContainer,
     OptimizersContainer,
 )
-from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 from torchtitan.models.common.moe import register_moe_load_balancing_hook
 
 
@@ -130,103 +125,6 @@ def _get_default_groups(model, config):
         if isinstance(optimizer, AdamW)
         for group in optimizer.param_groups
     ]
-
-
-def _run_torchft_moe_load_balancing_step(rank, store_path):
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"file://{store_path}",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=60),
-    )
-    try:
-        loss_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("loss",))
-        model = FakeMoEModel(load_balance_coeffs=(0.1, 0.2))
-        # Rows are MoE layers; columns are experts. Summing across ranks
-        # reverses rank 0's local imbalance in both layers.
-        local_counts_by_rank = {
-            0: [[10, 0], [0, 10]],
-            1: [[0, 20], [20, 0]],
-        }
-        expected_global_counts = torch.tensor([[10, 20], [20, 10]])
-        local_counts = torch.tensor(local_counts_by_rank[rank])
-        for layer, counts in zip(model.layers.values(), local_counts):
-            layer.moe.router.tokens_per_expert_E.copy_(counts)
-
-        config = TorchFTOptimizersContainer.Config(
-            optimizers=[
-                AdamW.Config(pattern=r".*", fused=False, lr=0.1, weight_decay=0.0),
-            ],
-        )
-        # Wrap the base step first to expose hook re-entry through super().step().
-        OptimizersContainer(config, model_parts=[FakeMoEModel()])
-
-        manager = Mock(spec=["start_quorum", "should_commit"])
-        manager.should_commit.return_value = True
-        container = config.build(
-            model_parts=[model],
-            ft_manager=SimpleNamespace(manager=manager, use_async_quorum=True),
-        )
-        register_moe_load_balancing_hook(
-            container, [model], FakeParallelismContext(loss_mesh=loss_mesh)
-        )
-
-        container.zero_grad()
-        model.weight.grad = torch.ones_like(model.weight)
-        # Keep Gloo communication real; only observe collectives during this step.
-        with patch(
-            "torch.distributed.all_reduce", wraps=dist.all_reduce
-        ) as load_all_reduce:
-            container.step()
-
-        # This is the regression: one accepted step must synchronize load once.
-        load_all_reduce.assert_called_once()
-        # all_reduce updates its input tensor in place.
-        global_counts = load_all_reduce.call_args.args[0]
-        torch.testing.assert_close(global_counts, expected_global_counts)
-
-        # Increase bias for the globally less-used expert in each layer.
-        torch.testing.assert_close(
-            model.layers["0"].moe.expert_bias_E,
-            torch.tensor([0.1, -0.1]),
-        )
-        torch.testing.assert_close(
-            model.layers["1"].moe.expert_bias_E,
-            torch.tensor([-0.2, 0.2]),
-        )
-
-        # The next training step must start with empty load counters.
-        torch.testing.assert_close(
-            model.layers["0"].moe.router.tokens_per_expert_E,
-            torch.tensor([0, 0]),
-        )
-        torch.testing.assert_close(
-            model.layers["1"].moe.router.tokens_per_expert_E,
-            torch.tensor([0, 0]),
-        )
-
-        manager.start_quorum.assert_called_once_with()
-        manager.should_commit.assert_called_once_with()
-        torch.testing.assert_close(model.weight, torch.tensor([0.9]))
-    finally:
-        dist.destroy_process_group()
-
-
-class TestTorchFTMoELoadBalancing(unittest.TestCase):
-    @unittest.skipUnless(
-        dist.is_available() and dist.is_gloo_available(),
-        "Requires Gloo for the two-rank MoE load-balancing test.",
-    )
-    def test_accepted_step_synchronizes_global_moe_load_once(self):
-        """A wrapped base step must not repeat the FT container's MoE hook."""
-        with tempfile.TemporaryDirectory() as directory:
-            mp.spawn(
-                _run_torchft_moe_load_balancing_step,
-                args=(f"{directory}/rendezvous",),
-                nprocs=2,
-                join=True,
-            )
 
 
 class TestOptimizerConfig(unittest.TestCase):
@@ -625,6 +523,73 @@ class TestDCPWithParamGroups(unittest.TestCase):
                     f"State mismatch for key {key}",
                 )
 
+    def test_cuda_graph_optimizer_state_round_trip(self):
+        source_model = torch.nn.Linear(2, 2)
+        config = OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=1e-3)]
+        )
+        source = config.build(model_parts=[source_model], enable_cuda_graph=True)
+        source_model(torch.ones(1, 2)).sum().backward()
+        source.step()
+        old_group = source.optimizers[0].param_groups[0]
+        old_group["lr"].fill_(5e-4)
+        state_dict = source.state_dict()
+        self.assertFalse(any(key.endswith(".capturable") for key in state_dict))
+        for fqn in old_group["param_names"]:
+            state_dict[f"param_groups.{fqn}.capturable"] = False
+        source.load_state_dict(state_dict)
+        captured_group = source.optimizers[0].param_groups[0]
+        self.assertIsNot(captured_group, old_group)
+        self.assertTrue(captured_group["capturable"])
+        self.assertIsInstance(captured_group["lr"], torch.Tensor)
+
+        with TemporaryDirectory() as checkpoint_dir:
+            dcp.save({"optimizer": source}, checkpoint_id=checkpoint_dir, no_dist=True)
+            target_model = torch.nn.Linear(2, 2)
+            target = OptimizersContainer.Config(
+                optimizers=[AdamW.Config(pattern=r".*", lr=1e-3)]
+            ).build(model_parts=[target_model])
+            dcp.load({"optimizer": target}, checkpoint_id=checkpoint_dir, no_dist=True)
+            captured_target = config.build(
+                model_parts=[torch.nn.Linear(2, 2)],
+                enable_cuda_graph=True,
+            )
+            dcp.load(
+                {"optimizer": captured_target},
+                checkpoint_id=checkpoint_dir,
+                no_dist=True,
+            )
+            captured_target.step()
+
+        target_group = target.optimizers[0].param_groups[0]
+        self.assertIsInstance(target_group["lr"], float)
+        self.assertAlmostEqual(target_group["lr"], 5e-4)
+        self.assertFalse(target_group["capturable"])
+        self.assertTrue(captured_target.optimizers[0].param_groups[0]["capturable"])
+        self.assertIsInstance(
+            captured_target.optimizers[0].param_groups[0]["lr"], torch.Tensor
+        )
+
+    def test_cuda_graph_setting_controls_capturable(self):
+        eager = OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=1e-3)]
+        ).build(model_parts=[torch.nn.Linear(2, 2)])
+        captured = OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=1e-3)]
+        ).build(
+            model_parts=[torch.nn.Linear(2, 2)],
+            enable_cuda_graph=True,
+        )
+
+        self.assertFalse(eager.optimizers[0].param_groups[0]["capturable"])
+        self.assertTrue(captured.optimizers[0].param_groups[0]["capturable"])
+
+    def test_optimizer_config_rejects_capturable(self):
+        with self.assertRaises(TypeError):
+            OptimizersContainer.Config(
+                optimizers=[AdamW.Config(pattern=r".*", lr=1e-3, capturable=True)]
+            )
+
 
 class TestMixedOptimizers(unittest.TestCase):
     def test_mixed_optimizer_types(self):
@@ -810,6 +775,72 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
                 self.assertAlmostEqual(base_lr, 5e-4, places=6)
             else:
                 self.assertAlmostEqual(base_lr, 1e-3, places=6)
+
+    def test_first_capturable_step_uses_stable_tensor_lr(self):
+        model = torch.nn.Linear(2, 2)
+        container = OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=1e-3)]
+        ).build(model_parts=[model], enable_cuda_graph=True)
+        optimizer = container.optimizers[0]
+        group = optimizer.param_groups[0]
+        lr = group["lr"]
+        self.assertIsInstance(lr, torch.Tensor)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: 1.0 / (step + 1)
+        )
+
+        model(torch.ones(1, 2)).sum().backward()
+        container.step()
+        scheduler.step()
+
+        self.assertTrue(group["capturable"])
+        self.assertEqual(group["lr"].device, model.weight.device)
+        self.assertAlmostEqual(group["lr"].item(), 5e-4)
+
+        model(torch.ones(1, 2)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+
+        self.assertIs(group["lr"], lr)
+        self.assertAlmostEqual(group["lr"].item(), 1e-3 / 3)
+
+    def test_cuda_graph_lr_metrics_stay_on_host(self):
+        model = torch.nn.Linear(2, 2)
+        config = OptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=r".*", lr=1e-3)]
+        )
+        optimizers = config.build(model_parts=[model], enable_cuda_graph=True)
+        group = optimizers.optimizers[0].param_groups[0]
+        lr = group["lr"]
+        schedulers = LRSchedulersContainer(
+            optimizers, lr_lambda=lambda step: 1.0 / (step + 1)
+        )
+
+        optimizers.step()
+        schedulers.step()
+
+        self.assertIsInstance(group["lr"], torch.Tensor)
+        self.assertIs(group["lr"], lr)
+        self.assertEqual(schedulers.schedulers[0].base_lrs, [1e-3])
+        self.assertIsInstance(schedulers.get_host_lrs_per_scheduler()[0][0], float)
+        self.assertAlmostEqual(schedulers.get_metrics()["lr/AdamW"], 5e-4)
+
+    def test_cuda_graph_rejects_unsupported_optimizer(self):
+        class SGD(torch.optim.SGD, BaseOptimizer):
+            @dataclass(kw_only=True, slots=True)
+            class Config(BaseOptimizer.Config):
+                lr: float = 1e-3
+
+            def __init__(self, config: Config, *, params) -> None:
+                super().__init__(params, lr=config.lr)
+
+        model = torch.nn.Linear(2, 2)
+        config = OptimizersContainer.Config(
+            optimizers=[SGD.Config(pattern=r".*")],
+        )
+
+        with self.assertRaisesRegex(ValueError, "SGD does not support"):
+            config.build(model_parts=[model], enable_cuda_graph=True)
 
 
 if __name__ == "__main__":

@@ -145,7 +145,19 @@ class TPUHFTransformerModel(HFTransformerModel):
       self._titan_injected_model_args["splash_kernel_kwargs"] = extract_splash_kwargs(
           getattr(config, "splash_attention_kernel", None)
       )
-      HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
+      # Upstream #4908 replaced ``update_from_config`` with
+      # ``load_hf_config`` (called by its flavors at recipe time); the TPU
+      # lane keeps applying ``--hf_model`` at trainer time, so load it here
+      # with the training context and determinism the base used to read.
+      del kwargs
+      HFTransformerModel.Config.load_hf_config(
+          self,
+          hf_model_id=hf_model_id,
+          max_context_length=config.training.max_context_length,
+          deterministic=config.debug.deterministic,
+      )
+      if hasattr(config.loss, "global_vocab_size"):
+        config.loss.global_vocab_size = self.vocab_size
       self._complete_from_hf_config(hf_model_id)
 
 

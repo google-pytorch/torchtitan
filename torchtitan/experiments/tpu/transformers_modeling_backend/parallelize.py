@@ -33,6 +33,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.experiments.transformers_modeling_backend.parallelize import (
     parallelize_hf_transformers,
 )
@@ -77,7 +78,7 @@ def parallelize_hf_transformers_tpu(
     parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config,
     dump_folder: str,
     tpu_compile_mode: str = "layer",

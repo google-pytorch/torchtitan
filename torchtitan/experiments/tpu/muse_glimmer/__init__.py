@@ -16,7 +16,7 @@ Wraps upstream ``torchtitan.models.muse_glimmer`` for the TPU lane:
 
 import dataclasses
 
-import torchtitan.models.muse_glimmer as upstream_muse_glimmer
+import torchtitan.models.muse_glimmer.flavors as upstream_muse_glimmer
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
 from torchtitan.config.transform import ModelConfigConverter
 
@@ -95,7 +95,7 @@ def _testmodel() -> MuseGlimmerModel.Config:
 
 def _upstream_flavor(flavor: str) -> MuseGlimmerModel.Config:
   """Builds an upstream flavor at its full context length, with TPU attention."""
-  build_config, max_context_length = upstream_muse_glimmer.muse_glimmer_configs[
+  build_config, max_context_length = upstream_muse_glimmer.MODEL_FLAVORS[
       flavor
   ]
   return use_tpu_attention(
@@ -133,7 +133,7 @@ def model_registry(
         f"Unsupported Muse Glimmer flavor on TPU: {flavor!r}. Supported:"
         f" {('testmodel',) + _UPSTREAM_TEXT_FLAVORS}"
     )
-  config = upstream_muse_glimmer.model_registry(
+  config = upstream_muse_glimmer.build_model_config(
       flavor,
       seq_len=seq_len,
       attn_backend="sdpa",

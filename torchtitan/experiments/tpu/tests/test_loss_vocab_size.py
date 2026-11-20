@@ -89,7 +89,7 @@ class JobConfigVocabSizeTest(absltest.TestCase):
     model_config.vocab_size = 2 * old_vocab  # what the widening does
     tp = 2
     set_global_vocab_size(config.loss, model_config)
-    loss_fn = config.loss.build(compile_config=config.compile)
+    loss_fn = config.loss.build()
     stale_loss_fn = CrossEntropyLoss(
         CrossEntropyLoss.Config(global_vocab_size=old_vocab)
     )

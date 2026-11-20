@@ -13,6 +13,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import MoE
+from torchtitan.distributed.local_compile import LocalCompileConfig
 
 
 def parallelize_qwen3_5(
@@ -22,7 +23,7 @@ def parallelize_qwen3_5(
     parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointingConfig | None",
     dump_folder: str,
     skip_dp: bool = False,

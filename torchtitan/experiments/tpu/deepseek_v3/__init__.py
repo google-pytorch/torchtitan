@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torchtitan.models.common as common_models
-import torchtitan.models.deepseek_v3 as deepseek_v3_models
+import torchtitan.models.deepseek_v3.flavors as deepseek_v3_models
 def parallelize_deepseekv3(model, **kwargs):
   return model.parallelize(**kwargs)
 
@@ -41,8 +41,6 @@ def _testmodel(
       router_top_k=2,
       router_score_func=common_models.Softmax.Config(),
       attn_backend=attn_backend,
-      moe_comm_backend="standard",
-      non_blocking_capacity_factor=None,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
           max_context_length=128,
@@ -102,8 +100,6 @@ def _testmodel_moe(
       router_top_k=2,
       router_score_func=common_models.Softmax.Config(),
       attn_backend=attn_backend,
-      moe_comm_backend="standard",
-      non_blocking_capacity_factor=None,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
           max_context_length=128,
@@ -140,19 +136,15 @@ def _testmodel_moe(
 def _upstream_flavor(flavor: str, attn_backend: str):
   """Builds an upstream deepseek-v3 flavor at its full context length.
 
-  Upstream d771abb0 changed
-  `deepseek_v3_models.deepseekv3_configs[flavor]` from a callable into a
+  Upstream d771abb0 changed the flavor table entries (now
+  `flavors.MODEL_FLAVORS`, #4913) from a callable into a
   `(builder, max_context_length)` pair, and made `seq_len` a required
   keyword-only argument of the builder. Passing the flavor's own
   `max_context_length` reproduces what the old callable produced.
   """
-  build_config, max_context_length = deepseek_v3_models.deepseekv3_configs[
-      flavor
-  ]
+  build_config, max_context_length = deepseek_v3_models.MODEL_FLAVORS[flavor]
   return build_config(
       attn_backend=attn_backend,
-      moe_comm_backend="standard",
-      enable_sp=True,
       seq_len=max_context_length,
   )
 

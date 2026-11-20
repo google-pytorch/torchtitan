@@ -98,7 +98,6 @@ class TokenDispatcherTest(base_device_test.BaseAcceleratorDeviceTest):
     # TPU; the TPU dispatcher's VJPs gather whole rows.
     cfg = make_routed_experts_config(
         dim=256, hidden_dim=128, num_experts=4, top_k=2, param_init={},
-        comm_backend="standard",
     )
     layer = SimpleNamespace(_native_moe_config=cfg)
     model = SimpleNamespace(layers={"0": layer}, _tpu_moe_pallas=False)

@@ -14,7 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from torchtitan.observability.metrics import TensorBoardLogger
-from torchtitan.components.optimizer.optimizer import (
+from torchtitan.components.optim.optimizer import (
     collect_moe_routing_metric_tensors,
     configure_moe_routing_metrics,
     get_moe_load_balancing_metrics,

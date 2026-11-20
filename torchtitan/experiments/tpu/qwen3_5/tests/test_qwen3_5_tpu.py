@@ -27,7 +27,7 @@ from absl.testing import parameterized
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 import torch.nn.functional as F
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.config.override import OverrideConfig
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
@@ -1810,7 +1810,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertTrue(compile_cfg.compile_grad_norm)
     self.assertFalse(bench_cfg.tpu_config.enable_amp)
     self.assertFalse(bench_cfg.tpu_config.enable_mfu_benchmark)
-    self.assertEqual(bench_cfg.optimizer.implementation, "fused")
+    self.assertEqual(bench_cfg.optim.optimizer.implementation, "fused")
     self.assertTrue(
         bench_cfg.splash_attention_kernel.use_splash_attention_kernel
     )
@@ -1875,7 +1875,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         parsed.training.num_tokens_per_microbatch_per_dp_rank, 65536
     )
     self.assertLen(parsed.model.layers, 40)
-    self.assertEqual(parsed.model.max_context_length, 262144)
+    # Upstream #4908 requires model.max_context_length to equal the training
+    # length; the TPU config aligns it to the command line's 8192 (see
+    # ``tpu_job_config.align_model_context_length``).
+    self.assertEqual(parsed.model.max_context_length, 8192)
     self.assertEqual(resets(parsed), [False] * 30)
     self.assertEqual(
         (

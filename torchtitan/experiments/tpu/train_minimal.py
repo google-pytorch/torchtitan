@@ -23,6 +23,7 @@ from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu.components import loss as tpu_loss
 from torchtitan.experiments.tpu.distributed import distributed_utils
 from torchtitan.experiments.tpu.distributed.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
@@ -182,24 +183,11 @@ class TrainerMinimal:
     )
 
     model_config = job_config.model
-    # MoELoadBalanceAuxLoss needs sample-counted batch sizes, and
-    # Qwen3Model.update_from_config raises without them. Same formula as
-    # Trainer, with the batch mesh's degree as the data-parallel degree.
-    training = job_config.training
-    local_global_batch_size = (
-        training.num_tokens_per_microbatch_per_dp_rank
-        // training.max_context_length
-    ) * batch_degree
-    global_batch_size = training.num_tokens_per_train_step
-    if global_batch_size < 0:  # One gradient accumulation step.
-      global_batch_size = local_global_batch_size
-    else:
-      global_batch_size //= training.max_context_length
-    model_config.update_from_config(
-        config=job_config,
-        local_global_batch_size=local_global_batch_size,
-        global_batch_size=global_batch_size,
-    )
+    # As Trainer.__init__: set sharding, then the fork's runtime hooks
+    # (MoELoadBalanceAuxLoss batch sizes, TPU-model update_from_config) with
+    # the batch mesh's degree as the data-parallel degree.
+    model_config.set_sharding_(job_config.parallelism)
+    torchtitan.trainer.prepare_model_config(job_config, dp_degree=batch_degree)
     self.model_config = model_config
 
     # TODO(jerryx99): Consider stop widening model_config.vocab_size to the
@@ -248,7 +236,7 @@ class TrainerMinimal:
     from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
 
     set_global_vocab_size(job_config.loss, self.model_config)
-    self.loss_fn = job_config.loss.build(compile_config=job_config.compile)
+    self.loss_fn = tpu_loss.build_loss(job_config.loss, job_config.compile)
 
     # Apply TPU-specific patches/workarounds
     workarounds.apply_patches(model, job_config)
@@ -302,10 +290,10 @@ class TrainerMinimal:
 
     assert (
         self.device.type != "tpu" or
-        job_config.optimizer.implementation != "fused"
+        job_config.optim.optimizer.implementation != "fused"
     ), ("TODO b/45811390 - Fused optimizer not supported on TPU."
         "You can disable this by setting --optimizer.implementation=foreach")
-    self.optimizers = job_config.optimizer.build(model_parts=[self.model])
+    self.optimizers = job_config.optim.optimizer.build(model_parts=[self.model])
 
     # get_spmd_context sets the process-wide SPMD mesh the spmd_types
     # collectives read, so components such as ChunkedLossWrapper support loss
@@ -499,7 +487,7 @@ class TrainerMinimal:
           num_tokens_per_step = (
               self.job_config.training.num_tokens_per_microbatch_per_dp_rank)
 
-          if step >= self.job_config.lr_scheduler.warmup_steps:
+          if step >= self.job_config.optim.lr_scheduler.warmup_steps:
             total_tokens += num_tokens_per_step
             total_time += step_time
 
@@ -545,12 +533,12 @@ def start_trainer(config: JobConfig):
 
   device = utils.get_local_device()
 
-  if config.optimizer.implementation == "fused" and device.type == "tpu":
+  if config.optim.optimizer.implementation == "fused" and device.type == "tpu":
     # TODO b/45811390 - Remove this once fused optimizer is supported on TPU.
     logger.warning(
         "Fused optimizer is not supported on TPU, changing to foreach."
     )
-    config.optimizer.implementation = "foreach"
+    config.optim.optimizer.implementation = "foreach"
 
   import sys
   logger.info("JAX LOADED BEFORE INIT: %s", "jax" in sys.modules)

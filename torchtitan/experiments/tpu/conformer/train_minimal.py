@@ -352,13 +352,13 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       model_param_count,
   )
 
-  if train_config.optimizer.implementation == "fused":
+  if train_config.optim.optimizer.implementation == "fused":
     logger.warning(
         "Fused optimizer is not supported on TPU, changing to foreach."
     )
-    train_config.optimizer.implementation = "foreach"
+    train_config.optim.optimizer.implementation = "foreach"
 
-  optimizer = train_config.optimizer.build(model_parts=[model])
+  optimizer = train_config.optim.optimizer.build(model_parts=[model])
 
   if train_config.compile.optimizer_compile == "separate_graph":
     logger.info("Applying torch.compile to optimizer.step")
@@ -401,7 +401,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   accumulated_time = 0.0
   accumulated_steps = 0
 
-  warmup_steps = train_config.lr_scheduler.warmup_steps
+  warmup_steps = train_config.optim.lr_scheduler.warmup_steps
 
   profiler_workaround.init(train_config)
 

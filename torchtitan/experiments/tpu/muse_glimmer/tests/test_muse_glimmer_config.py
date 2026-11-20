@@ -12,7 +12,7 @@ from absl.testing import parameterized
 import torch
 from torch.nn.attention import flex_attention
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
@@ -398,7 +398,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
         _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
     )
     self.assertEqual(
-        config.optimizer.implementation, optimizer_implementation
+        config.optim.optimizer.implementation, optimizer_implementation
     )
 
   @parameterized.parameters(

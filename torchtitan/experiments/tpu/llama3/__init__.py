@@ -1,5 +1,5 @@
 import torchtitan.models.common as common_models
-import torchtitan.models.llama3 as llama3_models
+import torchtitan.models.llama3.flavors as llama3_models
 
 from .infra.parallelize import parallelize_llama
 
@@ -51,13 +51,13 @@ def _upstream_flavor(
 ) -> llama3_models.Llama3Model.Config:
   """Builds an upstream llama3 flavor at that flavor's full context length.
 
-  Upstream d771abb0 changed `llama3_models.llama3_configs[flavor]` from a
+  Upstream d771abb0 changed the flavor table entries from a
   `(attn_backend) -> Config` callable into a `(builder, max_context_length)`
-  pair, and made `seq_len` a required keyword-only argument of the builder.
-  Passing the flavor's own `max_context_length` reproduces what the old
-  callable produced.
+  pair, and made `seq_len` a required keyword-only argument of the builder;
+  #4913 moved the table to `flavors.MODEL_FLAVORS`. Passing the flavor's own
+  `max_context_length` reproduces what the old callable produced.
   """
-  build_config, max_context_length = llama3_models.llama3_configs[flavor]
+  build_config, max_context_length = llama3_models.MODEL_FLAVORS[flavor]
   return build_config(attn_backend=attn_backend, seq_len=max_context_length)
 
 

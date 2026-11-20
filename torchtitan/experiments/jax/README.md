@@ -25,7 +25,7 @@ instead of the torchax PyTorch-on-JAX wrapper.
 jax/
 ├── train_minimal.py        # Entry point: parses flags, builds mesh, runs trainer
 ├── trainer.py              # JaxTrainer: model/optimizer/dataloader setup + train loop
-├── jax_job_config.py       # JaxConfig + JaxJobConfig dataclasses (tyro flags)
+├── jax_job_config.py       # JaxConfig + JaxJobConfig dataclasses (CLI --jax_config.* flags)
 ├── distributed.py          # JAX sharding utilities: apply_sharding_to_state, shard_input
 ├── splash_attn.py          # Builds splash attention callable from Pallas kernel
 ├── metrics.py              # JaxMetricsProcessor: TPS, TFLOPs, MFU logging

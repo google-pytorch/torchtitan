@@ -19,13 +19,13 @@ from torchtitan.distributed.spmd_types import current_spmd_mesh
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.tpu.distributed import gdist
-import torchtitan.config
 import torchtitan.trainer
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.distributed import device_env
 from torchtitan.experiments.tpu.distributed import distributed_utils
 from torchtitan.experiments.tpu.testing import numerical_validation
 from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu import config_manager as tpu_config_manager
 from torchtitan.experiments.tpu import train_minimal
 from torchtitan.experiments.tpu.distributed.cp_attention import revert_tpu_context_parallel
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -656,7 +656,7 @@ def _run_cpu_verification(
   init_state = recorded_history.pop("init")
 
   # Prepare CPU Configuration
-  config_manager = torchtitan.config.ConfigManager()
+  config_manager = tpu_config_manager.ConfigManager()
   cpu_config = config_manager.parse_args(config_args)
 
   # Force overrides for single-device CPU execution
@@ -937,7 +937,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     # contain global flags and not subcommands.
     config_args[:] = global_flags + config_args
 
-    config_manager = torchtitan.config.ConfigManager()
+    config_manager = tpu_config_manager.ConfigManager()
 
     config = config_manager.parse_args(config_args)
     config.dump_folder = tempfile.gettempdir()

@@ -20,7 +20,7 @@ from absl import app, flags
 import jax
 import torchtitan.observability.logging
 import torchtitan.config
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import trainer as jax_trainer

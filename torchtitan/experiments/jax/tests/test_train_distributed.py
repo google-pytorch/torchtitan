@@ -4,7 +4,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.experiments.jax import train_minimal
 
 

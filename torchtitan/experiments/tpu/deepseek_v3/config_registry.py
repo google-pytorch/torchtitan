@@ -7,8 +7,8 @@
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.config.configs import (
     ParallelismConfig,
@@ -25,7 +25,8 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
-from torchtitan.models.deepseek_v3.config_registry import model_registry
+from torchtitan.models.deepseek_v3 import build_model_config as model_registry
+from torchtitan.components.optim import Optim
 
 
 def deepseek_v3_debugmodel() -> TPUTrainerConfig:
@@ -36,12 +37,14 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       metrics=MetricsProcessor.Config(log_freq=1),
       model=model_registry("debugmodel", attn_backend="sdpa"),
       dataloader=c4_test_dataloader(),
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,

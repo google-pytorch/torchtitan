@@ -18,6 +18,7 @@ import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
+import torchtitan.trainer
 from torchtitan.tools import utils
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 
@@ -50,7 +51,8 @@ def _run_model_distributed(
 
   assert train_config.model is not None
   model_args = train_config.model
-  model_args.update_from_config(config=train_config)
+  model_args.set_sharding_(train_config.parallelism)
+  torchtitan.trainer.prepare_model_config(train_config)
 
   parallelism_config = train_config.parallelism
   parallel_dims = torchtitan.distributed.ParallelDims(
@@ -107,7 +109,7 @@ def _run_model_distributed(
   # Same as the trainers: fill `global_vocab_size` from the final model config
   # before building the loss (spmd_types loss-parallel CE under TP).
   tpu_loss.set_global_vocab_size(train_config.loss, model_args)
-  loss_fn = train_config.loss.build(compile_config=train_config.compile)
+  loss_fn = tpu_loss.build_loss(train_config.loss, train_config.compile)
   if isinstance(loss_fn, torchtitan.components.loss.ChunkedLossWrapper):
     loss_fn.set_lm_head(model.lm_head)
     model._skip_lm_head = True

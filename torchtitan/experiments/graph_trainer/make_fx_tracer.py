@@ -409,12 +409,6 @@ def minimal_fx_tracer(
     *,
     precompile_meshes: list[DeviceMesh] | None = None,
     graph_state: dict[str, torch.Tensor] | None = None,
-    prepare_inputs: Callable[[tuple[Any, ...], dict[str, Any]], None] | None = None,
-    prepare_call_inputs: Callable[
-        [tuple[Any, ...], dict[str, Any]],
-        tuple[tuple[Any, ...], dict[str, Any]] | None,
-    ]
-    | None = None,
     record_stack_traces: bool = True,
     _insert_runtime_asserts: bool = False,
 ) -> Callable[..., TracedResult]:
@@ -465,9 +459,6 @@ def minimal_fx_tracer(
     _check_optimizer_has_module(module, optimizer)
 
     def _trace_with_args(*args: Any, **kwargs: Any) -> TracedResult:
-        if prepare_inputs is not None:
-            prepare_inputs(args, kwargs)
-
         model_state, optim_state = extract_train_state(module, optimizer)
         state_fqns = list(model_state.keys())
         graph_state_t = graph_state or {}
@@ -570,10 +561,6 @@ def minimal_fx_tracer(
             user_args, user_kwargs = pytree.tree_unflatten(
                 list(user_flat), user_inputs_spec
             )
-            if prepare_call_inputs is not None:
-                prepared = prepare_call_inputs(user_args, user_kwargs)
-                if prepared is not None:
-                    user_args, user_kwargs = prepared
 
 # b/532628568 when torch_tpu wheel updated
             patch_engine_ctx = getattr(

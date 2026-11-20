@@ -7,8 +7,8 @@
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
     ParallelismConfig,
@@ -41,7 +41,8 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.models.llama3.config_registry import model_registry
+from torchtitan.models.llama3 import build_model_config as model_registry
+from torchtitan.components.optim import Optim
 
 
 # Llama3's `ComplexRoPE` calls `view_as_complex`, which cannot be traced inside
@@ -97,7 +98,7 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   )
   # bf16 Adam moments halve the optimizer state, which is 12.7 GiB at 405B and
   # the difference between sequence 8192 fitting and not.
-  graph_config.optimizer.implementation = "fused_opt_states_bf16"
+  graph_config.optim.optimizer.implementation = "fused_opt_states_bf16"
   # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
   # libtpu 0.0.48; see cl/979992733), which segfaults in
   # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
@@ -115,12 +116,14 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_registry("debugmodel", attn_backend="sdpa"),
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,
@@ -174,12 +177,14 @@ def llama3_1b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_registry("1B", attn_backend="sdpa"),
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=2,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=2,
+              decay_ratio=0.8,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=4 * 128,
@@ -205,11 +210,13 @@ def llama3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
       model=model_registry("8B", attn_backend="sdpa"),
-      optimizer=default_adamw(lr=3e-4, eps=1e-8),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=200,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=3e-4, eps=1e-8),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=200,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 8192,
@@ -259,11 +266,13 @@ def llama3_70b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_registry("70B", attn_backend="sdpa"),
-      optimizer=default_adamw(lr=1.5e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=200,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=1.5e-4),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=200,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 8192,
@@ -313,11 +322,13 @@ def llama3_405b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model=model_registry("405B", attn_backend="sdpa"),
-      optimizer=default_adamw(lr=8e-5),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=600,
-          decay_type="linear",
-          min_lr_factor=0.0,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=8e-5),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=600,
+              decay_type="linear",
+              min_lr_factor=0.0,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 8192,
@@ -378,12 +389,14 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
       model=model_registry("8B", attn_backend="sdpa"),
-      optimizer=default_adamw(lr=2e-5),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=25,
-          decay_ratio=0.9,
-          decay_type="cosine",
-          min_lr_factor=0.1,
+      optim=Optim.Config(
+          optimizer=default_adamw(lr=2e-5),
+          lr_scheduler=LRSchedulersContainer.Config(
+              warmup_steps=25,
+              decay_ratio=0.9,
+              decay_type="cosine",
+              min_lr_factor=0.1,
+          ),
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=2 * 8192,

@@ -17,6 +17,7 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
+from torchtitan.distributed.local_compile import LocalCompileConfig
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ def parallelize_llama(
     parallelism_context: torchtitan.distributed.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: torchtitan.config.CompileConfig,
+    compile_config: LocalCompileConfig,
     ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
     dump_folder: str,
     skip_dp: bool = False,

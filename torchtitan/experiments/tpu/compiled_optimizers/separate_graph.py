@@ -192,8 +192,9 @@ def _build_compiled_optimizer_groups(opt: torch.optim.Optimizer) -> list:
 def apply_compiled_optimizer(trainer: Any) -> None:
   """Wraps trainer.optimizers.step() to run AdamW in 1 compiled XLA graph.
 
-  ``trainer`` is any object exposing an ``optimizers`` container, normally the
-  ``TrainingEngine`` (which owns the optimizers since upstream ec953b36).
+  ``trainer`` is any object exposing an ``optimizers`` container, or an
+  ``optim`` (upstream's ``Optim``, #4913) that does -- normally the
+  ``TrainingEngine``.
 
   1. Intercepts optimizer.step().
   2. Extracts weight, grad, and optimizer states into flat tensors.
@@ -201,10 +202,12 @@ def apply_compiled_optimizer(trainer: Any) -> None:
   4. Lowers the FX graph via StaticCompiler into 1 static XLA binary.
   5. Executes the binary per step and copies updated tensors back in-place.
   """
+  _container = getattr(trainer, "optimizers", None)
+  if _container is None:
+    _container = trainer.optim.optimizers
   compiled_optimizers: list[Optional[list]] = [
-      None for _ in trainer.optimizers.optimizers
+      None for _ in _container.optimizers
   ]
-  _container = trainer.optimizers
 
   def _patched_step(closure: Any = None) -> None:
     assert closure is None, "compiled optimizer step does not support closures"

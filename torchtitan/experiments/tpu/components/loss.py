@@ -9,11 +9,16 @@ from typing import Literal
 
 import math
 import spmd_types as spmd
+import logging
+
 import torch
 from torchtitan.components import loss as components_loss
 import torchtitan.config
 import torchtitan.trainer
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
+from torchtitan.distributed.local_compile import LocalCompileConfig
+
+logger = logging.getLogger(__name__)
 
 
 # Pallas/JAX custom ops carry no spmd_types annotations; CP forces spmd_types.
@@ -140,7 +145,7 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
       self,
       config: Config,
       *,
-      compile_config: torchtitan.config.CompileConfig | None = None
+      compile_config: LocalCompileConfig | None = None
   ):
     self.fn = lambda pred, labels: pallas_cross_entropy_loss(
         pred,
@@ -158,7 +163,16 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     self.v_block_size = config.v_block_size
     self.soft_cap = config.soft_cap
     self.output_multiplier = config.output_multiplier
-    self._maybe_compile(compile_config)
+    # Upstream #4895 dropped ``BaseLoss._maybe_compile`` (core losses compile
+    # through ``LocalCompileConfig.regions``); the TPU compile config keeps
+    # the ``enable`` / ``components`` policy.
+    if (
+        compile_config is not None
+        and getattr(compile_config, "enable", False)
+        and "loss" in getattr(compile_config, "components", ())
+    ):
+      logger.info("Compiling the Pallas loss function with torch.compile")
+      self.fn = torch.compile(self.fn, backend=compile_config.backend)
 
 
 def _legacy_pallas_loss_config(
@@ -203,6 +217,17 @@ def set_global_vocab_size(loss_config, model_config) -> None:
     )
 
 
+def build_loss(loss_config, compile_config=None):
+  """Builds any loss config; only the TPU Pallas loss takes the compile policy.
+
+  Upstream #4895 removed the ``compile_config`` argument from the core losses
+  (they compile through ``LocalCompileConfig.regions``).
+  """
+  if isinstance(loss_config, PallasCrossEntropyLoss.Config):
+    return loss_config.build(compile_config=compile_config)
+  return loss_config.build()
+
+
 def build_cross_entropy_loss(
     job_config: (
         torchtitan.trainer.Trainer.Config
@@ -219,6 +244,9 @@ def build_cross_entropy_loss(
   loss_config = job_config.loss
   if isinstance(loss_config, PallasCrossEntropyLoss.Config):
     return loss_config.build(compile_config=job_config.compile)
+  if not isinstance(loss_config, components_loss.CrossEntropyLoss.Config):
+    # Another loss (e.g. MSE): upstream losses take no compile config.
+    return loss_config.build()
 
   # TODO: Remove this backward-compatibility fallback once all TPU recipes
   # select PallasCrossEntropyLoss.Config directly.

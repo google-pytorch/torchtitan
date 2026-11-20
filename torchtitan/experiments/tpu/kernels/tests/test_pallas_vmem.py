@@ -22,6 +22,7 @@ class PallasVmemTest(absltest.TestCase):
         ("tpu7x", 7),
         ("TPU-7", 7),
         ("TPU 7", 7),
+        ("tpu-4", 4),
         ("unknown accelerator", None),
     )
     for dev_name, expected in cases:
@@ -41,6 +42,24 @@ class PallasVmemTest(absltest.TestCase):
     )
     with mock.patch.object(torch, "tpu", failing_tpu, create=True):
       self.assertIsNone(pallas_vmem.tpu_generation())
+
+  def test_tpu_generation_is_a_compile_time_constant(self):
+    # Like the real binding, the fake get_device_properties is opaque to dynamo,
+    # so fullgraph compilation fails if dynamo traces into tpu_generation().
+    fake_tpu = SimpleNamespace(
+        get_device_properties=torch._dynamo.disable(
+            lambda: SimpleNamespace(name="TPU7x")
+        )
+    )
+
+    def fn(x):
+      return x + pallas_vmem.vmem_limit_bytes()
+
+    torch._dynamo.reset()
+    self.addCleanup(torch._dynamo.reset)
+    with mock.patch.object(torch, "tpu", fake_tpu, create=True):
+      out = torch.compile(fn, backend="eager", fullgraph=True)(torch.zeros(1))
+    self.assertEqual(out.item(), 64 * 1024 * 1024)
 
   def test_vmem_limit_bytes_per_generation(self):
     mib = 1024 * 1024

@@ -17,7 +17,8 @@ dV transposed:
   S     = Q2   [Q, D] @ K^T [D, C]   (K^T latched, shared by the G heads)
   P     = exp2(S - lse2) * mask
           (Q2 = bf16(bf16(Q * scale) * log2(e)): q rounded as the forward
-          rounds it; lse2: the forward's log2-domain logsumexp)
+          rounds it, with one more rounding, bf16(Q * ratio) first, for a
+          non-default scale; lse2: the forward's log2-domain logsumexp)
   dP    = dO   [Q, D] @ V^T [D, C]
   dS    = P * (dP - di)   (di = rowsum(o * dO), once per q block)
   dV^T += dO^T [D, Q] @ P   [Q, C]   (P latched; full-width output)
@@ -301,7 +302,7 @@ def _kernel(
     qseg_QL_ref: jax.Ref,
     kvseg_8S_ref: jax.Ref,
     # outputs (VMEM blocks)
-    dq_GQD_ref: jax.Ref,
+    dq_GDQ_ref: jax.Ref,
     dkt_DS_ref: jax.Ref,
     dvt_DS_ref: jax.Ref,
     # scratch (VMEM, f32)
@@ -314,6 +315,7 @@ def _kernel(
     group_size: int,
     block: int,
     q_scale: float,
+    q_ratio: float = 1.0,
 ) -> None:
   del b_ref  # used by the index maps only
   lse2_rows = lse2_GQ if group_size % 8 else lse2_GQ_ref
@@ -386,7 +388,14 @@ def _kernel(
         # Round q as the forward does before its Q.K (scale in XLA, then the
         # Tokamax kernel's bf16 `q *= LOG2E`), so that P matches lse2. dK
         # below uses the unrounded q.
-        if scale_in_q_dtype:
+        if q_ratio != 1.0:
+          # Non-default scale: the forward rounds q * ratio, then multiplies
+          # by bf16(1 / sqrt(D)) = q_scale / q_ratio (exact) and rounds again.
+          q1_DQ = (qt_DQ.astype(jnp.float32) * q_ratio).astype(q_dtype)
+          qk_DQ = (
+              q1_DQ.astype(jnp.float32) * (q_scale / q_ratio)
+          ).astype(q_dtype)
+        elif scale_in_q_dtype:
           qk_DQ = (qt_DQ * q_scale).astype(q_dtype)
         else:
           qk_DQ = (qt_DQ.astype(jnp.float32) * q_scale).astype(q_dtype)
@@ -426,7 +435,10 @@ def _kernel(
 
   @pl.when(should_write_dq)
   def _():
-    dq_GQD_ref[...] = (dq_GQD_acc[...] * q_scale).astype(dq_GQD_ref.dtype)
+    # dq leaves sequence-minor, like dk^T / dv^T; see transposed_attention_bwd.
+    for g in range(dq_GQD_acc.shape[0]):
+      # Round to bf16 before the transpose: half the XLU work of an f32 one.
+      dq_GDQ_ref[g] = (dq_GQD_acc[g] * q_scale).astype(dq_GDQ_ref.dtype).T
 
   @pl.when(should_write_dkv)
   def _():
@@ -449,6 +461,7 @@ def splash_tbwd_call(
     block: int,
     single_buffer_kv: bool,
     q_scale: float,
+    q_ratio: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """The pallas_call on kernel layouts.
 
@@ -461,9 +474,12 @@ def splash_tbwd_call(
     o_BHDS: forward output, for di = rowsum(o * dO).
     q_scale: the softmax scale exactly as the forward applied it to q (the
       product of its bf16-rounded constants); also scales dq and dk.
+    q_ratio: the forward's first, bf16-rounded multiply of q for a
+      non-default scale (q is rounded after it, then multiplied by
+      q_scale / q_ratio and rounded again); 1.0 at the default scale.
 
   Returns:
-    dq [B, H, S, D], dk^T and dv^T [B, N, D, S], in the input dtype.
+    dq^T [B, H, D, S], dk^T and dv^T [B, N, D, S], in the input dtype.
   """
   num_b, num_h, d, s = q_BHDS.shape
   num_kv = k_BNDS.shape[1]
@@ -473,11 +489,6 @@ def splash_tbwd_call(
       h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
   ) -> _BlockIndex:
     return (b[t], h, 0, qi[t])
-
-  def q_head_dim_minor(
-      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
-  ) -> _BlockIndex:
-    return (b[t], h, qi[t], 0)
 
   def per_kv_head(
       h: jax.Array, t: jax.Array, b: jax.Ref, *_: jax.Ref
@@ -512,12 +523,12 @@ def splash_tbwd_call(
       pl.BlockSpec((None, 8, s), kv_segments, **resident),
   ]
   out_specs = [
-      pl.BlockSpec((None, g, block, d), q_head_dim_minor),
+      pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
       pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
   ]
   out_shape = [
-      jax.ShapeDtypeStruct((num_b, num_h, s, d), q_BHDS.dtype),
+      jax.ShapeDtypeStruct((num_b, num_h, d, s), q_BHDS.dtype),
       jax.ShapeDtypeStruct((num_b, num_kv, d, s), k_BNDS.dtype),
       jax.ShapeDtypeStruct((num_b, num_kv, d, s), v_BNDS.dtype),
   ]
@@ -548,6 +559,7 @@ def splash_tbwd_call(
           group_size=g,
           block=block,
           q_scale=q_scale,
+          q_ratio=q_ratio,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=len(_SCHEDULE_KEYS),
@@ -715,6 +727,7 @@ def transposed_attention_bwd(
     segment_ids_BS: jax.Array | None,
     *,
     q_scale: float,
+    q_ratio: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """dq, dk, dv of causal attention, in the model layout [B, S, heads, D].
 
@@ -723,7 +736,7 @@ def transposed_attention_bwd(
       forward output and output gradient.
     lse2_BHS: the forward's log2-domain logsumexp (see `splash_tbwd_call`).
     segment_ids_BS: document id per token; None means one document per example.
-    q_scale: see `splash_tbwd_call`.
+    q_scale, q_ratio: see `splash_tbwd_call`.
 
   Raises:
     ValueError: for shapes outside "Supported shapes" (module docstring).
@@ -750,8 +763,13 @@ def transposed_attention_bwd(
   sched = build_schedule(segment_ids_BS, block)
   seg_BS = segment_ids_BS.astype(jnp.int32)
   # The transposes to sequence-minor lower to bitcasts in the model graph,
-  # where XLA already keeps q / k / v sequence-minor.
-  dq_BHSD, dkt_BNDS, dvt_BNDS = splash_tbwd_call(
+  # where XLA already keeps q / k / v sequence-minor. All three gradients also
+  # come back sequence-minor: a head-dim-minor dq made XLA pick head-dim-minor
+  # layouts for the RoPE tables shared by every layer, and with them for each
+  # layer's RoPE in the forward too, where interleaved RoPE's stride-2 head-dim
+  # slices are ~6x slower (8-layer Muse Glimmer with its sliding-window layers
+  # on splash_tbwd: 1.11 -> 0.98 s per step).
+  dqt_BHDS, dkt_BNDS, dvt_BNDS = splash_tbwd_call(
       sched,
       jnp.transpose(q_BSHD, (0, 2, 3, 1)),
       jnp.transpose(do_BSHD, (0, 2, 3, 1)),
@@ -765,9 +783,10 @@ def transposed_attention_bwd(
       block=block,
       single_buffer_kv=single_buffer_kv,
       q_scale=q_scale,
+      q_ratio=q_ratio,
   )
   return (
-      jnp.swapaxes(dq_BHSD, 1, 2),
+      jnp.transpose(dqt_BHDS, (0, 3, 1, 2)),
       jnp.transpose(dkt_BNDS, (0, 3, 1, 2)),
       jnp.transpose(dvt_BNDS, (0, 3, 1, 2)),
   )

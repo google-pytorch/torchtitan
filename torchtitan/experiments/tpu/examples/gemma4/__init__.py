@@ -10,9 +10,11 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
 )
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
-from torchtitan.models.common.attention import FusedQKVLinear
+from torchtitan.models.common.activation import Softmax
+from torchtitan.models.common.attention import QKVLinear
 from torchtitan.models.common.config_utils import (
-    _fused_qkv_param_init,
+    fused_gate_up_param_init,
+    fused_qkv_param_init,
     get_attention_config,
     make_token_dispatcher_config,
 )
@@ -28,7 +30,7 @@ from torchtitan.config.transform import (
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import (
-    FusedQKVLinearKeqV,
+    QKVLinearKeqV,
     fused_qk_param_init,
     Gemma4Attention,
     Gemma4Embedding,
@@ -43,7 +45,7 @@ from .sharding import set_gemma4_sharding_config
 from .state_dict_adapter import Gemma4StateDictAdapter
 
 __all__ = [
-    "FusedQKVLinearKeqV",
+    "QKVLinearKeqV",
     "Gemma4Attention",
     "Gemma4Embedding",
     "Gemma4FeedForward",
@@ -123,7 +125,7 @@ def _make_moe_config(
             dim=dim,
             num_experts=num_experts,
             top_k=top_k,
-            score_func="softmax",
+            score_func=Softmax.Config(),
             route_norm=True,
             aux_loss=MoELoadBalanceAuxLoss.Config(
                 type="sequence_wise",
@@ -209,13 +211,13 @@ def _build_gemma4_layers(
         # other layers project Q, K and V (R = heads_per_kv + 2). The fused
         # weight is initialized slice-wise, so it matches separate wq/wk/wv.
         if layer_use_k_eq_v:
-            qkv_linear_cls = FusedQKVLinearKeqV
+            qkv_linear_cls = QKVLinearKeqV
             qkv_out_features = (n_heads + layer_n_kv_heads) * layer_head_dim
             qkv_param_init = fused_qk_param_init
         else:
-            qkv_linear_cls = FusedQKVLinear
+            qkv_linear_cls = QKVLinear
             qkv_out_features = (n_heads + 2 * layer_n_kv_heads) * layer_head_dim
-            qkv_param_init = _fused_qkv_param_init
+            qkv_param_init = fused_qkv_param_init
         qkv_linear_cfg = qkv_linear_cls.Config(
             n_heads=n_heads,
             n_kv_heads=layer_n_kv_heads,
@@ -269,19 +271,18 @@ def _build_gemma4_layers(
                     ),
                 ),
                 feed_forward=Gemma4FeedForward.Config(
-                    w1=Linear.Config(
+                    w13=Linear.Config(
                         in_features=dim,
-                        out_features=hidden_dim,
-                        param_init=p["linear_in"],
+                        out_features=2 * hidden_dim,
+                        # Gate (w1) and up (w3) slices keep their separate
+                        # initializers inside the fused parameter.
+                        param_init=fused_gate_up_param_init(
+                            p["linear_in"], p["linear_out"]
+                        ),
                     ),
                     w2=Linear.Config(
                         in_features=hidden_dim,
                         out_features=dim,
-                        param_init=p["linear_out"],
-                    ),
-                    w3=Linear.Config(
-                        in_features=dim,
-                        out_features=hidden_dim,
                         param_init=p["linear_out"],
                     ),
                 ),

@@ -40,7 +40,7 @@ NUM_PYTEST_SHARDS = 2
 # Trees run under pytest even when a file has a unittest entry point. pytest
 # collects unittest.TestCase natively, so routing the whole unit test suite
 # through one runner keeps behavior uniform. Paths are relative to REPO_ROOT.
-PYTEST_ONLY_DIRS = ("tests/unit_tests",)
+PYTEST_ONLY_DIRS = ("tests/unit_tests", "tests/rl/unit_tests")
 
 # Directory names pruned during the walk. These hold no importable tests.
 EXCLUDED_DIR_NAMES = {
@@ -73,35 +73,33 @@ DISABLED_TESTS = {
     # TODO: mark_dynamic() no longer sets _dynamo_dynamic_range, so the copy assertion is stale.
     "torchtitan.experiments.graph_trainer.tests.test_trace_module",
     # Missing optional dependency renderers (upstream moved experiments/rl
-    # tests to tests/unit_tests/rl)
-    "tests.unit_tests.rl.test_alphabet_sort",
-    "tests.unit_tests.rl.test_async_controller",
-    "tests.unit_tests.rl.test_rollout_recorder",
-    "tests.unit_tests.rl.test_rollout_utils",
-    "tests.unit_tests.rl.test_search_r1",
-    "tests.unit_tests.rl.test_weight_sync",
-    "tests.unit_tests.rl.test_dapo_math",
-    "tests.unit_tests.rl.test_muse_glimmer_renderer",
-    "tests.unit_tests.rl.test_renderer",
-    "tests.unit_tests.rl.test_rollouter_pool",
-    "tests.unit_tests.rl.test_rollout_worker",
-    "tests.unit_tests.rl.test_token_env",
+    # tests to tests/unit_tests/rl, then to tests/rl/unit_tests in #4889)
+    "tests.rl.unit_tests.cpu.test_alphabet_sort",
+    "tests.rl.unit_tests.cpu.test_async_controller",
+    "tests.rl.unit_tests.cpu.test_rollout_recorder",
+    "tests.rl.unit_tests.cpu.test_rollout_utils",
+    "tests.rl.unit_tests.cpu.test_search_r1",
+    "tests.rl.unit_tests.cpu.test_weight_sync",
+    "tests.rl.unit_tests.cpu.test_dapo_math",
+    "tests.rl.unit_tests.cpu.test_muse_glimmer_renderer",
+    "tests.rl.unit_tests.cpu.test_renderer",
+    "tests.rl.unit_tests.cpu.test_rollouter_pool",
+    "tests.rl.unit_tests.cpu.test_rollout_worker",
+    "tests.rl.unit_tests.cpu.test_token_env",
     # Missing optional dependency torchstore
-    "tests.unit_tests.rl.test_engine_loop",
+    "tests.rl.unit_tests.cpu.test_engine_loop",
     # Missing optional dependency monarch
-    "tests.unit_tests.rl.test_shutdown",
-    "tests.unit_tests.rl.test_inter_generator_router",
-    "tests.unit_tests.rl.test_trainer",
-    "tests.unit_tests.rl.test_intra_generator_router",
+    "tests.rl.unit_tests.cpu.test_shutdown",
+    "tests.rl.unit_tests.cpu.test_inter_generator_router",
+    "tests.rl.unit_tests.cpu.test_trainer",
+    "tests.rl.unit_tests.cpu.test_intra_generator_router",
     # Missing optional dependency vllm
-    "tests.unit_tests.rl.test_generator",
-    "tests.unit_tests.rl.test_gdn_cudagraph",
-    "tests.unit_tests.rl.test_bitwise_parity",
-    "tests.unit_tests.rl.test_vllm_otel_stat_logger",
-    "tests.unit_tests.rl.test_vllm_wrapper",
+    "tests.rl.unit_tests.cpu.test_generator",
+    "tests.rl.unit_tests.cpu.test_vllm_otel_stat_logger",
+    "tests.rl.unit_tests.cpu.test_vllm_wrapper",
     # Missing optional dependency verifiers
-    "tests.unit_tests.rl.test_verifiers",
-    "tests.unit_tests.rl.test_verifiers_example",
+    "tests.rl.unit_tests.cpu.test_verifiers",
+    "tests.rl.unit_tests.cpu.test_verifiers_example",
     # Missing optional dependency torch_checkpointing
     "tests.unit_tests.cpu.test_torch_checkpointing",
     # Requires CUDA; upstream runs these tests only on CUDA
@@ -122,7 +120,6 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_kimi_k3_pp_block_grads",
     "tests.unit_tests.cpu.test_kimi_k3_pp_layout",
     "tests.unit_tests.cpu.test_qwen3_5_moe",
-    "tests.unit_tests.rl.test_gdn_graph_metadata",
     # Missing optional dependency torchvision
     "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
     "tests.unit_tests.cpu.components.data.test_qwen_multimodal_data",
@@ -131,7 +128,6 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_qwen3_8",
     "tests.unit_tests.cpu.test_mm_dataset_preprocessing",
     "tests.unit_tests.cpu.test_debug_config_defaults",
-    "tests.unit_tests.cpu.test_no_new_cli_options",
     "tests.unit_tests.cpu.test_integration_test_definitions",
     # TPUGrainDataLoader.Config overrides `dataset` as a plain str.
     "tests.unit_tests.cpu.test_dataset_flux",
@@ -148,7 +144,7 @@ DISABLED_TESTS = {
 }
 
 # Upstream GPU-only tests; upstream runs these only on CUDA runners.
-GPU_ONLY_DIRS = ("tests/unit_tests/gpu",)
+GPU_ONLY_DIRS = ("tests/unit_tests/gpu", "tests/rl/unit_tests/gpu")
 
 # Individual upstream pytest tests that are disabled, as node-ID prefixes passed
 # to `pytest --deselect`. Use this instead of DISABLED_TESTS when the rest of

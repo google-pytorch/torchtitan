@@ -127,7 +127,14 @@ class Optim(Configurable):
 
     def _update(self, loss: torch.Tensor) -> torch.Tensor:
         """Clip gradients, check loss and gradient norm, then update parameters."""
-        grad_norm = self.clip_grad_norm()
+        # Fork hook, looked up defensively: upstream's unit tests drive this
+        # method on namespace stubs.
+        clip_grad_norm = getattr(self, "clip_grad_norm", None)
+        grad_norm = (
+            clip_grad_norm()
+            if clip_grad_norm is not None
+            else Optim.clip_grad_norm(self)
+        )
         loss_is_finite = torch.isfinite(loss).all().to(torch.int32)
         if not self.parallelism_context.pp_enabled or self.pp_has_last_stage:
             loss_mesh = self.parallelism_context.get_optional_mesh("loss")

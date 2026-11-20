@@ -23,6 +23,7 @@ from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu.components import loss as tpu_loss
 from torchtitan.experiments.tpu.distributed import distributed_utils
 from torchtitan.experiments.tpu.distributed.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
@@ -235,7 +236,7 @@ class TrainerMinimal:
     from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
 
     set_global_vocab_size(job_config.loss, self.model_config)
-    self.loss_fn = job_config.loss.build(compile_config=job_config.compile)
+    self.loss_fn = tpu_loss.build_loss(job_config.loss, job_config.compile)
 
     # Apply TPU-specific patches/workarounds
     workarounds.apply_patches(model, job_config)

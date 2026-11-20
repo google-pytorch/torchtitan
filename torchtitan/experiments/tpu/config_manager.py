@@ -542,7 +542,8 @@ def apply_cli_overrides(config: Any, tokens: list[str]) -> Any:
       while i < len(tokens) and not _is_flag(tokens[i]):
         values.append(tokens[i])
         i += 1
-      new_value = list(current or []) + parse_cli_imports(values)
+      # Replaces the recipe's list, as every tyro sequence flag did.
+      new_value = parse_cli_imports(values)
     elif is_bool:
       if i < len(tokens) and tokens[i].lower() in (_TRUE | _FALSE):
         new_value = _coerce(tokens[i], bool, current=current, path=path)

@@ -109,7 +109,7 @@ def _run_model_distributed(
   # Same as the trainers: fill `global_vocab_size` from the final model config
   # before building the loss (spmd_types loss-parallel CE under TP).
   tpu_loss.set_global_vocab_size(train_config.loss, model_args)
-  loss_fn = train_config.loss.build(compile_config=train_config.compile)
+  loss_fn = tpu_loss.build_loss(train_config.loss, train_config.compile)
   if isinstance(loss_fn, torchtitan.components.loss.ChunkedLossWrapper):
     loss_fn.set_lm_head(model.lm_head)
     model._skip_lm_head = True

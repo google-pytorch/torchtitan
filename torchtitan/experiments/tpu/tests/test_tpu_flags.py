@@ -3,9 +3,8 @@
 import dataclasses
 
 from absl.testing import absltest
-import tyro
 
-from torchtitan.config.manager import custom_registry
+from torchtitan.experiments.tpu import config_manager
 from torchtitan.experiments.tpu import tpu_flags
 
 
@@ -199,7 +198,7 @@ class ExtraFlagsTest(absltest.TestCase):
 
 
 class FlagMapCommandLineTest(absltest.TestCase):
-  """The tyro rule that lets one string set any flag, whatever the default."""
+  """The parser that lets one string set any flag, whatever the default."""
 
   @dataclasses.dataclass
   class _Config:
@@ -208,11 +207,8 @@ class FlagMapCommandLineTest(absltest.TestCase):
     )
 
   def _parse(self, default: dict[str, str], *args: str) -> dict[str, str]:
-    config = tyro.cli(
-        self._Config,
-        args=list(args),
-        default=self._Config(tpu_flags.FlagMap(default)),
-        registry=custom_registry,
+    config = config_manager.apply_cli_overrides(
+        self._Config(tpu_flags.FlagMap(default)), list(args)
     )
     return dict(config.libtpu_init_flags)
 

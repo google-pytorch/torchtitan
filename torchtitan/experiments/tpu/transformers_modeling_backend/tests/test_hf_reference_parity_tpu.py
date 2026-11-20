@@ -29,11 +29,11 @@ from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 
-import torchtitan.config
 from transformers.modeling_utils import PreTrainedModel
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu import config_manager
 from torchtitan.experiments.tpu import train_minimal
 from torchtitan.experiments.tpu.transformers_modeling_backend import (
     attention as splash_adapter,
@@ -78,7 +78,7 @@ def _reference_logits(reference, wrapper, input_ids, kwargs):
 
 def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   """One step on ``device``, the same step on the raw HF model on CPU."""
-  config = torchtitan.config.ConfigManager().parse_args(config_args)
+  config = config_manager.ConfigManager().parse_args(config_args)
   config.dump_folder = tempfile.gettempdir()
   torch.manual_seed(config.debug.seed or 42)
   trainer = train_minimal.TrainerMinimal(device=device, rank=0, world_size=1, job_config=config)

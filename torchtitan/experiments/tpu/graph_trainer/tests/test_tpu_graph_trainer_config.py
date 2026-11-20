@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.config import CompileConfig, apply_overrides
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.jax.jax_job_config import JaxJobConfig
 from torchtitan.experiments.graph_trainer import llama3 as llama3_gt

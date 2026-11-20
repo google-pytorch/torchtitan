@@ -7,7 +7,7 @@ from unittest import mock
 from absl.testing import absltest
 import torch
 from torch import nn
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.experiments.graph_trainer import make_fx_tracer
 from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,

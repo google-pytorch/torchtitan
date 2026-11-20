@@ -27,9 +27,7 @@ import logging
 import os
 from typing import Iterable, Mapping, MutableMapping
 
-import tyro
-
-from torchtitan.config.manager import custom_registry
+from torchtitan.experiments.tpu import config_manager
 
 logger = logging.getLogger(__name__)
 
@@ -48,26 +46,16 @@ class FlagMap(dict[str, str]):
 
   A plain ``dict`` field would take its CLI options from the keys present in its
   default, so a config that already declares flags could only retune those --
-  never add one. Giving the field its own type lets the parser rule below accept
-  the same ``flag=value`` string the environment variables use, whatever the
-  config declares.
+  never add one. Giving the field its own type lets the registered parser below
+  accept the same ``flag=value`` string the environment variables use, whatever
+  the config declares.
   """
 
 
-@custom_registry.primitive_rule
-def _flag_map_rule(
-    type_info: tyro.constructors.PrimitiveTypeInfo,
-) -> tyro.constructors.PrimitiveConstructorSpec | None:
-  """Parses a ``FlagMap`` field from one ``flag=value ...`` string."""
-  if type_info.type is not FlagMap:
-    return None
-  return tyro.constructors.PrimitiveConstructorSpec(
-      nargs=1,
-      metavar='"FLAG=VALUE ..."',
-      instance_from_str=lambda args: FlagMap(parse_flags(args[0])),
-      is_instance=lambda instance: isinstance(instance, dict),
-      str_from_instance=lambda instance: [format_flags(instance)],
-  )
+# Parses a ``FlagMap`` field from one ``flag=value ...`` command-line string
+# (see ``config_manager``), so ``--libtpu-init-flags "a=1 b=2"`` replaces the
+# whole set a recipe declares instead of only retuning its existing keys.
+config_manager.register_parser(FlagMap, lambda s: FlagMap(parse_flags(s)))
 
 
 def merge_flags(

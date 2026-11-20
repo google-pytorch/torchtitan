@@ -23,7 +23,7 @@ import ray.util.scheduling_strategies
 
 import torchtitan.experiments.tpu.rl_nc_ray  # Ensure mock runs first
 
-from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.config_manager import ConfigManager
 from torchtitan.rl.controller import Controller
 from torchtitan.experiments.tpu.rl_nc_ray.trainer import RayTPUPolicyTrainer
 from torchtitan.experiments.tpu.rl_nc_ray.generator import RayVLLMGenerator

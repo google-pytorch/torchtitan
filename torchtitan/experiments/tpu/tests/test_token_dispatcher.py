@@ -411,6 +411,26 @@ def test_scale_before_down_proj_allows_ep1_parallelize():
   parent_parallelize.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "ep_transport", ["ring_of_experts", "ragged_all_to_all", "auto"]
+)
+def test_scale_before_down_proj_allows_tpu_ep_transports_at_parallelize(
+    ep_transport,
+):
+  routed = TpuRoutedExperts.Config(
+      inner_experts=GroupedExperts.Config(dim=4, hidden_dim=6, num_experts=4),
+      token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+          num_experts=4, top_k=2, ep_transport=ep_transport
+      ),
+      scale_before_down_proj=True,
+  ).build()
+  with mock.patch(
+      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+  ) as parent_parallelize:
+    routed.parallelize(_parallel_dims_with_ep(has_ep=True))
+  parent_parallelize.assert_called_once()
+
+
 def test_scale_before_down_proj_rejects_all_to_all_metadata():
   # AllToAllDispatchMetadata subclasses LocalDispatchMetadata. Before the
   # explicit check, EP metadata passed the EP=1 guard and the forward reduced
@@ -439,9 +459,11 @@ def test_scale_before_down_proj_rejects_all_to_all_metadata():
       routed(x, scores, expert_ids, counts)
 
 
-@pytest.mark.parametrize("ep_transport", ["all_to_all", "ragged_all_to_all"])
+@pytest.mark.parametrize(
+    "ep_transport", ["all_to_all", "ragged_all_to_all", "ring_of_experts", "auto"]
+)
 def test_ep1_combine_keeps_the_fixed_k_reduction(ep_transport):
-  """Without an EP mesh, either transport uses the local fixed-K reduction."""
+  """Without an EP mesh, any transport uses the local fixed-K reduction."""
   generator = torch.Generator().manual_seed(11)
   num_experts, top_k, dim, tokens = 4, 2, 8, 6
   dispatcher = TpuAllToAllTokenDispatcher.Config(

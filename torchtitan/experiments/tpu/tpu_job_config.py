@@ -35,6 +35,21 @@ class TPUConfig:
       "DEFER_NEVER",
       "DEFER_NEVER_AND_LAUNCH_BLOCKING",
   ] = ""
+  # Optional CLI overrides forwarded to `use_expert_parallel` under EP > 1.
+  # `ep_transport`: None keeps each MoE dispatcher's explicit transport and
+  # uses "auto" where none is set; any value here applies to every dispatcher.
+  # "ring_of_experts" needs a TPU and hidden_dim % 128 == 0 and raises
+  # otherwise; "auto" then picks "ragged_all_to_all".
+  # `ep_capacity_factor`: multiples of the balanced per-rank routed rows
+  # `T * top_k`. On "ragged_all_to_all" it bounds the receive buffer and
+  # expert rows; on "ring_of_experts" only the locally gathered expert rows
+  # (rounded up to a multiple of 1024; the all-gather stays full size).
+  # None keeps the dispatcher's factor (default: dropless).
+  ep_transport: Literal[
+      "all_to_all", "ragged_all_to_all", "ring_of_experts", "auto"
+  ] | None = None
+  ep_scale_before_down_proj: bool | None = None
+  ep_capacity_factor: float | None = None
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]

@@ -3,16 +3,20 @@
 from dataclasses import dataclass
 from typing import Any
 
+# pyformat: disable
+# Import torch before spmd_types to avoid circular import with torch_tpu.
 import torch
+import spmd_types as spmd
+# pyformat: enable
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.distributed.spmd_types import annotate_input_spmd_types, set_current_spmd_mesh
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types, set_current_spmd_mesh, spmd_local_context
 from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
 from torchtitan.models.common.attention import AttentionMasksType, FlexInnerAttention, VarlenInnerAttention
-from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+from torchtitan.models.common.decoder_sharding import CP, decoder_input_sharding, DP, SpmdType, TP
 from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35Model, Qwen35TransformerBlock
 from torchtitan.models.qwen3_5.sharding import annotate_deltanet_cu_seqlens
@@ -36,6 +40,8 @@ class TpuQwen35Attention(Qwen35Attention):
       x_TD: torch.Tensor,
       attention_masks: AttentionMasksType | None,
       positions: torch.Tensor | None = None,
+      *,
+      full_positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
     num_tokens = x_TD.shape[0]
 
@@ -72,6 +78,12 @@ class TpuQwen35Attention(Qwen35Attention):
         enable_gqa=self.enable_gqa,
         # TPU: pass `positions`; SDPA / Splash mask packed documents with it.
         positions=positions,
+        # Context parallelism: the unsharded positions, from which the CP
+        # inner attention builds the whole sequence's segment_ids without a
+        # collective.
+        **(
+            {} if full_positions is None else {"full_positions": full_positions}
+        ),
     ).contiguous()
 
     # Output gating
@@ -85,7 +97,9 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
 
   Identical to upstream ``Qwen35TransformerBlock.forward`` except that the
   GatedDeltaNet (``gated_delta.TpuGatedDeltaNet``) also receives ``positions``,
-  from which it derives packed-document boundaries.
+  from which it derives packed-document boundaries, and that both layer types
+  take ``TpuQwen35Model.forward``'s ``full_positions`` (context parallelism)
+  and the GatedDeltaNet its ``gated_delta_document_resets`` override.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -97,6 +111,9 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
       x_TD: torch.Tensor,
       attention_masks: Qwen35AttentionMaskDict | None,
       positions: torch.Tensor | None = None,
+      *,
+      full_positions: torch.Tensor | None = None,
+      gated_delta_document_resets: bool | None = None,
   ) -> torch.Tensor:
     layer_mask = (
         attention_masks[self.attn_mask_key]
@@ -105,7 +122,12 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     )
     h_TD = self.attention_norm(x_TD)
     # TPU: both layer types get `positions` (upstream: full attention only).
-    h_TD = self.attn(h_TD, layer_mask, positions)
+    layer_kwargs: dict[str, Any] = {}
+    if full_positions is not None:
+      layer_kwargs["full_positions"] = full_positions
+    if not self.full_attn and gated_delta_document_resets is not None:
+      layer_kwargs["document_resets"] = gated_delta_document_resets
+    h_TD = self.attn(h_TD, layer_mask, positions, **layer_kwargs)
     x_TD = x_TD + h_TD
 
     h_TD = self.ffn_norm(x_TD)
@@ -127,6 +149,9 @@ class TpuQwen35Model(Qwen35Model):
   head-tail the folded ``[B * S]`` token stream), caches the CP-rank tensor and
   precomputes the full-sequence ``segment_ids``; the CP GatedDeltaNet
   (``cp_gated_delta``) relies on the same layout.
+  ``preprocess_inputs`` also passes the unsharded positions as
+  ``cp_full_positions``, so the CP attention and GatedDeltaNet layers get the
+  whole sequence's document boundaries without per-layer all-gathers.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -144,6 +169,75 @@ class TpuQwen35Model(Qwen35Model):
           ),
           ep_capacity_factor=getattr(tpu_cfg, "ep_capacity_factor", None),
       )
+
+  def forward(  # pyrefly: ignore [bad-override]
+      self,
+      tokens: torch.Tensor,
+      *,
+      attention_masks: Any = None,
+      positions: torch.Tensor | None = None,
+      cp_full_positions: torch.Tensor | None = None,
+      gated_delta_document_resets: bool | None = None,
+      **kwargs,
+  ):
+    """``Qwen35Model.forward`` plus two per-batch layer inputs.
+
+    Args:
+      tokens: Token ids (or embeddings when ``tok_embeddings`` is ``None``).
+      attention_masks: As upstream.
+      positions: As upstream; under CP, this rank's shard.
+      cp_full_positions: Under context parallelism, the positions of every token
+        of the unsharded sequence, in sequence order (the CP-sharded
+        ``positions`` before ``cp_shard``). The CP attention and GatedDeltaNet
+        layers derive the whole sequence's document boundaries from them instead
+        of all-gathering ``positions`` in every layer.
+      gated_delta_document_resets: Overrides every GatedDeltaNet's
+        ``document_resets.enabled`` for this batch, e.g. ``False`` when each
+        ``[B, S]`` row (``set_unflatten_seq_len``) holds one document, so the
+        unsegmented kernels run. ``None`` keeps the config.
+      **kwargs: Upstream's multimodal arguments.
+
+    Returns:
+      As upstream.
+    """
+    if cp_full_positions is None and gated_delta_document_resets is None:
+      return super().forward(
+          tokens,
+          attention_masks=attention_masks,
+          positions=positions,
+          **kwargs,
+      )
+    if any(v is not None for k, v in kwargs.items() if k != "special_tokens"):
+      raise NotImplementedError(
+          "cp_full_positions / gated_delta_document_resets support text-only"
+          " batches; got"
+          f" {sorted(k for k, v in kwargs.items() if v is not None)}."
+      )
+    # Text-only `Qwen35Model.forward` with the extra layer inputs.
+    with spmd_local_context("dp"):
+      x = (
+          self.tok_embeddings(tokens)
+          if self.tok_embeddings is not None
+          else (tokens)
+      )
+    if spmd.is_type_checking():
+      spmd.assert_type(
+          x,
+          {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},
+          spmd.PartitionSpec(("dp", "cp"), None),
+      )
+    for layer in self.layers.values():
+      x = layer(
+          x,
+          attention_masks,
+          positions,
+          full_positions=cp_full_positions,
+          gated_delta_document_resets=gated_delta_document_resets,
+      )
+    x = self.norm(x) if self.norm is not None else x
+    if self._skip_lm_head:
+      return x
+    return self.lm_head(x) if self.lm_head is not None else x
 
   def preprocess_inputs(
       self,
@@ -194,6 +288,12 @@ class TpuQwen35Model(Qwen35Model):
     # TPU: the CP inner attention shards the inputs (see the class docstring).
     batch = self._cp_shard_inputs(
         batch, input_sharding, parallel_dims, parallelism
+    )
+    # Unsharded positions: identical on every CP rank.
+    batch["cp_full_positions"] = positions
+    input_sharding["cp_full_positions"] = SpmdType(
+        {DP: spmd.V, CP: spmd.R, TP: spmd.R},
+        partition_spec=spmd.PartitionSpec(DP),
     )
     batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
     attention_masks = batch.get("attention_masks")

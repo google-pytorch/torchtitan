@@ -63,9 +63,11 @@ __all__ = [
     "KVAllGatherCPScaledDotProductInnerAttention",
     "KVAllGatherCPVarlenInnerAttention",
     "cp_all_gather",
+    "cp_all_gather_with_grad",
     "cp_all_to_all",
     "cp_input_layout",
     "cp_rank_tensor",
+    "cp_reduce_scatter",
     "reorder_sequence",
     "register_tpu_cp_inner_attention",
     "register_tpu_cp_reverter",
@@ -349,6 +351,63 @@ def cp_all_gather(x: torch.Tensor, group: Any, *, dim: int = 0) -> torch.Tensor:
   return spmd.redistribute(x, group, src=spmd.S(dim), dst=spmd.R)
 
 
+def cp_all_gather_with_grad(
+    x: torch.Tensor,
+    group: Any,
+    *,
+    dim: int = _TOKEN_DIM,
+    reduce_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+  """All-gathers activations ``x`` along ``dim`` over the CP ``group``.
+
+  Differentiable: the backward reduce-scatters the gradient in
+  ``reduce_dtype``, as KV all-gather CP does for K and V.
+  """
+  return _all_gather_kv(x, group, seq_dim=dim, reduce_dtype=reduce_dtype)
+
+
+class _ReduceScatterSum(torch.autograd.Function):
+  """Reduce-scatter (sum) in forward, all-gather in backward."""
+
+  @staticmethod
+  def forward(
+      ctx,
+      x: torch.Tensor,
+      group: Any,
+      dim: int,
+      reduce_dtype: torch.dtype,
+  ) -> torch.Tensor:
+    ctx.group = group
+    ctx.dim = dim
+    out = _wait(
+        funcol.reduce_scatter_tensor(x.to(reduce_dtype), "sum", dim, group)
+    )
+    return out.to(x.dtype)
+
+  @staticmethod
+  def backward(ctx, grad_out: torch.Tensor):
+    grad = _wait(funcol.all_gather_tensor(grad_out, ctx.dim, ctx.group))
+    return grad, None, None, None
+
+
+@spmd.no_typecheck()
+def cp_reduce_scatter(
+    x: torch.Tensor,
+    group: Any,
+    *,
+    dim: int = _TOKEN_DIM,
+    reduce_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+  """Sums per-rank partial ``x`` over the CP ``group`` and scatters ``dim``.
+
+  Each rank gets its ``1 / cp`` slice of ``dim`` (rank order), summed in
+  ``reduce_dtype`` and cast back to ``x.dtype``. Differentiable: the backward
+  all-gathers the gradient. Uses functional collectives in eager and traced
+  mode; the caller re-asserts the output's SPMD type.
+  """
+  return _ReduceScatterSum.apply(x, group, dim, reduce_dtype)
+
+
 def reorder_sequence(
     tensor: torch.Tensor,
     cp_size: int,
@@ -550,14 +609,21 @@ class UlyssesCPInnerAttention(_TPUCPInnerAttention):
     )
     if "enable_gqa" in kwargs:
       kwargs["enable_gqa"] = q_THK.shape[_HEAD_DIM] != k_THK.shape[_HEAD_DIM]
-    # In normal training, cp_shard + Decoder.forward compute full-sequence
-    # segment_ids once per step before the layer loop. Fall back to
-    # all-gathering positions only when called directly with sharded inputs.
+    # Packed-document segment_ids of the whole sequence, from (in order):
+    # explicit full-length segment_ids; ``full_positions``, the unsharded
+    # positions the model passes (no collective); the ones cp_shard attached
+    # to ``positions``; else an all-gather of the sharded ``positions``.
     positions = kwargs.pop("positions", None)
+    full_positions = kwargs.pop("full_positions", None)
     seg = kwargs.get("segment_ids")
     if seg is None or seg.shape[_TOKEN_DIM] != q_THK.shape[_TOKEN_DIM]:
       full_seg = getattr(positions, "_cp_full_segment_ids", None)
-      if full_seg is not None:
+      if full_positions is not None:
+        with spmd.no_typecheck():
+          kwargs["segment_ids"] = _orig_segment_ids_from_positions(
+              full_positions.reshape(-1)
+          )
+      elif full_seg is not None:
         kwargs["segment_ids"] = full_seg
       elif positions is not None:
         kwargs["segment_ids"] = _full_sequence_segment_ids(positions, group)
@@ -651,18 +717,7 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
     raw_positions = input_dict.get("positions")
     full_segment_ids = None
     if isinstance(raw_positions, torch.Tensor):
-      if (
-          seq_len is not None
-          and raw_positions.ndim == 1
-          and raw_positions.shape[0] > seq_len
-          and raw_positions.shape[0] % seq_len == 0
-      ):
-        full_segment_ids = _orig_segment_ids_from_positions(
-            raw_positions.reshape(-1, seq_len)
-        )
-      else:
-        seg = _orig_segment_ids_from_positions(raw_positions)
-        full_segment_ids = seg.unsqueeze(0) if seg.ndim == 1 else seg
+      full_segment_ids = cls.full_segment_ids(raw_positions)
 
     # When multiple sequences (B > 1) are folded into 1D [B * S], head-tail
     # reordering and CP sharding must happen per sequence of length S, not
@@ -817,6 +872,26 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
     # SDPA-based models set the window on the module, not in its config.
     return getattr(self, "sliding_window_size", None) is not None
 
+  @staticmethod
+  def full_segment_ids(full_positions: torch.Tensor) -> torch.Tensor:
+    """``(B, S)`` segment_ids of the unsharded, sequence-order positions.
+
+    Rows come from ``set_unflatten_seq_len`` when the positions fold several
+    ``S``-token sequences; each row's documents are numbered on their own.
+    """
+    seq_len = get_unflatten_seq_len()
+    if (
+        seq_len is not None
+        and full_positions.ndim == 1
+        and full_positions.shape[0] > seq_len
+        and full_positions.shape[0] % seq_len == 0
+    ):
+      return _orig_segment_ids_from_positions(
+          full_positions.reshape(-1, seq_len)
+      )
+    seg = _orig_segment_ids_from_positions(full_positions)
+    return seg.unsqueeze(0) if seg.ndim == 1 else seg
+
   @spmd.no_typecheck()
   def _full_sequence_segment_ids_all_gather(
       self,
@@ -942,9 +1017,15 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
       # (B, S) segment_ids once per step before the layer loop. Fall back to
       # all-gathering positions/segment_ids only when called with sharded inputs.
       positions = kwargs.pop("positions", None)
+      full_positions = kwargs.pop("full_positions", None)
       seg = kwargs.get("segment_ids")
       if seg is not None and seg.numel() == bsz * kv_seq_len:
         kwargs["segment_ids"] = seg.reshape(bsz, kv_seq_len)
+      elif full_positions is not None:
+        # The unsharded positions the model passes: no collective.
+        kwargs["segment_ids"] = self.full_segment_ids(full_positions).reshape(
+            bsz, kv_seq_len
+        )
       elif getattr(positions, "_cp_full_segment_ids", None) is not None:
         kwargs["segment_ids"] = positions._cp_full_segment_ids.reshape(
             bsz, kv_seq_len

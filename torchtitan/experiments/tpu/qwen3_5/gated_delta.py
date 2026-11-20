@@ -23,9 +23,11 @@ axis as one stream. This module provides the TPU replacements:
    pretraining runs over each ``[B, S]`` row as one stream.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from torchtitan.config.configurable import Configurable
@@ -509,8 +511,12 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
       key_head_dim: int,
       value_head_dim: int,
       positions: torch.Tensor | None = None,
+      full_positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
+    if positions is None:
+      # Without context parallelism the full positions are the positions.
+      positions = full_positions
     num_tokens = query_TC.shape[0]
     g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
     beta_TH = torch.sigmoid(b_TH)
@@ -574,9 +580,7 @@ class TpuRMSNormGated(RMSNormGated):
 
   def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     weight = self.weight
-    if rms_norm_gated is not None and rms_norm_gated.supports(
-        x, gate, weight
-    ):
+    if rms_norm_gated is not None and rms_norm_gated.supports(x, gate, weight):
       return rms_norm_gated.rms_norm_gated(x, gate, weight, self.eps)
     input_dtype = x.dtype
     x = x.to(torch.float32)
@@ -656,16 +660,96 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     def reset_at_documents(self, value: bool) -> None:
       self.document_resets = replace(self.document_resets, enabled=value)
 
+    # Run the six input projections (q, k, v, z, a, b) as one matmul over
+    # their concatenated weights. They read the same input, so one wider
+    # matmul replaces six narrow ones. Requires plain, bias-free `nn.Linear`
+    # projections (no Float8 or other converted linears).
+    fuse_input_projections: bool = False
+
   def __init__(self, config: Config):
     super().__init__(config)
     self.reset_at_documents = config.document_resets.enabled
+    self.fuse_input_projections = config.fuse_input_projections
+
+  def _projections(self) -> tuple[nn.Linear, ...]:
+    return (
+        self.in_proj_q,
+        self.in_proj_k,
+        self.in_proj_v,
+        self.in_proj_z,
+        self.in_proj_a,
+        self.in_proj_b,
+    )
+
+  def input_projections(
+      self,
+      x_TD: torch.Tensor,
+      select: Callable[[torch.Tensor], torch.Tensor] | None = None,
+  ) -> tuple[torch.Tensor, ...]:
+    """Returns the ``(query, key, value, gate, a, b)`` input projections of ``x_TD``.
+
+    Args:
+      x_TD: The layer input.
+      select: Maps each projection's full weight (and bias) to the rows to use,
+        e.g. one CP rank's heads (``CPTpuGatedDeltaNet``). ``None`` uses the
+        projection modules as they are.
+
+    Returns:
+      The six projections, in the order of ``GatedDeltaNet.forward``.
+    """
+    projections = self._projections()
+    if select is None and not self.fuse_input_projections:
+      return tuple(proj(x_TD) for proj in projections)
+    for proj in projections:
+      if not torch.compiler.is_compiling() and (
+          not isinstance(proj, nn.Linear)
+          or type(proj).forward is not nn.Linear.forward
+      ):
+        raise ValueError(
+            "Fused or head-sliced GatedDeltaNet input projections read the"
+            " projection weights directly, so they need plain nn.Linear"
+            f" projections; got {type(proj).__qualname__}."
+        )
+    select = select if select is not None else (lambda w: w)
+    weights = [select(proj.weight) for proj in projections]
+    biases = [
+        select(proj.bias) if proj.bias is not None else None
+        for proj in projections
+    ]
+    if not self.fuse_input_projections:
+      return tuple(F.linear(x_TD, w, b) for w, b in zip(weights, biases))
+    if any(b is not None for b in biases):
+      raise ValueError(
+          "fuse_input_projections requires bias-free GatedDeltaNet input"
+          " projections."
+      )
+    fused = F.linear(x_TD, torch.cat(weights, dim=0))
+    return tuple(torch.split(fused, [w.shape[0] for w in weights], dim=-1))
 
   def forward(
       self,
       x_TD: torch.Tensor,
       attention_masks: VarlenMetadata | None = None,
       positions: torch.Tensor | None = None,
+      *,
+      full_positions: torch.Tensor | None = None,
+      document_resets: bool | None = None,
   ) -> torch.Tensor:
+    """GatedDeltaNet forward (upstream, plus ``positions``).
+
+    Args:
+      x_TD: The layer input.
+      attention_masks: Varlen metadata, used for ``cu_seqlens`` only.
+      positions: Per-token positions; packed documents start at 0.
+      full_positions: Under context parallelism, every token's position in
+        sequence order (``TpuQwen35Model.forward``'s ``cp_full_positions``), so
+        the CP inner module does not all-gather ``positions``.
+      document_resets: Overrides ``reset_at_documents`` for this call, e.g.
+        ``False`` for a micro-batch whose rows hold one document each.
+
+    Returns:
+      The layer output.
+    """
     num_tokens = x_TD.shape[0]
     if attention_masks is not None:
       cu_seqlens = attention_masks.cu_seq_q
@@ -678,12 +762,15 @@ class TpuGatedDeltaNet(GatedDeltaNet):
           device=x_TD.device,
       )
 
-    query_TC = self.in_proj_q(x_TD)
-    key_TC = self.in_proj_k(x_TD)
-    value_TC = self.in_proj_v(x_TD)
-    gate_TC = self.in_proj_z(x_TD)
-    a_TH = self.in_proj_a(x_TD)
-    b_TH = self.in_proj_b(x_TD)
+    query_TC, key_TC, value_TC, gate_TC, a_TH, b_TH = self.input_projections(
+        x_TD
+    )
+    resets = (
+        self.reset_at_documents if document_resets is None else document_resets
+    )
+    position_kwargs = {"positions": positions if resets else None}
+    if resets and full_positions is not None:
+      position_kwargs["full_positions"] = full_positions
 
     output_THV = self.inner_gated_delta_net(
         query_TC,
@@ -701,7 +788,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         value_head_dim=self.value_head_dim,
         # TPU: pass `positions` so packed documents restart conv + recurrence,
         # unless document resets are disabled (pretraining).
-        positions=positions if self.reset_at_documents else None,
+        **position_kwargs,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)

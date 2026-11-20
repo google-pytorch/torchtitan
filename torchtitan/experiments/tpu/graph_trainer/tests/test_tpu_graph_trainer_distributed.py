@@ -186,8 +186,9 @@ class TpuGraphTrainerDistributedTest(
       # 128-token sliding window, so the sliding layers actually mask; the
       # token budget keeps 4 sequences per rank. Plain SDPA: Splash/tokamax
       # parity on Gemma 4 is its own PR. No scan case: the sliding (head_dim
-      # 32, QKVLinear) and global (head_dim 64, QKVLinearKeqV) layers cannot
-      # be stacked. No TP case: the wrapper is SimpleFSDP/HSDP only.
+      # 32, FusedQKVLinear) and global (head_dim 64, FusedQKVLinearKeqV)
+      # layers cannot be stacked. No TP case: the wrapper is SimpleFSDP/HSDP
+      # only.
       dict(
           testcase_name="gemma4_simple_fsdp",
           module="torchtitan.experiments.tpu.examples.gemma4",

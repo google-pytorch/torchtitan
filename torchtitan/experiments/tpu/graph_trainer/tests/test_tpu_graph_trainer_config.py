@@ -1778,8 +1778,8 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   def test_scan_is_refused_at_model_build(self) -> None:
     """Gemma 4's sliding and global layers cannot share a stack.
 
-    Layer 0 is sliding (``QKVLinear``) while layer 5 is global ``K=V``
-    (``QKVLinearKeqV`` with a larger ``head_dim``), so ``check_layers_are_stackable``
+    Layer 0 is sliding while layer 5 is global ``K=V`` (with a larger
+    ``head_dim`` and ``k_eq_v=True``), so ``check_layers_are_stackable``
     refuses the model when ``build()`` constructs the scan stack.
     """
     graph_config = graph_trainer_gemma4_debugmodel()
@@ -1794,6 +1794,35 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         ),
     ):
       graph_config.model_spec.model.build()
+
+  @parameterized.parameters(
+      (graph_trainer_gemma4_debugmodel, 6, 1),
+      (graph_trainer_gemma4_moe_debug, 6, 1),
+      (gemma4_31b, 60, 10),
+      (gemma4_31b_graph_trainer, 60, 10),
+      (gemma4_31b_graph_split, 60, 10),
+      (gemma4_31b_graph_split_offload, 60, 10),
+      (gemma4_26b_a4b, 30, 5),
+      (gemma4_26b_a4b_graph_trainer, 30, 5),
+      (gemma4_26b_a4b_graph_split, 30, 5),
+      (gemma4_26b_a4b_graph_split_offload, 30, 5),
+  )
+  def test_graph_trainer_recipes_use_packed_qkv(
+      self, recipe, expected_packed_layers: int, expected_keqv_layers: int
+  ) -> None:
+    """Production and GraphTrainer Gemma 4 recipes convert all layers (sliding and global K=V) to TpuPackedQKVLinear."""
+    config = recipe()
+    assert config.model_spec is not None
+    packed_cfgs = [
+        cfg
+        for _, cfg, _, _ in config.model_spec.model.traverse(
+            TpuPackedQKVLinear.Config
+        )
+    ]
+    self.assertLen(packed_cfgs, expected_packed_layers)
+    self.assertEqual(
+        sum(1 for cfg in packed_cfgs if cfg.k_eq_v), expected_keqv_layers
+    )
 
   @parameterized.parameters(
       gemma4_debugmodel,

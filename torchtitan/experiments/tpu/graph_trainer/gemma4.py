@@ -20,9 +20,9 @@ Only SimpleFSDP / HSDP is supported here.
 
 Scan (``--compile.use_scan_layers``) is not supported without
 homogeneous-group partitioning: the sliding and global layers have different
-``head_dim`` / ``n_kv_heads`` and different QKV projections (``QKVLinear`` vs
-``QKVLinearKeqV``), so ``check_layers_are_stackable`` refuses them. Graph split
-is the large-size path for Gemma 4.
+``head_dim`` / ``n_kv_heads`` and different QKV projections (``FusedQKVLinear``
+vs ``FusedQKVLinearKeqV``), so ``check_layers_are_stackable`` refuses them.
+Graph split is the large-size path for Gemma 4.
 """
 
 import dataclasses

@@ -392,13 +392,15 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
   Qwen3.5-35B-A3B (``D = 2048``, ``C = 8256`` in, ``4096`` out) and the default
   float32 ``cp_reduce_dtype`` that is about the same bytes at ``cp = 2`` and
   twice at ``cp = 4`` (0.66x / 1.33x with bfloat16), for two collectives instead
-  of six; backward also keeps the all-gathered ``(T, D)`` input. Benchmark
-  before choosing it. It is the same computation as the single-device layer
-  except for the order of the ``out_proj`` reduction over heads. Works with
-  either full-attention CP strategy (load balancer ``"headtail"`` or ``None``)
-  and every ``cp`` dividing ``n_key_heads`` and ``n_value_heads``. The input
-  projections and ``out_proj`` must be plain ``nn.Linear`` (their weights are
-  sliced).
+  of six; backward also keeps the all-gathered ``(T, D)`` input. Measured on
+  Qwen3.5-35B-A3B (TPU7x, 32K context): at ``cp = 2`` it is 2% (float32) / 4%
+  (bfloat16) faster than ``all_to_all`` with Ulysses, for about 4 GiB more
+  HBM per device; at ``cp = 4`` with float32 it is 6% slower. It is the same
+  computation as the single-device layer except for the order of the
+  ``out_proj`` reduction over heads. Works with either full-attention CP
+  strategy (load balancer ``"headtail"`` or ``None``) and every ``cp`` dividing
+  ``n_key_heads`` and ``n_value_heads``. The input projections and
+  ``out_proj`` must be plain ``nn.Linear`` (their weights are sliced).
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -409,7 +411,8 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
     cp_reduce_dtype: str = "float32"
     """dtype of the ``allgather_reducescatter`` reductions (the forward
     ``out_proj`` reduce-scatter and the backward input-gradient
-    reduce-scatter)."""
+    reduce-scatter). At ``cp = 2`` ``"bfloat16"`` gives the same result for
+    bfloat16 activations: the sum of two bfloat16 values is rounded once."""
 
   def __init__(self, config: Config):
     super().__init__(config)

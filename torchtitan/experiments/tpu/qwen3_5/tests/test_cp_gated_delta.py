@@ -593,12 +593,8 @@ class CompiledAllGatherReduceScatterGatedDeltaNetTest(parameterized.TestCase):
         mock.patch.object(cp_gated_delta, "spmd_mesh_group", world)
     )
 
-  @parameterized.product(
-      load_balancer=(None, "headtail"), fuse_input_projections=(False, True)
-  )
-  def test_one_graph_one_wait_per_collective(
-      self, load_balancer, fuse_input_projections
-  ):
+  @parameterized.parameters(None, "headtail")
+  def test_one_graph_one_wait_per_collective(self, load_balancer):
     from functorch.compile import min_cut_rematerialization_partition  # pylint: disable=g-import-not-at-top
     from torch._dynamo.backends.common import aot_autograd  # pylint: disable=g-import-not-at-top
 
@@ -608,7 +604,6 @@ class CompiledAllGatherReduceScatterGatedDeltaNetTest(parameterized.TestCase):
     _, delta_cfg, _, _ = next(
         iter(model_cfg.traverse(CPTpuGatedDeltaNet.Config))
     )
-    delta_cfg.fuse_input_projections = fuse_input_projections
     with torch.device("cpu"):
       module = delta_cfg.build()
     for p in module.parameters():
@@ -705,7 +700,7 @@ class AllGatherReduceScatterChecksTest(absltest.TestCase):
 
 
 class Qwen35LayerInputsTest(parameterized.TestCase):
-  """Single-device ``fuse_input_projections`` and document-reset override."""
+  """Single-device input-projection checks and document-reset override."""
 
   def setUp(self):
     super().setUp()
@@ -737,33 +732,8 @@ class Qwen35LayerInputsTest(parameterized.TestCase):
         n: p.grad.clone() for n, p in model.named_parameters()
     }
 
-  def test_fused_input_projections_match(self):
-    model, ref = self._models()
-    _set_gated_delta_modules(model, fuse_input_projections=True)
-    got_loss, got_grads = self._loss_and_grads(model)
-    want_loss, want_grads = self._loss_and_grads(ref)
-    torch.testing.assert_close(got_loss, want_loss, rtol=1e-5, atol=1e-4)
-    for name, want in want_grads.items():
-      torch.testing.assert_close(
-          got_grads[name], want, rtol=1e-4, atol=1e-5, msg=name
-      )
-
-  def test_fused_input_projections_reject_bias(self):
-    model, _ = self._models()
-    delta_net = next(
-        m for m in model.modules() if isinstance(m, TpuGatedDeltaNet)
-    )
-    delta_net.fuse_input_projections = True
-    delta_net.in_proj_q.bias = torch.nn.Parameter(
-        torch.zeros(delta_net.in_proj_q.out_features)
-    )
-    with self.assertRaisesRegex(ValueError, "bias-free"):
-      delta_net.input_projections(
-          torch.randn(4, delta_net.in_proj_q.in_features)
-      )
-
   def test_weight_reading_projections_reject_non_plain_linear(self):
-    """Fused / head-sliced projections refuse a Linear with its own forward."""
+    """Head-sliced projections refuse a Linear with its own forward."""
 
     class ScaledLinear(torch.nn.Linear):  # e.g. a converter's linear
 
@@ -779,11 +749,8 @@ class Qwen35LayerInputsTest(parameterized.TestCase):
     scaled.weight = q.weight
     delta_net.in_proj_q = scaled
     x = torch.randn(4, q.in_features)
-    for fused, kwargs in ((False, {"select": lambda w: w}), (True, {})):
-      delta_net.fuse_input_projections = fused
-      with self.subTest(fused=fused):
-        with self.assertRaisesRegex(ValueError, "plain nn.Linear"):
-          delta_net.input_projections(x, **kwargs)
+    with self.assertRaisesRegex(ValueError, "plain nn.Linear"):
+      delta_net.input_projections(x, select=lambda w: w)
 
   def test_document_resets_override_matches_config(self):
     """``gated_delta_document_resets=False`` == ``document_resets.enabled=False``."""

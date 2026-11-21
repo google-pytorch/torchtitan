@@ -645,7 +645,7 @@ class GatedDeltaDocumentResets(Configurable):
 def _is_plain_linear(module: nn.Module) -> bool:
   """Whether ``module`` is an ``nn.Linear`` that computes ``F.linear``.
 
-  Fused and head-sliced projections read ``weight``/``bias`` directly, which
+  Head-sliced projections read ``weight``/``bias`` directly, which
   would skip a subclass's own ``forward`` (e.g. a Float8 linear).
   """
   return (
@@ -667,9 +667,8 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     flex and varlen attention backends and whose shape changes with the
     number of documents;
   * ``document_resets`` can override ``Config.document_resets`` per call;
-  * ``input_projections`` can fuse the six input projections into one matmul
-    (``Config.fuse_input_projections``) or slice them to a subset of heads
-    (``CPTpuGatedDeltaNet``).
+  * ``input_projections`` can slice the six input projections to a subset of
+    heads (``CPTpuGatedDeltaNet``).
 
   ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the
   convolution and the recurrence run over each ``[B, S]`` row as one stream, as
@@ -697,16 +696,9 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     def reset_at_documents(self, value: bool) -> None:
       self.document_resets = replace(self.document_resets, enabled=value)
 
-    # Run the six input projections (q, k, v, z, a, b) as one matmul over
-    # their concatenated weights. They read the same input, so one wider
-    # matmul replaces six narrow ones. Requires plain, bias-free `nn.Linear`
-    # projections (no Float8 or other converted linears).
-    fuse_input_projections: bool = False
-
   def __init__(self, config: Config):
     super().__init__(config)
     self.reset_at_documents = config.document_resets.enabled
-    self.fuse_input_projections = config.fuse_input_projections
 
   def _projections(self) -> tuple[nn.Linear, ...]:
     return (
@@ -735,30 +727,23 @@ class TpuGatedDeltaNet(GatedDeltaNet):
       The six projections, in the order of ``GatedDeltaNet.forward``.
     """
     projections = self._projections()
-    if select is None and not self.fuse_input_projections:
+    if select is None:
       return tuple(proj(x_TD) for proj in projections)
     for proj in projections:
       if not _is_plain_linear(proj):
         raise ValueError(
-            "Fused or head-sliced GatedDeltaNet input projections read the"
-            " projection weights directly, so they need plain nn.Linear"
-            f" projections; got {type(proj).__qualname__}."
+            "Head-sliced GatedDeltaNet input projections read the projection"
+            " weights directly, so they need plain nn.Linear projections; got"
+            f" {type(proj).__qualname__}."
         )
-    select = select if select is not None else (lambda w: w)
-    weights = [select(proj.weight) for proj in projections]
-    biases = [
-        select(proj.bias) if proj.bias is not None else None
+    return tuple(
+        F.linear(
+            x_TD,
+            select(proj.weight),
+            select(proj.bias) if proj.bias is not None else None,
+        )
         for proj in projections
-    ]
-    if not self.fuse_input_projections:
-      return tuple(F.linear(x_TD, w, b) for w, b in zip(weights, biases))
-    if any(b is not None for b in biases):
-      raise ValueError(
-          "fuse_input_projections requires bias-free GatedDeltaNet input"
-          " projections."
-      )
-    fused = F.linear(x_TD, torch.cat(weights, dim=0))
-    return tuple(torch.split(fused, [w.shape[0] for w in weights], dim=-1))
+    )
 
   def forward(
       self,

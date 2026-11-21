@@ -23,9 +23,11 @@ axis as one stream. This module provides the TPU replacements:
    pretraining runs over each ``[B, S]`` row as one stream.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from torchtitan.config.configurable import Configurable
@@ -504,13 +506,33 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
       conv_v_weight_C1W: torch.Tensor,
       A_log_H: torch.Tensor,
       dt_bias_H: torch.Tensor,
-      cu_seqlens: torch.Tensor,
+      cu_seqlens: torch.Tensor | None,
       *,
       key_head_dim: int,
       value_head_dim: int,
       positions: torch.Tensor | None = None,
+      full_positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    """``InnerGatedDeltaNet.forward`` over ``[B, S]`` rows, with resets.
+
+    Takes upstream's arguments; only those that differ are listed.
+
+    Args:
+      cu_seqlens: Unused (rows come from ``set_unflatten_seq_len``); may be
+        ``None``.
+      positions: Per-token positions; packed documents (``positions == 0``)
+        restart the convolution and the recurrence. ``None`` runs each row as
+        one stream.
+      full_positions: Used as ``positions`` when ``positions`` is ``None``
+        (without CP the full positions are the positions); ignored otherwise.
+
+    Returns:
+      The ``(T, H, V)`` output.
+    """
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
+    if positions is None:
+      # Without context parallelism the full positions are the positions.
+      positions = full_positions
     num_tokens = query_TC.shape[0]
     g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
     beta_TH = torch.sigmoid(b_TH)
@@ -620,15 +642,33 @@ class GatedDeltaDocumentResets(Configurable):
     self.enabled = config.enabled
 
 
+def _is_plain_linear(module: nn.Module) -> bool:
+  """Whether ``module`` is an ``nn.Linear`` that computes ``F.linear``.
+
+  Head-sliced projections read ``weight``/``bias`` directly, which
+  would skip a subclass's own ``forward`` (e.g. a Float8 linear).
+  """
+  return (
+      isinstance(module, nn.Linear)
+      and type(module).forward is nn.Linear.forward
+  )
+
+
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 
-  Identical to upstream ``GatedDeltaNet.forward`` except that it also takes
-  ``positions`` (``Qwen35Model.forward`` hands them to every layer) and passes
-  them to ``TpuInnerGatedDeltaNet``, which restarts the convolution and the
-  recurrence at every packed document. Upstream instead passes ``cu_seqlens``
-  document offsets, which ``Qwen35Model`` only builds for the flex and varlen
-  attention backends and whose shape changes with the number of documents.
+  Identical to upstream ``GatedDeltaNet.forward`` except that:
+
+  * it also takes ``positions`` (``Qwen35Model.forward`` hands them to every
+    layer) and, under context parallelism, ``full_positions``, and passes them
+    to ``TpuInnerGatedDeltaNet``, which restarts the convolution and the
+    recurrence at every packed document. Upstream instead passes
+    ``cu_seqlens`` document offsets, which ``Qwen35Model`` only builds for the
+    flex and varlen attention backends and whose shape changes with the
+    number of documents;
+  * ``document_resets`` can override ``Config.document_resets`` per call;
+  * ``input_projections`` can slice the six input projections to a subset of
+    heads (``CPTpuGatedDeltaNet``).
 
   ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the
   convolution and the recurrence run over each ``[B, S]`` row as one stream, as
@@ -660,12 +700,75 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     super().__init__(config)
     self.reset_at_documents = config.document_resets.enabled
 
+  def _projections(self) -> tuple[nn.Linear, ...]:
+    return (
+        self.in_proj_q,
+        self.in_proj_k,
+        self.in_proj_v,
+        self.in_proj_z,
+        self.in_proj_a,
+        self.in_proj_b,
+    )
+
+  def input_projections(
+      self,
+      x_TD: torch.Tensor,
+      select: Callable[[torch.Tensor], torch.Tensor] | None = None,
+  ) -> tuple[torch.Tensor, ...]:
+    """Returns the ``(query, key, value, gate, a, b)`` input projections of ``x_TD``.
+
+    Args:
+      x_TD: The layer input.
+      select: Maps each projection's full weight (and bias) to the rows to use,
+        e.g. one CP rank's heads (``CPTpuGatedDeltaNet``). ``None`` uses the
+        projection modules as they are.
+
+    Returns:
+      The six projections, in the order of ``GatedDeltaNet.forward``.
+    """
+    projections = self._projections()
+    if select is None:
+      return tuple(proj(x_TD) for proj in projections)
+    for proj in projections:
+      if not _is_plain_linear(proj):
+        raise ValueError(
+            "Head-sliced GatedDeltaNet input projections read the projection"
+            " weights directly, so they need plain nn.Linear projections; got"
+            f" {type(proj).__qualname__}."
+        )
+    return tuple(
+        F.linear(
+            x_TD,
+            select(proj.weight),
+            select(proj.bias) if proj.bias is not None else None,
+        )
+        for proj in projections
+    )
+
   def forward(
       self,
       x_TD: torch.Tensor,
       attention_masks: VarlenMetadata | None = None,
       positions: torch.Tensor | None = None,
+      *,
+      full_positions: torch.Tensor | None = None,
+      document_resets: bool | None = None,
   ) -> torch.Tensor:
+    """GatedDeltaNet forward (upstream, plus positions and document resets).
+
+    Args:
+      x_TD: The layer input.
+      attention_masks: Varlen metadata, used for ``cu_seqlens`` only.
+      positions: Per-token positions; packed documents start at 0.
+      full_positions: Under context parallelism, every token's position in
+        sequence order (``TpuQwen35Model.forward``'s ``cp_full_positions``), so
+        the CP inner module does not all-gather ``positions``.
+      document_resets: Overrides ``reset_at_documents`` for this call, e.g.
+        ``False`` for a micro-batch whose rows hold one document each.
+
+    Returns:
+      The layer output.
+    """
     num_tokens = x_TD.shape[0]
     if attention_masks is not None:
       cu_seqlens = attention_masks.cu_seq_q
@@ -678,12 +781,12 @@ class TpuGatedDeltaNet(GatedDeltaNet):
           device=x_TD.device,
       )
 
-    query_TC = self.in_proj_q(x_TD)
-    key_TC = self.in_proj_k(x_TD)
-    value_TC = self.in_proj_v(x_TD)
-    gate_TC = self.in_proj_z(x_TD)
-    a_TH = self.in_proj_a(x_TD)
-    b_TH = self.in_proj_b(x_TD)
+    query_TC, key_TC, value_TC, gate_TC, a_TH, b_TH = self.input_projections(
+        x_TD
+    )
+    resets = (
+        self.reset_at_documents if document_resets is None else document_resets
+    )
 
     output_THV = self.inner_gated_delta_net(
         query_TC,
@@ -699,9 +802,10 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         cu_seqlens,
         key_head_dim=self.key_head_dim,
         value_head_dim=self.value_head_dim,
-        # TPU: pass `positions` so packed documents restart conv + recurrence,
-        # unless document resets are disabled (pretraining).
-        positions=positions if self.reset_at_documents else None,
+        # TPU: pass the positions so packed documents restart conv +
+        # recurrence, unless document resets are disabled (pretraining).
+        positions=positions if resets else None,
+        full_positions=full_positions if resets else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)

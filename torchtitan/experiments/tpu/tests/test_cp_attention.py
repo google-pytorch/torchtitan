@@ -167,17 +167,18 @@ def _emulated_cp_group(ranks: _Ranks, traced: bool):
             cp_attention, "spmd_mesh_group", lambda axis: ranks.group()
         )
     )
+    # Functional collectives also run eagerly (e.g. cp_reduce_scatter).
+    for name, fn in (
+        ("all_to_all_single", all_to_all_single),
+        ("all_gather_tensor", all_gather_tensor),
+        ("reduce_scatter_tensor", reduce_scatter_tensor),
+    ):
+      stack.enter_context(mock.patch.object(funcol, name, fn))
     if traced:
       # The branch the CP attentions take under torch.compile.
       stack.enter_context(
           mock.patch.object(cp_attention, "_tracing", lambda: True)
       )
-      for name, fn in (
-          ("all_to_all_single", all_to_all_single),
-          ("all_gather_tensor", all_gather_tensor),
-          ("reduce_scatter_tensor", reduce_scatter_tensor),
-      ):
-        stack.enter_context(mock.patch.object(funcol, name, fn))
     else:
       stack.enter_context(mock.patch.object(spmd, "redistribute", redistribute))
     yield
@@ -248,6 +249,17 @@ def _dense_local_attention(q, k, v, *, segment_ids=None, scale=None, **unused):
   )
 
 
+def _reset_cp_state(test: absltest.TestCase) -> None:
+  """Clears the CP rank cache, rank-miss warnings and recorded input layout."""
+  for clear in (
+      cp_attention._CP_RANK_CACHE.clear,
+      cp_attention._CP_RANK_MISS_WARNED.clear,
+      cp_attention._clear_cp_input_layout,
+  ):
+    clear()
+    test.addCleanup(clear)
+
+
 # Two sequences of 32 tokens, with documents crossing the head-tail chunks.
 _SEQ_LEN = 32
 _DOCS = ((5, 11, 9, 7), (16, 3, 13))
@@ -259,8 +271,7 @@ class CPAttentionParityTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
 
   def _run(
       self, strategy, make_attn, cp, n_heads, n_kv_heads, kwargs_fn, traced
@@ -358,14 +369,43 @@ class CPAttentionParityTest(parameterized.TestCase):
     )
     self._check(inputs, got, use_documents=True)
 
+  @parameterized.product(traced=(False, True), cp=(2, 4))
+  def test_ulysses_sliding_window_matches_single_device(self, traced, cp):
+    """Ulysses CP over the sliding-window SDPA (no kernel) applies the window."""
+    from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention, UlyssesCPSlidingWindowScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
+
+    window = 8
+    cls = UlyssesCPSlidingWindowScaledDotProductInnerAttention
+    inputs, got = self._run(
+        "ulysses",
+        lambda: cls(cls.Config(window_size=window)),
+        cp,
+        4,
+        4,
+        lambda local_positions: dict(positions=local_positions),
+        traced,
+    )
+    q, k, v, grad, positions = inputs
+    q, k, v = (t.clone().requires_grad_(True) for t in (q, k, v))
+    single = SlidingWindowScaledDotProductInnerAttention(
+        SlidingWindowScaledDotProductInnerAttention.Config(window_size=window)
+    )
+    with set_unflatten_seq_len(_SEQ_LEN):
+      want = single(q, k, v, positions=positions)
+    want.backward(grad)
+    for name, g, w in zip(
+        ("out", "dq", "dk", "dv"), got, (want.detach(), q.grad, k.grad, v.grad)
+    ):
+      torch.testing.assert_close(g, w, rtol=2e-5, atol=2e-5, msg=name)
+
 
 class CPShardTest(parameterized.TestCase):
   """KV all-gather input sharding and the head-tail order."""
 
   def setUp(self):
     super().setUp()
-    cp_attention._CP_RANK_CACHE.clear()  # cp_shard caches the rank tensor.
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    # cp_shard caches the rank tensor and records its token layout.
+    _reset_cp_state(self)
 
   @parameterized.parameters((2, 1), (2, 3), (4, 1), (4, 2))
   def test_kv_all_gather_cp_shard_layout(self, cp, bsz):
@@ -585,8 +625,7 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
     super().setUp()
     torch._dynamo.reset()
     self.addCleanup(torch._dynamo.reset)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
     self.enter_context(
         mock.patch.object(
             cp_attention, "spmd_mesh_group", lambda axis: dist.group.WORLD
@@ -814,12 +853,56 @@ class CPValidationTest(parameterized.TestCase):
       ):
         config.__post_init__()
 
+  def test_register_rejects_a_second_cp_pair_for_the_same_attention(self):
+    """A second, different CP pair for a registered attention is rejected."""
+
+    class OtherUlysses(UlyssesCPScaledDotProductInnerAttention):
+      pass
+
+    # Re-registering the same pair is a no-op.
+    cp_attention.register_tpu_cp_inner_attention(
+        cp_attention.ScaledDotProductInnerAttention,
+        UlyssesCPScaledDotProductInnerAttention,
+        KVAllGatherCPScaledDotProductInnerAttention,
+    )
+    with self.assertRaisesRegex(ValueError, "already has TPU CP"):
+      cp_attention.register_tpu_cp_inner_attention(
+          cp_attention.ScaledDotProductInnerAttention,
+          OtherUlysses,
+          KVAllGatherCPScaledDotProductInnerAttention,
+      )
+    # The CP versions must subclass the attention and their strategy's mixin.
+    with self.assertRaisesRegex(TypeError, "must subclass"):
+      cp_attention.register_tpu_cp_inner_attention(
+          cp_attention.ScaledDotProductInnerAttention,
+          KVAllGatherCPScaledDotProductInnerAttention,
+          KVAllGatherCPScaledDotProductInnerAttention,
+      )
+
+  def test_cp_rank_tensor_miss_under_non_strict_tracing(self):
+    """A traced miss warns once and returns the rank without caching it."""
+    _reset_cp_state(self)
+    group = mock.Mock()
+    group.rank.return_value = 1
+    with mock.patch.object(cp_attention, "_tracing", return_value=True):
+      with self.assertLogs(cp_attention.logger, level="WARNING") as logs:
+        rank = cp_attention.cp_rank_tensor("cpu", group)
+        cp_attention.cp_rank_tensor("cpu", group)
+    self.assertLen(logs.output, 1)
+    self.assertEqual(rank.tolist(), [1])
+    self.assertEmpty(cp_attention._CP_RANK_CACHE)
+
   def test_rejects_non_causal_kv_all_gather(self):
     config = self._config("all_gather")
     for layer in config.model_spec.model.layers:
       layer.attention.inner_attention = (
           KVAllGatherCPVarlenInnerAttention.Config(window_size=(-1, -1))
       )
+    with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
+      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+    # A window parsed from a config file or the command line is a list.
+    for layer in config.model_spec.model.layers:
+      layer.attention.inner_attention.window_size = [-1, -1]
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
       validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):

@@ -14,6 +14,7 @@ from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
 )
 from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.moe_sharding import expert_param_placement_dense
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.sharding import ShardingConfig
@@ -273,6 +274,22 @@ class TpuGroupedExperts(GroupedExperts):
         ):
             self._sharding_config = _native_weight_sharding(self._sharding_config)
             self._native_sharding_applied = True
+        if self.fp8_gather_quantized_weights and self._sharding_config is not None:
+            # `_distribute_states` needs a placement for every buffer. The
+            # pre-quantized placeholders stay empty and replicated here: the
+            # scan body swaps each layer's gathered FP8 weight in through
+            # `functional_call`. FP8 experts reject EP, so the dense family
+            # applies.
+            state_shardings = dict(self._sharding_config.state_shardings)
+            for key in self.scan_prequantize_groups():
+                for suffix in ("_q", "_scale"):
+                    state_shardings.setdefault(
+                        f"{key}{suffix}",
+                        expert_param_placement_dense(tp_placement=spmd.R),
+                    )
+            self._sharding_config = replace(
+                self._sharding_config, state_shardings=state_shardings
+            )
         super()._distribute_states(parallel_dims)
 
     def parallelize(self, parallel_dims) -> None:

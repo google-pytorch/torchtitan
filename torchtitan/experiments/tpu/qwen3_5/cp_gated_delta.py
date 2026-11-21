@@ -251,7 +251,7 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
       conv_v_weight_C1W: torch.Tensor,
       A_log_H: torch.Tensor,
       dt_bias_H: torch.Tensor,
-      cu_seqlens: torch.Tensor,
+      cu_seqlens: torch.Tensor | None,
       *,
       key_head_dim: int,
       value_head_dim: int,
@@ -271,7 +271,8 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
       conv_v_weight_C1W: Full depthwise conv weight for ``v``.
       A_log_H: Full ``A_log``.
       dt_bias_H: Full ``dt_bias``.
-      cu_seqlens: Unused (rows come from ``set_unflatten_seq_len``).
+      cu_seqlens: Unused (rows come from ``set_unflatten_seq_len``); may be
+        ``None``.
       key_head_dim: Key head dim.
       value_head_dim: Value head dim.
       positions: This rank's token-sharded positions. With document resets and

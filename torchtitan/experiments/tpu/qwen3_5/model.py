@@ -122,6 +122,8 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     )
     h_TD = self.attention_norm(x_TD)
     # TPU: both layer types get `positions` (upstream: full attention only).
+    # The CP-only kwargs are passed only when set, so an upstream `attn`
+    # without them still works.
     layer_kwargs: dict[str, Any] = {}
     if full_positions is not None:
       layer_kwargs["full_positions"] = full_positions

@@ -343,13 +343,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
 
 def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU (regular trainer)."""
-  model_spec = model_registry("8B", attn_backend="sdpa")
-  model_config = cast(Qwen3Model.Config, model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, std=1.0)
-  }
-  model_spec.parallelize_fn = tpu_parallelize_qwen3
+  model_spec = _qwen3_dense_model_spec("8B")
 
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
@@ -542,7 +536,18 @@ def qwen3_1_7b_ulysses_cp4() -> TPUTrainerConfig:
 
 
 def _qwen3_dense_model_spec(flavor: str) -> ModelSpec:
+  """Upstream dense Qwen3 flavor with the TPU parallelizer and packed QKV.
+
+  Packed QKV keeps upstream's single fused ``wqkv`` parameter (one FSDP
+  all-gather per layer) but stores it as contiguous [Q; K; V] rows, which
+  removes the fused projection's interleaved-output relayouts: -3.5% step time
+  and -19.7 GiB peak HBM on 32B at local batch 8. Qwen3-8B used separate
+  wq/wk/wv projections for the same reason before packed QKV existed.
+  """
   model_spec = model_registry(flavor, attn_backend="sdpa")
+  model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(model_spec.model)
+  )
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -682,11 +687,6 @@ def qwen3_32b() -> TpuGraphTrainer.Config:
   """
   cfg = qwen3_8b_zero3()
   cfg.model_spec = to_graph_trainer_model_spec(_qwen3_dense_model_spec("32B"))
-  # Packed QKV removes the fused projection's interleaved-output relayouts:
-  # -3.5% step time and -19.7 GiB peak HBM at local batch 8.
-  cfg.model_spec.model = (
-      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
-  )
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. Set the context length first; the budgets are 8 local and
   # 1024 global sequences at that context.

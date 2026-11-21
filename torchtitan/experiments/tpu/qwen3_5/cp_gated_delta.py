@@ -66,7 +66,7 @@ from torchtitan.experiments.tpu.distributed.cp_attention import (
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
-from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet, TpuInnerGatedDeltaNet
+from torchtitan.experiments.tpu.qwen3_5.gated_delta import _is_plain_linear, TpuGatedDeltaNet, TpuInnerGatedDeltaNet
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 from torchtitan.protocols.module import Module
 
@@ -372,12 +372,12 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
   float32 ``cp_reduce_dtype`` that is about the same bytes at ``cp = 2`` and
   twice at ``cp = 4`` (0.66x / 1.33x with bfloat16), for two collectives instead
   of six; backward also keeps the all-gathered ``(T, D)`` input. Benchmark
-  before choosing it. It is
-  the same computation as the single-device layer except for the order of the
-  ``out_proj`` reduction over heads. Works with either full-attention CP
-  strategy (load balancer ``"headtail"`` or ``None``) and every ``cp``
-  dividing ``n_key_heads`` and ``n_value_heads``. The input projections and
-  ``out_proj`` must be plain ``nn.Linear`` (their weights are sliced).
+  before choosing it. It is the same computation as the single-device layer
+  except for the order of the ``out_proj`` reduction over heads. Works with
+  either full-attention CP strategy (load balancer ``"headtail"`` or ``None``)
+  and every ``cp`` dividing ``n_key_heads`` and ``n_value_heads``. The input
+  projections and ``out_proj`` must be plain ``nn.Linear`` (their weights are
+  sliced).
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -424,10 +424,7 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
           "cp_strategy='allgather_reducescatter' needs a"
           f" CPTpuInnerGatedDeltaNet, got {type(inner).__qualname__}."
       )
-    if (
-        not isinstance(self.out_proj, torch.nn.Linear)
-        or type(self.out_proj).forward is not torch.nn.Linear.forward
-    ):
+    if not _is_plain_linear(self.out_proj):
       raise ValueError(
           "cp_strategy='allgather_reducescatter' slices out_proj's weight, so"
           " it needs a plain nn.Linear; got"

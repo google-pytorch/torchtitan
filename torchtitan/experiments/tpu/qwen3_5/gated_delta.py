@@ -626,15 +626,34 @@ class GatedDeltaDocumentResets(Configurable):
     self.enabled = config.enabled
 
 
+def _is_plain_linear(module: nn.Module) -> bool:
+  """Whether ``module`` is an ``nn.Linear`` that computes ``F.linear``.
+
+  Fused and head-sliced projections read ``weight``/``bias`` directly, which
+  would skip a subclass's own ``forward`` (e.g. a Float8 linear).
+  """
+  return (
+      isinstance(module, nn.Linear)
+      and type(module).forward is nn.Linear.forward
+  )
+
+
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 
-  Identical to upstream ``GatedDeltaNet.forward`` except that it also takes
-  ``positions`` (``Qwen35Model.forward`` hands them to every layer) and passes
-  them to ``TpuInnerGatedDeltaNet``, which restarts the convolution and the
-  recurrence at every packed document. Upstream instead passes ``cu_seqlens``
-  document offsets, which ``Qwen35Model`` only builds for the flex and varlen
-  attention backends and whose shape changes with the number of documents.
+  Identical to upstream ``GatedDeltaNet.forward`` except that:
+
+  * it also takes ``positions`` (``Qwen35Model.forward`` hands them to every
+    layer) and, under context parallelism, ``full_positions``, and passes them
+    to ``TpuInnerGatedDeltaNet``, which restarts the convolution and the
+    recurrence at every packed document. Upstream instead passes
+    ``cu_seqlens`` document offsets, which ``Qwen35Model`` only builds for the
+    flex and varlen attention backends and whose shape changes with the
+    number of documents;
+  * ``document_resets`` can override ``Config.document_resets`` per call;
+  * ``input_projections`` can fuse the six input projections into one matmul
+    (``Config.fuse_input_projections``) or slice them to a subset of heads
+    (``CPTpuGatedDeltaNet``).
 
   ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the
   convolution and the recurrence run over each ``[B, S]`` row as one stream, as
@@ -703,10 +722,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     if select is None and not self.fuse_input_projections:
       return tuple(proj(x_TD) for proj in projections)
     for proj in projections:
-      if (
-          not isinstance(proj, nn.Linear)
-          or type(proj).forward is not nn.Linear.forward
-      ):
+      if not _is_plain_linear(proj):
         raise ValueError(
             "Fused or head-sliced GatedDeltaNet input projections read the"
             " projection weights directly, so they need plain nn.Linear"
@@ -737,7 +753,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
       full_positions: torch.Tensor | None = None,
       document_resets: bool | None = None,
   ) -> torch.Tensor:
-    """GatedDeltaNet forward (upstream, plus ``positions``).
+    """GatedDeltaNet forward (upstream, plus positions and document resets).
 
     Args:
       x_TD: The layer input.
@@ -770,9 +786,6 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     resets = (
         self.reset_at_documents if document_resets is None else document_resets
     )
-    position_kwargs = {"positions": positions if resets else None}
-    if resets and full_positions is not None:
-      position_kwargs["full_positions"] = full_positions
 
     output_THV = self.inner_gated_delta_net(
         query_TC,
@@ -788,9 +801,10 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         cu_seqlens,
         key_head_dim=self.key_head_dim,
         value_head_dim=self.value_head_dim,
-        # TPU: pass `positions` so packed documents restart conv + recurrence,
-        # unless document resets are disabled (pretraining).
-        **position_kwargs,
+        # TPU: pass the positions so packed documents restart conv +
+        # recurrence, unless document resets are disabled (pretraining).
+        positions=positions if resets else None,
+        full_positions=full_positions if resets else None,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)

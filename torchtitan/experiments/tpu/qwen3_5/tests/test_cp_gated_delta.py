@@ -423,6 +423,33 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
     ``gated_delta_document_resets=False``; the reference disables the
     GatedDeltaNet document resets in its config instead.
     """
+    self._check_debug_model(
+        strategy, traced, gated_delta_strategy, full_positions, document_resets
+    )
+
+  @parameterized.parameters("all_to_all", "allgather_reducescatter")
+  def test_debug_model_with_out_proj_bias_matches_single_device(
+      self, gated_delta_strategy
+  ):
+    """The ``out_proj`` bias is added once, after the reduce-scatter."""
+    self._check_debug_model(
+        "ulysses",
+        traced=False,
+        gated_delta_strategy=gated_delta_strategy,
+        full_positions=True,
+        document_resets=None,
+        out_proj_bias=True,
+    )
+
+  def _check_debug_model(
+      self,
+      strategy,
+      traced,
+      gated_delta_strategy,
+      full_positions,
+      document_resets,
+      out_proj_bias=False,
+  ):
     cp = 2
     recipe = (
         config_registry.qwen35_debugmodel_allgather_cp2
@@ -447,6 +474,16 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
       ref_model = ref_cfg.model_spec.model.build()
       ref_model.init_states(buffer_device=torch.device("cpu"))
       cp_model = cp_cfg.model_spec.model.build()
+    if out_proj_bias:
+      for model in (ref_model, cp_model):
+        for module in model.modules():
+          if isinstance(module, GatedDeltaNet):
+            module.out_proj.bias = torch.nn.Parameter(
+                torch.empty(module.out_proj.out_features)
+            )
+      for module in ref_model.modules():
+        if isinstance(module, GatedDeltaNet):
+          torch.nn.init.normal_(module.out_proj.bias)
     cp_model.load_state_dict(ref_model.state_dict())
 
     tokens = _SEQ_LEN * len(_DOCS)
@@ -621,6 +658,49 @@ class CompiledAllGatherReduceScatterGatedDeltaNetTest(parameterized.TestCase):
     self.assertNotIn("all_to_all", code)
 
 
+class AllGatherReduceScatterChecksTest(absltest.TestCase):
+  """``allgather_reducescatter`` refuses modules it would compute wrongly."""
+
+  def setUp(self):
+    super().setUp()
+    # The checks run before the group is used.
+    self.enter_context(
+        mock.patch.object(
+            cp_gated_delta, "spmd_mesh_group", lambda axis: object()
+        )
+    )
+    model_cfg = GatedDeltaNetContextParallelTransform(
+        load_balancer=None, strategy="allgather_reducescatter"
+    ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+    _, delta_cfg, _, _ = next(
+        iter(model_cfg.traverse(CPTpuGatedDeltaNet.Config))
+    )
+    with torch.device("cpu"):
+      self.module = delta_cfg.build()
+    self.x = torch.randn(4, self.module.in_proj_q.in_features)
+
+  def test_rejects_non_cp_inner_module(self):
+    self.module.inner_gated_delta_net = TpuInnerGatedDeltaNet(
+        TpuInnerGatedDeltaNet.Config(kernel=TpuGatedDeltaKernel.Config())
+    )
+    with self.assertRaisesRegex(TypeError, "CPTpuInnerGatedDeltaNet"):
+      self.module(self.x)
+
+  def test_rejects_non_plain_out_proj(self):
+
+    class ScaledLinear(torch.nn.Linear):  # e.g. a converter's linear
+
+      def forward(self, x):
+        return 2 * super().forward(x)
+
+    out = self.module.out_proj
+    self.module.out_proj = ScaledLinear(
+        out.in_features, out.out_features, bias=False
+    )
+    with self.assertRaisesRegex(ValueError, "slices out_proj"):
+      self.module(self.x)
+
+
 class Qwen35LayerInputsTest(parameterized.TestCase):
   """Single-device ``fuse_input_projections`` and document-reset override."""
 
@@ -696,9 +776,9 @@ class Qwen35LayerInputsTest(parameterized.TestCase):
     scaled.weight = q.weight
     delta_net.in_proj_q = scaled
     x = torch.randn(4, q.in_features)
-    for kwargs in ({"select": lambda w: w}, {}):
-      delta_net.fuse_input_projections = not kwargs
-      with self.subTest(**{"fused": not kwargs}):
+    for fused, kwargs in ((False, {"select": lambda w: w}), (True, {})):
+      delta_net.fuse_input_projections = fused
+      with self.subTest(fused=fused):
         with self.assertRaisesRegex(ValueError, "plain nn.Linear"):
           delta_net.input_projections(x, **kwargs)
 

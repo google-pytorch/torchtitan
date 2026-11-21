@@ -142,7 +142,10 @@ def _check_grad_accum_step(test, trainer, model, num_microbatches, device):
       got, want = got.grad.full_tensor(), want.grad.full_tensor()
     else:
       got, want = got.grad, want.grad
-    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6, msg=name)
+    # A callable msg keeps assert_close's mismatch report; a string replaces it.
+    torch.testing.assert_close(
+        got, want, rtol=1e-5, atol=1e-6, msg=lambda m: f"{name}: {m}"
+    )
 
 
 class MfuBenchmarkTest(absltest.TestCase):
@@ -381,6 +384,14 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
 
 class GradAccumulationTest(BaseAcceleratorDeviceTest):
   """Grads add up over a step's fwd+bwd calls to the full-batch grad."""
+
+  def setUp(self):
+    super().setUp()
+    # Compare at full f32 matmul precision, as the gemma4 TPU tests do; a
+    # reduced default would put rounding above the 1e-5 tolerance.
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    self.addCleanup(torch.set_float32_matmul_precision, previous)
 
   @parameterized.named_parameters(
       ("ga1", "tied", 1, True),

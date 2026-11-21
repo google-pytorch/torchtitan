@@ -517,7 +517,7 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
       )
 
 
-class CompiledCPGatedDeltaNetTest(parameterized.TestCase):
+class CompiledAllGatherReduceScatterGatedDeltaNetTest(parameterized.TestCase):
   """``allgather_reducescatter`` compiles to one graph, one wait per collective.
 
   Runs on a fake 2-rank process group (as ``test_cp_attention``'s
@@ -955,6 +955,21 @@ class CPQwen35ConfigTest(parameterized.TestCase):
           parallel_dims=mock.Mock(cp_enabled=True),
           parallelism=cfg.parallelism,
       )
+
+
+class TestModuleTest(absltest.TestCase):
+
+  def test_test_class_names_are_unique(self):
+    """A second class with the same name would silently hide the first's tests."""
+    import ast  # pylint: disable=g-import-not-at-top
+
+    with open(__file__) as f:
+      names = [
+          node.name
+          for node in ast.parse(f.read()).body
+          if isinstance(node, ast.ClassDef)
+      ]
+    self.assertLen(set(names), len(names), names)
 
 
 if __name__ == "__main__":

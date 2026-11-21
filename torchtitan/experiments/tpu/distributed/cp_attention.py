@@ -97,6 +97,9 @@ _CP_RANK_MISS_WARNED: set[tuple[torch.device, int]] = set()
 # global rather than an attribute of the sharded tensors, which compiled
 # blocks receive as plain graph inputs; keyed by the token count so that a
 # later micro-batch of another size is not checked against a stale layout.
+# Best effort: it holds the last cp_shard only, and compiled layers read it at
+# trace time (Dynamo guards on it), so it catches layout mismatches when a
+# graph is traced, not on every call.
 _CP_INPUT_LAYOUT: tuple[int, int, int] | None = None
 
 

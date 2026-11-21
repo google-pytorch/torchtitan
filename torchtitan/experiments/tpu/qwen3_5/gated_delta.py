@@ -580,7 +580,9 @@ class TpuRMSNormGated(RMSNormGated):
 
   def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     weight = self.weight
-    if rms_norm_gated is not None and rms_norm_gated.supports(x, gate, weight):
+    if rms_norm_gated is not None and rms_norm_gated.supports(
+        x, gate, weight
+    ):
       return rms_norm_gated.rms_norm_gated(x, gate, weight, self.eps)
     input_dtype = x.dtype
     x = x.to(torch.float32)
@@ -701,7 +703,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     if select is None and not self.fuse_input_projections:
       return tuple(proj(x_TD) for proj in projections)
     for proj in projections:
-      if not torch.compiler.is_compiling() and (
+      if (
           not isinstance(proj, nn.Linear)
           or type(proj).forward is not nn.Linear.forward
       ):

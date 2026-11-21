@@ -351,7 +351,7 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
   """``TpuGatedDeltaNet`` with a selectable context-parallel strategy.
 
   ``cp_strategy="all_to_all"`` is ``TpuGatedDeltaNet`` with
-  ``CPTpuInnerGatedDeltaNet``: four all-to-alls move the projected ``q`` /
+  ``CPTpuInnerGatedDeltaNet``: five all-to-alls move the projected ``q`` /
   ``k`` / ``v`` / ``a`` / ``b`` to head-sharded and one moves the output back.
 
   ``cp_strategy="allgather_reducescatter"`` moves the layer input instead:
@@ -365,8 +365,13 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
      ``(T, D)`` output, and reduce-scatter it back to ``T / cp`` tokens (summed
      in ``cp_reduce_dtype``; all-gather of the gradient in backward).
 
-  Per token it moves ``2 * D`` values each way instead of ``2 * C_qk + C_v +
-  2 * H_v`` in and ``C_v`` out, and replaces five collectives with two. It is
+  Per rank and direction, the all-to-alls move ``(cp - 1) / cp**2 * T * C``
+  values (``C`` = the projected channels in, ``C_v`` out), while the all-gather
+  and the reduce-scatter move ``(cp - 1) / cp * T * D`` each: ``cp * D / C``
+  times as much. For Qwen3.5-35B-A3B (``D = 2048``, ``C = 8256`` in, ``4096``
+  out) that is about even at ``cp = 2`` and twice the bytes at ``cp = 4`` (more
+  with the fp32 reduce), for two collectives instead of six; backward also keeps
+  the all-gathered ``(T, D)`` input. Benchmark before choosing it. It is
   the same computation as the single-device layer except for the order of the
   ``out_proj`` reduction over heads. Works with either full-attention CP
   strategy (load balancer ``"headtail"`` or ``None``) and every ``cp``
@@ -418,7 +423,7 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
           "cp_strategy='allgather_reducescatter' needs a"
           f" CPTpuInnerGatedDeltaNet, got {type(inner).__qualname__}."
       )
-    if not torch.compiler.is_compiling() and (
+    if (
         not isinstance(self.out_proj, torch.nn.Linear)
         or type(self.out_proj).forward is not torch.nn.Linear.forward
     ):

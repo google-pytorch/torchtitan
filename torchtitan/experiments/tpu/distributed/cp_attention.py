@@ -68,10 +68,10 @@ __all__ = [
     "cp_input_layout",
     "cp_rank_tensor",
     "cp_reduce_scatter",
-    "reorder_sequence",
     "register_tpu_cp_inner_attention",
     "register_tpu_cp_reverter",
     "register_tpu_cp_validator",
+    "reorder_sequence",
     "tpu_cp_inner_attention",
     "tpu_cp_load_balancer",
     "validate_tpu_context_parallel",
@@ -905,12 +905,7 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
   ) -> torch.Tensor:
     """All-gather sharded ``positions`` and return contiguous ``(B, S)`` ``segment_ids``."""
     cp = group.size()
-    if _tracing():
-      pos_ag = _wait(funcol.all_gather_tensor(positions, _TOKEN_DIM, group))
-    else:
-      pos_ag = spmd.redistribute(
-          positions, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
-      )
+    pos_ag = cp_all_gather(positions, group, dim=_TOKEN_DIM)
     pos_bs = (
         pos_ag.reshape(cp, bsz, q_seq_len)
         .movedim(0, 1)
@@ -1038,13 +1033,7 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
             positions, group, bsz, q_seq_len
         )
       elif seg is not None and seg.numel() == bsz * q_seq_len:
-        seg_ag = (
-            _wait(funcol.all_gather_tensor(seg, _TOKEN_DIM, group))
-            if _tracing()
-            else spmd.redistribute(
-                seg, group, src=spmd.S(_TOKEN_DIM), dst=spmd.R
-            )
-        )
+        seg_ag = cp_all_gather(seg, group, dim=_TOKEN_DIM)
         seg_bs = (
             seg_ag.reshape(cp, bsz, q_seq_len)
             .movedim(0, 1)

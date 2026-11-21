@@ -679,6 +679,29 @@ class Qwen35LayerInputsTest(parameterized.TestCase):
           torch.randn(4, delta_net.in_proj_q.in_features)
       )
 
+  def test_weight_reading_projections_reject_non_plain_linear(self):
+    """Fused / head-sliced projections refuse a Linear with its own forward."""
+
+    class ScaledLinear(torch.nn.Linear):  # e.g. a converter's linear
+
+      def forward(self, x):
+        return 2 * super().forward(x)
+
+    model, _ = self._models()
+    delta_net = next(
+        m for m in model.modules() if isinstance(m, TpuGatedDeltaNet)
+    )
+    q = delta_net.in_proj_q
+    scaled = ScaledLinear(q.in_features, q.out_features, bias=False)
+    scaled.weight = q.weight
+    delta_net.in_proj_q = scaled
+    x = torch.randn(4, q.in_features)
+    for kwargs in ({"select": lambda w: w}, {}):
+      delta_net.fuse_input_projections = not kwargs
+      with self.subTest(**{"fused": not kwargs}):
+        with self.assertRaisesRegex(ValueError, "plain nn.Linear"):
+          delta_net.input_projections(x, **kwargs)
+
   def test_document_resets_override_matches_config(self):
     """``gated_delta_document_resets=False`` == ``document_resets.enabled=False``."""
     model, ref = self._models()

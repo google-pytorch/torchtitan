@@ -207,18 +207,20 @@ class TpuQwen35Model(Qwen35Model):
           positions=positions,
           **kwargs,
       )
-    if any(v is not None for k, v in kwargs.items() if k != "special_tokens"):
+    unsupported = sorted(
+        k for k, v in kwargs.items() if v is not None and k != "special_tokens"
+    )
+    if unsupported:
       raise NotImplementedError(
           "cp_full_positions / gated_delta_document_resets support text-only"
-          " batches; got"
-          f" {sorted(k for k, v in kwargs.items() if v is not None)}."
+          f" batches; got {unsupported}."
       )
     # Text-only `Qwen35Model.forward` with the extra layer inputs.
     with spmd_local_context("dp"):
       x = (
           self.tok_embeddings(tokens)
           if self.tok_embeddings is not None
-          else (tokens)
+          else tokens
       )
     if spmd.is_type_checking():
       spmd.assert_type(

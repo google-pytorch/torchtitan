@@ -367,11 +367,12 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
 
   Per rank and direction, the all-to-alls move ``(cp - 1) / cp**2 * T * C``
   values (``C`` = the projected channels in, ``C_v`` out), while the all-gather
-  and the reduce-scatter move ``(cp - 1) / cp * T * D`` each: ``cp * D / C``
-  times as much. For Qwen3.5-35B-A3B (``D = 2048``, ``C = 8256`` in, ``4096``
-  out) that is about even at ``cp = 2`` and twice the bytes at ``cp = 4`` (more
-  with the fp32 reduce), for two collectives instead of six; backward also keeps
-  the all-gathered ``(T, D)`` input. Benchmark before choosing it. It is
+  and the reduce-scatter move ``(cp - 1) / cp * T * D`` each. For
+  Qwen3.5-35B-A3B (``D = 2048``, ``C = 8256`` in, ``4096`` out) and the default
+  float32 ``cp_reduce_dtype`` that is about the same bytes at ``cp = 2`` and
+  twice at ``cp = 4`` (0.66x / 1.33x with bfloat16), for two collectives instead
+  of six; backward also keeps the all-gathered ``(T, D)`` input. Benchmark
+  before choosing it. It is
   the same computation as the single-device layer except for the order of the
   ``out_proj`` reduction over heads. Works with either full-attention CP
   strategy (load balancer ``"headtail"`` or ``None``) and every ``cp``

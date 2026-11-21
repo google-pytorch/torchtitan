@@ -1031,17 +1031,19 @@ class GraphSplitTest(absltest.TestCase):
     group_index = max(
         i for i, arg in enumerate(launch.args) if isinstance(arg, str)
     )
-    fsdp_args = launch.args
-    self.addCleanup(setattr, launch, "args", fsdp_args)
-    launch.args = (
-        fsdp_args[:group_index] + ("cp_group",) + fsdp_args[group_index + 1 :]
+    cp_args = (
+        launch.args[:group_index]
+        + ("cp_group",)
+        + launch.args[group_index + 1 :]
     )
-    owners = graph_split_lib._collect_backward_collective_owners(
-        chains, 4, ("ag", "rs")
-    )
+    fsdp_args, launch.args = launch.args, cp_args
+    try:
+      owners = graph_split_lib._collect_backward_collective_owners(
+          chains, 4, ("ag", "rs")
+      )
+    finally:
+      launch.args = fsdp_args
     self.assertNotIn(launch, owners)
-    # Restore for the checks below (the cleanup covers a failed assert).
-    launch.args = fsdp_args
     with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
       split_backward_graph_by_layer(
           backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=()

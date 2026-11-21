@@ -506,13 +506,29 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
       conv_v_weight_C1W: torch.Tensor,
       A_log_H: torch.Tensor,
       dt_bias_H: torch.Tensor,
-      cu_seqlens: torch.Tensor,
+      cu_seqlens: torch.Tensor | None,
       *,
       key_head_dim: int,
       value_head_dim: int,
       positions: torch.Tensor | None = None,
       full_positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    """``InnerGatedDeltaNet.forward`` over ``[B, S]`` rows, with resets.
+
+    Takes upstream's arguments, except:
+
+    Args:
+      cu_seqlens: Unused (rows come from ``set_unflatten_seq_len``); may be
+        ``None``.
+      positions: Per-token positions; packed documents (``positions == 0``)
+        restart the convolution and the recurrence. ``None`` runs each row as
+        one stream.
+      full_positions: Used as ``positions`` when ``positions`` is ``None``
+        (without CP the full positions are the positions); ignored otherwise.
+
+    Returns:
+      The ``(T, H, V)`` output.
+    """
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
     if positions is None:
       # Without context parallelism the full positions are the positions.

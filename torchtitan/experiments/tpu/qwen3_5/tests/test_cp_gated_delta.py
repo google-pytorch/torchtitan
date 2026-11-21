@@ -431,7 +431,10 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
   def test_debug_model_with_out_proj_bias_matches_single_device(
       self, gated_delta_strategy
   ):
-    """The ``out_proj`` bias is added once, after the reduce-scatter."""
+    """Under both GDN CP strategies the ``out_proj`` bias is added once.
+
+    With ``allgather_reducescatter`` it is added after the reduce-scatter.
+    """
     self._check_debug_model(
         "ulysses",
         traced=False,
@@ -680,9 +683,9 @@ class AllGatherReduceScatterChecksTest(absltest.TestCase):
     self.x = torch.randn(4, self.module.in_proj_q.in_features)
 
   def test_rejects_non_cp_inner_module(self):
-    self.module.inner_gated_delta_net = TpuInnerGatedDeltaNet(
-        TpuInnerGatedDeltaNet.Config(kernel=TpuGatedDeltaKernel.Config())
-    )
+    self.module.inner_gated_delta_net = TpuInnerGatedDeltaNet.Config(
+        kernel=TpuGatedDeltaKernel.Config()
+    ).build()
     with self.assertRaisesRegex(TypeError, "CPTpuInnerGatedDeltaNet"):
       self.module(self.x)
 

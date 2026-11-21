@@ -186,6 +186,35 @@ def _local_heads(x: torch.Tensor, rank: torch.Tensor, cp: int) -> torch.Tensor:
   )
 
 
+def _gather_positions(
+    positions: torch.Tensor | None,
+    full_positions: torch.Tensor | None,
+    group: Any,
+) -> torch.Tensor | None:
+  """All-gathers ``positions`` unless ``full_positions`` already holds them.
+
+  Document resets need every token's position (one per token). Returns
+  ``None`` when there is nothing to gather.
+  """
+  if positions is None or full_positions is not None:
+    return None
+  return cp_all_gather(positions.reshape(-1), group)
+
+
+def _sequence_positions(
+    gathered_positions: torch.Tensor | None,
+    full_positions: torch.Tensor | None,
+    cp: int,
+    headtail: bool,
+) -> torch.Tensor | None:
+  """Every token's position in sequence order, or ``None`` (no resets)."""
+  if full_positions is not None:
+    return full_positions.reshape(-1)
+  if headtail and gathered_positions is not None:
+    return _headtail_to_sequence_order(gathered_positions, cp)
+  return gathered_positions
+
+
 class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
   """Head-parallel ``TpuInnerGatedDeltaNet`` for context parallelism.
 
@@ -283,10 +312,7 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
     )
     if not headtail:
       _check_contiguous_layout(query_TC.shape[0])
-    gathered_positions = None
-    if positions is not None and full_positions is None:
-      # Document resets need every token's position (one per token).
-      gathered_positions = cp_all_gather(positions.reshape(-1), group)
+    gathered_positions = _gather_positions(positions, full_positions, group)
     type_check = spmd.is_type_checking()
     if type_check:
       out_type = (
@@ -300,14 +326,8 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
             _headtail_to_sequence_order(x, cp)
             for x in (query_TC, key_TC, value_TC, a_TH, b_TH)
         )
-        if gathered_positions is not None:
-          gathered_positions = _headtail_to_sequence_order(
-              gathered_positions, cp
-          )
-      sequence_positions = (
-          full_positions.reshape(-1)
-          if full_positions is not None
-          else gathered_positions
+      sequence_positions = _sequence_positions(
+          gathered_positions, full_positions, cp, headtail
       )
       out_THV = self.local_forward(
           query_TC,
@@ -441,9 +461,9 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
     resets = (
         self.reset_at_documents if document_resets is None else document_resets
     )
-    gathered_positions = None
-    if resets and full_positions is None and positions is not None:
-      gathered_positions = cp_all_gather(positions.reshape(-1), group)
+    if not resets:
+      positions = full_positions = None
+    gathered_positions = _gather_positions(positions, full_positions, group)
     type_check = spmd.is_type_checking()
     if type_check:
       x_type = (spmd.get_local_type(x_TD), spmd.get_partition_spec(x_TD))
@@ -457,17 +477,9 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
     with spmd.no_typecheck():
       if headtail:
         x_full_TD = _headtail_to_sequence_order(x_full_TD, cp)
-        if gathered_positions is not None:
-          gathered_positions = _headtail_to_sequence_order(
-              gathered_positions, cp
-          )
-      sequence_positions = None
-      if resets:
-        sequence_positions = (
-            full_positions.reshape(-1)
-            if full_positions is not None
-            else gathered_positions
-        )
+      sequence_positions = _sequence_positions(
+          gathered_positions, full_positions, cp, headtail
+      )
       num_tokens = x_full_TD.shape[0]
       query_TC, key_TC, value_TC, gate_TC, a_TH, b_TH = self.input_projections(
           x_full_TD, select=lambda w: _local_heads(w, rank, cp)
@@ -483,14 +495,7 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
           _local_heads(self.conv_v.weight, rank, cp),
           _local_heads(self.A_log, rank, cp),
           _local_heads(self.dt_bias, rank, cp),
-          # Unused: rows come from set_unflatten_seq_len.
-          torch.arange(
-              0,
-              num_tokens + 1,
-              num_tokens,
-              dtype=torch.int32,
-              device=x_TD.device,
-          ),
+          None,  # cu_seqlens: rows come from set_unflatten_seq_len.
           key_head_dim=self.key_head_dim,
           value_head_dim=self.value_head_dim,
           positions=sequence_positions,

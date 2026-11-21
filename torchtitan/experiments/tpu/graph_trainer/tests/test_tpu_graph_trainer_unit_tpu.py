@@ -96,7 +96,11 @@ class _ShardedModel(nn.Module):
 
 def _loss(model: nn.Module, inputs, labels, global_valid_tokens):
   pred = model(inputs)
-  loss = F.cross_entropy(pred.view(-1, 128), labels.view(-1), reduction="sum")
+  # log_softmax + nll_loss, not F.cross_entropy: eager can pick a fused
+  # cross-entropy kernel that the traced graph decomposes, which rounds
+  # differently. This way both paths run the same ops.
+  logp = F.log_softmax(pred.view(-1, 128), dim=-1)
+  loss = F.nll_loss(logp, labels.view(-1), reduction="sum")
   return loss / global_valid_tokens
 
 

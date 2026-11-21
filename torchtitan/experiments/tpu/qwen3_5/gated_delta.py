@@ -515,7 +515,7 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
   ) -> torch.Tensor:
     """``InnerGatedDeltaNet.forward`` over ``[B, S]`` rows, with resets.
 
-    Takes upstream's arguments, except:
+    Takes upstream's arguments; only those that differ are listed.
 
     Args:
       cu_seqlens: Unused (rows come from ``set_unflatten_seq_len``); may be

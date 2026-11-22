@@ -1,6 +1,7 @@
 """Tests for the minimal distributed training setup under TpuGraphTrainer."""
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -96,6 +97,50 @@ class _RecordLosses:
         json.dump(history, f)
 
 
+class _RecordEpDropStats:
+  """Runs the trainer, saving rank 0's losses and logged EP drop counts.
+
+  Wraps ``TpuGraphTrainer._maybe_log_ep_drop_stats``, which returns the
+  batch-mesh sum it logged, so the record is what the run reported. A
+  module-level class for the same pickling reason as ``_RecordLosses``.
+  """
+
+  def __init__(self, output_path: str):
+    self.output_path = output_path
+    self.__name__ = "_RecordEpDropStats"
+    self.__qualname__ = "_RecordEpDropStats"
+
+  def __call__(self, config):
+    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer  # pylint: disable=g-import-not-at-top
+
+    losses = []
+    drop_stats = []
+    original_log = metrics.MetricsProcessor.log
+    original_drop_stats = TpuGraphTrainer._maybe_log_ep_drop_stats
+
+    def log(processor, step, global_avg_loss, global_max_loss, *args, **kwargs):
+      losses.append([step, global_avg_loss])
+      return original_log(
+          processor, step, global_avg_loss, global_max_loss, *args, **kwargs
+      )
+
+    def log_drop_stats(trainer):
+      stats = original_drop_stats(trainer)
+      if stats is not None:
+        drop_stats.append([trainer.step, stats.tolist()])
+      return stats
+
+    with mock.patch.object(metrics.MetricsProcessor, "log", log):
+      with mock.patch.object(
+          TpuGraphTrainer, "_maybe_log_ep_drop_stats", log_drop_stats
+      ):
+        torchtitan.experiments.tpu.train.start_trainer(config)
+
+    if int(os.environ.get("RANK", "0")) == 0:
+      with open(self.output_path, "w") as f:
+        json.dump({"losses": losses, "ep_drop_stats": drop_stats}, f)
+
+
 class TpuGraphTrainerDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
@@ -185,8 +230,9 @@ class TpuGraphTrainerDistributedTest(
       # 128-token sliding window, so the sliding layers actually mask; the
       # token budget keeps 4 sequences per rank. Plain SDPA: Splash/tokamax
       # parity on Gemma 4 is its own PR. No scan case: the sliding (head_dim
-      # 32, QKVLinear) and global (head_dim 64, QKVLinearKeqV) layers cannot
-      # be stacked. No TP case: the wrapper is SimpleFSDP/HSDP only.
+      # 32, FusedQKVLinear) and global (head_dim 64, FusedQKVLinearKeqV)
+      # layers cannot be stacked. No TP case: the wrapper is SimpleFSDP/HSDP
+      # only.
       dict(
           testcase_name="gemma4_simple_fsdp",
           module="torchtitan.experiments.tpu.examples.gemma4",
@@ -404,6 +450,119 @@ class TpuGraphTrainerDistributedTest(
           abs(layer_losses[step]) * 1e-5,
           msg=f"control, step {step}",
       )
+
+  def test_qwen3_5_moe_graph_trainer_ep2_matches_ep1(self):
+    """GraphTrainer Qwen3.5 MoE at EP=2 (Ring-of-Experts via auto) matches EP=1 at step 1."""
+    tempdir = self.create_tempdir().full_path
+    step1_loss = {}
+    for ep, extra_args in (
+        (1, []),
+        (
+            2,
+            [
+                "--parallelism.expert_parallel_degree=2",
+                "--compile.no-compile_grad_norm",
+                "--compile.graph_split.backward_partition_mode=by_layer",
+            ],
+        ),
+    ):
+      path = os.path.join(tempdir, f"ep{ep}.json")
+      self._test_train_distributed(
+          config_args=_train_args(
+              "torchtitan.experiments.tpu.qwen3_5",
+              "graph_trainer_qwen35_moe_debugmodel",
+              use_splash_attention_kernel=False,
+          )
+          + ["--training.steps=1"]
+          + extra_args,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        step1_loss[ep] = dict(json.load(f))[1]
+    logging.info("qwen3_5 MoE GraphTrainer step-1 loss by EP: %s", step1_loss)
+    self.assertTrue(math.isfinite(step1_loss[2]))
+    self.assertLess(
+        abs(step1_loss[2] - step1_loss[1]), abs(step1_loss[1]) * 1e-3
+    )
+
+  def test_qwen3_5_moe_graph_trainer_ep2_capacity_reports_drops(self):
+    """Capacity-bounded EP=2 reports every MoE layer's drops from the step.
+
+    A traced step does not write module state back, so the counts are a step
+    output. Each capacity-bounded arm must count every rank's routes on every
+    layer at steps 1 and 2; the dropless arm must not collect them at all.
+    Per rank: 512 tokens * top_k 2 = 1024 routes, worst case 2 * 1024 rows.
+    - ``ragged_half``: ragged all-to-all caps at int(1024 * 0.5) = 512 rows,
+      half the balanced load, so at least half the routes drop.
+    - ``roe_half_rounded``: ``auto`` picks Ring-of-Experts at EP=2, which
+      rounds the 512-row cap up to the Pallas block, 1024 rows, i.e. the
+      balanced load. With 2048 routes over two ranks each holding 1024, fewer
+      than half can drop (only if every route went to one rank would half).
+    - ``roe_worst_case``: 2.0 is the EP=2 worst case, so nothing drops.
+    """
+    tokens_per_rank = 512  # _train_args' per-rank token budget.
+    ep2 = [
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+        "--compile.graph_split.backward_partition_mode=by_layer",
+        "--training.steps=2",
+    ]
+    arms = {
+        "ragged_half": [
+            "--tpu_config.ep_transport=ragged_all_to_all",
+            "--tpu_config.ep_capacity_factor=0.5",
+        ],
+        "roe_half_rounded": ["--tpu_config.ep_capacity_factor=0.5"],
+        "roe_worst_case": ["--tpu_config.ep_capacity_factor=2.0"],
+        "dropless": [],
+    }
+    tempdir = self.create_tempdir().full_path
+    records = {}
+    for arm, extra_args in arms.items():
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=_train_args(
+              "torchtitan.experiments.tpu.qwen3_5",
+              "graph_trainer_qwen35_moe_debugmodel",
+              use_splash_attention_kernel=False,
+          )
+          + ep2
+          + extra_args,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordEpDropStats(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        records[arm] = json.load(f)
+    logging.info("qwen3_5 MoE EP=2 capacity records by arm: %s", records)
+
+    for arm, record in records.items():
+      for step, loss in record["losses"]:
+        self.assertTrue(math.isfinite(loss), msg=f"{arm} step {step}")
+      if arm == "dropless":
+        self.assertEqual(record["ep_drop_stats"], [], msg=arm)
+        continue
+      self.assertEqual(
+          [step for step, _ in record["ep_drop_stats"]], [1, 2], msg=arm
+      )
+      for step, rows in record["ep_drop_stats"]:
+        msg = f"{arm} step {step}"
+        self.assertNotEmpty(rows, msg=msg)
+        for dropped, routes in rows:
+          # Every rank's tokens times top_k, on every MoE layer.
+          self.assertEqual(routes, self.num_devices * tokens_per_rank * 2, msg=msg)
+          if arm == "roe_worst_case":
+            self.assertEqual(dropped, 0, msg=msg)
+          elif arm == "ragged_half":
+            self.assertGreaterEqual(2 * dropped, routes, msg=msg)
+            self.assertLess(dropped, routes, msg=msg)
+          else:
+            self.assertGreaterEqual(dropped, 0, msg=msg)
+            self.assertLess(2 * dropped, routes, msg=msg)
 
   def test_qwen3_5_graph_trainer_matches_eager(self):
     """The graph-split GraphTrainer must train Qwen3.5 MoE to eager's losses.

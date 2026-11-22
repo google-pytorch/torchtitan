@@ -89,6 +89,7 @@ from torchtitan.experiments.tpu.overrides.real_rope import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
 from torchtitan.experiments.tpu.qwen3.config_registry import (
@@ -108,6 +109,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_235b_fsdp_activation_offload_maxtext,
     qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_fp8,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
     reg_trainer_qwen3_8b,
@@ -1145,6 +1147,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         94,
     )
 
+  def test_235b_scan_fp8_keeps_route_scores_after_the_experts(self) -> None:
+    # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2,
+    # so the recipe multiplies them after the experts instead.
+    config = qwen3_moe_235b_scan_fp8()
+
+    assert config.model_spec is not None
+    model = config.model_spec.model
+    experts = list(model.traverse(TpuGroupedExperts.Config))
+    self.assertLen(experts, 94)
+    self.assertTrue(all(e.use_fp8_grouped_mm for _, e, _, _ in experts))
+    # The recipe targets v7x, so it turns on in-kernel W1/W3 quantization.
+    self.assertTrue(all(e.fp8_w13_fused_lhs_quant for _, e, _, _ in experts))
+    routed = list(model.traverse(TpuRoutedExperts.Config))
+    self.assertLen(routed, 94)
+    self.assertFalse(any(r.scale_before_down_proj for _, r, _, _ in routed))
+    dispatchers = list(model.traverse(TpuAllToAllTokenDispatcher.Config))
+    self.assertLen(dispatchers, 94)
+    self.assertTrue(
+        all(d.fuse_route_score_backward for _, d, _, _ in dispatchers)
+    )
+
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()
 
@@ -1815,8 +1838,8 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   def test_scan_is_refused_at_model_build(self) -> None:
     """Gemma 4's sliding and global layers cannot share a stack.
 
-    Layer 0 is sliding (``QKVLinear``) while layer 5 is global ``K=V``
-    (``QKVLinearKeqV`` with a larger ``head_dim``), so ``check_layers_are_stackable``
+    Layer 0 is sliding while layer 5 is global ``K=V`` (with a larger
+    ``head_dim`` and ``k_eq_v=True``), so ``check_layers_are_stackable``
     refuses the model when ``build()`` constructs the scan stack.
     """
     graph_config = graph_trainer_gemma4_debugmodel()
@@ -1831,6 +1854,35 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         ),
     ):
       graph_config.model_spec.model.build()
+
+  @parameterized.parameters(
+      (graph_trainer_gemma4_debugmodel, 6, 1),
+      (graph_trainer_gemma4_moe_debug, 6, 1),
+      (gemma4_31b, 60, 10),
+      (gemma4_31b_graph_trainer, 60, 10),
+      (gemma4_31b_graph_split, 60, 10),
+      (gemma4_31b_graph_split_offload, 60, 10),
+      (gemma4_26b_a4b, 30, 5),
+      (gemma4_26b_a4b_graph_trainer, 30, 5),
+      (gemma4_26b_a4b_graph_split, 30, 5),
+      (gemma4_26b_a4b_graph_split_offload, 30, 5),
+  )
+  def test_graph_trainer_recipes_use_packed_qkv(
+      self, recipe, expected_packed_layers: int, expected_keqv_layers: int
+  ) -> None:
+    """Production and GraphTrainer Gemma 4 recipes convert all layers (sliding and global K=V) to TpuPackedQKVLinear."""
+    config = recipe()
+    assert config.model_spec is not None
+    packed_cfgs = [
+        cfg
+        for _, cfg, _, _ in config.model_spec.model.traverse(
+            TpuPackedQKVLinear.Config
+        )
+    ]
+    self.assertLen(packed_cfgs, expected_packed_layers)
+    self.assertEqual(
+        sum(1 for cfg in packed_cfgs if cfg.k_eq_v), expected_keqv_layers
+    )
 
   @parameterized.parameters(
       gemma4_debugmodel,
@@ -2026,6 +2078,27 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     ])
     self.assertEqual(pipeline_cfg.compile.graph_split.pipeline_kinds, ("rs",))
     apply_tpu_graph_trainer_model_transforms(pipeline_cfg)
+
+  def test_ep_rejects_fsdp_pipeline_and_allows_by_layer(self) -> None:
+    ep_pipeline_cfg = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+    ])
+    with self.assertRaisesRegex(
+        ValueError, "backward_partition_mode=by_layer"
+    ):
+      apply_tpu_graph_trainer_model_transforms(ep_pipeline_cfg)
+
+    ep_by_layer_cfg = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3_5",
+        "--config=graph_trainer_qwen35_moe_debugmodel",
+        "--parallelism.expert_parallel_degree=2",
+        "--compile.no-compile_grad_norm",
+        "--compile.graph_split.backward_partition_mode=by_layer",
+    ])
+    apply_tpu_graph_trainer_model_transforms(ep_by_layer_cfg)
 
 
 if __name__ == "__main__":

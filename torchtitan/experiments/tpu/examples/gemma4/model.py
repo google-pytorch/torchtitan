@@ -1,20 +1,24 @@
+from collections.abc import Callable
 import dataclasses
 from dataclasses import dataclass
+from typing import ClassVar
 
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate
 from torch.nn.attention import sdpa_kernel
 
+from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     FlexInnerAttention,
+    FusedQKVLinear,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     GQAttention,
-    QKVLinear,
     ScaledDotProductInnerAttention,
     VarlenInnerAttention,
 )
@@ -88,39 +92,165 @@ class Gemma4RoPE(CosSinRoPE):
         return torch.cat([theta.cos(), theta.sin()], dim=-1)
 
 
-class QKVLinearKeqV(QKVLinear):
-    """Two separate linear projections for Q and K, reusing K as V (global K=V layers)."""
+class _FusedQKInit:
+    """Slice-wise initializer for ``FusedQKVLinearKeqV.wqkv``.
+
+    Mirrors ``torchtitan.models.common.config_utils._FusedQKVInit`` for two
+    slices: Q and K are initialized as if they were separate ``wq`` / ``wk``
+    parameters and interleaved per KV group into the fused ``[n_kv, R, hd]``
+    layout (R = heads_per_kv + 1).
+    """
+
+    def __init__(
+        self,
+        base_init: Callable,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+    ) -> None:
+        self.base_init = base_init
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.heads_per_kv = n_heads // n_kv_heads
+
+    def __call__(self, t: torch.Tensor) -> None:
+        n_kv_heads, head_dim = self.n_kv_heads, self.head_dim
+        tail = t.shape[1:]
+        q = t.new_empty(self.n_heads * head_dim, *tail)
+        k = t.new_empty(n_kv_heads * head_dim, *tail)
+        self.base_init(q)
+        self.base_init(k)
+        fused = torch.cat(
+            [
+                q.view(n_kv_heads, self.heads_per_kv, head_dim, *tail),
+                k.view(n_kv_heads, 1, head_dim, *tail),
+            ],
+            dim=1,
+        ).view(-1, *tail)
+        with torch.no_grad():
+            if not isinstance(t, DTensor) and (tp_size := spmd_mesh_size("tp")) > 1:
+                mesh = current_spmd_mesh()
+                assert mesh is not None
+                fused = fused.chunk(tp_size, dim=0)[mesh.get_local_rank("tp")]
+            t.copy_(fused)
+
+
+def fused_qk_param_init(
+    base_param_init: dict[str, Callable],
+    *,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> dict[str, Callable]:
+    """``_fused_qkv_param_init`` counterpart for ``FusedQKVLinearKeqV`` (Q, K)."""
+    return {
+        param: _FusedQKInit(base_init, n_heads, n_kv_heads, head_dim)
+        for param in ("weight", "bias")
+        if (base_init := base_param_init.get(param)) is not None
+    }
+
+
+class FusedQKVLinearKeqV(FusedQKVLinear):
+    """Single fused Q/K projection, reusing K as V (global K=V layers).
+
+    Like :class:`FusedQKVLinear`, but ``wqkv`` holds only Q and K rows:
+    ``out_features = (n_heads + n_kv_heads) * head_dim``, split along
+    R = heads_per_kv + 1 (Q heads per KV group + K). ``forward`` returns
+    ``(xq, xk, xk)``. Checkpoints expose only ``wq.*`` / ``wk.*`` (no ``wv``),
+    matching the HF checkpoint, which has no ``v_proj`` on these layers.
+    """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(QKVLinear.Config):
-        pass
+    class Config(FusedQKVLinear.Config):
+        k_eq_v: ClassVar[bool] = True
 
     def __init__(self, config: Config) -> None:
-        # Call BaseQKVLinear.__init__ directly so we only build wq and wk (no wv).
-        super(QKVLinear, self).__init__(config)
-        self.wq = config.wq.build()
-        self.wk = config.wkv.build()
+        super().__init__(config)
+        self.r_dim = self.heads_per_kv + 1
+        expected_rows = (config.n_heads + config.n_kv_heads) * config.head_dim
+        if config.wqkv.out_features != expected_rows:
+            raise ValueError(
+                f"wqkv.out_features ({config.wqkv.out_features}) must equal "
+                f"(n_heads + n_kv_heads) * head_dim ({expected_rows}) for K=V"
+            )
 
-    def forward(
+    @spmd.local_map(
+        out_types=(
+            (
+                {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+                spmd.PartitionSpec(("dp", "cp"), "tp", None),
+            ),
+        )
+        * 3
+    )
+    def forward(  # pyrefly: ignore[bad-override]
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_tokens = x.shape[0]
-        xq, xk = self.wq(x), self.wk(x)
+        # [T, n_kv_heads * R * head_dim] -> [T, n_kv_heads, R, head_dim]; -1 for
+        # n_kv_heads so TP head sharding is handled automatically.
+        qk = self.wqkv(x)
+        with spmd.local():
+            qk = qk.view(num_tokens, -1, self.r_dim, self.head_dim)
+            if spmd.is_type_checking():
+                spmd.assert_type(
+                    qk,
+                    spmd.V,
+                    spmd.PartitionSpec(("dp", "cp"), "tp", None, None),
+                )
 
-        def local_qkv_head_split(tensor: torch.Tensor) -> torch.Tensor:
-            with spmd.local():
-                tensor_ = tensor.view(num_tokens, -1, self.head_dim)
-                if spmd.is_type_checking():
-                    spmd.assert_type(
-                        tensor_,
-                        spmd.V,
-                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
-                    )
-            return tensor_
-
-        xq = local_qkv_head_split(xq)
-        xk = local_qkv_head_split(xk)
+        local_num_tokens = qk.shape[0]
+        xq, xk = torch.split(qk, [self.heads_per_kv, 1], dim=-2)
+        xq = xq.reshape(local_num_tokens, -1, self.head_dim).contiguous()
+        xk = xk.reshape(local_num_tokens, -1, self.head_dim).contiguous()
         return xq, xk, xk
+
+    @staticmethod
+    def _split_qkv_on_save(module, state_dict, prefix, local_metadata) -> None:
+        """Split fused ``wqkv`` into ``wq`` / ``wk`` (weight and bias)."""
+        hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
+
+        for param, ndim in (("weight", 4), ("bias", 3)):
+            key = f"{prefix}wqkv.{param}"
+            if key not in state_dict:
+                continue
+            tensor = state_dict.pop(key)
+            if isinstance(tensor, DTensor):
+                tensor = tensor.redistribute(
+                    tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
+                )
+            n_kv = tensor.shape[0] // (r * hd)
+            tail = (tensor.shape[1],) if ndim == 4 else ()
+            w = tensor.reshape(n_kv, r, hd, *tail)
+            state_dict[f"{prefix}wq.{param}"] = (
+                w[:, :hpk].reshape(-1, *tail).contiguous()
+            )
+            state_dict[f"{prefix}wk.{param}"] = (
+                w[:, hpk].reshape(-1, *tail).contiguous()
+            )
+
+    @staticmethod
+    def _merge_qkv_on_load(module, state_dict, prefix, *args) -> None:
+        """Merge ``wq`` / ``wk`` back into fused ``wqkv`` (weight and bias)."""
+        hd, hpk = module.head_dim, module.heads_per_kv
+
+        for param, ndim in (("weight", 4), ("bias", 3)):
+            keys = [f"{prefix}{w}.{param}" for w in ("wq", "wk")]
+            if not all(k in state_dict for k in keys):
+                continue
+            wq, wk = (state_dict.pop(k) for k in keys)
+            if isinstance(wq, DTensor):
+                wq, wk = (
+                    t.redistribute(t.device_mesh, [Replicate()] * t.device_mesh.ndim)
+                    for t in (wq, wk)
+                )
+            n_kv = wk.shape[0] // hd
+            tail = (wq.shape[1],) if ndim == 4 else ()
+            q = wq.reshape(n_kv, hpk, hd, *tail)
+            k = wk.reshape(n_kv, 1, hd, *tail)
+            fused = torch.cat([q, k], dim=1)
+            state_dict[f"{prefix}wqkv.{param}"] = fused.reshape(-1, *tail)
 
 
 class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
@@ -661,7 +791,9 @@ class Gemma4Model(Decoder):
                 n_kv_heads = attention.n_kv_heads or n_heads
                 head_dim = attention.head_dim or dim // n_heads
 
-                if isinstance(attention.qkv_linear, QKVLinearKeqV.Config):
+                if isinstance(attention.qkv_linear, FusedQKVLinearKeqV.Config) or getattr(
+                    attention.qkv_linear, "k_eq_v", False
+                ):
                     # Global K=V layers have only Q, K, and O projections (no V projection).
                     qkv_out = (n_heads + n_kv_heads) * head_dim
                 else:
@@ -742,6 +874,7 @@ class Gemma4Model(Decoder):
 
 
 __all__ = [
+    "FusedQKVLinearKeqV",
     "Gemma4Attention",
     "Gemma4Embedding",
     "Gemma4FeedForward",
@@ -750,5 +883,5 @@ __all__ = [
     "Gemma4RoPE",
     "Gemma4Router",
     "Gemma4TransformerBlock",
-    "QKVLinearKeqV",
+    "fused_qk_param_init",
 ]

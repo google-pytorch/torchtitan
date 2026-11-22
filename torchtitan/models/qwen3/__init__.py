@@ -205,7 +205,7 @@ def _build_qwen3_moe_layers(
     return layers
 
 
-def _debugmodel(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _debugmodel(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 256
     head_dim = 128
     n_layers = 8
@@ -226,7 +226,7 @@ def _debugmodel(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qw
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -243,25 +243,8 @@ def _debugmodel(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qw
     )
 
 
-def _debugmodel_non_fused_qkv(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
-    # Reverse of the default fused QKV: keeps coverage for the separate
-    # wq/wk/wv path now that fuse_qkv defaults to True.
-    config = _debugmodel(attn_backend, seq_len=seq_len)
-    config.layers = _build_qwen3_layers(
-        fuse_qkv=False,
-        n_layers=8,
-        dim=256,
-        n_heads=16,
-        n_kv_heads=8,
-        head_dim=128,
-        hidden_dim=3072,
-        attn_backend=attn_backend,
-        rope=CosSinRoPE.Config(dim=128, max_context_length=seq_len, theta=1000000.0),
-    )
-    return config
 
-
-def _0_6b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _0_6b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 1024
     head_dim = 128
     n_layers = 28
@@ -282,7 +265,7 @@ def _0_6b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mod
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -299,7 +282,7 @@ def _0_6b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mod
     )
 
 
-def _1_7b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _1_7b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 2048
     head_dim = 128
     n_layers = 28
@@ -320,7 +303,7 @@ def _1_7b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mod
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -337,7 +320,7 @@ def _1_7b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mod
     )
 
 
-def _4b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _4b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 2560
     head_dim = 128
     n_layers = 36
@@ -358,7 +341,7 @@ def _4b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=32,
@@ -375,7 +358,7 @@ def _4b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model
     )
 
 
-def _8b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _8b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 4096
     head_dim = 128
     n_layers = 36
@@ -393,7 +376,7 @@ def _8b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=32,
@@ -410,7 +393,7 @@ def _8b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model
     )
 
 
-def _14b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _14b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 5120
     head_dim = 128
     n_layers = 40
@@ -428,7 +411,7 @@ def _14b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mode
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=40,
@@ -445,7 +428,7 @@ def _14b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mode
     )
 
 
-def _32b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _32b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 5120
     head_dim = 128
     n_layers = 64
@@ -463,7 +446,7 @@ def _32b(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Mode
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=64,
@@ -488,7 +471,6 @@ def _debugmodel_moe(
     moe_comm_backend: str = "standard",
     *,
     seq_len: int,
-    fuse_qkv: bool = True,
 ) -> Qwen3Model.Config:
     dim = 256
     head_dim = 128
@@ -507,7 +489,7 @@ def _debugmodel_moe(
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_moe_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -532,7 +514,6 @@ def _30b_a3b(
     moe_comm_backend: str = "standard",
     *,
     seq_len: int,
-    fuse_qkv: bool = True,
     load_balance_coeff: float | None = 1e-3,
     global_aux_loss_coeff: float | None = None,
 ) -> Qwen3Model.Config:
@@ -553,7 +534,7 @@ def _30b_a3b(
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_moe_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=32,
@@ -580,13 +561,11 @@ def _30b_a3b_global_aux(
     moe_comm_backend: str = "standard",
     *,
     seq_len: int,
-    fuse_qkv: bool = True,
 ) -> Qwen3Model.Config:
     return _30b_a3b(
         attn_backend,
         moe_comm_backend,
         seq_len=seq_len,
-        fuse_qkv=fuse_qkv,
         load_balance_coeff=None,
         global_aux_loss_coeff=1e-3,
     )
@@ -597,7 +576,6 @@ def _235b_a22b(
     moe_comm_backend: str = "standard",
     *,
     seq_len: int,
-    fuse_qkv: bool = True,
 ) -> Qwen3Model.Config:
     dim = 4096
     head_dim = 128
@@ -616,7 +594,7 @@ def _235b_a22b(
             param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_moe_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=64,
@@ -636,7 +614,7 @@ def _235b_a22b(
     )
 
 
-def _testmodel(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwen3Model.Config:
+def _testmodel(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 128
     head_dim = 16
     n_layers = 3
@@ -655,7 +633,7 @@ def _testmodel(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwe
             in_features=dim, out_features=vocab_size, param_init=_LINEAR_INIT
         ),
         layers=_build_qwen3_layers(
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=8,
@@ -671,16 +649,9 @@ def _testmodel(attn_backend: str, *, seq_len: int, fuse_qkv: bool = True) -> Qwe
         ),
     )
 
-# TPU fork change (google-pytorch/torchtitan), to be upstreamed to
-# pytorch/torchtitan: every flavor builder above takes `fuse_qkv` (default
-# True, matching upstream) so callers can select the separate wq/wk/wv
-# projections. On TPU, `fuse_qkv=False` avoids the fused-QKV relayout copies in
-# training and the full FSDP all-gather in `FusedQKVLinear._split_qkv_on_save`
-# during RL weight sync.
 qwen3_configs = {
     "testmodel": (_testmodel, 128),
     "debugmodel": (_debugmodel, 4096),
-    "debugmodel_non_fused_qkv": (_debugmodel_non_fused_qkv, 4096),
     "0.6B": (_0_6b, 40960),
     "1.7B": (_1_7b, 40960),
     "4B": (_4b, 40960),
@@ -700,8 +671,6 @@ def model_registry(
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
-    # TPU fork change, to be upstreamed: None keeps the flavor's default.
-    fuse_qkv: bool | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     get_config, max_context_len = qwen3_configs[flavor]
@@ -717,7 +686,6 @@ def model_registry(
         **{"moe_comm_backend": moe_comm_backend}
         if moe_comm_backend is not None
         else {},
-        **{"fuse_qkv": fuse_qkv} if fuse_qkv is not None else {},
     )
     if converters is not None:
         validate_converter_order(converters)

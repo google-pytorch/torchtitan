@@ -1,8 +1,8 @@
-"""Unit tests for the flags of the TPU selective activation checkpointing.
+"""Unit tests for the flag of the TPU selective activation checkpointing.
 
-Covers ``TPUSelectiveAC``'s save set for every flag combination and its
-defaults, and, eagerly on CPU, that a flag changes which forward ops backward
-re-runs but not a single bit of the gradients.
+Covers ``TPUSelectiveAC``'s save set with ``save_pallas_attention`` on (the
+default) and off, and, eagerly on CPU, that the flag changes which forward ops
+backward re-runs but not a single bit of the gradients.
 """
 
 import collections
@@ -12,11 +12,10 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 from torch import nn
-from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.components import activation_checkpoint as tpu_ac
 
-_DEFAULTS = {"recompute_bmm": False, "save_pallas_attention": True}
+_DEFAULTS = {"save_pallas_attention": True}
 _FLAGS = tuple(_DEFAULTS)
 _COLLECTIVES = {
     torch.ops._c10d_functional.all_to_all_single.default,
@@ -68,20 +67,6 @@ _splash_like_fwd.register_autograd(
 )
 
 
-class _BmmLoopBlock(nn.Module):
-  """A Python loop of small batched matmuls, as in a chunked recurrence."""
-
-  def __init__(self, dim: int, num_steps: int):
-    super().__init__()
-    self.weight = nn.Parameter(torch.randn(num_steps, dim, dim) / dim**0.5)
-
-  def forward(self, x: torch.Tensor) -> torch.Tensor:
-    state = x
-    for weight in self.weight.unbind(0):
-      state = torch.tanh(torch.bmm(state, weight.expand(x.shape[0], -1, -1)))
-    return state
-
-
 class _SplashLikeBlock(nn.Module):
   """A block whose only expensive op is the splash-like forward."""
 
@@ -104,20 +89,6 @@ class _Model(nn.Module):
     return self.layers["0"](x)
 
 
-class _CountOps(TorchDispatchMode):
-  """Counts calls of the given aten ops."""
-
-  def __init__(self, ops):
-    super().__init__()
-    self.ops = ops
-    self.counts = collections.Counter()
-
-  def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-    if func in self.ops:
-      self.counts[func] += 1
-    return func(*args, **(kwargs or {}))
-
-
 def _save_ops(**flags) -> set:
   config = tpu_ac.TPUSelectiveAC.Config(**flags)
   return tpu_ac.TPUSelectiveAC(config).get_save_ops()
@@ -127,8 +98,8 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
   return t.detach().contiguous().view(torch.uint8)
 
 
-class TPUSelectiveACFlagsTest(parameterized.TestCase):
-  """The flags of ``TPUSelectiveAC``."""
+class TPUSelectiveACFlagTest(parameterized.TestCase):
+  """The flag of ``TPUSelectiveAC``."""
 
   def test_flag_defaults(self):
     names = {f.name for f in dataclasses.fields(tpu_ac.TPUSelectiveAC.Config)}
@@ -138,8 +109,8 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     for flag, default in _DEFAULTS.items():
       self.assertIs(getattr(config, flag), default, msg=flag)
 
-  def test_flags_off_is_core_minus_the_collectives(self):
-    """Both flags off: core ``SelectiveAC``'s save set minus the collectives."""
+  def test_flag_off_is_core_minus_the_collectives(self):
+    """The flag off: core ``SelectiveAC``'s save set minus the collectives."""
     off = _save_ops(save_pallas_attention=False)
     core = SelectiveAC(SelectiveAC.Config()).get_save_ops()
     self.assertIs(type(off), set)
@@ -159,12 +130,6 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     save_ops = tpu_ac.TPUSelectiveAC(SelectiveAC.Config()).get_save_ops()
     self.assertEqual(set(save_ops), _save_ops(save_pallas_attention=False))
     self.assertIn(_SPLASH_FWD, save_ops)
-
-  def test_recompute_bmm_drops_only_bmm(self):
-    off = _save_ops(save_pallas_attention=False)
-    recompute_bmm = _save_ops(recompute_bmm=True, save_pallas_attention=False)
-    self.assertEqual(recompute_bmm, off - {torch.ops.aten.bmm.default})
-    self.assertIn(torch.ops.aten.mm.default, recompute_bmm)
 
   def test_save_pallas_attention_matches_the_splash_forward_by_name(self):
     off = _save_ops(save_pallas_attention=False)
@@ -198,28 +163,14 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     self.assertNotIn(torch.ops.aten.bmm.default, derived["a - b"])
     self.assertEqual(set(derived["copy"]), set(save_ops))
 
-  @parameterized.product(
-      recompute_bmm=(False, True), save_pallas_attention=(False, True)
-  )
-  def test_flags_compose(self, recompute_bmm, save_pallas_attention):
-    off = _save_ops(save_pallas_attention=False)
-    save_ops = _save_ops(
-        recompute_bmm=recompute_bmm, save_pallas_attention=save_pallas_attention
-    )
-    want = off - ({torch.ops.aten.bmm.default} if recompute_bmm else set())
-    self.assertEqual(set(save_ops), want)
-    self.assertEqual(_SPLASH_FWD in save_ops, save_pallas_attention)
-
   def test_build_keeps_every_field(self):
     config = tpu_ac.TPUSelectiveAC.Config(
-        recompute_bmm=True,
         save_pallas_attention=False,
         preserve_rng_state=False,
         debug=True,
     )
     policy = config.build(dump_folder="")
     self.assertIs(type(policy), tpu_ac.TPUSelectiveAC)
-    self.assertTrue(policy.config.recompute_bmm)
     self.assertFalse(policy.config.save_pallas_attention)
     self.assertFalse(policy.config.preserve_rng_state)
     self.assertTrue(policy.config.debug)
@@ -234,34 +185,16 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
       self.assertIs(getattr(converted, flag), default, msg=flag)
 
   def _run(self, block_fn, x, **flags):
-    """Forward + backward of a wrapped block; ops counted during backward."""
+    """Forward + backward of a wrapped block; splash calls during backward."""
     torch.manual_seed(0)
     model = _Model(block_fn())
     tpu_ac.TPUSelectiveAC(tpu_ac.TPUSelectiveAC.Config(**flags)).apply(model)
     leaf = x.clone().requires_grad_()
     out = model(leaf)
     _CALLS.clear()
-    with _CountOps({torch.ops.aten.bmm.default}) as counter:
-      out.sum().backward()
+    out.sum().backward()
     grads = [leaf.grad] + [p.grad for p in model.parameters()]
-    bmm_calls = counter.counts[torch.ops.aten.bmm.default]
-    return out, grads, bmm_calls, _CALLS["splash_fwd"]
-
-  def test_recompute_bmm_reruns_the_loop_bmm_in_backward_bitwise(self):
-    num_steps, dim = 4, 8
-    x = torch.randn(3, 5, dim)
-
-    def block():
-      return _BmmLoopBlock(dim, num_steps)
-
-    out, grads, bmm_saved, _ = self._run(block, x)
-    out_r, grads_r, bmm_recomputed, _ = self._run(block, x, recompute_bmm=True)
-    # Saved: backward runs only the gradient bmm. Recomputed: plus the
-    # forward's num_steps bmm, once each.
-    self.assertEqual(bmm_recomputed - bmm_saved, num_steps)
-    self.assertTrue(torch.equal(_bits(out), _bits(out_r)))
-    for g, g_r in zip(grads, grads_r, strict=True):
-      self.assertTrue(torch.equal(_bits(g), _bits(g_r)))
+    return out, grads, _CALLS["splash_fwd"]
 
   def test_save_pallas_attention_skips_the_forward_rerun_bitwise(self):
     dim = 8
@@ -270,10 +203,10 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     def block():
       return _SplashLikeBlock(dim)
 
-    out, grads, _, fwd_recomputed = self._run(
+    out, grads, fwd_recomputed = self._run(
         block, x, save_pallas_attention=False
     )
-    out_s, grads_s, _, fwd_saved = self._run(block, x)  # The default.
+    out_s, grads_s, fwd_saved = self._run(block, x)  # The default.
     self.assertEqual(fwd_recomputed, 1)
     self.assertEqual(fwd_saved, 0)
     self.assertTrue(torch.equal(_bits(out), _bits(out_s)))

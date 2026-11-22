@@ -62,12 +62,6 @@ class TPUSelectiveAC(SelectiveAC):
   ``save_pallas_attention=False`` recomputes it instead. A core
   ``SelectiveAC.Config`` passed to this policy directly saves it too.
 
-  ``recompute_bmm`` (off by default) recomputes ``aten.bmm`` outputs instead
-  of saving them. A Python loop of small batched matmuls (the XLA
-  GatedDeltaNet chunk recurrence: three per 64-token chunk) otherwise hands
-  one saved tensor per loop step from the compiled forward to the compiled
-  backward.
-
   Saving or recomputing an op runs the same op on the same inputs. On CPU the
   values are bit-identical; on TPU a recomputed op is compiled into the
   backward program, where XLA may fuse it differently, so results can differ
@@ -76,9 +70,6 @@ class TPUSelectiveAC(SelectiveAC):
 
   @dataclass(kw_only=True, slots=True)
   class Config(SelectiveAC.Config):
-    recompute_bmm: bool = False
-    """Recompute ``aten.bmm`` outputs in backward instead of saving them."""
-
     save_pallas_attention: bool = True
     """Save the Pallas splash-attention forward (output + logsumexp).
 
@@ -89,8 +80,6 @@ class TPUSelectiveAC(SelectiveAC):
   def get_save_ops(self) -> set:
     config = self.config
     save_ops = super().get_save_ops() - _SAVED_COLLECTIVES
-    if getattr(config, "recompute_bmm", False):
-      save_ops.discard(torch.ops.aten.bmm.default)
     # A core SelectiveAC.Config has no field: it gets the default.
     if getattr(config, "save_pallas_attention", True):
       save_ops = _SaveOpsIncludingPallasAttention(save_ops)

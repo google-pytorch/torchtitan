@@ -54,8 +54,13 @@ class TPUSelectiveAC(SelectiveAC):
   about (SDPA, flex attention, varlen attention), the save set also holds the
   Pallas splash-attention forward (output + logsumexp, matched by name), so
   backward runs only the splash backward kernel instead of re-running the
-  forward kernel first. ``save_pallas_attention=False`` recomputes it instead.
-  A core ``SelectiveAC.Config`` passed to this policy directly saves it too.
+  forward kernel first. Measured on Llama-3.2-1B / 4x v6e, the recomputed
+  splash forward ran 32 times per step (16 layers, twice) and the duplicate
+  cost 81 ms of an 840 ms step. Saving it costs one attention output plus its
+  logsumexp per layer (``bf16[1, H, T, D]`` + ``f32[1, H, T]``: ~69 MB per
+  layer at T=16384, H=32, D=64), the same trade upstream makes for SDPA.
+  ``save_pallas_attention=False`` recomputes it instead. A core
+  ``SelectiveAC.Config`` passed to this policy directly saves it too.
 
   ``recompute_bmm`` (off by default) recomputes ``aten.bmm`` outputs instead
   of saving them. A Python loop of small batched matmuls (the XLA
@@ -144,27 +149,3 @@ class _SaveOpsIncludingPallasAttention(set):
 
   def copy(self):
     return type(self)(self)
-
-
-class AttentionSavingSelectiveAC(SelectiveAC):
-  """``SelectiveAC`` that also saves the attention output on TPU.
-
-  Upstream's default save set already holds every attention implementation it
-  knows about -- the three ``aten::_scaled_dot_product_*`` variants and the
-  flex-attention HOP -- so on GPU the attention output is kept and only cheap
-  ops are recomputed. The TPU lane's attention is a Pallas custom op, which is
-  in none of those lists, so selective AC recomputes it: measured on
-  Llama-3.2-1B / 4x v6e, the splash forward kernel runs 32 times per step (16
-  layers, twice) and the duplicate costs 81 ms of an 840 ms step.
-
-  Saving it costs one attention output plus its logsumexp per layer
-  (``bf16[1, H, T, D]`` + ``f32[1, H, T]``: ~69 MB per layer at T=16384, H=32,
-  D=64), which is the same trade upstream already makes for SDPA.
-  """
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(SelectiveAC.Config):
-    pass
-
-  def get_save_ops(self) -> set:
-    return _SaveOpsIncludingPallasAttention(super().get_save_ops())

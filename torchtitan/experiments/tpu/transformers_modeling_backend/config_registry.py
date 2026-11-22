@@ -23,7 +23,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.experiments.tpu.components.activation_checkpoint import AttentionSavingSelectiveAC
+from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
@@ -263,11 +263,11 @@ def _tpu_hf_config(
           interval=10,
           last_save_model_only=False,
       ),
-      # ``save_attention`` swaps in the policy that also keeps the Pallas
-      # attention output, as upstream's default set already does for every
-      # attention implementation it knows about (SDPA variants, flex).
+      # ``save_attention`` swaps in TPUSelectiveAC, which also keeps the
+      # Pallas attention output, as upstream's default set already does for
+      # every attention implementation it knows about (SDPA variants, flex).
       activation_checkpoint=(
-          AttentionSavingSelectiveAC.Config() if save_attention
+          TPUSelectiveAC.Config() if save_attention
           else SelectiveAC.Config()
       ),
   )

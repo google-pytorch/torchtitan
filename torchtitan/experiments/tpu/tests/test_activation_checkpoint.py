@@ -1,8 +1,8 @@
 """Unit tests for the flags of the TPU selective activation checkpointing.
 
-Covers ``TPUSelectiveAC``'s save set for every flag combination, and, eagerly on
-CPU, that a flag changes which forward ops backward re-runs but not a single
-bit of the gradients.
+Covers ``TPUSelectiveAC``'s save set for every flag combination and its
+defaults, and, eagerly on CPU, that a flag changes which forward ops backward
+re-runs but not a single bit of the gradients.
 """
 
 import collections
@@ -16,7 +16,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.components import activation_checkpoint as tpu_ac
 
-_FLAGS = ("recompute_bmm", "save_pallas_attention")
+_DEFAULTS = {"recompute_bmm": False, "save_pallas_attention": True}
+_FLAGS = tuple(_DEFAULTS)
 _COLLECTIVES = {
     torch.ops._c10d_functional.all_to_all_single.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
@@ -129,32 +130,44 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 class TPUSelectiveACFlagsTest(parameterized.TestCase):
   """The flags of ``TPUSelectiveAC``."""
 
-  def test_flags_are_off_by_default(self):
+  def test_flag_defaults(self):
     names = {f.name for f in dataclasses.fields(tpu_ac.TPUSelectiveAC.Config)}
     core = {f.name for f in dataclasses.fields(SelectiveAC.Config)}
     self.assertEqual(names - core, set(_FLAGS))
     config = tpu_ac.TPUSelectiveAC.Config()
-    for flag in _FLAGS:
-      self.assertIs(getattr(config, flag), False, msg=flag)
+    for flag, default in _DEFAULTS.items():
+      self.assertIs(getattr(config, flag), default, msg=flag)
 
-  def test_flags_off_is_the_unchanged_policy(self):
+  def test_flags_off_is_core_minus_the_collectives(self):
     """Both flags off: core ``SelectiveAC``'s save set minus the collectives."""
-    off = _save_ops()
+    off = _save_ops(save_pallas_attention=False)
     core = SelectiveAC(SelectiveAC.Config()).get_save_ops()
     self.assertIs(type(off), set)
     self.assertEqual(off, core - _COLLECTIVES)
     self.assertIn(torch.ops.aten.bmm.default, off)
     self.assertNotIn(_SPLASH_FWD, off)
 
+  def test_default_saves_the_splash_forward(self):
+    """Default: the same ops, plus the splash forward, as upstream for SDPA."""
+    default = _save_ops()
+    self.assertEqual(set(default), _save_ops(save_pallas_attention=False))
+    self.assertIn(_SPLASH_FWD, default)
+    self.assertNotIn(_SPLASH_BWD, default)
+
+  def test_core_config_given_to_the_policy_saves_the_splash_forward(self):
+    """A core config built into ``TPUSelectiveAC`` directly gets the default."""
+    save_ops = tpu_ac.TPUSelectiveAC(SelectiveAC.Config()).get_save_ops()
+    self.assertEqual(set(save_ops), _save_ops(save_pallas_attention=False))
+    self.assertIn(_SPLASH_FWD, save_ops)
+
   def test_recompute_bmm_drops_only_bmm(self):
-    off = _save_ops()
-    self.assertEqual(
-        _save_ops(recompute_bmm=True), off - {torch.ops.aten.bmm.default}
-    )
-    self.assertIn(torch.ops.aten.mm.default, _save_ops(recompute_bmm=True))
+    off = _save_ops(save_pallas_attention=False)
+    recompute_bmm = _save_ops(recompute_bmm=True, save_pallas_attention=False)
+    self.assertEqual(recompute_bmm, off - {torch.ops.aten.bmm.default})
+    self.assertIn(torch.ops.aten.mm.default, recompute_bmm)
 
   def test_save_pallas_attention_matches_the_splash_forward_by_name(self):
-    off = _save_ops()
+    off = _save_ops(save_pallas_attention=False)
     save_ops = _save_ops(save_pallas_attention=True)
     matcher = tpu_ac._SaveOpsIncludingPallasAttention  # pylint: disable=protected-access
     self.assertIsInstance(save_ops, matcher)
@@ -164,11 +177,32 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     self.assertIn(splash_like.default, save_ops)
     self.assertNotIn(_SPLASH_BWD, save_ops)
 
+  def test_set_operations_keep_the_splash_match(self):
+    """A subclass may return ``super().get_save_ops() | {op}`` or ``- {op}``."""
+    save_ops = _save_ops()
+    extra = {torch.ops.aten.cumsum.default}
+    bmm = {torch.ops.aten.bmm.default}
+    derived = {
+        "a | b": save_ops | extra,
+        "b | a": extra | save_ops,
+        "a - b": save_ops - bmm,
+        "union": save_ops.union(extra),
+        "difference": save_ops.difference(bmm),
+        "copy": save_ops.copy(),
+    }
+    for name, ops in derived.items():
+      self.assertIn(_SPLASH_FWD, ops, msg=name)
+      self.assertNotIn(_SPLASH_BWD, ops, msg=name)
+    self.assertIn(torch.ops.aten.cumsum.default, derived["a | b"])
+    self.assertIn(torch.ops.aten.cumsum.default, derived["b | a"])
+    self.assertNotIn(torch.ops.aten.bmm.default, derived["a - b"])
+    self.assertEqual(set(derived["copy"]), set(save_ops))
+
   @parameterized.product(
       recompute_bmm=(False, True), save_pallas_attention=(False, True)
   )
   def test_flags_compose(self, recompute_bmm, save_pallas_attention):
-    off = _save_ops()
+    off = _save_ops(save_pallas_attention=False)
     save_ops = _save_ops(
         recompute_bmm=recompute_bmm, save_pallas_attention=save_pallas_attention
     )
@@ -179,25 +213,25 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
   def test_build_keeps_every_field(self):
     config = tpu_ac.TPUSelectiveAC.Config(
         recompute_bmm=True,
-        save_pallas_attention=True,
+        save_pallas_attention=False,
         preserve_rng_state=False,
         debug=True,
     )
     policy = config.build(dump_folder="")
     self.assertIs(type(policy), tpu_ac.TPUSelectiveAC)
     self.assertTrue(policy.config.recompute_bmm)
-    self.assertTrue(policy.config.save_pallas_attention)
+    self.assertFalse(policy.config.save_pallas_attention)
     self.assertFalse(policy.config.preserve_rng_state)
     self.assertTrue(policy.config.debug)
 
-  def test_tpu_selective_ac_config_leaves_the_flags_off(self):
+  def test_tpu_selective_ac_config_uses_the_flag_defaults(self):
     converted = tpu_ac.tpu_selective_ac_config(
         SelectiveAC.Config(preserve_rng_state=False)
     )
     self.assertIs(type(converted), tpu_ac.TPUSelectiveAC.Config)
     self.assertFalse(converted.preserve_rng_state)
-    for flag in _FLAGS:
-      self.assertIs(getattr(converted, flag), False, msg=flag)
+    for flag, default in _DEFAULTS.items():
+      self.assertIs(getattr(converted, flag), default, msg=flag)
 
   def _run(self, block_fn, x, **flags):
     """Forward + backward of a wrapped block; ops counted during backward."""
@@ -236,10 +270,10 @@ class TPUSelectiveACFlagsTest(parameterized.TestCase):
     def block():
       return _SplashLikeBlock(dim)
 
-    out, grads, _, fwd_recomputed = self._run(block, x)
-    out_s, grads_s, _, fwd_saved = self._run(
-        block, x, save_pallas_attention=True
+    out, grads, _, fwd_recomputed = self._run(
+        block, x, save_pallas_attention=False
     )
+    out_s, grads_s, _, fwd_saved = self._run(block, x)  # The default.
     self.assertEqual(fwd_recomputed, 1)
     self.assertEqual(fwd_saved, 0)
     self.assertTrue(torch.equal(_bits(out), _bits(out_s)))

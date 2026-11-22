@@ -292,6 +292,8 @@ class TpuGroupedExperts(GroupedExperts):
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
+        *,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``GroupedExperts.forward`` with a configurable activation.
 
@@ -299,7 +301,10 @@ class TpuGroupedExperts(GroupedExperts):
         ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
         silu.
         """
-        w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
+        if weights is not None:
+            w1_EFD, w2_EDF, w3_EFD = weights
+        else:
+            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
 
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
         if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
@@ -319,16 +324,51 @@ class TpuGroupedExperts(GroupedExperts):
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
 
+    def unshard_weights(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the local expert weights (w1, w2, w3) as ``forward`` uses them.
+
+        Reading the parameters runs SimpleFSDP's all-gathers, so EP token
+        chunking calls this once per layer and passes the result to every
+        chunk's ``forward(pre_unsharded_weights=...)``. The weights come in the
+        layout ``forward`` consumes: kernel-native or transposed for the Pallas
+        grouped matmuls, canonical otherwise.
+
+        GraphTrainer's SimpleFSDP bucketing keys the all-gathers on the
+        ``module_fqn`` that ``annotate_module_fqns`` attaches to ``forward``.
+        This second entry point does not go through ``forward``, so the TPU
+        GraphTrainer tags it the same way (``annotate_expert_unshard_fqns``).
+        FSDP2 would reshard after the call returns; chunking rejects it.
+        """
+        if self.use_kernel_native_weight_layout:
+            w1_EKN = self.w1_EDF
+            w2_EKN = self.w2_EFD
+            w3_EKN = self.w3_EDF
+        elif self.use_pallas_grouped_mm:
+            w1_EKN = self.w1_EFD.transpose(-2, -1)
+            w2_EKN = self.w2_EDF.transpose(-2, -1)
+            w3_EKN = self.w3_EFD.transpose(-2, -1)
+        else:
+            return self.w1_EFD, self.w2_EDF, self.w3_EFD
+        if self._use_transposed_w2_rhs:
+            w2_EKN = w2_EKN.transpose(-2, -1)
+        return w1_EKN, w2_EKN, w3_EKN
+
     def forward(
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
         row_scale_R: torch.Tensor | None = None,
+        *,
+        pre_unsharded_weights: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
     ) -> torch.Tensor:
         """Run the experts on expert-sorted rows.
 
         ``row_scale_R``, if given, multiplies each row's hidden activation
-        before the down projection (W2).
+        before the down projection (W2). ``pre_unsharded_weights``, if given,
+        is the output of ``unshard_weights`` and is used instead of the
+        parameters.
         """
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
@@ -336,20 +376,16 @@ class TpuGroupedExperts(GroupedExperts):
         if not self.use_pallas_grouped_mm:
             if row_scale_R is not None:
                 raise ValueError("row_scale_R requires Pallas grouped matmul")
-            if self.activation == "silu":
+            if self.activation == "silu" and pre_unsharded_weights is None:
                 return super().forward(x_RD, num_tokens_per_expert_E)
-            return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
-        if self.use_kernel_native_weight_layout:
-            w1_EKN = self.w1_EDF
-            w2_EKN = self.w2_EFD
-            w3_EKN = self.w3_EDF
-        else:
-            w1_EKN = self.w1_EFD.transpose(-2, -1)
-            w2_EKN = self.w2_EDF.transpose(-2, -1)
-            w3_EKN = self.w3_EFD.transpose(-2, -1)
-
-        if self._use_transposed_w2_rhs:
-            w2_EKN = w2_EKN.transpose(-2, -1)
+            return self._native_experts_forward(
+                x_RD, num_tokens_per_expert_E, weights=pre_unsharded_weights
+            )
+        w1_EKN, w2_EKN, w3_EKN = (
+            pre_unsharded_weights
+            if pre_unsharded_weights is not None
+            else self.unshard_weights()
+        )
 
         # Match GroupedExperts: expert compute is BF16 even when the surrounding
         # model is FP32, and the final result is restored to the caller's dtype.

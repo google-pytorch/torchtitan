@@ -9,6 +9,7 @@
 import dataclasses
 import typing
 from types import SimpleNamespace
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -30,6 +31,9 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_pass_pipeline,
+)
+from torchtitan.experiments.tpu.graph_trainer import (
+    tpu_graph_trainer as tpu_graph_trainer_module,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
@@ -2062,6 +2066,59 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         "--compile.graph_split.backward_partition_mode=by_layer",
     ])
     apply_tpu_graph_trainer_model_transforms(ep_by_layer_cfg)
+
+
+class TpuGraphTrainerEpDropStatsTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ("_single_rank", False, False, False),
+      ("_dp_cp", True, False, False),
+      ("_ep_dp_cp", True, True, False),
+      ("_ep_tp", True, True, True),
+      ("_ep_tp_only", False, True, True),
+      # tp without EP holds the same tokens; drop stats never get here, but
+      # the reduction must not add tp.
+      ("_tp_without_ep", True, False, True),
+  )
+  def test_drop_stats_sum_over_token_holding_ranks(
+      self, has_loss_mesh, ep_enabled, has_tp_mesh
+  ):
+    loss_mesh = object() if has_loss_mesh else None
+    tp_group = object()
+    tp_mesh = (
+        SimpleNamespace(get_group=lambda: tp_group) if has_tp_mesh else None
+    )
+    meshes = {"loss": loss_mesh, "tp": tp_mesh}
+
+    def get_mesh(name):
+      raise AssertionError(f"drop stats must not require the {name!r} mesh")
+
+    trainer = SimpleNamespace(
+        _ep_drop_stats_enabled=True,
+        _ep_drop_stats_L2=torch.tensor([[1, 8], [0, 8]], dtype=torch.int32),
+        parallel_dims=SimpleNamespace(
+            ep_enabled=ep_enabled,
+            get_optional_mesh=meshes.__getitem__,
+            get_mesh=get_mesh,
+        ),
+        step=1,
+    )
+    with mock.patch.object(
+        tpu_graph_trainer_module.dist_utils,
+        "dist_sum_tensor",
+        side_effect=lambda x, mesh=None, extra_pg=None: x,
+    ) as sum_mock:
+      global_L2 = TpuGraphTrainer._maybe_log_ep_drop_stats(
+          typing.cast(typing.Any, trainer)
+      )
+    sum_mock.assert_called_once()
+    args, kwargs = sum_mock.call_args
+    self.assertIs(args[1], loss_mesh)
+    self.assertIs(
+        kwargs["extra_pg"], tp_group if ep_enabled and has_tp_mesh else None
+    )
+    self.assertEqual(global_L2.dtype, torch.int64)
+    self.assertEqual(global_L2.tolist(), [[1, 8], [0, 8]])
 
 
 if __name__ == "__main__":

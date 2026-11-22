@@ -274,7 +274,8 @@ class TpuGraphTrainer(GraphTrainer):
         """Logs global and worst-layer EP dropped-route rates when capacity-bounded.
 
         Sums the latest step's per-layer ``[dropped, total]`` route counts over
-        the batch mesh and logs one line; with gradient accumulation that is
+        every rank holding distinct tokens (the loss mesh, plus tp under EP)
+        and logs one line; with gradient accumulation that is
         the last microbatch. Runs at only a few steps because it waits for the
         device. Returns the summed int64 ``[n_moe_layers, 2]`` counts on the
         CPU, or ``None`` when the counts aren't collected.
@@ -291,13 +292,26 @@ class TpuGraphTrainer(GraphTrainer):
 
             (local_L2,) = collect_ep_drop_stat_tensors(self.model_parts)
         with torch.no_grad():
-            mesh = (
-                self.parallel_dims.get_mesh("batch")
-                if self.parallel_dims.dp_enabled
+            # A rank counts dropped routes for the rows it receives and total
+            # routes for the tokens it sends, so the sum must span every rank
+            # that holds distinct tokens: dp_replicate x dp_shard x cp, the
+            # `loss` mesh (None when it has size 1). EP can also span tp
+            # (efsdp * ep = dp_shard * cp * tp), and under EP the tp axis
+            # splits the routed tokens like a sequence split (as for upstream's
+            # MoE load-balance counts), so tp is summed too when EP is on.
+            # Without that split, tp ranks would hold the same tokens and must
+            # not be summed; drop stats only exist under EP. pp stages hold
+            # different layers and are not summed.
+            loss_mesh = self.parallel_dims.get_optional_mesh("loss")
+            tp_mesh = (
+                self.parallel_dims.get_optional_mesh("tp")
+                if self.parallel_dims.ep_enabled
                 else None
             )
             global_L2 = dist_utils.dist_sum_tensor(
-                local_L2.detach().to(torch.int64), mesh
+                local_L2.detach().to(torch.int64),
+                loss_mesh,
+                extra_pg=tp_mesh.get_group() if tp_mesh is not None else None,
             ).cpu()
         dropped_L = global_L2[:, 0].to(torch.float64)
         routes_L = global_L2[:, 1].to(torch.float64)

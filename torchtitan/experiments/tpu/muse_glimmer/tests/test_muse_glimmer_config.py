@@ -18,6 +18,7 @@ from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import resolve_save_regions
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer import attention as tpu_attention
 from torchtitan.experiments.tpu.muse_glimmer import config_registry
@@ -483,6 +484,18 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     model = self._build_fused_ce_model(config)
     self.assertIsInstance(model.lm_head, fused_loss.FusedLossLinearWrapper)
     workarounds._check_fused_loss_logit_transform(model, config)
+
+  @parameterized.parameters(
+      ("graph_trainer_muse_glimmer_debugmodel", 8),
+      ("muse_glimmer_30b_full_logits", 52),
+      ("muse_glimmer_30b_fused_ce", 52),
+      ("reg_trainer_muse_glimmer_30b_fused_ce", 52),
+  )
+  def test_recipes_use_packed_qkv(self, name, expected_layers):
+    """Tests that GraphTrainer and 30B recipes convert all layers to TpuPackedQKVLinear."""
+    config = getattr(config_registry, name)()
+    packed = list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config))
+    self.assertLen(packed, expected_layers)
 
 
 if __name__ == "__main__":

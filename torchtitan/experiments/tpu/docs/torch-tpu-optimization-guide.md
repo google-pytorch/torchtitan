@@ -560,7 +560,8 @@ Constraints:
   parameter names stops matching. Model checkpoints keep their per-layer keys and move freely
   between scan and non-scan runs. Optimizer checkpoints do not, so a run cannot resume across a
   flip of the flag.
-- The generic `*_and_offload` memory policies are rejected. Use `full_and_scan_offload`.
+- Of the `*_and_offload` memory policies, only `full_and_scan_offload` and
+  `tpu_selective_and_offload` work with scan; the others are rejected.
 - Use the recipe's libtpu flag bundle. In the 235B recipe each layer's expert-gradient
   reduce-scatters land at the end of the loop body with little compute left to hide them, and the
   scan step runs measurably slower without the recipe's flags.
@@ -632,7 +633,7 @@ Select it through the memory policy:
 |---|---|---|
 | `sac_and_offload` | unrolled graph or graph splitter | activations that selective recompute still saves |
 | `full_and_offload` | unrolled graph or graph splitter | saved layer boundaries under full recompute |
-| `tpu_selective_and_offload` | unrolled graph or graph splitter | saved layer boundaries; the `tpu_selective` save regions stay in HBM |
+| `tpu_selective_and_offload` | unrolled graph, graph splitter, or scan | saved layer boundaries (with scan, the one stacked layer-input tensor); the `tpu_selective` save regions stay in HBM |
 | `full_and_scan_offload` | scan | the one stacked layer-input tensor |
 
 `compile.cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors

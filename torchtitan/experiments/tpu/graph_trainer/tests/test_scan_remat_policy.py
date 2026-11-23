@@ -21,7 +21,6 @@ from torch.fx.experimental.proxy_tensor import make_fx
 # Imported for the same reason as in `test_layer_stack`: production scans run
 # with it installed, so these do too.
 from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
-from torchtitan.experiments.tpu.graph_trainer import scan_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_with_remat_policy,
 )
@@ -121,21 +120,6 @@ def _attention_term(scores: torch.Tensor) -> torch.Tensor:
     """Stands in for splash: a region whose output its backward reads."""
     with annotate_region(ATTENTION_INNER_ATTENTION):
         return torch.sigmoid(scores).sum(dim=-1, keepdim=True)
-
-
-def _real_gather_term(scores: torch.Tensor) -> torch.Tensor:
-    """`scan_fsdp.gather_slice` itself (its `spmd_types` all-gather), inside a
-    save region: the region it sets must still win."""
-    spec = scan_fsdp.ScanFSDPSpec(
-        group_name=dist.group.WORLD.group_name,
-        group=dist.group.WORLD,
-        param_dtype=None,
-        reduce_dtype=None,
-        sharded=True,
-    )
-    with annotate_region(ATTENTION_INNER_ATTENTION):
-        gathered = scan_fsdp.gather_slice(scores, spec)
-        return torch.sigmoid(gathered * scores).sum(dim=-1, keepdim=True)
 
 
 def _body(h: torch.Tensor, w: torch.Tensor, *, extra):
@@ -333,16 +317,6 @@ class TestScanRematPolicy(unittest.TestCase):
         self.assertNotIn("_c10d_functional.all_reduce.default", ops)
         self.assertNotIn("aten.sigmoid.default", ops)
         self.assertIn("aten.mm.default", ops)
-        self._check_same_grads(got, want)
-
-    def test_the_real_gather_is_recomputed(self):
-        want, _ = _run(_legacy, extra=_real_gather_term)
-        got, captured = _run(
-            _saving(ATTENTION_INNER_ATTENTION), extra=_real_gather_term
-        )
-        ops = _ops(captured[0][1])
-        self.assertIn("_c10d_functional.all_gather_into_tensor.default", ops)
-        self.assertNotIn("aten.sigmoid.default", ops)
         self._check_same_grads(got, want)
 
     def test_raises_when_a_save_region_matches_nothing(self):

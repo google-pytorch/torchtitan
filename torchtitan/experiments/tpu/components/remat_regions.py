@@ -37,9 +37,6 @@ MOE_EP_DISPATCH = "moe.ep_dispatch"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"
-# Each layer's FSDP all-gather inside a scan body. The scan body always
-# recomputes it, so the gathered weight is never kept for backward.
-FSDP_GATHER = "fsdp.gather"
 # The MoE aux loss's all-reduced expert counts. The scan body always saves
 # them: redoing the all-reduce in backward is an exposed round trip per layer.
 MOE_EXPERT_COUNTS = "moe.expert_counts"

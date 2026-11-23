@@ -7,8 +7,8 @@ op's ``remat_region`` (see ``remat_regions.py``):
 
 * ``moe.expert_counts``: save. Redoing the all-reduce is an exposed round trip.
 * a region in ``save_regions``, e.g. ``attention.inner_attention``: save.
-* everything else, ``fsdp.gather`` included: recompute. Saving the gather
-  would keep every layer's whole weight.
+* everything else, the FSDP all-gather included: recompute. Saving the
+  gather would keep every layer's whole weight.
 """
 
 import functools

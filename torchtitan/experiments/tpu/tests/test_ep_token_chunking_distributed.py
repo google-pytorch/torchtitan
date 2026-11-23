@@ -8,9 +8,11 @@
 
 from unittest import mock
 
-import pytest
+from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.device_mesh import init_device_mesh
 import torch.nn.functional as F
@@ -194,9 +196,10 @@ def _run_chunked_ep_parity(
         )
 
 
-@pytest.mark.parametrize(
-    "ep_size, ep_transport, scale_before_w2, num_chunks, tokens_per_rank",
-    [
+class ChunkedEpParityTest(parameterized.TestCase):
+    """Multi-process parity of chunked EP against an EP=1 reference."""
+
+    @parameterized.parameters(
         (2, "ring_of_experts", False, 3, 12),
         (2, "ring_of_experts", True, 4, 12),
         (2, "ragged_all_to_all", False, 3, 12),
@@ -204,20 +207,19 @@ def _run_chunked_ep_parity(
         (4, "auto", False, 4, 8),
         # 10 tokens are not divisible by 4 chunks: snaps to 2 chunks.
         (2, "ring_of_experts", False, 4, 10),
-    ],
-)
-def test_chunked_ep_matches_ep1(
-    ep_size, ep_transport, scale_before_w2, num_chunks, tokens_per_rank
-):
-    distributed.run_distributed(
-        ep_size,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_chunked_ep_parity,
-        ep_transport,
-        scale_before_w2,
-        num_chunks,
-        tokens_per_rank,
     )
+    def test_chunked_ep_matches_ep1(
+        self, ep_size, ep_transport, scale_before_w2, num_chunks, tokens_per_rank
+    ):
+        distributed.run_distributed(
+            ep_size,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_chunked_ep_parity,
+            ep_transport,
+            scale_before_w2,
+            num_chunks,
+            tokens_per_rank,
+        )
 
 
 class _LinearExperts(torch.nn.Module):
@@ -287,130 +289,130 @@ def _stub_inputs(tokens: int):
     )
 
 
-@pytest.mark.parametrize(
-    "accumulate_fp32, weight_dtype",
-    [(True, torch.float32), (False, torch.bfloat16)],
-)
-def test_chunked_forward_unshards_once_and_widens_weights(
-    accumulate_fp32, weight_dtype
-):
-    torch.manual_seed(0)
-    dim, tokens = 8, 12
-    routed, chunk_rows = _stub_chunked_routed(dim, 4, accumulate_fp32)
-    x = torch.randn(tokens, dim)
-    out = routed(x, *_stub_inputs(tokens))
-    experts = routed.inner_experts
-    assert experts.unshard_calls == 1
-    assert chunk_rows == [3, 3, 3, 3]
-    assert experts.weight_dtypes == [weight_dtype] * 4
-    torch.testing.assert_close(
-        out, (x.bfloat16() @ experts.w.bfloat16()).float(), rtol=1e-2, atol=1e-2
+class ChunkedRoutedExpertsTest(parameterized.TestCase):
+    """Single-process checks of chunked TpuRoutedExperts."""
+
+    @parameterized.parameters(
+        (True, torch.float32), (False, torch.bfloat16)
     )
-    out.sum().backward()
-    assert experts.w.grad is not None
-    assert experts.w.grad.dtype == torch.bfloat16
-
-
-@pytest.mark.parametrize(
-    "accumulate_fp32, add_dtype",
-    [(True, torch.float32), (False, torch.bfloat16)],
-)
-def test_chunk_weight_grads_accumulate_in_fp32(accumulate_fp32, add_dtype):
-    dim, tokens, num_chunks = 8, 16, 4
-    routed, _ = _stub_chunked_routed(dim, num_chunks, accumulate_fp32)
-    stub_inputs = _stub_inputs(tokens)
-
-    def step(x, w):
-        out = torch.func.functional_call(
-            routed, {"inner_experts.w": w}, (x, *stub_inputs)
+    def test_chunked_forward_unshards_once_and_widens_weights(
+        self, accumulate_fp32, weight_dtype
+    ):
+        torch.manual_seed(0)
+        dim, tokens = 8, 12
+        routed, chunk_rows = _stub_chunked_routed(dim, 4, accumulate_fp32)
+        x = torch.randn(tokens, dim)
+        out = routed(x, *_stub_inputs(tokens))
+        experts = routed.inner_experts
+        assert experts.unshard_calls == 1
+        assert chunk_rows == [3, 3, 3, 3]
+        assert experts.weight_dtypes == [weight_dtype] * 4
+        torch.testing.assert_close(
+            out, (x.bfloat16() @ experts.w.bfloat16()).float(), rtol=1e-2, atol=1e-2
         )
-        (dw,) = torch.autograd.grad(out.float().sum(), (w,))
-        return dw
+        out.sum().backward()
+        assert experts.w.grad is not None
+        assert experts.w.grad.dtype == torch.bfloat16
 
-    with torch.fx.traceback.preserve_node_meta():
-        gm = make_fx(step)(
-            torch.randn(tokens, dim),
-            routed.inner_experts.w.detach().clone().requires_grad_(True),
+    @parameterized.parameters(
+        (True, torch.float32), (False, torch.bfloat16)
+    )
+    def test_chunk_weight_grads_accumulate_in_fp32(
+        self, accumulate_fp32, add_dtype
+    ):
+        dim, tokens, num_chunks = 8, 16, 4
+        routed, _ = _stub_chunked_routed(dim, num_chunks, accumulate_fp32)
+        stub_inputs = _stub_inputs(tokens)
+
+        def step(x, w):
+            out = torch.func.functional_call(
+                routed, {"inner_experts.w": w}, (x, *stub_inputs)
+            )
+            (dw,) = torch.autograd.grad(out.float().sum(), (w,))
+            return dw
+
+        with torch.fx.traceback.preserve_node_meta():
+            gm = make_fx(step)(
+                torch.randn(tokens, dim),
+                routed.inner_experts.w.detach().clone().requires_grad_(True),
+            )
+        add_ops = (torch.ops.aten.add.Tensor, torch.ops.aten.add_.Tensor)
+        weight_grad_adds = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target in add_ops
+            and isinstance(n.meta.get("val"), torch.Tensor)
+            and tuple(n.meta["val"].shape) == (dim, dim)
+        ]
+        # Autograd sums the C per-chunk weight gradients with C - 1 adds.
+        assert len(weight_grad_adds) == num_chunks - 1
+        assert {n.meta["val"].dtype for n in weight_grad_adds} == {add_dtype}
+        chunk_ids = {
+            n.meta["custom"]["ep_chunk_idx"]
+            for n in gm.graph.nodes
+            if "ep_chunk_idx" in n.meta.get("custom", {})
+        }
+        assert chunk_ids == set(range(num_chunks))
+
+    def test_unshard_weights_matches_forward_layout_and_module_fqn(self):
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            annotate_module_fqns,
         )
-    add_ops = (torch.ops.aten.add.Tensor, torch.ops.aten.add_.Tensor)
-    weight_grad_adds = [
-        n
-        for n in gm.graph.nodes
-        if n.op == "call_function"
-        and n.target in add_ops
-        and isinstance(n.meta.get("val"), torch.Tensor)
-        and tuple(n.meta["val"].shape) == (dim, dim)
-    ]
-    # Autograd sums the C per-chunk weight gradients with C - 1 adds.
-    assert len(weight_grad_adds) == num_chunks - 1
-    assert {n.meta["val"].dtype for n in weight_grad_adds} == {add_dtype}
-    chunk_ids = {
-        n.meta["custom"]["ep_chunk_idx"]
-        for n in gm.graph.nodes
-        if "ep_chunk_idx" in n.meta.get("custom", {})
-    }
-    assert chunk_ids == set(range(num_chunks))
+        from torchtitan.experiments.tpu.components.grouped_experts import (
+            TpuGroupedExperts,
+        )
+        from torchtitan.experiments.tpu.graph_trainer.qwen3_5 import (
+            annotate_expert_unshard_fqns,
+        )
 
+        class _Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = TpuGroupedExperts.Config(
+                    dim=128, hidden_dim=128, num_experts=2, use_pallas_grouped_mm=True
+                ).build()
 
-def test_unshard_weights_matches_forward_layout_and_module_fqn():
-    from torchtitan.experiments.graph_trainer.common_utils import (
-        annotate_module_fqns,
-    )
-    from torchtitan.experiments.tpu.components.grouped_experts import (
-        TpuGroupedExperts,
-    )
-    from torchtitan.experiments.tpu.graph_trainer.qwen3_5 import (
-        annotate_expert_unshard_fqns,
-    )
+        model = torch.nn.Module()
+        model.block = _Block()
+        experts = model.block.experts
+        with torch.no_grad():  # build() leaves the parameters uninitialized
+            for param in experts.parameters():
+                param.copy_(torch.randn_like(param))
+        w1, w2, w3 = experts.unshard_weights()
+        # The Pallas grouped matmuls take [E, K, N] weights.
+        assert torch.equal(w1, experts.w1_EFD.transpose(-2, -1))
+        assert torch.equal(w3, experts.w3_EFD.transpose(-2, -1))
+        assert w2.shape == (2, 128, 128)
 
-    class _Block(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.experts = TpuGroupedExperts.Config(
-                dim=128, hidden_dim=128, num_experts=2, use_pallas_grouped_mm=True
-            ).build()
+        annotate_module_fqns(model)
+        annotate_expert_unshard_fqns(model)
 
-    model = torch.nn.Module()
-    model.block = _Block()
-    experts = model.block.experts
-    with torch.no_grad():  # build() leaves the parameters uninitialized
-        for param in experts.parameters():
-            param.copy_(torch.randn_like(param))
-    w1, w2, w3 = experts.unshard_weights()
-    # The Pallas grouped matmuls take [E, K, N] weights.
-    assert torch.equal(w1, experts.w1_EFD.transpose(-2, -1))
-    assert torch.equal(w3, experts.w3_EFD.transpose(-2, -1))
-    assert w2.shape == (2, 128, 128)
+        def step(x):
+            u1, u2, u3 = experts.unshard_weights()
+            return x + u1.sum() + u2.sum() + u3.sum()
 
-    annotate_module_fqns(model)
-    annotate_expert_unshard_fqns(model)
+        with torch.fx.traceback.preserve_node_meta():
+            gm = make_fx(step)(torch.zeros(()))
+        transposes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.transpose.int
+        ]
+        assert transposes
+        assert {n.meta.get("custom", {}).get("module_fqn") for n in transposes} == {
+            "block.experts"
+        }
 
-    def step(x):
-        u1, u2, u3 = experts.unshard_weights()
-        return x + u1.sum() + u2.sum() + u3.sum()
-
-    with torch.fx.traceback.preserve_node_meta():
-        gm = make_fx(step)(torch.zeros(()))
-    transposes = [
-        n
-        for n in gm.graph.nodes
-        if n.op == "call_function" and n.target == torch.ops.aten.transpose.int
-    ]
-    assert transposes
-    assert {n.meta.get("custom", {}).get("module_fqn") for n in transposes} == {
-        "block.experts"
-    }
-
-
-def test_chunked_ep_rejects_fsdp2_experts():
-    routed, _ = _stub_chunked_routed(8, 4, True)
-    experts = routed.inner_experts
-    # fully_shard swaps the module class the same way.
-    experts.__class__ = type(
-        f"FSDP{type(experts).__name__}", (FSDPModule, type(experts)), {}
-    )
-    with pytest.raises(NotImplementedError, match="SimpleFSDP"):
-        routed(torch.randn(8, 8), *_stub_inputs(8))
+    def test_chunked_ep_rejects_fsdp2_experts(self):
+        routed, _ = _stub_chunked_routed(8, 4, True)
+        experts = routed.inner_experts
+        # fully_shard swaps the module class the same way.
+        experts.__class__ = type(
+            f"FSDP{type(experts).__name__}", (FSDPModule, type(experts)), {}
+        )
+        with self.assertRaisesRegex(NotImplementedError, "SimpleFSDP"):
+            routed(torch.randn(8, 8), *_stub_inputs(8))
 
 
 def _tag(node, val, *, fqn=None, chunk=None, bwd=False):
@@ -548,45 +550,48 @@ def _chunked_moe_graph(num_layers=2, num_chunks=4, rows=2, dim=4):
     return torch.fx.GraphModule(torch.nn.Module(), graph)
 
 
-def test_ep_chunk_barrier_pass_bounds_inflight_chunks():
-    num_layers, num_chunks, rows, dim = 2, 4, 2, 4
-    torch.manual_seed(1)
-    inputs = (
-        torch.randn(num_chunks * rows, dim).bfloat16(),
-        torch.randn(num_chunks * rows, dim).bfloat16(),
-        *(torch.randn(dim, dim).bfloat16() for _ in range(num_layers)),
-    )
-    expected = _chunked_moe_graph(num_layers, num_chunks, rows, dim)(*inputs)
+class EpChunkBarrierPassTest(parameterized.TestCase):
+    """Tests for the EP chunk optimization-barrier pass."""
 
-    gm = apply_ep_chunk_barrier_pass(
-        _chunked_moe_graph(num_layers, num_chunks, rows, dim)
-    )
-    barriers = [
-        n
-        for n in gm.graph.nodes
-        if n.op == "call_function" and n.target is _optimization_barrier
-    ]
-    fwd = [b for b in barriers if not b.meta.get("autograd_backward")]
-    bwd = [b for b in barriers if b.meta.get("autograd_backward")]
-    # layers * (C - W) barriers per phase, with W = 2.
-    assert len(fwd) == num_layers * (num_chunks - 2)
-    assert len(bwd) == num_layers * (num_chunks - 2)
-    # The BF16 -> FP32 weight widening stays out of forward barriers, so XLA can
-    # fold bf16(fp32(w)) back to w instead of materializing FP32 weights.
-    for barrier in fwd:
-        assert all(arg.meta["val"].dtype == torch.bfloat16 for arg in barrier.args)
-    # Backward barriers hold the running FP32 weight-gradient accumulators.
-    fp32_accumulators = [
-        arg
-        for barrier in bwd
-        for arg in barrier.args
-        if arg.target is torch.ops.aten.add.Tensor
-        and arg.meta["val"].dtype == torch.float32
-    ]
-    assert len(fp32_accumulators) == num_layers
-    # Barriers are identities on CPU: the outputs are unchanged.
-    for got, want in zip(gm(*inputs), expected):
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    def test_ep_chunk_barrier_pass_bounds_inflight_chunks(self):
+        num_layers, num_chunks, rows, dim = 2, 4, 2, 4
+        torch.manual_seed(1)
+        inputs = (
+            torch.randn(num_chunks * rows, dim).bfloat16(),
+            torch.randn(num_chunks * rows, dim).bfloat16(),
+            *(torch.randn(dim, dim).bfloat16() for _ in range(num_layers)),
+        )
+        expected = _chunked_moe_graph(num_layers, num_chunks, rows, dim)(*inputs)
+
+        gm = apply_ep_chunk_barrier_pass(
+            _chunked_moe_graph(num_layers, num_chunks, rows, dim)
+        )
+        barriers = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target is _optimization_barrier
+        ]
+        fwd = [b for b in barriers if not b.meta.get("autograd_backward")]
+        bwd = [b for b in barriers if b.meta.get("autograd_backward")]
+        # layers * (C - W) barriers per phase, with W = 2.
+        assert len(fwd) == num_layers * (num_chunks - 2)
+        assert len(bwd) == num_layers * (num_chunks - 2)
+        # The BF16 -> FP32 weight widening stays out of forward barriers, so XLA can
+        # fold bf16(fp32(w)) back to w instead of materializing FP32 weights.
+        for barrier in fwd:
+            assert all(arg.meta["val"].dtype == torch.bfloat16 for arg in barrier.args)
+        # Backward barriers hold the running FP32 weight-gradient accumulators.
+        fp32_accumulators = [
+            arg
+            for barrier in bwd
+            for arg in barrier.args
+            if arg.target is torch.ops.aten.add.Tensor
+            and arg.meta["val"].dtype == torch.float32
+        ]
+        assert len(fp32_accumulators) == num_layers
+        # Barriers are identities on CPU: the outputs are unchanged.
+        for got, want in zip(gm(*inputs), expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 class _AllGather(torch.autograd.Function):
@@ -635,102 +640,108 @@ class _GatheredSwiGLUExperts(torch.nn.Module):
         return (h @ w2.bfloat16()).to(x_RD.dtype)
 
 
-def test_zero3_backward_barriers_keep_fp32_weight_widen_out():
-    """ZeRO-3 recomputes the FP32 weight widen in backward; barriers skip it."""
-    from torchtitan.experiments.graph_trainer.common_utils import (
-        _is_backward_node,
-        _MODULE_FQN,
-    )
-    from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-        minimal_fx_tracer,
-    )
-    from torchtitan.experiments.graph_trainer.memory_policy import (
-        _make_full_memory_policy,
-        tag_sac_policy,
-    )
-    from torchtitan.experiments.graph_trainer.selective_activation_remat import (
-        selective_activation_remat_pass,
-    )
+class Zero3EpChunkBarrierTest(parameterized.TestCase):
+    """EP chunk barriers under ZeRO-3 (full recompute) on a 1-rank gloo group."""
 
-    dim, hidden, tokens, num_chunks = 24, 40, 32, 4
-    weight_shapes = {(dim, hidden), (hidden, dim)}
-    created_group = not dist.is_initialized()
-    if created_group:
-        dist.init_process_group(
-            "gloo", rank=0, world_size=1, store=dist.HashStore()
+    def test_zero3_backward_barriers_keep_fp32_weight_widen_out(self):
+        """ZeRO-3 recomputes the FP32 weight widen in backward; barriers skip it."""
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            _is_backward_node,
+            _MODULE_FQN,
         )
-    try:
-        routed = TpuRoutedExperts.Config(
-            inner_experts=GroupedExperts.Config(
-                dim=dim, hidden_dim=hidden, num_experts=2
-            ),
-            token_dispatcher=ReferenceRoETokenDispatcher.Config(
-                num_experts=2, top_k=1, ep_transport="ring_of_experts"
-            ),
-            num_token_chunks=num_chunks,
-            accumulate_chunk_weight_grads_fp32=True,
-        ).build()
-        routed.inner_experts = _GatheredSwiGLUExperts(dim, hidden)
-        dispatcher = routed.token_dispatcher
-        ep_mesh = mock.Mock()
-        ep_mesh.size.return_value = 2
-        dispatcher.ep_mesh = ep_mesh
-        dispatcher.dispatch = lambda x_c, s_c, i_c, c_c: (x_c, c_c, None)
-        dispatcher.combine = lambda out_c, meta_c, x_c: out_c
+        from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+            minimal_fx_tracer,
+        )
+        from torchtitan.experiments.graph_trainer.memory_policy import (
+            _make_full_memory_policy,
+            tag_sac_policy,
+        )
+        from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+            selective_activation_remat_pass,
+        )
 
-        def step(x, scores, ids, counts):
-            with torch.fx.traceback.annotate({_MODULE_FQN: "layers.0.moe.experts"}):
-                out = routed(x, scores, ids, counts)
-            params = [p for p in routed.parameters() if p.requires_grad]
-            return torch.autograd.grad(out.float().sum(), [x, *params])
-
-        gm = minimal_fx_tracer(step, module=routed)(
-            torch.randn(tokens, dim, requires_grad=True), *_stub_inputs(tokens)
-        ).gm
-        # ZeRO-3: full recompute, including the SimpleFSDP all-gathers.
-        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
-        selective_activation_remat_pass(gm)
-        apply_ep_chunk_barrier_pass(gm)
-    finally:
+        dim, hidden, tokens, num_chunks = 24, 40, 32, 4
+        weight_shapes = {(dim, hidden), (hidden, dim)}
+        created_group = not dist.is_initialized()
         if created_group:
-            dist.destroy_process_group()
+            dist.init_process_group(
+                "gloo", rank=0, world_size=1, store=dist.HashStore()
+            )
+        try:
+            routed = TpuRoutedExperts.Config(
+                inner_experts=GroupedExperts.Config(
+                    dim=dim, hidden_dim=hidden, num_experts=2
+                ),
+                token_dispatcher=ReferenceRoETokenDispatcher.Config(
+                    num_experts=2, top_k=1, ep_transport="ring_of_experts"
+                ),
+                num_token_chunks=num_chunks,
+                accumulate_chunk_weight_grads_fp32=True,
+            ).build()
+            routed.inner_experts = _GatheredSwiGLUExperts(dim, hidden)
+            dispatcher = routed.token_dispatcher
+            ep_mesh = mock.Mock()
+            ep_mesh.size.return_value = 2
+            dispatcher.ep_mesh = ep_mesh
+            dispatcher.dispatch = lambda x_c, s_c, i_c, c_c: (x_c, c_c, None)
+            dispatcher.combine = lambda out_c, meta_c, x_c: out_c
 
-    def is_weight(arg):
-        val = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
-        return isinstance(val, torch.Tensor) and tuple(val.shape) in weight_shapes
+            def step(x, scores, ids, counts):
+                with torch.fx.traceback.annotate({_MODULE_FQN: "layers.0.moe.experts"}):
+                    out = routed(x, scores, ids, counts)
+                params = [p for p in routed.parameters() if p.requires_grad]
+                return torch.autograd.grad(out.float().sum(), [x, *params])
 
-    barriers = [
-        n
-        for n in gm.graph.nodes
-        if n.op == "call_function" and n.target is _optimization_barrier
-    ]
-    fwd = [b for b in barriers if not _is_backward_node(b)]
-    bwd = [b for b in barriers if _is_backward_node(b)]
-    assert len(fwd) == len(bwd) == num_chunks - 2
-    # The recomputed bf16 -> fp32 weight widen (`_to_copy*_recomputed`) is not a
-    # barrier operand in either phase.
-    weight_args = [a for b in barriers for a in b.args if is_weight(a)]
-    recomputed_fp32 = [
-        a.name
-        for a in weight_args
-        if "recomputed" in a.name and a.meta["val"].dtype == torch.float32
-    ]
-    assert not recomputed_fp32, recomputed_fp32
-    assert not [a for b in fwd for a in b.args if is_weight(a)]
-    # Backward barriers still order the FP32 dW accumulators.
-    assert any(
-        a.target is torch.ops.aten.add.Tensor and a.meta["val"].dtype == torch.float32
-        for b in bwd
-        for a in b.args
-        if is_weight(a)
-    )
+            gm = minimal_fx_tracer(step, module=routed)(
+                torch.randn(tokens, dim, requires_grad=True), *_stub_inputs(tokens)
+            ).gm
+            # ZeRO-3: full recompute, including the SimpleFSDP all-gathers.
+            tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+            selective_activation_remat_pass(gm)
+            apply_ep_chunk_barrier_pass(gm)
+        finally:
+            if created_group:
+                dist.destroy_process_group()
+
+        def is_weight(arg):
+            val = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
+            return isinstance(val, torch.Tensor) and tuple(val.shape) in weight_shapes
+
+        barriers = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target is _optimization_barrier
+        ]
+        fwd = [b for b in barriers if not _is_backward_node(b)]
+        bwd = [b for b in barriers if _is_backward_node(b)]
+        assert len(fwd) == len(bwd) == num_chunks - 2
+        # The recomputed bf16 -> fp32 weight widen (`_to_copy*_recomputed`) is not a
+        # barrier operand in either phase.
+        weight_args = [a for b in barriers for a in b.args if is_weight(a)]
+        recomputed_fp32 = [
+            a.name
+            for a in weight_args
+            if "recomputed" in a.name and a.meta["val"].dtype == torch.float32
+        ]
+        assert not recomputed_fp32, recomputed_fp32
+        assert not [a for b in fwd for a in b.args if is_weight(a)]
+        # Backward barriers still order the FP32 dW accumulators.
+        assert any(
+            a.target is torch.ops.aten.add.Tensor and a.meta["val"].dtype == torch.float32
+            for b in bwd
+            for a in b.args
+            if is_weight(a)
+        )
 
 
-def test_default_num_token_chunks():
-    assert default_num_token_chunks(1) == 1
-    assert default_num_token_chunks(2) == 4
-    assert default_num_token_chunks(8) == 8
-    assert default_num_token_chunks(32) == 16
+class DefaultNumTokenChunksTest(parameterized.TestCase):
+    """Tests for default_num_token_chunks."""
+
+    def test_default_num_token_chunks(self):
+        assert default_num_token_chunks(1) == 1
+        assert default_num_token_chunks(2) == 4
+        assert default_num_token_chunks(8) == 8
+        assert default_num_token_chunks(32) == 16
 
 
 def _run_chunked_ep_capacity_overflow(device, rank, world_size):
@@ -827,10 +838,17 @@ def _run_chunked_ep_capacity_overflow(device, rank, world_size):
         torch.testing.assert_close(roe_t, ra2a_t, rtol=1e-5, atol=1e-5)
 
 
-def test_chunked_ep_with_capacity_factor():
-    distributed.run_distributed(
-        2,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_chunked_ep_capacity_overflow,
-    )
+class ChunkedEpCapacityFactorTest(parameterized.TestCase):
+    """Multi-process chunked EP with a capacity factor."""
 
+    def test_chunked_ep_with_capacity_factor(self):
+        distributed.run_distributed(
+            2,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_chunked_ep_capacity_overflow,
+        )
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
+    absltest.main()

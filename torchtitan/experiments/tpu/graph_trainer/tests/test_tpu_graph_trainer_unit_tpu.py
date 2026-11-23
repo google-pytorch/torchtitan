@@ -22,6 +22,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
+from torchtitan.experiments.graph_trainer.trainer import FwdBwdOutputs
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
@@ -110,7 +111,9 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
   def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
     loss = _loss(model, inputs, labels, global_valid_tokens)
     params = [p for _, p in model.named_parameters(remove_duplicate=False)]
-    return [loss, *torch.autograd.grad(loss, params)]
+    grads = list(torch.autograd.grad(loss, params))
+    # Same output structure as make_fwd_bwd_step, which the trainer reads.
+    return FwdBwdOutputs(loss, grads, [], {})
 
   inputs = torch.randint(0, 128, (batch_size, 16), device=device)
   labels = torch.randint(0, 128, (batch_size, 16), device=device)

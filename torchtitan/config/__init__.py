@@ -12,11 +12,9 @@ TORCH_DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
 }
 
-from typing import TYPE_CHECKING
-
-from .configs import CommConfig, DebugConfig, TrainingConfig
+from .configs import CommConfig, DebugConfig, PrecisionConfig, TrainingConfig
 from .configurable import Configurable
-from .function import Function
+from .function import CallableFunction, Function
 from .loader import ConfigLoader
 from .override import (
     apply_overrides,
@@ -27,29 +25,17 @@ from .override import (
     OverrideConfig,
 )
 
-if TYPE_CHECKING:
-    from .parallelism import FSDPSymmMemScope, ParallelismConfig
-
-
-def __getattr__(name: str):
-    # Lazy: parallelism -> context_parallel imports back into torchtitan.config.
-    if name in ("ParallelismConfig", "FSDPSymmMemScope"):
-        from . import parallelism
-
-        return getattr(parallelism, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 __all__ = [
     "ConfigLoader",
     "Configurable",
+    "CallableFunction",
     "Function",
     "TORCH_DTYPE_MAP",
     # Config dataclasses
     "CommConfig",
+    "PrecisionConfig",
     "TrainingConfig",
     "DebugConfig",
-    "FSDPSymmMemScope",
-    "ParallelismConfig",
     # Override mechanism
     "OverrideConfig",
     "Override",

@@ -11,17 +11,19 @@ from functools import partial
 
 import torch.nn as nn
 
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     ModelConfigConverter,
     validate_converter_compatibility,
 )
 
+from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 
-from .model.autoencoder import AutoEncoder
-from .model.hf_embedder import FluxEmbedder
-from .model.layers import (
+from .autoencoder import AutoEncoder
+from .hf_embedder import FluxEmbedder
+from .layers import (
     DoubleStreamBlock,
     EmbedND,
     LastLayer,
@@ -31,7 +33,8 @@ from .model.layers import (
     SelfAttention,
     SingleStreamBlock,
 )
-from .model.model import FluxModel
+from .model import FluxModel
+from .sharding import flux_inner_attention_sharding_config
 
 __all__ = [
     "FluxModel",
@@ -105,6 +108,9 @@ def _make_double_block_config(
                     param_init=_NORM_INIT,
                 ),
             ),
+            inner_attention=VarlenInnerAttention.Config(
+                sharding_config=flux_inner_attention_sharding_config(),
+            ),
         ),
         txt_attn=SelfAttention.Config(
             num_heads=num_heads,
@@ -131,6 +137,9 @@ def _make_double_block_config(
                     param_init=_NORM_INIT,
                 ),
             ),
+            inner_attention=VarlenInnerAttention.Config(
+                sharding_config=flux_inner_attention_sharding_config(),
+            ),
         ),
         img_mlp_in=Linear.Config(
             in_features=hs,
@@ -156,6 +165,9 @@ def _make_double_block_config(
             bias=True,
             param_init=_XAVIER_LINEAR,
         ),
+        inner_attention=VarlenInnerAttention.Config(
+            sharding_config=flux_inner_attention_sharding_config()
+        ),
     )
 
 
@@ -171,15 +183,9 @@ def _make_single_block_config(
         hidden_size=hs,
         num_heads=num_heads,
         mlp_ratio=mlp_ratio,
-        lin_qkv=Linear.Config(
+        linear1=Linear.Config(
             in_features=hs,
-            out_features=hs * 3,
-            bias=True,
-            param_init=_XAVIER_LINEAR,
-        ),
-        lin_mlp=Linear.Config(
-            in_features=hs,
-            out_features=mlp_hidden_dim,
+            out_features=hs * 3 + mlp_hidden_dim,
             bias=True,
             param_init=_XAVIER_LINEAR,
         ),
@@ -208,10 +214,13 @@ def _make_single_block_config(
                 param_init=_NORM_INIT,
             ),
         ),
+        inner_attention=VarlenInnerAttention.Config(
+            sharding_config=flux_inner_attention_sharding_config()
+        ),
     )
 
 
-def _flux_dev() -> FluxModel.Config:
+def _flux_dev(*, seq_len: int) -> FluxModel.Config:
     hidden_size = 3072
     num_heads = 24
     mlp_ratio = 4.0
@@ -233,6 +242,7 @@ def _flux_dev() -> FluxModel.Config:
         mlp_ratio=mlp_ratio,
     )
     return FluxModel.Config(
+        max_context_length=seq_len,
         in_channels=in_channels,
         out_channels=64,
         vec_in_dim=vec_in_dim,
@@ -325,7 +335,7 @@ def _flux_dev() -> FluxModel.Config:
     )
 
 
-def _flux_schnell() -> FluxModel.Config:
+def _flux_schnell(*, seq_len: int) -> FluxModel.Config:
     hidden_size = 3072
     num_heads = 24
     mlp_ratio = 4.0
@@ -347,6 +357,7 @@ def _flux_schnell() -> FluxModel.Config:
         mlp_ratio=mlp_ratio,
     )
     return FluxModel.Config(
+        max_context_length=seq_len,
         in_channels=in_channels,
         out_channels=64,
         vec_in_dim=vec_in_dim,
@@ -439,7 +450,7 @@ def _flux_schnell() -> FluxModel.Config:
     )
 
 
-def _flux_debug() -> FluxModel.Config:
+def _flux_debug(*, seq_len: int) -> FluxModel.Config:
     hidden_size = 1536
     num_heads = 12
     mlp_ratio = 4.0
@@ -461,120 +472,7 @@ def _flux_debug() -> FluxModel.Config:
         mlp_ratio=mlp_ratio,
     )
     return FluxModel.Config(
-        in_channels=in_channels,
-        out_channels=64,
-        vec_in_dim=vec_in_dim,
-        context_in_dim=context_in_dim,
-        hidden_size=hidden_size,
-        mlp_ratio=mlp_ratio,
-        num_heads=num_heads,
-        depth=depth,
-        depth_single_blocks=depth_single_blocks,
-        axes_dim=(16, 56, 56),
-        theta=10_000,
-        qkv_bias=qkv_bias,
-        img_in=Linear.Config(
-            in_features=in_channels,
-            out_features=hidden_size,
-            bias=True,
-            param_init=_XAVIER_LINEAR,
-        ),
-        txt_in=Linear.Config(
-            in_features=context_in_dim,
-            out_features=hidden_size,
-            bias=True,
-            param_init=_XAVIER_LINEAR,
-        ),
-        autoencoder=AutoEncoder.Config(
-            resolution=256,
-            in_channels=3,
-            ch=128,
-            out_ch=3,
-            ch_mult=(1, 2, 4, 4),
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
-        ),
-        clip_encoder=FluxEmbedder.Config(version=_CLIP_ENCODER_VERSION),
-        t5_encoder=FluxEmbedder.Config(version=_T5_ENCODER_VERSION),
-        pe_config=EmbedND.Config(dim=128, theta=10_000, axes_dim=(16, 56, 56)),
-        time_in_config=MLPEmbedder.Config(
-            in_dim=256,
-            hidden_dim=hidden_size,
-            in_layer=Linear.Config(
-                in_features=256,
-                out_features=hidden_size,
-                bias=True,
-                param_init=_NORMAL_02,
-            ),
-            out_layer=Linear.Config(
-                in_features=hidden_size,
-                out_features=hidden_size,
-                bias=True,
-                param_init=_NORMAL_02,
-            ),
-        ),
-        vector_in_config=MLPEmbedder.Config(
-            in_dim=vec_in_dim,
-            hidden_dim=hidden_size,
-            in_layer=Linear.Config(
-                in_features=vec_in_dim,
-                out_features=hidden_size,
-                bias=True,
-                param_init=_NORMAL_02,
-            ),
-            out_layer=Linear.Config(
-                in_features=hidden_size,
-                out_features=hidden_size,
-                bias=True,
-                param_init=_NORMAL_02,
-            ),
-        ),
-        double_blocks=[deepcopy(double_tmpl) for _ in range(depth)],
-        single_blocks=[deepcopy(single_tmpl) for _ in range(depth_single_blocks)],
-        final_layer_config=LastLayer.Config(
-            hidden_size=hidden_size,
-            patch_size=1,
-            out_channels=64,
-            linear=Linear.Config(
-                in_features=hidden_size,
-                out_features=1 * 1 * 64,
-                bias=True,
-                param_init=_ZERO_LINEAR,
-            ),
-            adaln_linear=Linear.Config(
-                in_features=hidden_size,
-                out_features=2 * hidden_size,
-                bias=True,
-                param_init=_ZERO_LINEAR,
-            ),
-        ),
-    )
-
-
-def _flux_test() -> FluxModel.Config:
-    hidden_size = 256
-    num_heads = 2
-    mlp_ratio = 4.0
-    qkv_bias = True
-    vec_in_dim = 64
-    in_channels = 64
-    context_in_dim = 64
-    depth = 1
-    depth_single_blocks = 1
-    double_tmpl = _make_double_block_config(
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        qkv_bias=qkv_bias,
-    )
-    single_tmpl = _make_single_block_config(
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-    )
-    return FluxModel.Config(
+        max_context_length=seq_len,
         in_channels=in_channels,
         out_channels=64,
         vec_in_dim=vec_in_dim,
@@ -668,20 +566,27 @@ def _flux_test() -> FluxModel.Config:
 
 
 # The default lengths are ``_flux_seq_len(img_size, max_t5_encoding_len)`` for
-# the img_size / T5 length each shipped trainer config uses.
+# the img_size / T5 length each shipped trainer config uses. Unlike the decoders'
+# capability lengths, they are defaults, not caps.
 MODEL_FLAVORS = {
-    "flux-test": _flux_test,
-    "flux-dev": _flux_dev,
-    "flux-schnell": _flux_schnell,
-    "flux-debug": _flux_debug,
+    "flux-dev": (_flux_dev, 768),
+    "flux-schnell": (_flux_schnell, 512),
+    "flux-debug": (_flux_debug, 512),
 }
 
 
 def build_model_config(
     flavor: str,
     converters: list[ModelConfigConverter.Config] | None = None,
+    *,
+    parallelism: ParallelismConfig,
+    seq_len: int | None = None,
 ) -> FluxModel.Config:
-    config = MODEL_FLAVORS[flavor]()
+    # Flux only declares CP sharding, which does not depend on the
+    # parallelism settings; the argument keeps the builder API uniform.
+    del parallelism
+    get_config, default_seq_len = MODEL_FLAVORS[flavor]
+    config = get_config(seq_len=seq_len or default_seq_len)
     if converters is not None:
         validate_converter_compatibility(converters)
         for c in converters:

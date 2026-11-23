@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Full text+image logit parity: TorchTitan Kimi K3 vs HuggingFace Kimi K3.
+"""Pinned BF16 forward parity: TorchTitan Kimi K3 vs HuggingFace Kimi K3.
 
 Runs the released HuggingFace model code and TorchTitan in one process on the
 same text+image prompt. Each side performs its own image preprocessing, so the
@@ -17,16 +17,20 @@ TorchTitan, and strictly transfers its state dict to HuggingFace.
 
 The script downloads the config, modeling, processor, and tokenizer assets from
 a pinned HuggingFace revision without downloading the released weight shards.
-The released code requires ``transformers==4.56.2`` and ``tiktoken``.
+Install the pinned reference dependencies with::
+
+    pip install fla-core==0.5.2 tiktoken==0.14.0 transformers==4.56.2
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python -m \
         scripts.checkpoint_conversion.numerical_tests_kimi_k3
 
-Add ``--force-hf-routing`` for the routing-fixed diagnostic.
+Add ``--force-hf-routing`` to isolate arithmetic after imposing Moonshot's
+expert IDs.
 """
 
 import argparse
+from dataclasses import replace
 from typing import Any, cast
 
 import torch
@@ -34,13 +38,18 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from PIL import Image
 
-from torchtitan.hf_datasets.multimodal.utils.image import (
-    process_image,
-    resize_to_navit_patch_grid,
-    vision_to_patches,
+from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.common.activation import SiTUGLU
+from torchtitan.models.common.attention.kda import InnerKDA, KDA
+from torchtitan.models.common.feed_forward import DenseFeedForward
+from torchtitan.models.kimi_k3 import (
+    build_model_config,
+    KIMI_K3_VISION_PROCESSOR_KWARGS,
 )
-from torchtitan.models.kimi_k3 import build_model_config
-from torchtitan.models.kimi_k3.model import KimiK3Model
+from torchtitan.models.kimi_k3.attention import KimiMLAAttention
+from torchtitan.models.kimi_k3.model import KimiK3MultimodalModel
+from torchtitan.models.kimi_k3.moe import KimiLatentMoE
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
@@ -48,12 +57,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 _HF_REPO_ID = "moonshotai/Kimi-K3"
 _HF_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 _DTYPE = torch.bfloat16
-_HF_ATTN_BACKEND = "flash_attention_2"
+_HF_ATTN_BACKEND = "eager"
 _MEDIA_TOKEN_ID = 163605
-_PATCH_SIZE = 14
-_MERGE_SIZE = 2
-_MAX_PATCHES = 65536
-_MAX_PATCHES_PER_SIDE = 512
 _PROMPT = (
     "<|kimi_image_placeholder|>\n" "What is shown in this image? Describe it briefly."
 )
@@ -65,21 +70,33 @@ def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
     hf_full_attention_layers = [
         layer_idx + 1
         for layer_idx, layer in enumerate(tt_config.layers)
-        if layer.attention is not None
+        if isinstance(layer.attention, KimiMLAAttention.Config)
     ]
     hf_kda_layers = [
         layer_idx + 1
         for layer_idx, layer in enumerate(tt_config.layers)
-        if layer.delta_attention is not None
+        if isinstance(layer.attention, KDA.Config)
     ]
-    mla = next(layer.attention for layer in tt_config.layers if layer.attention)
+    mla = tt_config.first_full_attention
     kda = next(
-        layer.delta_attention for layer in tt_config.layers if layer.delta_attention
+        layer.attention
+        for layer in tt_config.layers
+        if isinstance(layer.attention, KDA.Config)
     )
+    inner_attention = cast(InnerKDA.Config, kda.inner_attention)
+    kda_kernel = inner_attention.kernel
     dense_ffn = next(
-        layer.feed_forward for layer in tt_config.layers if layer.feed_forward
+        layer.feed_forward
+        for layer in tt_config.layers
+        if isinstance(layer.feed_forward, DenseFeedForward.Config)
     )
-    moe = next(layer.moe for layer in tt_config.layers if layer.moe)
+    dense_activation = cast(SiTUGLU.Config, dense_ffn.activation_fn)
+    moe = next(
+        layer.feed_forward
+        for layer in tt_config.layers
+        if isinstance(layer.feed_forward, KimiLatentMoE.Config)
+    )
+    assert moe.shared_experts is not None
     shared_hidden_dim = moe.shared_experts.w13.out_features
     expert_hidden_dim = moe.routed_experts.w2.in_features
     if shared_hidden_dim % expert_hidden_dim:
@@ -100,8 +117,8 @@ def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
         "qk_nope_head_dim": mla.qk_nope_head_dim,
         "qk_rope_head_dim": mla.qk_rope_head_dim,
         "v_head_dim": mla.v_head_dim,
-        "activation_situ_beta": dense_ffn.beta,
-        "activation_situ_linear_beta": dense_ffn.linear_beta,
+        "activation_situ_beta": dense_activation.beta,
+        "activation_situ_linear_beta": dense_activation.linear_beta,
         "num_experts": moe.num_experts,
         "num_experts_per_token": moe.router.top_k,
         "num_shared_experts": shared_hidden_dim // expert_hidden_dim,
@@ -110,16 +127,18 @@ def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
         "routed_expert_hidden_size": moe.routed_down.out_features,
         "routed_scaling_factor": moe.router.route_scale,
         "first_k_dense_replace": next(
-            layer_idx for layer_idx, layer in enumerate(tt_config.layers) if layer.moe
+            layer_idx
+            for layer_idx, layer in enumerate(tt_config.layers)
+            if isinstance(layer.feed_forward, KimiLatentMoE.Config)
         ),
         "attn_res_block_size": tt_config.layers[0].attn_res_block_size,
         "linear_attn_config": {
             "full_attn_layers": hf_full_attention_layers,
             "kda_layers": hf_kda_layers,
             "head_dim": kda.head_dim,
-            "num_heads": kda.num_heads,
+            "num_heads": kda.n_heads,
             "short_conv_kernel_size": kda.conv_kernel_size,
-            "gate_lower_bound": kda.kernel.lower_bound,
+            "gate_lower_bound": kda_kernel.lower_bound,
             "use_full_rank_gate": True,
         },
     }
@@ -127,7 +146,6 @@ def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
         setattr(text_config, name, value)
 
     vision = tt_config.vision_encoder
-    assert vision is not None
     vision_overrides = {
         "patch_size": vision.patch_size,
         "init_pos_emb_height": vision.init_pos_emb_height,
@@ -153,13 +171,35 @@ def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
     hf_config._name_or_path = hf_model_path
 
 
-def _build_tt_model(tt_config, dtype: torch.dtype) -> KimiK3Model:
+def _build_tt_model(tt_config, dtype: torch.dtype) -> KimiK3MultimodalModel:
     with torch.device("meta"):
         model = tt_config.build()
-    model.to_empty(device="cpu")
     model.to(dtype=dtype)
+    model.to_empty(device="cpu")
     model.init_states(buffer_device=torch.device("cpu"))
     return model.eval()
+
+
+def _use_released_vocab(
+    tt_config: KimiK3MultimodalModel.Config,
+    hf_model_path: str,
+) -> KimiK3MultimodalModel.Config:
+    """Keep released tokenizer IDs valid in the reduced TorchTitan model."""
+    hf_config = AutoConfig.from_pretrained(
+        hf_model_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    vocab_size = hf_config.text_config.vocab_size
+    return replace(
+        tt_config,
+        vocab_size=vocab_size,
+        tok_embeddings=replace(
+            tt_config.tok_embeddings,
+            num_embeddings=vocab_size,
+        ),
+        lm_head=replace(tt_config.lm_head, out_features=vocab_size),
+    )
 
 
 def _build_hf_model(
@@ -177,7 +217,19 @@ def _build_hf_model(
     hf_config.text_config._attn_implementation = _HF_ATTN_BACKEND
     hf_config.vision_config._attn_implementation = _HF_ATTN_BACKEND
     model = AutoModelForCausalLM.from_config(hf_config, trust_remote_code=True)
+    # Moonshot's decoder constructor forces FlashAttention 2. Reset the shared
+    # decoder config after construction so MLA uses the pinned eager backend.
     model.language_model.config._attn_implementation = _HF_ATTN_BACKEND
+    model.language_model._use_flash_attention_2 = False
+    vision_backends = {
+        block.attn_implementation for block in model.vision_tower.encoder.blocks
+    }
+    if vision_backends != {_HF_ATTN_BACKEND}:
+        raise RuntimeError(
+            f"Expected Moonshot vision backend {_HF_ATTN_BACKEND}, "
+            f"found {sorted(vision_backends)}."
+        )
+    print(f"Moonshot decoder and vision backends: {_HF_ATTN_BACKEND}")
     model.to(dtype=dtype)
     model.load_state_dict(hf_state_dict, strict=True)
     return model.eval()
@@ -308,7 +360,8 @@ def _print_routing_comparison(
 def _force_hf_routing(model, expert_indices, device) -> None:
     """Use HF expert IDs with TorchTitan's independently computed scores."""
     for layer_idx, layer in model.layers.items():
-        if (moe := cast(Any, layer.moe)) is None:
+        moe = layer.feed_forward
+        if not isinstance(moe, KimiLatentMoE):
             continue
         ids = expert_indices[int(layer_idx)].to(device)
         router, original = moe.router, moe.router.forward
@@ -324,14 +377,19 @@ def _force_hf_routing(model, expert_indices, device) -> None:
             weights = scores_TE.gather(dim=-1, index=_ids)
             if _router.route_norm:
                 weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-            return weights * _router.route_scale, _ids, scores_TE
+            routing_map_TE = torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(
+                -1,
+                _ids,
+                True,
+            )
+            return weights * _router.route_scale, _ids, routing_map_TE
 
         router.forward = forced_forward
 
 
 @torch.no_grad()
 def run_tt(
-    model: KimiK3Model,
+    model: KimiK3MultimodalModel,
     ref: dict[str, Any],
     vision_dtype: torch.dtype,
     device: torch.device,
@@ -340,7 +398,6 @@ def run_tt(
     """Run TorchTitan preprocessing and the reduced TorchTitan model."""
     print(f"Loading TorchTitan Kimi K3 (debugmodel) on {device} ...")
     model.to(device)
-    assert model.vision_encoder is not None
 
     if force_hf_routing:
         print("Using HF expert selections with TorchTitan router scores")
@@ -348,9 +405,8 @@ def run_tt(
 
     expert_indices: dict[int, torch.Tensor] = {}
     for layer_idx, layer in model.layers.items():
-        if layer.moe is not None:
-            # pyrefly: ignore [missing-attribute]
-            layer.moe.router.register_forward_hook(
+        if isinstance(layer.feed_forward, KimiLatentMoE):
+            layer.feed_forward.router.register_forward_hook(
                 lambda _module, _inputs, output, layer_idx=int(layer_idx): (
                     expert_indices.__setitem__(
                         layer_idx,
@@ -359,49 +415,36 @@ def run_tt(
                 )
             )
 
-    image = process_image(
-        Image.fromarray(ref["raw_image"].numpy()),
-        patch_size=_PATCH_SIZE,
-        merge_size=_MERGE_SIZE,
-        resize_fn=resize_to_navit_patch_grid,
-        max_patches=_MAX_PATCHES,
-        max_patches_per_side=_MAX_PATCHES_PER_SIDE,
-        image_mean=(0.5, 0.5, 0.5),
-        image_std=(0.5, 0.5, 0.5),
+    vision_processor = VisionProcessor.Config(**KIMI_K3_VISION_PROCESSOR_KWARGS).build()
+    pixels, _ = vision_processor.resize_and_normalize(
+        Image.fromarray(ref["raw_image"].numpy())
     )
-    if image is None:
-        raise ValueError("TorchTitan failed to process the numerical test image.")
-    patches, grid = vision_to_patches(
-        image,
-        patch_size=_PATCH_SIZE,
-        temporal_patch_size=1,
-        merge_size=_MERGE_SIZE,
-        patch_order="raster",
-    )
+    patches, grid_thw = vision_processor.patchify(pixels)
+    num_vision_tokens = vision_processor.num_placeholder_tokens(grid_thw)
     pixel_values = patches.to(device=device, dtype=vision_dtype)
-    grid_thw = grid.unsqueeze(0).to(device)
-    num_vision_tokens = (grid[1] // _MERGE_SIZE) * (grid[2] // _MERGE_SIZE)
+    grid_thw = grid_thw.unsqueeze(0).to(device)
     tokens = _expand_image_placeholder(
         ref["input_ids"],
         _MEDIA_TOKEN_ID,
-        int(num_vision_tokens.item()),
+        num_vision_tokens,
     ).to(device)
     positions = torch.arange(
         tokens.shape[0],
         dtype=torch.int32,
         device=device,
     )
-    attention_masks = model.get_attention_masks(positions)
+    attention_metadata = model._get_attention_metadata(positions)
 
     print(
         f"tokens={tuple(tokens.shape)} pixel_values={tuple(pixel_values.shape)} "
-        f"grid_thw={grid_thw.tolist()} vision_tokens={num_vision_tokens.item()}"
+        f"grid_thw={grid_thw.tolist()} vision_tokens={num_vision_tokens}"
     )
 
     hf_pixels = ref["pixel_values"].flatten(1)
     pixel_diff = (hf_pixels - patches.float()).abs()
+    pixel_max_diff = pixel_diff.max().item()
     print(
-        f"pixel values: max_diff={pixel_diff.max().item():.3e} "
+        f"pixel values: max_diff={pixel_max_diff:.3e} "
         f"num_differ={(pixel_diff > 1e-6).sum().item()}/{pixel_diff.numel()}"
     )
 
@@ -423,13 +466,16 @@ def run_tt(
         grid_thw=grid_thw,
         special_tokens={"image_id": _MEDIA_TOKEN_ID},
         positions=positions,
-        attention_masks=attention_masks,
+        attention_metadata=attention_metadata,
     )
     _print_routing_comparison(ref["expert_indices"], expert_indices)
     return logits[-1].float().cpu()
 
 
-def compare(ref_logits: torch.Tensor, tt_logits: torch.Tensor) -> None:
+def compare(
+    ref_logits: torch.Tensor,
+    tt_logits: torch.Tensor,
+) -> None:
     """Print last-token parity metrics."""
     ref = ref_logits.squeeze()
     tt = tt_logits.squeeze()
@@ -452,7 +498,7 @@ def compare(ref_logits: torch.Tensor, tt_logits: torch.Tensor) -> None:
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_flavor", default="debugmodel")
+    parser.add_argument("--model_flavor", default="debugmodel_mm")
     parser.add_argument("--image_size", type=int, default=336)
     parser.add_argument(
         "--force-hf-routing",
@@ -464,6 +510,7 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         parser.error("Kimi K3 numerical parity requires a CUDA GPU.")
+    torch.use_deterministic_algorithms(True)
 
     hf_model_path = snapshot_download(
         repo_id=_HF_REPO_ID,
@@ -472,9 +519,18 @@ def main() -> None:
     )
     device = torch.device("cuda")
     dtype = _DTYPE
-    print(f"dtype={dtype} hf_attn={_HF_ATTN_BACKEND}")
+    print(
+        f"revision={_HF_REVISION} seed={args.seed} dtype={dtype} "
+        f"hf_attn={_HF_ATTN_BACKEND}"
+    )
 
-    tt_config = build_model_config(args.model_flavor)
+    tt_config = build_model_config(args.model_flavor, parallelism=ParallelismConfig())
+    if not isinstance(tt_config, KimiK3MultimodalModel.Config):
+        raise ValueError(
+            f"--model_flavor {args.model_flavor!r} has no vision encoder; the parity "
+            "check compares multimodal inputs, so use a '_mm' flavor."
+        )
+    tt_config = _use_released_vocab(tt_config, hf_model_path)
     torch.manual_seed(args.seed)
     tt_model = _build_tt_model(tt_config, dtype)
     hf_state_dict = KimiK3StateDictAdapter(tt_config, hf_assets_path=None).to_hf(

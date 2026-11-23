@@ -13,16 +13,23 @@ from typing import Any
 import grain.python as grain
 import torch
 
+from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
 
 
 class TrainingMicrobatch(ABC):
-    """A data-parallel-rank-local input to one training forward/backward."""
+    """A data-parallel-rank-local input to one training forward/backward.
+
+    ``loss_token_counts`` is scalar for one objective and has one entry per
+    objective for MTP. ``routing_token_counts`` has one entry per routing depth.
+    Both are local counts; the standard trainer accumulates and reduces them.
+    """
 
     __slots__ = ()
 
     labels: torch.Tensor
-    num_valid_tokens: int
+    loss_token_counts: torch.Tensor
+    routing_token_counts: torch.Tensor
 
     @abstractmethod
     def as_input_dict(self) -> dict[str, Any]:
@@ -32,32 +39,22 @@ class TrainingMicrobatch(ABC):
     def to_input_dict(
         self, device: torch.device | str, *, non_blocking: bool = False
     ) -> dict[str, Any]:
-        """Return model inputs with top-level tensors moved to ``device``."""
-        return {
-            key: (
-                value.to(device, non_blocking=non_blocking)
-                if isinstance(value, torch.Tensor)
-                else value
-            )
-            for key, value in self.as_input_dict().items()
-        }
+        """Return model inputs with top-level and ``loss_kwargs`` tensors moved to ``device``."""
 
-    def loss_kwargs(self) -> dict[str, Any]:
-        """Return additional keyword arguments for the loss function."""
-        return {}
+        def to_device(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.to(device, non_blocking=non_blocking)
+            return value
 
-    def to_loss_kwargs(
-        self, device: torch.device | str, *, non_blocking: bool = False
-    ) -> dict[str, Any]:
-        """Return loss arguments with top-level tensors moved to ``device``."""
-        return {
-            key: (
-                value.to(device, non_blocking=non_blocking)
-                if isinstance(value, torch.Tensor)
-                else value
-            )
-            for key, value in self.loss_kwargs().items()
+        input_dict = {
+            key: to_device(value) for key, value in self.as_input_dict().items()
         }
+        if "loss_kwargs" in input_dict:
+            input_dict["loss_kwargs"] = {
+                key: to_device(value)
+                for key, value in input_dict["loss_kwargs"].items()
+            }
+        return input_dict
 
 
 @dataclass(kw_only=True, slots=True)
@@ -73,7 +70,8 @@ class TokenizedTrainingMicrobatch(TrainingMicrobatch):
     labels: torch.Tensor
     positions: torch.Tensor
     padding_mask: torch.Tensor
-    num_valid_tokens: int
+    loss_token_counts: torch.Tensor
+    routing_token_counts: torch.Tensor
     model_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def as_input_dict(self) -> dict[str, Any]:
@@ -96,6 +94,10 @@ class DatasetBuildContext:
     num_tokens_per_microbatch: int
     read_options: grain.ReadOptions
     max_num_documents: int | None = None
+    num_mtp_layers: int = 0
+    vision_processor: VisionProcessor | None = None
+    """The model's image and video preprocessing. None: no image or video
+    inputs."""
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import logging
 import math
-import os as os
+from dataclasses import dataclass
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
-from torchtitan.observability.metrics import BaseLogger, TensorBoardLogger, WandBLogger
+from torchtitan.observability.metrics import TensorBoardLogger, WandBLogger
+from torchtitan.rl.controller.metrics import compute_rollout_metrics
 
 from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.types import RolloutTurnID
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +363,64 @@ class TestAggregator:
         assert agg["len/_mean"] == 2.0
 
 
+class TestFold:
+    def test_aggregates_like_unfolded(self) -> None:
+        records = [
+            m.Metric("ttft", m.Mean(2.0)),
+            m.Metric("ttft", m.Max(2.0)),
+            m.Metric("ttft", m.Mean(4.0)),
+            m.Metric("ttft", m.Max(4.0)),
+            m.Metric("ttft", m.Max.from_list([])),  # NaN, ignored by the reduction
+            m.Metric("tokens", m.Sum(3.0)),
+            m.Metric("tokens", m.Sum(5.0)),
+            m.Metric("latency", m.Min(0.5)),
+            m.Metric("latency", m.Min(0.2)),
+            m.Metric("reward", m.SummaryStats.from_list([1.0, 0.0])),
+            m.Metric("loss", m.NoReduce(1.5)),
+        ]
+        folded = m.fold(records)
+        assert len(folded) == 6
+        assert m.MetricsProcessor._aggregate_metrics(
+            folded
+        ) == m.MetricsProcessor._aggregate_metrics(records)
+
+    def test_compute_rollout_metrics_folds_generator_metrics(self) -> None:
+        def turn(turn_id: int, ttft_ms: float) -> RolloutTurn:
+            return RolloutTurn(
+                rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=turn_id),
+                prompt_prefix_len=0,
+                prompt_delta_token_ids=np.array([1], dtype=np.int32),
+                completion_token_ids=np.array([2], dtype=np.int32),
+                completion_logprobs=np.array([-0.1], dtype=np.float32),
+                metrics=[
+                    m.Metric("generator/ttft_ms", m.Mean(ttft_ms)),
+                    m.Metric("generator/ttft_ms", m.Max(ttft_ms)),
+                ],
+            )
+
+        rollouts = [
+            Rollout(
+                group_id=0,
+                rollout_id=rollout_id,
+                status=RolloutStatus.COMPLETED,
+                turns=[turn(0, 1.0 + rollout_id), turn(1, 3.0 + rollout_id)],
+                reward=1.0,
+            )
+            for rollout_id in range(2)
+        ]
+        generator_metrics = [
+            metric
+            for metric in compute_rollout_metrics("rollout", rollouts)
+            if metric.key.startswith("generator/")
+        ]
+        # 2 rollouts x 2 turns x (Mean, Max) folded into one Mean and one Max
+        assert len(generator_metrics) == 2
+        assert m.MetricsProcessor._aggregate_metrics(generator_metrics) == {
+            "generator/ttft_ms/mean": 2.5,
+            "generator/ttft_ms/max": 4.0,
+        }
+
+
 # ---------------------------------------------------------------------------
 # log_to_console (stateless utility)
 # ---------------------------------------------------------------------------
@@ -476,21 +538,16 @@ def test_fmt_metric_value(value, expected) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Backend identity
-# ---------------------------------------------------------------------------
-
-
-def test_metric_backend_is_base_logger() -> None:
-    assert m.MetricBackend is BaseLogger
-
-
-# ---------------------------------------------------------------------------
 # MetricsProcessor fan-out + build
 # ---------------------------------------------------------------------------
 
 
 class _RecordingBackend(m.MetricBackend):
-    def __init__(self) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(m.MetricBackend.Config):
+        pass
+
+    def __init__(self, config, *, log_dir, config_dict, tag) -> None:
         self.calls: list[tuple[dict, int]] = []
         self.closed = False
 
@@ -517,10 +574,10 @@ class _RaisingBackend(m.MetricBackend):
 
 class TestMetricsProcessorFanOut:
     def test_log_aggregates_and_dispatches(self) -> None:
-        b1 = _RecordingBackend()
-        b2 = _RecordingBackend()
-        logger_inst = m.MetricsProcessor(m.MetricsProcessor.Config())
-        logger_inst._backends = [b1, b2]
+        logger_inst = m.MetricsProcessor.Config(
+            loggers=[_RecordingBackend.Config(), _RecordingBackend.Config()]
+        ).build(log_dir="unused")
+        b1, b2 = logger_inst._backends
         logger_inst.log(
             5,
             [
@@ -532,7 +589,9 @@ class TestMetricsProcessorFanOut:
         assert b2.calls == [({"k/mean": 2.0, "k/max": 3.0}, 5)]
 
     def test_log_isolates_failures(self, caplog: pytest.LogCaptureFixture) -> None:
-        good = _RecordingBackend()
+        good = _RecordingBackend.Config().build(
+            log_dir="unused", config_dict=None, tag=None
+        )
         bad = _RaisingBackend()
         # Both orderings: ensure the good backend always runs.
         for backends in ([bad, good], [good, bad]):
@@ -546,7 +605,9 @@ class TestMetricsProcessorFanOut:
             assert good.calls == [({"k": 1.0}, 0)]
 
     def test_close_isolates_failures(self, caplog: pytest.LogCaptureFixture) -> None:
-        good = _RecordingBackend()
+        good = _RecordingBackend.Config().build(
+            log_dir="unused", config_dict=None, tag=None
+        )
         bad = _RaisingBackend()
         logger_inst = m.MetricsProcessor(m.MetricsProcessor.Config())
         logger_inst._backends = [bad, good]
@@ -567,29 +628,20 @@ class TestMetricsProcessorBuild:
 
     def test_wandb_without_log_dir_raises(self) -> None:
         with pytest.raises(ValueError, match="log_dir is required"):
-            m.MetricsProcessor.Config(enable_wandb=True).build()
+            m.MetricsProcessor.Config(loggers=[WandBLogger.Config()]).build()
 
     def test_tensorboard_without_log_dir_raises(self) -> None:
         with pytest.raises(ValueError, match="log_dir is required"):
-            m.MetricsProcessor.Config(enable_tensorboard=True).build()
+            m.MetricsProcessor.Config(loggers=[TensorBoardLogger.Config()]).build()
 
     def test_tensorboard_appends_backend(self, tmp_path) -> None:
-        logger_inst = m.MetricsProcessor.Config(enable_tensorboard=True).build(
-            log_dir=str(tmp_path)
-        )
+        logger_inst = m.MetricsProcessor.Config(
+            loggers=[TensorBoardLogger.Config()]
+        ).build(log_dir=str(tmp_path))
         backend_types = [type(b).__name__ for b in logger_inst._backends]
         assert "TensorBoardLogger" in backend_types
         assert isinstance(logger_inst._backends[0], TensorBoardLogger)
         logger_inst.close()
-
-    def test_tensorboard_only_does_not_set_wandb_project_env(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        monkeypatch.delenv("WANDB_PROJECT", raising=False)
-        m.MetricsProcessor.Config(enable_tensorboard=True).build(
-            log_dir=str(tmp_path)
-        ).close()
-        assert os.environ.get("WANDB_PROJECT") is None
 
     def test_wandb_and_tensorboard_create_both(self, tmp_path, monkeypatch) -> None:
         fake_wandb = MagicMock()
@@ -597,7 +649,7 @@ class TestMetricsProcessorBuild:
         monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
 
         logger_inst = m.MetricsProcessor.Config(
-            enable_wandb=True, enable_tensorboard=True
+            loggers=[WandBLogger.Config(), TensorBoardLogger.Config()]
         ).build(log_dir=str(tmp_path))
         backend_types = [type(b).__name__ for b in logger_inst._backends]
         assert "WandBLogger" in backend_types
@@ -622,7 +674,7 @@ class TestMetricsProcessorBuild:
         config_dict = {"job": "rl-debug"}
         log_dir = str(tmp_path / "wandb_dir")
 
-        logger_inst = m.MetricsProcessor.Config(enable_wandb=True).build(
+        logger_inst = m.MetricsProcessor.Config(loggers=[WandBLogger.Config()]).build(
             log_dir=log_dir,
             job_config=config_dict,
         )
@@ -635,82 +687,44 @@ class TestMetricsProcessorBuild:
 
         # `log` forwards to the stub.
         logger_inst.log(3, [m.Metric("k", m.NoReduce(1.0))])
-        fake_wandb.log.assert_called_once_with({"k": 1.0}, step=3, commit=True)
+        fake_wandb.log.assert_called_once_with({"k": 1.0, "trainer/step": 3})
 
         # `close` calls `wandb.finish` when there's a run.
         fake_wandb.run = MagicMock()
         logger_inst.close()
         fake_wandb.finish.assert_called_once()
 
-    def test_console_log_keys_round_trip(self) -> None:
-        """`MetricsProcessor.Config` carries the two per-context allow lists; the
-        controller picks them up at the callsite. The build method
-        ignores them since they aren't part of any backend."""
-        cfg = m.MetricsProcessor.Config(
-            console_log_keys_train=[r"^loss/mean$"],
-            console_log_keys_validation=[r"^validation/reward$"],
-        )
-        # Build should succeed and produce no backends (no W&B configured).
-        logger_inst = cfg.build()
-        assert logger_inst._backends == []
-        # Round-trip: caller can read them straight off the config.
-        assert cfg.console_log_keys_train == [r"^loss/mean$"]
-        assert cfg.console_log_keys_validation == [r"^validation/reward$"]
-
-    def test_wandb_project_default_titan_rl(self, tmp_path, monkeypatch) -> None:
-        """When `WANDB_PROJECT` is unset and `wandb_project` is at the
-        default, the build should write `titan_rl` to the env var."""
-        monkeypatch.delenv("WANDB_PROJECT", raising=False)
-
-        captured = {}
-        fake_wandb = MagicMock()
-        fake_wandb.init = MagicMock(
-            side_effect=lambda **kwargs: captured.update(
-                {**kwargs, "_env_project": os.environ.get("WANDB_PROJECT")}
-            )
-        )
-        monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
-
-        m.MetricsProcessor.Config(enable_wandb=True).build(log_dir=str(tmp_path))
-        assert captured.get("_env_project") == "titan_rl"
-
     def test_wandb_project_env_var_wins(self, tmp_path, monkeypatch) -> None:
-        """User-set `WANDB_PROJECT` takes precedence over the config field
-        because `setdefault` does not overwrite an existing env var."""
+        """WANDB_PROJECT takes precedence over the shared default."""
         monkeypatch.setenv("WANDB_PROJECT", "my-other-project")
 
         captured = {}
         fake_wandb = MagicMock()
         fake_wandb.init = MagicMock(
-            side_effect=lambda **kwargs: captured.update(
-                {**kwargs, "_env_project": os.environ.get("WANDB_PROJECT")}
-            )
+            side_effect=lambda **kwargs: captured.update(kwargs)
         )
         monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
 
-        m.MetricsProcessor.Config(enable_wandb=True).build(log_dir=str(tmp_path))
-        assert captured.get("_env_project") == "my-other-project"
+        m.MetricsProcessor.Config(loggers=[WandBLogger.Config()]).build(
+            log_dir=str(tmp_path)
+        )
+        assert captured.get("project") == "my-other-project"
 
-    def test_wandb_project_config_overrides_default(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """When the user sets `wandb_project` explicitly and no env var
-        exists, the config value should win over the default."""
+    def test_wandb_project_defaults_to_torchtitan(self, tmp_path, monkeypatch) -> None:
+        """W&B uses the shared project when WANDB_PROJECT is unset."""
         monkeypatch.delenv("WANDB_PROJECT", raising=False)
 
         captured = {}
         fake_wandb = MagicMock()
         fake_wandb.init = MagicMock(
-            side_effect=lambda **kwargs: captured.update(
-                {**kwargs, "_env_project": os.environ.get("WANDB_PROJECT")}
-            )
+            side_effect=lambda **kwargs: captured.update(kwargs)
         )
         monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
 
-        m.MetricsProcessor.Config(
-            enable_wandb=True, wandb_project="custom_project"
-        ).build(log_dir=str(tmp_path))
-        assert captured.get("_env_project") == "custom_project"
+        m.MetricsProcessor.Config(loggers=[WandBLogger.Config()]).build(
+            log_dir=str(tmp_path)
+        )
+        assert captured.get("project") == "torchtitan"
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +795,9 @@ class TestIsValidationSwitch:
         assert "custom/key: 7.0" in msg
 
     def test_backends_get_every_call_regardless_of_console_filter(self) -> None:
-        backend = _RecordingBackend()
+        backend = _RecordingBackend.Config().build(
+            log_dir="unused", config_dict=None, tag=None
+        )
         logger_inst = m.MetricsProcessor(
             m.MetricsProcessor.Config(console_log_keys_train=[]),
         )

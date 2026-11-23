@@ -11,12 +11,12 @@ import torch
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.deepseek_v3.mtp import MTPLoss, roll_mtp_sequence
+from torchtitan.models.deepseek_v3.mtp import MTPCrossEntropyLoss, roll_mtp_sequence
 
 from .model import DeepSeekV4TransformerBlock
 
 if TYPE_CHECKING:
-    from torchtitan.models.common.attention import AttentionMasksType
+    from torchtitan.models.common.attention import VarlenAttentionMetadata
 
     from .mhc import HcHead
 
@@ -48,10 +48,11 @@ class MTPBlock(DeepSeekV4TransformerBlock):
         prev_hc_hidden: torch.Tensor,
         mtp_input_ids_T: torch.Tensor,
         mtp_input_valid_mask: torch.Tensor,
-        attention_masks: "AttentionMasksType | None",
+        attention_metadata: "VarlenAttentionMetadata | None",
         positions: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if prev_hc_hidden.ndim != 3:
             raise ValueError(
@@ -69,17 +70,18 @@ class MTPBlock(DeepSeekV4TransformerBlock):
         next_hc_hidden = super().forward(
             hidden,
             mtp_input_ids_T,
-            attention_masks,
+            attention_metadata,
             positions,
             padding_mask=(
                 ~mtp_input_valid_mask
                 if padding_mask is None
                 else ~mtp_input_valid_mask | padding_mask
             ),
+            aux_loss_denominator=aux_loss_denominator,
         )
         prediction_hidden = self.hc_head(next_hc_hidden)
         prediction_hidden = self.mtp_norm(prediction_hidden)
         return next_hc_hidden, prediction_hidden
 
 
-__all__ = ["MTPBlock", "MTPLoss", "roll_mtp_sequence"]
+__all__ = ["MTPBlock", "MTPCrossEntropyLoss", "roll_mtp_sequence"]

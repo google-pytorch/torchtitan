@@ -22,22 +22,15 @@ Two complementary pieces live here:
 
 from __future__ import annotations
 
-import glob
-import json
-import logging
-import os
 import re
 from typing import Any, TYPE_CHECKING
 
 import torch
-from safetensors import safe_open
 
-from torchtitan.protocols.state_dict_adapter import StateDictAdapter
+from torchtitan.models.base.state_dict_adapter import StateDictAdapter
 
 if TYPE_CHECKING:
     from .model import HFTransformerModel
-
-logger = logging.getLogger(__name__)
 
 # Mapping from titan key -> original HF key for keys where the reverse
 # regex would produce a different result than the original (e.g. a
@@ -57,10 +50,6 @@ class HFTransformerStateDictAdapter(StateDictAdapter):
 
     Handles weight tying: when tie_word_embeddings is True, some HF checkpoints
     omit lm_head.weight from safetensors (it shares storage with embed_tokens).
-
-    Each key is resolved against the keys the checkpoint actually has, so a
-    text-only model can also load the decoder of a multimodal checkpoint, which
-    stores it under `model.language_model.*` (see `_checkpoint_key`).
     """
 
     def __init__(
@@ -70,88 +59,41 @@ class HFTransformerStateDictAdapter(StateDictAdapter):
     ):
         super().__init__(model_config, hf_assets_path)
         self._tie_word_embeddings = getattr(model_config, "tie_word_embeddings", False)
-        self._checkpoint_keys = (
-            _checkpoint_keys(hf_assets_path)
-            if hf_assets_path and os.path.isdir(hf_assets_path)
-            else None
-        )
-        # HF key of the model -> key in the checkpoint, recorded by to_hf so
-        # that from_hf can invert it.
-        self._checkpoint_key_of: dict[str, str] = {}
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        if to_quantized_layout:
+            raise ValueError(
+                f"{type(self).__name__} does not support loading quantized "
+                "HF checkpoints."
+            )
         hf_state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
         # When weights are tied, lm_head.weight may not exist in the
         # safetensors file. Exclude it so DCP doesn't fail on missing key.
         if (
             self._tie_word_embeddings
             and "lm_head.weight" in hf_state_dict
-            and _embedding_key(hf_state_dict) is not None
+            and "model.embed_tokens.weight" in hf_state_dict
         ):
             del hf_state_dict["lm_head.weight"]
-        self._checkpoint_key_of = {k: self._checkpoint_key(k) for k in hf_state_dict}
-        num_mapped = sum(k != v for k, v in self._checkpoint_key_of.items())
-        if num_mapped:
-            logger.info(
-                f"Mapped {num_mapped} keys to '{_COMPOSITE_TEXT_MODEL_PREFIX}' keys of "
-                f"the multimodal HF checkpoint at {self.hf_assets_path}."
+        return hf_state_dict
+
+    def from_hf(
+        self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        if is_quantized_layout:
+            raise ValueError(
+                f"{type(self).__name__} does not support loading quantized "
+                "HF checkpoints."
             )
-        return {self._checkpoint_key_of[k]: v for k, v in hf_state_dict.items()}
-
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        model_key_of = {v: k for k, v in self._checkpoint_key_of.items()}
-        hf_state_dict = {model_key_of.get(k, k): v for k, v in hf_state_dict.items()}
         # Reconstruct lm_head.weight from embed_tokens if it was excluded
-        embedding_key = _embedding_key(hf_state_dict)
-        if "lm_head.weight" not in hf_state_dict and embedding_key is not None:
-            hf_state_dict["lm_head.weight"] = hf_state_dict[embedding_key]
-        return {"model." + k: v for k, v in hf_state_dict.items()}
-
-    def _checkpoint_key(self, key: str) -> str:
-        """Returns the checkpoint key that holds the model's HF key `key`.
-
-        A key the checkpoint has is used as is, so text-only models load
-        text-only checkpoints and multimodal models load multimodal ones
-        unchanged. A text-only model's decoder key (`model.*`) missing from a
-        multimodal checkpoint is read from `model.language_model.*`, where
-        multimodal checkpoints (e.g. Gemma-3/4 ForConditionalGeneration) store
-        the same decoder next to their vision/audio towers.
-        """
-        if self._checkpoint_keys is None or key in self._checkpoint_keys:
-            return key
-        if key.startswith("model.") and not key.startswith(
-            _COMPOSITE_TEXT_MODEL_PREFIX
+        if (
+            "lm_head.weight" not in hf_state_dict
+            and "model.embed_tokens.weight" in hf_state_dict
         ):
-            composite_key = _COMPOSITE_TEXT_MODEL_PREFIX + key.removeprefix("model.")
-            if composite_key in self._checkpoint_keys:
-                return composite_key
-        return key
-
-
-_COMPOSITE_TEXT_MODEL_PREFIX = "model.language_model."
-
-_EMBEDDING_KEYS = (
-    "model.embed_tokens.weight",
-    _COMPOSITE_TEXT_MODEL_PREFIX + "embed_tokens.weight",
-)
-
-
-def _embedding_key(hf_state_dict: dict[str, Any]) -> str | None:
-    """Returns the input embedding's key, for text-only or multimodal models."""
-    return next((k for k in _EMBEDDING_KEYS if k in hf_state_dict), None)
-
-
-def _checkpoint_keys(hf_assets_path: str) -> set[str]:
-    """Returns the tensor names of the safetensors checkpoint in a folder."""
-    index_path = os.path.join(hf_assets_path, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            return set(json.load(f)["weight_map"])
-    keys = set()
-    for path in glob.glob(os.path.join(hf_assets_path, "*.safetensors")):
-        with safe_open(path, framework="pt") as f:
-            keys.update(f.keys())
-    return keys
+            hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
+        return {"model." + k: v for k, v in hf_state_dict.items()}
 
 
 def _build_hf_to_titan_patterns() -> list[tuple[str, str, bool]]:
@@ -161,7 +103,7 @@ def _build_hf_to_titan_patterns() -> list[tuple[str, str, bool]]:
         (r"^(.*\.)router\.proj\.weight$", r"\1router.gate.weight", False),
         (r"^(.*\.)gate\.e_score_correction_bias$", r"\1expert_bias", False),
         (r"^(.*\.)experts\.down_proj$", rf"\1{_TITAN_W2_WEIGHT}", False),
-        # Shared experts use FeedForward (w1/w2/w3 attribute names, not params)
+        # Shared experts use DenseFeedForward (w1/w2/w3 attribute names, not params)
         (r"^(.*\.shared_experts)\.gate_proj\.weight$", r"\1.w1.weight", False),
         (r"^(.*\.shared_experts)\.up_proj\.weight$", r"\1.w3.weight", False),
         (r"^(.*\.shared_experts)\.down_proj\.weight$", r"\1.w2.weight", False),

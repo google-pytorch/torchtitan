@@ -14,9 +14,10 @@ from typing import Any
 import grain.python as grain
 from grain import experimental as grain_experimental
 from torch.distributed.checkpoint.stateful import Stateful
-
 from torchtitan.components.data.collators import Collator, TextCollator
 from torchtitan.components.data.dataset import DatasetConfig
+
+from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.components.data.types import (
     DatasetBuildContext,
     DatasetIterationPolicy,
@@ -48,8 +49,12 @@ class BaseDataLoader(Stateful, ABC, Configurable):
     class Config(Configurable.Config):
         max_num_documents: int | None = None
         """Maximum non-padding document segments in one local token microbatch."""
+        num_mtp_layers: int = 0
+        """Model-derived MTP depth used while preparing token counts."""
 
         def __post_init__(self) -> None:
+            if self.num_mtp_layers < 0:
+                raise ValueError("num_mtp_layers must be non-negative")
             if self.max_num_documents is not None and self.max_num_documents <= 0:
                 raise ValueError("max_num_documents must be positive")
 
@@ -87,6 +92,7 @@ class GrainDataLoader(BaseDataLoader):
         tokenizer: BaseTokenizer,
         max_context_length: int,
         num_tokens_per_microbatch: int,
+        vision_processor: VisionProcessor | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -113,6 +119,8 @@ class GrainDataLoader(BaseDataLoader):
             num_tokens_per_microbatch=num_tokens_per_microbatch,
             read_options=read_options,
             max_num_documents=config.max_num_documents,
+            num_mtp_layers=config.num_mtp_layers,
+            vision_processor=vision_processor,
         )
         dataset_iteration_policy = DatasetIterationPolicy(
             seed=config.seed,

@@ -13,6 +13,7 @@ from torchtitan.components.data import (
     HuggingFaceRandomAccessSource,
     SingleDatasetConfig,
 )
+from torchtitan.components.data.text_datasets import ChatProcessor, DATASETS
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optim import (
     AdamW,
@@ -22,14 +23,12 @@ from torchtitan.components.optim import (
 )
 from torchtitan.config import DebugConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.distributed.context_parallel import PTRRFlexAttentionCPLoadBalancer
-from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.experiments.transformers_modeling_backend import build_model_config
 from torchtitan.experiments.transformers_modeling_backend.tokenizer import (
     HFBackendTokenizer,
 )
-from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
 from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.observability.profiler import Profiler
@@ -67,7 +66,6 @@ def transformers_modeling_backend_debugmodel(
         ),
         training=TrainingConfig(
             num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
-            max_context_length=seq_len,
             steps=10,
         ),
         dataloader=GrainDataLoader.Config(
@@ -78,7 +76,7 @@ def transformers_modeling_backend_debugmodel(
             pipeline_parallel_schedule="1F1B",
         ),
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_remat=DefaultActivationRematConfig(),
     )
 
 
@@ -91,7 +89,6 @@ def transformers_modeling_backend_debugmodel_compile(
         seq_len=seq_len,
         deterministic=deterministic,
     )
-    config.compile = LocalCompileConfig()
     return config
 
 
@@ -126,7 +123,6 @@ def transformers_modeling_backend_debugmodel_moe(
         ),
         training=TrainingConfig(
             num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
-            max_context_length=seq_len,
             steps=10,
         ),
         dataloader=GrainDataLoader.Config(
@@ -137,7 +133,7 @@ def transformers_modeling_backend_debugmodel_moe(
             pipeline_parallel_schedule="1F1B",
         ),
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_remat=DefaultActivationRematConfig(),
     )
 
 
@@ -178,7 +174,6 @@ def transformers_modeling_backend_sft_debugmodel(
             # logits tensor. 16384 tokens is ~9GB in fp32 and OOMs the 22GB
             # CI GPUs.
             num_tokens_per_microbatch_per_dp_rank=1 * seq_len,
-            max_context_length=seq_len,
             steps=10,
         ),
         dataloader=GrainDataLoader.Config(
@@ -201,7 +196,7 @@ def transformers_modeling_backend_sft_debugmodel(
             pipeline_parallel_schedule="1F1B",
         ),
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_remat=DefaultActivationRematConfig(),
     )
 
 
@@ -214,7 +209,7 @@ def transformers_backend_moe_fsdp_tp_ep_cp() -> Trainer.Config:
     config.parallelism.context_parallel_load_balancer = (
         PTRRFlexAttentionCPLoadBalancer.Config()
     )
-    config.training.disable_cuda_graphs = True
+    config.training.disable_accelerator_graphs = True
     config.training.steps = 2
     return config
 
@@ -227,7 +222,7 @@ def transformers_backend_dense_fsdp_tp_pp() -> Trainer.Config:
     config.parallelism.num_pp_microbatches = 2
     config.parallelism.pipeline_parallel_schedule = "1F1B"
     config.training.num_tokens_per_microbatch_per_dp_rank = 2048
-    config.training.disable_cuda_graphs = True
+    config.training.disable_accelerator_graphs = True
     config.training.steps = 2
     return config
 
@@ -243,7 +238,7 @@ def transformers_backend_dense_cp_pp() -> Trainer.Config:
         PTRRFlexAttentionCPLoadBalancer.Config()
     )
     config.training.num_tokens_per_microbatch_per_dp_rank = 2048
-    config.training.disable_cuda_graphs = True
+    config.training.disable_accelerator_graphs = True
     config.training.steps = 2
     return config
 

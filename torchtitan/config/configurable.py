@@ -45,6 +45,9 @@ class Configurable:
 
         _owner: ClassVar[type | None] = None
 
+        def __post_init__(self) -> None:
+            """Validate this config. A second call must leave a valid config unchanged."""
+
         def to_dict(self) -> dict:
             """Serialize config to a plain dict (recursing into nested configs)."""
 
@@ -86,6 +89,9 @@ class Configurable:
             Recursively traverses dataclass fields, including items inside lists.
             The *fqn* mirrors the module FQN that ``build()`` would produce
             (e.g. ``"layers.0.feed_forward.w1"``).
+
+            TODO: This is not actually true, for example for vision encoders
+            building the layers at build time from a single config.
 
             *parent* and *field_name* allow replacing the config in the tree.
             They are ``None`` for the root config::

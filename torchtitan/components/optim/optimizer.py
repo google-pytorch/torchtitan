@@ -6,28 +6,28 @@
 
 from __future__ import annotations
 
-import dataclasses
-import json
+import fnmatch
 import logging
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, cast, Literal, overload, Protocol
+from dataclasses import dataclass, field, replace
+from typing import Any, cast, Literal, overload
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable
-from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.flex_shard import (
     BucketConfig,
     ComputeLayout,
     DistMuon as FlexShardDistMuon,
 )
+from torchtitan.distributed.utils import build_alternative_fsdp_mesh
 
 from .utils import (
     get_flat_optim_state_dict,
@@ -44,34 +44,7 @@ __all__ = [
     "BaseOptimizer",
     "DistMuon",
     "OptimizersContainer",
-    "ParamGroupConfig",
-    "collect_moe_routing_metric_tensors",
-    "configure_moe_routing_metrics",
-    "default_adamw",
-    "get_moe_load_balancing_metrics",
-    "register_moe_load_balancing_hook",
-    "register_moe_quantile_balancing_hook",
-    "set_moe_routing_metric_tensors",
 ]
-
-
-@dataclass(kw_only=True, slots=True)
-class ParamGroupConfig:
-    """Backward-compatible parameter group descriptor."""
-
-    pattern: str
-    optimizer_name: str
-    optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
-
-
-class _MoERouterLike(Protocol):
-    tokens_per_expert_E: torch.Tensor  # noqa: N815
-
-
-class _MoELike(Protocol):
-    load_balance_coeff: float | None
-    expert_bias_E: torch.Tensor  # noqa: N815
-    router: _MoERouterLike
 
 MomentDType = Literal["parameter", "bfloat16"]
 
@@ -214,7 +187,16 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
 
 
 class DistMuon(FlexShardDistMuon, BaseOptimizer):
-    """Configurable TorchTitan wrapper around FlexShard's ``DistMuon``."""
+    """Configurable TorchTitan wrapper around FlexShard's ``DistMuon``.
+
+    Note:
+        The CTA cap is disabled by default because it is a workload-dependent
+        memory/performance tradeoff. Enabling it builds explicit redistribution
+        meshes backed by resource-independent NCCL child communicators and
+        passes them through ``BucketConfig``. Each communicator adds fixed
+        memory and may reduce throughput; the cap benefits workloads only when
+        the reduction in all-peer connection state outweighs that overhead.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseOptimizer.Config):
@@ -224,12 +206,38 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         weight_decay: float = 0.1
         momentum: float = 0.95
         nesterov: bool = True
-        ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+        ns_coefficients: (
+            tuple[float, float, float] | tuple[tuple[float, float, float], ...]
+        ) = (3.4445, -4.7750, 2.0315)
         eps: float = 1e-7
         ns_steps: int = 5
         adjust_lr_fn: Literal[
             "original", "match_rms_adamw", "spectral_unclamped"
         ] | None = None
+        ns_device: Literal["accelerator"] | None = None
+        """Where Newton-Schulz runs. ``None`` keeps the storage device, where each
+        parameter's local shard lives (the host under FSDP2 CPU offload).
+        ``"accelerator"`` copies each matrix to the current accelerator, runs
+        Newton-Schulz there and copies the result back. Momentum, parameters,
+        gradients and the exchange between ranks stay where they are, so this only
+        changes anything when the parameters live on the host."""
+        max_nccl_ctas_for_comms: int = -1  # Cap NCCL CTAs to save memory; <=0 disables.
+        """Limit NCCL CTAs for DistMuon redistribution only; ``<= 0`` disables.
+
+        All-to-all opens connection buffers for every peer and channel. A lower
+        CTA cap reduces this connection state on dedicated child communicators
+        of the ``dp_shard``/``edp_shard`` groups, while FSDP keeps its original
+        communicators. Each child adds fixed workspace memory, and fewer CTAs
+        may reduce all-to-all bandwidth.
+
+        A positive value requires NCCL on the FSDP shard axes. Other backends
+        raise ``ValueError``; fake warns and keeps the storage groups without
+        modeling the cap.
+
+        TODO: Replace this temporary all-to-all connection-memory workaround
+        with lower-memory redistribution, such as a pull-based symmetric-memory
+        implementation.
+        """
 
     def __init__(
         self,
@@ -237,10 +245,58 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         *,
         params: Iterable[dict[str, Any]] | Iterable[Tensor],
     ) -> None:
+        param_groups = tuple(cast(Iterable[dict[str, Any]], params))
+        bucket_configs = config.bucket_configs
+        if config.max_nccl_ctas_for_comms > 0:
+            if len(param_groups) != 1:
+                raise ValueError("DistMuon requires exactly one parameter group")
+            param_group = param_groups[0]
+            group_names = param_group.get("param_names")
+            if group_names is None:
+                raise ValueError("DistMuon requires param_names")
+            named_parameters = tuple(
+                zip(group_names, param_group["params"], strict=True)
+            )
+
+            resolved_bucket_configs = []
+            # OptimizersContainer builds this instance for one local model part;
+            # reuse meshes across its buckets without keeping a run-wide cache.
+            redistribution_mesh_by_storage_mesh: dict[DeviceMesh, DeviceMesh] = {}
+            for bucket_config in bucket_configs:
+                matched_parameter = next(
+                    (
+                        parameter
+                        for fqn, parameter in named_parameters
+                        if any(
+                            fnmatch.fnmatchcase(fqn, pattern)
+                            for pattern in bucket_config.patterns
+                        )
+                    ),
+                    None,
+                )
+                if matched_parameter is None:
+                    resolved_bucket_configs.append(bucket_config)
+                    continue
+                storage_mesh = cast(Any, matched_parameter).device_mesh
+                if storage_mesh not in redistribution_mesh_by_storage_mesh:
+                    redistribution_mesh_by_storage_mesh[
+                        storage_mesh
+                    ] = build_alternative_fsdp_mesh(
+                        storage_mesh,
+                        max_ctas=config.max_nccl_ctas_for_comms,
+                    )
+                resolved_bucket_configs.append(
+                    replace(
+                        bucket_config,
+                        mesh=redistribution_mesh_by_storage_mesh[storage_mesh],
+                    )
+                )
+            bucket_configs = resolved_bucket_configs
+
         super().__init__(
-            cast(Iterable[dict[str, Any]], params),
+            param_groups,
             compute_sharding_by_fqn=config.compute_sharding_by_fqn,
-            bucket_configs=config.bucket_configs,
+            bucket_configs=bucket_configs,
             lr=config.lr,
             weight_decay=config.weight_decay,
             momentum=config.momentum,
@@ -249,6 +305,7 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
             eps=config.eps,
             ns_steps=config.ns_steps,
             adjust_lr_fn=config.adjust_lr_fn,
+            ns_device=config.ns_device,
         )
 
 
@@ -270,7 +327,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
     Args:
         config (Config): Ordered optimizer configurations.
         model_parts (List[nn.Module]): List of model parts to be optimized.
-        enable_cuda_graph: Prepare every optimizer for CUDA graph capture.
+        enable_accelerator_graph: Prepare every optimizer for accelerator graph capture.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -278,66 +335,8 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         optimizers: list[BaseOptimizer.Config] = field(default_factory=list)
         """Optimizer configurations in first-match-wins pattern order."""
 
-        implementation: Literal[
-            "for-loop", "foreach", "fused", "fused_opt_states_bf16"
-        ] = "fused"
-        """Optimizer implementation mode applied when overridden on the container."""
-
-        @property
-        def param_groups(self) -> list[ParamGroupConfig]:
-            groups: list[ParamGroupConfig] = []
-            for opt in self.optimizers:
-                opt_name = type(opt).__qualname__.removesuffix(".Config")
-                kwargs: dict[str, Any] = {}
-                for k in ("lr", "betas", "eps", "weight_decay", "momentum", "nesterov"):
-                    if hasattr(opt, k):
-                        kwargs[k] = getattr(opt, k)
-                groups.append(
-                    ParamGroupConfig(
-                        pattern=opt.pattern,
-                        optimizer_name=opt_name,
-                        optimizer_kwargs=kwargs,
-                    )
-                )
-            return groups
-
     optimizers: list[Optimizer]
     model_parts: list[nn.Module]
-
-    @staticmethod
-    def _apply_container_implementation(
-        optimizer_config: BaseOptimizer.Config,
-        implementation: str,
-    ) -> BaseOptimizer.Config:
-        if implementation == "fused" or not isinstance(
-            optimizer_config, (Adam.Config, AdamW.Config)
-        ):
-            return optimizer_config
-        if implementation == "foreach":
-            replace_kwargs: dict[str, Any] = {
-                "fused": False,
-                "moment_dtype": "parameter",
-            }
-            if isinstance(optimizer_config, AdamW.Config):
-                replace_kwargs["foreach"] = True
-            return dataclasses.replace(optimizer_config, **replace_kwargs)
-        if implementation == "for-loop":
-            replace_kwargs = {
-                "fused": False,
-                "moment_dtype": "parameter",
-            }
-            if isinstance(optimizer_config, AdamW.Config):
-                replace_kwargs["foreach"] = False
-            return dataclasses.replace(optimizer_config, **replace_kwargs)
-        if implementation == "fused_opt_states_bf16":
-            replace_kwargs = {
-                "fused": True,
-                "moment_dtype": "bfloat16",
-            }
-            if isinstance(optimizer_config, AdamW.Config):
-                replace_kwargs["foreach"] = None
-            return dataclasses.replace(optimizer_config, **replace_kwargs)
-        return optimizer_config
 
     @staticmethod
     def _build_param_group(
@@ -373,7 +372,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         config: Config,
         *,
         model_parts: list[nn.Module],
-        enable_cuda_graph: bool = False,
+        enable_accelerator_graph: bool = False,
     ) -> None:
         all_params: list[nn.Parameter] = []
         self.optimizers = []
@@ -381,24 +380,20 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
 
         for part_idx, model in enumerate(self.model_parts):
             claimed: set[str] = set()
-            for raw_optimizer_config in config.optimizers:
-                optimizer_config = self._apply_container_implementation(
-                    raw_optimizer_config,
-                    config.implementation,
-                )
+            for optimizer_config in config.optimizers:
                 param_group = self._build_param_group(
                     model,
                     optimizer_config,
                     claimed,
                 )
                 optimizer = optimizer_config.build(params=[param_group])
-                if enable_cuda_graph:
+                if enable_accelerator_graph:
                     if any(
                         "capturable" not in group for group in optimizer.param_groups
                     ):
                         raise ValueError(
                             f"Optimizer {type(optimizer).__name__} does not support "
-                            "CUDA graph capture."
+                            "accelerator graph capture."
                         )
                     for group in optimizer.param_groups:
                         group["initial_lr"] = group["lr"]
@@ -522,270 +517,3 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
     def init_cache_state_dict(self) -> None:
         """Initialize cached state dict for TorchFT. No-op for base class."""
         pass
-
-
-def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config:
-    """Create an OptimizersContainer.Config with a catch-all AdamW optimizer.
-
-    Use as a convenience for the common case::
-
-        optimizer=default_adamw(lr=3e-4)
-    """
-    config_kwargs: dict[str, Any] = {}
-    if "implementation" in kwargs:
-        config_kwargs["implementation"] = kwargs.pop("implementation")
-
-    return OptimizersContainer.Config(
-        optimizers=[
-            AdamW.Config(
-                pattern=r".*",
-                lr=lr,
-                **kwargs,
-            )
-        ],
-        **config_kwargs,
-    )
-
-
-def _iter_moe_layers(
-    model_parts: list[nn.Module],
-) -> Iterator[tuple[nn.Module, _MoELike]]:
-    """Yield ``(transformer_block, moe)`` for every MoE layer in the model."""
-    for model_part in model_parts:
-        # MTP decoder blocks live in ``mtp_layers`` after FSDP wrapping;
-        # they are only temporarily inserted into ``layers`` while FSDP
-        # is applied. Keep both containers in the runtime hook so MTP
-        # expert bias and usage counters receive the same update as the
-        # main decoder layers.
-        layers = getattr(model_part, "layers", None)
-        if layers is None:
-            continue
-        layer_containers = [layers]
-        mtp_layers = getattr(model_part, "mtp_layers", None)
-        if mtp_layers is not None:
-            layer_containers.append(mtp_layers)
-        for layers in layer_containers:
-            assert isinstance(layers, (nn.ModuleDict, nn.ModuleList))
-            for transformer_block in layers.children():
-                if getattr(transformer_block, "moe_enabled", False):
-                    yield transformer_block, cast(_MoELike, transformer_block.moe)
-
-
-def register_moe_load_balancing_hook(
-    optimizers: Optimizer,
-    model_parts: list[nn.Module],
-    parallelism_context: ParallelismContext | None = None,
-    *,
-    parallel_dims: ParallelismContext | None = None,
-) -> None:
-    from torchtitan.models.common.moe import (
-        register_moe_load_balancing_hook as _register_moe_load_balancing_hook,
-    )
-
-    if parallelism_context is None:
-        parallelism_context = parallel_dims
-    assert parallelism_context is not None
-    _register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
-
-
-def register_moe_quantile_balancing_hook(
-    optimizers: Optimizer,
-    model_parts: list[nn.Module],
-    parallelism_context: ParallelismContext | None = None,
-    *,
-    parallel_dims: ParallelismContext | None = None,
-) -> None:
-    from torchtitan.models.common.moe import (
-        register_moe_quantile_balancing_hook as _register_moe_quantile_balancing_hook,
-    )
-
-    if parallelism_context is None:
-        parallelism_context = parallel_dims
-    assert parallelism_context is not None
-    _register_moe_quantile_balancing_hook(optimizers, model_parts, parallelism_context)
-
-
-def _moe_routing_metrics_aux_loss(moe: nn.Module) -> Any:
-    """Return the MoE's router aux loss if it produces routing metrics.
-
-    Only ``MoELoadBalanceAuxLoss`` (set as ``router.aux_loss``) produces them;
-    it is duck-typed here because this module cannot import the model code.
-    """
-    aux_loss = getattr(getattr(moe, "router", None), "aux_loss", None)
-    if aux_loss is None or not hasattr(aux_loss, "collect_routing_metrics"):
-        return None
-    return aux_loss
-
-
-def configure_moe_routing_metrics(
-    model_parts: list[nn.Module], enabled: bool
-) -> bool:
-    """Enable graph-safe routing metric capture on supported MoE layers."""
-    found_supported_layer = False
-    for _transformer_block, moe in _iter_moe_layers(model_parts):
-        aux_loss = _moe_routing_metrics_aux_loss(moe)
-        if aux_loss is None:
-            continue
-        if enabled and aux_loss.type != "batch_wise":
-            raise ValueError(
-                "MoE routing metrics currently require batch_wise auxiliary loss"
-            )
-        aux_loss.collect_routing_metrics = enabled
-        found_supported_layer = True
-    return enabled and found_supported_layer
-
-
-def _local_metric_tensor(value: torch.Tensor) -> torch.Tensor:
-    if isinstance(value, torch.distributed.tensor.DTensor):
-        return value.to_local()
-    return value
-
-
-def collect_moe_routing_metric_tensors(
-    model_parts: list[nn.Module],
-) -> list[torch.Tensor]:
-    """Collect the fixed-shape local tensors produced by the latest forward."""
-    local_counts = []
-    local_normalized_aux_losses = []
-    for _transformer_block, moe in _iter_moe_layers(model_parts):
-        aux_loss = _moe_routing_metrics_aux_loss(moe)
-        if aux_loss is None or not aux_loss.collect_routing_metrics:
-            continue
-        if not hasattr(aux_loss, "_last_local_tokens_per_expert_E") or not hasattr(
-            aux_loss, "_last_local_normalized_aux_loss"
-        ):
-            raise RuntimeError(
-                "MoE routing metrics were enabled but the forward did not produce them"
-            )
-        local_counts.append(
-            _local_metric_tensor(aux_loss._last_local_tokens_per_expert_E)
-        )
-        local_normalized_aux_losses.append(
-            _local_metric_tensor(aux_loss._last_local_normalized_aux_loss)
-        )
-
-    if not local_counts:
-        return []
-    return [
-        torch.stack(local_counts).float(),
-        torch.stack(local_normalized_aux_losses).float(),
-    ]
-
-
-def set_moe_routing_metric_tensors(
-    model_parts: list[nn.Module], metric_tensors: list[torch.Tensor]
-) -> None:
-    """Restore graph outputs as runtime sidecars consumed by metric logging."""
-    if not metric_tensors:
-        return
-    if len(metric_tensors) != 2:
-        raise ValueError(
-            f"Expected two MoE routing metric tensors, got {len(metric_tensors)}"
-        )
-    local_counts_LE, local_normalized_aux_losses_L = metric_tensors
-    aux_loss_modules = [
-        aux_loss
-        for _transformer_block, moe in _iter_moe_layers(model_parts)
-        if (aux_loss := _moe_routing_metrics_aux_loss(moe)) is not None
-        and aux_loss.collect_routing_metrics
-    ]
-    if (
-        local_counts_LE.size(0) != len(aux_loss_modules)
-        or local_normalized_aux_losses_L.size(0) != len(aux_loss_modules)
-    ):
-        raise ValueError("MoE routing metric output shapes do not match the model")
-    for layer_idx, aux_loss in enumerate(aux_loss_modules):
-        aux_loss._last_local_tokens_per_expert_E = local_counts_LE[layer_idx]
-        aux_loss._last_local_normalized_aux_loss = local_normalized_aux_losses_L[
-            layer_idx
-        ]
-
-
-def get_moe_load_balancing_metrics(
-    model_parts: list[nn.Module],
-) -> dict[str, Any]:
-    metric_tensors = collect_moe_routing_metric_tensors(model_parts)
-    if not metric_tensors:
-        return {}
-
-    local_tokens_per_expert_LE, local_normalized_aux_loss_L = metric_tensors
-    aux_loss_modules = [
-        aux_loss
-        for _transformer_block, moe in _iter_moe_layers(model_parts)
-        if (aux_loss := _moe_routing_metrics_aux_loss(moe)) is not None
-        and aux_loss.collect_routing_metrics
-    ]
-    local_sums = torch.cat(
-        [local_tokens_per_expert_LE, local_normalized_aux_loss_L.unsqueeze(1)], dim=1
-    )
-    global_sums = _all_reduce_moe_metric_sums(local_sums, aux_loss_modules[0])
-    global_tokens_per_expert_LE = global_sums[:, :-1]
-    dp_degree = (
-        aux_loss_modules[0].dp_mesh.size()
-        if aux_loss_modules[0].dp_mesh is not None
-        else 1
-    )
-    normalized_aux_loss_L = global_sums[:, -1] / dp_degree
-
-    mean_counts_L = global_tokens_per_expert_LE.mean(dim=1)
-    max_mean_L = global_tokens_per_expert_LE.amax(dim=1) / mean_counts_L
-    route_cv_L = (
-        (global_tokens_per_expert_LE - mean_counts_L.unsqueeze(1))
-        .square()
-        .mean(dim=1)
-        .sqrt()
-        / mean_counts_L
-    )
-    assignment_totals_L = global_tokens_per_expert_LE.sum(dim=1)
-    # TPU workaround: torch_tpu lacks aten::median; sorting preserves
-    # PyTorch's lower-median semantics.
-    median_idx = (max_mean_L.numel() - 1) // 2
-
-    metrics = {
-        "moe/global_aux_loss_normalized": normalized_aux_loss_L.mean(),
-        "moe/route_max_mean_max": max_mean_L.amax(),
-        "moe/route_max_mean_mean": max_mean_L.mean(),
-        "moe/route_max_mean_median": max_mean_L.sort().values[median_idx],
-        "moe/route_cv_max": route_cv_L.amax(),
-        "moe/route_cv_mean": route_cv_L.mean(),
-        "moe/route_cv_median": route_cv_L.sort().values[median_idx],
-        "moe/route_assignments_min": assignment_totals_L.amin(),
-        "moe/route_assignments_max": assignment_totals_L.amax(),
-    }
-
-    for layer_idx, (layer_loss, layer_counts, layer_max_mean, layer_cv) in enumerate(
-        zip(
-            normalized_aux_loss_L,
-            global_tokens_per_expert_LE,
-            max_mean_L,
-            route_cv_L,
-            strict=True,
-        )
-    ):
-        metrics[f"moe/global_aux_loss_normalized/layer_{layer_idx:03d}"] = layer_loss
-        metrics[f"moe/route_max_mean/layer_{layer_idx:03d}"] = layer_max_mean
-        metrics[f"moe/route_cv/layer_{layer_idx:03d}"] = layer_cv
-        metrics[f"moe/route_assignments/layer_{layer_idx:03d}"] = layer_counts.sum()
-
-    # Preserve exact per-expert counts in one event; thousands of individual
-    # scalar writes can make the metrics rank miss the process-group timeout.
-    metrics["moe/route_counts_json"] = json.dumps(
-        global_tokens_per_expert_LE.to(dtype=torch.int64, device="cpu").tolist(),
-        separators=(",", ":"),
-    )
-
-    return metrics
-
-
-def _all_reduce_moe_metric_sums(
-    values: torch.Tensor,
-    aux_loss: Any,
-) -> torch.Tensor:
-    with torch.no_grad():
-        for reduce_mesh in (aux_loss.tp_mesh, aux_loss.dp_mesh, aux_loss.cp_mesh):
-            if reduce_mesh is None:
-                continue
-            torch.distributed.all_reduce(
-                values, group=reduce_mesh.get_group(), op=torch.distributed.ReduceOp.SUM
-            )
-    return values

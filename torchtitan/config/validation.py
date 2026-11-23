@@ -10,16 +10,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.attention import Attention, LinearAttention
 
 if TYPE_CHECKING:
     from torchtitan.config import DebugConfig, TrainingConfig
     from torchtitan.config.parallelism import ParallelismConfig
-    from torchtitan.distributed.activation_checkpoint import (
-        ActivationCheckpointingConfig,
-    )
-    from torchtitan.distributed.local_compile import LocalCompileConfig
-    from torchtitan.protocols.module import Module
+    from torchtitan.distributed.activation_remat import ActivationRematConfig
+    from torchtitan.models.base.model import BaseModel
+    from torchtitan.models.base.module import Module
 
 __all__ = [
     "validate_context_parallel",
@@ -28,41 +26,24 @@ __all__ = [
 
 
 def validate_model_training_config(
-    model: Module.Config,
+    model: BaseModel.Config,
     *,
     parallelism: ParallelismConfig,
     training: TrainingConfig,
     debug: DebugConfig,
-    activation_checkpoint: ActivationCheckpointingConfig,
-    local_compile_config: LocalCompileConfig,
+    activation_remat: ActivationRematConfig | None,
     max_num_documents: int | None,
 ) -> None:
     """Validate compatibility between a model and its training configuration."""
-    from torchtitan.distributed.activation_checkpoint import SelectiveAC
-    from torchtitan.distributed.cuda_graph import cuda_graphs_supported
-    from torchtitan.models.common.attention import (
-        FlexInnerAttention,
-        VarlenInnerAttention,
-    )
+    from torchtitan.distributed.accelerator_graph import accelerator_graphs_supported
+    from torchtitan.models.common.attention import VarlenInnerAttention
     from torchtitan.models.common.decoder import Decoder
     from torchtitan.models.common.moe import MoE
-    from torchtitan.models.common.token_dispatcher import (
+    from torchtitan.models.common.moe.token_dispatcher import (
         DeepEPTokenDispatcher,
         HybridEPTokenDispatcher,
         LocalTokenDispatcher,
     )
-
-    model_context_length = getattr(model, "max_context_length", None)
-    if (
-        model_context_length is not None
-        and training.max_context_length != model_context_length
-    ):
-        raise ValueError(
-            "training.max_context_length must equal model.max_context_length; "
-            f"got {training.max_context_length} and {model_context_length}. "
-            "Choose the training length when constructing the model config so "
-            "the data path, RoPE cache, and inference engine stay aligned."
-        )
 
     if isinstance(model, Decoder.Config):
         if model.enable_weight_tying and parallelism.pipeline_parallel_degree > 1:
@@ -71,14 +52,13 @@ def validate_model_training_config(
             )
 
         tp = parallelism.tensor_parallel_degree
-        attention = model.first_attention
+        attention = model.first_full_attention
         if tp > 1 and attention is not None:
             num_heads = attention.n_heads
             num_kv_heads = getattr(attention, "n_kv_heads", None) or num_heads
             if num_heads % tp != 0:
                 raise ValueError(
-                    f"tensor_parallel_degree ({tp}) must divide "
-                    f"n_heads ({num_heads})."
+                    f"tensor_parallel_degree ({tp}) must divide n_heads ({num_heads})."
                 )
             # Fused QKV projections shard whole KV-head groups. Attention with
             # separate K/V projections may instead shard each head's features.
@@ -101,12 +81,7 @@ def validate_model_training_config(
                     f"{moe_fqn}.num_experts ({moe.num_experts}) must be "
                     f"divisible by expert_parallel_degree ({ep})."
                 )
-            # Fork: EP-disabled routed-expert weights keep a replicated
-            # sharding config (spmd_types FSDP needs DTensors; see
-            # moe_sharding._expert_param_placement_dense_replicated) and TPU
-            # recipes may run ``GroupedExperts`` (``inner_experts``) instead
-            # of ``w13``/``w2``, so upstream's "sharding config present iff
-            # EP > 1" check does not apply.
+
 
         for fqn, dispatcher, _, _ in model.traverse(LocalTokenDispatcher.Config):
             if ep == 1 and isinstance(
@@ -122,14 +97,14 @@ def validate_model_training_config(
         if mtp_layers and parallelism.pipeline_parallel_degree > 1:
             raise NotImplementedError("MTP does not support pipeline parallelism yet.")
 
-    if not training.disable_cuda_graphs and cuda_graphs_supported():
+    if not training.disable_accelerator_graphs and accelerator_graphs_supported():
         if max_num_documents is None:
             for fqn, _, _, _ in model.traverse(VarlenInnerAttention.Config):
                 raise ValueError(
-                    "CUDA graphs require fixed-shape varlen document "
+                    "Accelerator graphs require fixed-shape varlen document "
                     f"metadata for {fqn}, but max_num_documents is unset. "
                     "Configure an upper bound on documents per local token "
-                    "microbatch, or set training.disable_cuda_graphs."
+                    "microbatch, or set training.disable_accelerator_graphs."
                 )
 
         if parallelism.expert_parallel_degree > 1:
@@ -143,31 +118,19 @@ def validate_model_training_config(
                     continue
 
                 raise ValueError(
-                    "CUDA graphs support only expert parallel token dispatcher "
+                    "Accelerator graphs support only expert parallel token dispatcher "
                     "configurations without CPU synchronization. "
                     "Set HybridEP non_blocking_capacity_factor, or set "
-                    "training.disable_cuda_graphs. Unsupported token "
+                    "training.disable_accelerator_graphs. Unsupported token "
                     f"dispatcher: {type(dispatcher_config).__qualname__}."
                 )
 
-    if (
-        debug.spmd_typechecking
-        and isinstance(activation_checkpoint, SelectiveAC.Config)
-        and any(model.traverse(FlexInnerAttention.Config))
-    ):
-        # TODO(pianpwk): Enable SAC with FlexInnerAttention under SPMD typechecking.
-        raise ValueError(
-            "Selective activation checkpointing (SAC) is not supported "
-            "with FlexInnerAttention while SPMD typechecking is enabled. "
-            "Use full activation checkpointing, disable activation "
-            "checkpointing, or switch to a non-Flex attention backend."
-        )
-
-    if debug.spmd_typechecking and local_compile_config.regions:
+    if debug.spmd_typechecking and model.local_compile.regions:
         # TODO: Remove this once Dynamo supports tracing SPMD typechecking.
         raise ValueError(
             "Local compilation is not supported with SPMD typechecking. "
-            "Set compile.regions=[] or disable debug.spmd_typechecking."
+            "Set model.local_compile.regions=[] or disable "
+            "debug.spmd_typechecking."
         )
 
     validate_context_parallel(model, parallelism)
@@ -176,23 +139,25 @@ def validate_model_training_config(
 def validate_context_parallel(
     model: "Module.Config", parallelism: "ParallelismConfig"
 ) -> None:
-    """Validate that each inner attention matches the CP configuration."""
-    from torchtitan.models.common.cp_attention import (
+    """Validate CP inner attentions, load balancers, and Ulysses head sharding."""
+    from torchtitan.distributed.context_parallel import supports_cp_inner_attention
+    from torchtitan.models.common.attention.cp_attention import (
+        AllGatherKVVarlen,
         CPInnerAttention,
-        UlyssesCPInnerAttention,
+        Ulysses,
     )
+    from torchtitan.models.common.attention.gdn import GDN
+    from torchtitan.models.common.decoder import Decoder
 
     cp = parallelism.context_parallel_degree
-    first_cp_config: tuple[str, type] | None = None
-
-    for fqn, traversed, _, _ in model.traverse(BaseAttention.Config):
+    for fqn, traversed, _, _ in model.traverse(Attention.Config):
         attention = traversed
         inner_attention = attention.inner_attention
         is_cp_attention = isinstance(inner_attention, CPInnerAttention.Config)
         if cp > 1 and not is_cp_attention:
             raise ValueError(
                 f"{fqn}.inner_attention must use CPInnerAttention, such as "
-                "KVAllGatherCPFlexInnerAttention, when the context parallel degree is "
+                "AllGatherKVFlexInnerAttention, when the context parallel degree is "
                 "larger than 1. Apply ContextParallelTransform; see an example in "
                 "torchtitan_recipes/models/muse_glimmer.py."
             )
@@ -204,29 +169,16 @@ def validate_context_parallel(
         if not is_cp_attention:
             continue
 
-        cp_config_type = type(inner_attention)
-        if first_cp_config is None:
-            first_cp_config = (fqn, cp_config_type)
-        elif first_cp_config[1] is not cp_config_type:
-            raise ValueError(
-                f"{fqn}.inner_attention and "
-                f"{first_cp_config[0]}.inner_attention use different CP "
-                "backends, but model inputs are sharded once."
-            )
-        # TODO(fegin): it seems to be cleaner if we move this logic to each
-        # backend class definition. We need to revisit a good strategy to
-        # define "where" should a validation implementation lives.
-        if isinstance(inner_attention, UlyssesCPInnerAttention.Config):
-            if parallelism.context_parallel_load_balancer is not None:
-                raise ValueError(
-                    f"{fqn}.inner_attention uses {cp_config_type.__qualname__}, so "
-                    "context_parallel_load_balancer must be None."
-                )
-            head_shard_degree = (
-                parallelism.tensor_parallel_degree * parallelism.context_parallel_degree
-            )
+        cp_inner_attention = inner_attention._owner
+        assert cp_inner_attention is not None and issubclass(
+            cp_inner_attention, CPInnerAttention
+        )
+        if issubclass(cp_inner_attention, Ulysses):
+            head_shard_degree = parallelism.tensor_parallel_degree * cp
             n_heads = attention.n_heads
             n_kv_heads = getattr(attention, "n_kv_heads", None) or n_heads
+            if isinstance(attention, GDN.Config):
+                n_kv_heads = attention.n_key_heads
             for name, count in (("n_heads", n_heads), ("n_kv_heads", n_kv_heads)):
                 if count % head_shard_degree != 0:
                     raise ValueError(
@@ -234,3 +186,29 @@ def validate_context_parallel(
                         "by tensor_parallel_degree * context_parallel_degree "
                         f"({head_shard_degree})."
                     )
+
+        load_balancer_config = parallelism.context_parallel_load_balancer
+        # Linear attention either routes states or restores token order using
+        # the shared permutation; the full-attention backend selects the balancer.
+        if isinstance(attention, LinearAttention.Config):
+            continue
+        if load_balancer_config is None:
+            continue
+        # Decoder ignores load balancers without full attention.
+        # And Varlen rejects PTRR.
+        if (
+            isinstance(model, Decoder.Config)
+            and model.first_full_attention is None
+            and not issubclass(cp_inner_attention, AllGatherKVVarlen)
+        ):
+            continue
+        if issubclass(cp_inner_attention, Ulysses):
+            raise ValueError(
+                f"{fqn}.inner_attention uses {cp_inner_attention.__qualname__}, so "
+                "context_parallel_load_balancer must be None."
+            )
+        if not supports_cp_inner_attention(load_balancer_config, cp_inner_attention):
+            raise ValueError(
+                f"{type(load_balancer_config).__qualname__} does not support "
+                f"{fqn}.inner_attention using {cp_inner_attention.__qualname__}."
+            )

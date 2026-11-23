@@ -209,10 +209,6 @@ class TpuGraphTrainerDistributedTest(
               "--compile.use_scan_layers",
           ],
           skip_devices=[
-              # TODO(b/587033846): multi-axis meshes fail on spmd_types under
-              # enable_tpu_topo_mesh; enable with the fix. CPU/CUDA: the flag
-              # is a no-op there.
-              device_type.AcceleratorDeviceType.TPU,
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],

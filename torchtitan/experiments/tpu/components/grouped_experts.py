@@ -132,7 +132,7 @@ class GroupedExperts(Module):
         up_RF = self._grouped_mm(
             A=x_RD.bfloat16(), weight_EOI=self.w3_EFD, offs=offsets_E
         )
-        h_RF = self.activation_fn(gate_RF, up_RF)
+        h_RF = self.activation_fn(torch.stack([gate_RF, up_RF], dim=-2))
         return self._grouped_mm(
             A=h_RF, weight_EOI=self.w2_EDF, offs=offsets_E
         ).type_as(x_RD)
@@ -222,7 +222,7 @@ class TpuRoutedExperts(RoutedExperts):
             )
             if self.output_postprocess is not None:
                 routed_output_RD = self.output_postprocess(routed_output_RD)
-        return self.token_dispatcher.combine(routed_output_RD, metadata)
+        return self.token_dispatcher.combine(routed_output_RD, metadata, x_TD)
 
 
 class TpuGroupedExperts(GroupedExperts):

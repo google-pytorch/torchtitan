@@ -43,7 +43,7 @@ import torchtitan.trainer
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 JobConfig = torchtitan.trainer.Trainer.Config
-ParallelDims = torchtitan.distributed.ParallelDims
+ParallelDims = torchtitan.distributed.parallel_dims.ParallelDims
 logger = logging.getLogger(__name__)
 
 TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], None]
@@ -177,7 +177,7 @@ class TrainerMinimal:
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=self.tokenizer,
-        max_context_length=job_config.training.max_context_length,
+        max_context_length=job_config.model.max_context_length,
         num_tokens_per_microbatch=(
             job_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
@@ -213,7 +213,7 @@ class TrainerMinimal:
 
     with (
         torch.device("meta"),
-        utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
+        utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.precision.dtype]),
     ):
       model = model_config.build()
 
@@ -223,7 +223,7 @@ class TrainerMinimal:
         model_param_count,
         _,
     ) = model_config.get_nparams_and_flops(
-        model, job_config.training.max_context_length
+        model, job_config.model.max_context_length
     )
 
     logger.info(
@@ -253,7 +253,7 @@ class TrainerMinimal:
           training=job_config.training,
           parallelism=job_config.parallelism,
           compile_config=job_config.compile,
-          ac_config=job_config.activation_checkpoint,
+          ac_config=job_config.activation_remat,
           dump_folder=job_config.dump_folder,
       )
       if isinstance(model, Llama3Model):
@@ -310,7 +310,7 @@ class TrainerMinimal:
     from torchtitan.models.base.model import BaseModel  # pylint: disable=g-import-not-at-top
 
     data_iterator = iter(self.dataloader)
-    seq_len = self.job_config.training.max_context_length
+    seq_len = self.job_config.model.max_context_length
 
     try:
 
@@ -555,7 +555,7 @@ def start_trainer(config: JobConfig):
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     # Upstream d771abb0 renamed training.seq_len ->
     # training.max_context_length.
-    with set_unflatten_seq_len(config.training.max_context_length):
+    with set_unflatten_seq_len(config.model.max_context_length):
       trainer.train()
   finally:
     if torch.distributed.is_initialized():

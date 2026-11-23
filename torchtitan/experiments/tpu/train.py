@@ -199,7 +199,7 @@ class TpuTrainingEngine(TrainingEngine):
   ):
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
 
-    with set_unflatten_seq_len(self.config.training.max_context_length):
+    with set_unflatten_seq_len(self.config.model.max_context_length):
       return super().forward_backward(
           microbatch_groups=microbatch_groups,
           global_valid_tokens=global_valid_tokens,
@@ -307,14 +307,14 @@ def _apply_flux_img_size(
         dataset=_with_img_size(validator.dataloader.dataset),
     )
   latent = img_size // flux_utils.IMAGE_LATENT_SIZE_RATIO
-  train_config.training.max_context_length = (
+  train_config.model.max_context_length = (
       latent // flux_utils.PATCH_HEIGHT
   ) * (latent // flux_utils.PATCH_WIDTH) + (
       train_config.tokenizer.max_t5_encoding_len
   )
   logger.info(
       f"--flux.img_size={img_size}: max_context_length="
-      f"{train_config.training.max_context_length}"
+      f"{train_config.model.max_context_length}"
   )
 
 
@@ -434,7 +434,7 @@ def start_trainer(
         from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
         # Upstream d771abb0 renamed training.seq_len ->
         # training.max_context_length.
-        with set_unflatten_seq_len(train_config.training.max_context_length):
+        with set_unflatten_seq_len(train_config.model.max_context_length):
           trainer.train()
   except Exception:
     if trainer:

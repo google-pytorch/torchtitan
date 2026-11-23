@@ -1,3 +1,4 @@
+from torchtitan.config.parallelism import ParallelismConfig
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -12,9 +13,9 @@ from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import default_adamw
+from torchtitan.experiments.tpu.components.optim import default_adamw
 from torchtitan.config.configs import (
-    ParallelismConfig,
+    PrecisionConfig,
     TrainingConfig,
 )
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
@@ -57,7 +58,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader, TPUGrainDataLoader
 from torchtitan.models.common.attention import Attention as BaseAttention
 from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss, MoE
-from torchtitan_recipes.tests.models.qwen3 import qwen3_30b_a3b_global_aux
+from torchtitan_recipes.tests.models.qwen3 import qwen3_30b_a3b as qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.observability.profiler import Profiler
 from torchtitan.components.optim import Optim
@@ -170,7 +171,9 @@ def _use_global_batch_aux_loss(config: TPUTrainerConfig) -> None:
   assert config.model is not None
   for _, moe, _, _ in config.model.traverse(MoE.Config):
     moe.load_balance_coeff = None
-    moe.router.aux_loss = BatchWiseLoadBalanceLoss.Config(coeff=1e-3)
+    moe.router.aux_loss = BatchWiseLoadBalanceLoss.Config(
+        coeff=1e-3, num_experts=moe.num_experts
+    )
 
 
 def qwen3_debugmodel() -> TPUTrainerConfig:
@@ -201,7 +204,6 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,
-          max_context_length=2048,
           steps=10,
       ),
       dataloader=c4_test_dataloader(),
@@ -210,7 +212,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=DefaultActivationRematConfig(),
+      activation_remat=DefaultActivationRematConfig(),
       validator=None,
   )
 
@@ -237,7 +239,7 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. Set the context length first; the microbatch budget is four
   # sequences at that new context.
-  cfg.training.max_context_length = 128
+  cfg.model.max_context_length = 128
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 4 * 128
 
   return cfg
@@ -267,11 +269,10 @@ def qwen3_1_7b() -> TPUTrainerConfig:
           ),
           max_norm=1.0,
       ),
+      precision=PrecisionConfig(reduce_dtype="bfloat16"),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 2048,
-          max_context_length=2048,
           steps=15,
-          mixed_precision_reduce="bfloat16",
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -279,7 +280,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullActivationRematConfig(),
+      activation_remat=FullActivationRematConfig(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
           use_jax_profiler=False,
@@ -329,11 +330,10 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           ),
           max_norm=1.0,
       ),
+      precision=PrecisionConfig(reduce_dtype="float32"),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=6 * 2048,
-          max_context_length=2048,
           steps=15,
-          mixed_precision_reduce="float32",
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -342,7 +342,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullActivationRematConfig(),
+      activation_remat=FullActivationRematConfig(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
           use_jax_profiler=True,
@@ -391,11 +391,17 @@ def _qwen3_cp(
       strategy
   )
   model = cast(Qwen3Model.Config, config.model)
-  inner_attention = model.first_full_attention_backend
+  assert model.first_full_attention is not None
+  inner_attention = model.first_full_attention.inner_attention
   assert inner_attention is not None
   cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
   return apply_transforms(
-      config, [ContextParallelTransform(inner_attention=cp_inner_attention)]
+      config,
+      [
+          ContextParallelTransform(
+              inner_attention_map={inner_attention._owner: cp_inner_attention}
+          )
+      ],
   )
 
 
@@ -420,7 +426,7 @@ def qwen3_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
 def _qwen3_1_7b_32k() -> TPUTrainerConfig:
   """Qwen3 1.7B at 32k context, one sequence per data-parallel rank."""
   config = qwen3_1_7b()
-  config.training.max_context_length = 32768
+  config.model.max_context_length = 32768
   config.training.num_tokens_per_microbatch_per_dp_rank = 32768
   return config
 
@@ -475,11 +481,10 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
           ),
           max_norm=1.0,
       ),
+      precision=PrecisionConfig(reduce_dtype="float32"),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=6 * 2048,
-          max_context_length=2048,
           steps=15,
-          mixed_precision_reduce="float32",
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -493,7 +498,7 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
       checkpointer=None,
       # GraphTrainer does not apply this eager AC config; its graph
       # rematerialization policy is selected on the final compile config below.
-      activation_checkpoint=DefaultActivationRematConfig(),
+      activation_remat=DefaultActivationRematConfig(),
       tpu_config=TPUConfig(),
       # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
       # libtpu 0.0.48; see cl/979992733), which segfaults in
@@ -557,7 +562,7 @@ def qwen3_8b_maxtext_parity() -> TpuGraphTrainer.Config:
   policy but not the loop representation.
   """
   cfg = qwen3_8b_zero3()
-  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.precision.reduce_dtype = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   _use_maxtext_flops(cfg)
   return cfg
@@ -583,7 +588,7 @@ def qwen3_32b() -> TpuGraphTrainer.Config:
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. Set the context length first; the budgets are 8 local and
   # 1024 global sequences at that context.
-  cfg.training.max_context_length = 4096
+  cfg.model.max_context_length = 4096
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 8 * 4096
   cfg.training.num_tokens_per_train_step = 1024 * 4096
   # Prefetch beats interleave by 0.3-0.6% here for ~4 GiB more peak HBM.
@@ -618,7 +623,7 @@ def qwen3_32b_4x8x8() -> TpuGraphTrainer.Config:
 def qwen3_32b_maxtext_parity() -> TpuGraphTrainer.Config:
   """Qwen3 32B recipe with MaxText's BF16 reductions and BF16 RoPE."""
   cfg = qwen3_32b()
-  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.precision.reduce_dtype = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   _use_maxtext_flops(cfg)
   return cfg
@@ -629,7 +634,7 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
   cfg.loss = CrossEntropyLoss.Config()
   cfg.model = model_registry(
-      "30B-A3B-global-aux",
+      "30B-A3B",
       attn_backend="sdpa",
       converters=[
           TpuTokenDispatcherConverter.Config(),
@@ -710,12 +715,13 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
   _scale_routes_before_down_proj(cfg)
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.
-  cfg.training.max_context_length = 2048
+  cfg.model.max_context_length = 2048
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 6 * 2048
   cfg.training.num_tokens_per_train_step = 768 * 2048
   cfg.training.steps = 8
   cfg.tpu_config = TPUConfig()
-  cfg.optim.optimizer.implementation = "fused"
+  for opt in cfg.optim.optimizer.optimizers:
+    opt.fused = True
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       backend="tpu",
@@ -817,7 +823,7 @@ def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TpuGraphTrainer.Config:
   MaxText FLOPs, so its MFU is comparable with MaxText's published Q30 numbers.
   """
   cfg = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
-  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.precision.reduce_dtype = "bfloat16"
   _use_maxtext_flops(cfg)
   return cfg
 
@@ -897,7 +903,7 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
     experts.use_kernel_native_weight_layout = True
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.
-  cfg.training.max_context_length = 4096
+  cfg.model.max_context_length = 4096
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 4096
   cfg.training.num_tokens_per_train_step = 8192 * 4096
   cfg.training.steps = 15
@@ -963,7 +969,7 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TpuGraphTrainer.Config:
   """MaxText-numerics variant of the Q235 activation-offload recipe."""
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
   _without_splash_saves(cfg)
-  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.precision.reduce_dtype = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   _use_maxtext_flops(cfg)
@@ -983,7 +989,7 @@ def _configure_qwen3_moe_235b_fsdp_128(
   # `_qwen3_moe_235b_fsdp_only`, which has already set `max_context_length`, so
   # scale the 2048-sequence global batch by the context length in effect.
   cfg.training.num_tokens_per_train_step = (
-      2048 * replicate_degree * cfg.training.max_context_length
+      2048 * replicate_degree * cfg.model.max_context_length
   )
 
 
@@ -1040,7 +1046,7 @@ def qwen3_moe_235b_fsdp_smoke() -> TpuGraphTrainer.Config:
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. Set the context length first; the microbatch budget below is
   # one sequence at the new, shorter context.
-  cfg.training.max_context_length = 128
+  cfg.model.max_context_length = 128
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 1 * 128
   # `num_tokens_per_train_step` has to be restated, not inherited: under the
   # old fields `_qwen3_moe_235b_fsdp_only`'s `global_batch_size = 8192` was a
@@ -1102,7 +1108,7 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
     experts.use_kernel_native_weight_layout = True
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.
-  cfg.training.max_context_length = 4096
+  cfg.model.max_context_length = 4096
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 4096
   cfg.training.num_tokens_per_train_step = 8192 * 4096
   cfg.training.steps = 15
@@ -1123,7 +1129,6 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   cfg.compile.fsdp_allreduce_slice_parameter_patterns = ()
   # The routing metrics stash tensors on the module, which a scan body cannot
   # do (https://github.com/google-pytorch/torchtitan/issues/28).
-  cfg.metrics.enable_moe_routing = False
   cfg.metrics.log_freq = 1
   # Left to the command line these get forgotten, and a scan step measured
   # without them runs ~10% slow.
@@ -1190,7 +1195,7 @@ def qwen3_moe_235b_scan_maxtext() -> TpuGraphTrainer.Config:
   published Ironwood number.
   """
   cfg = qwen3_moe_235b_scan()
-  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.precision.reduce_dtype = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   _use_maxtext_flops(cfg)
   return cfg

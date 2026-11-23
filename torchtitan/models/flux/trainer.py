@@ -24,6 +24,10 @@ from torchtitan.models.flux.model import FluxModel
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.models.flux.validator import FluxValidator, SamplingConfig
 from torchtitan.trainer import Trainer
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+
+
+_LOCAL_TOKENIZER_PATH = "tests/assets/tokenizer"
 
 
 @dataclass(kw_only=True, slots=True)
@@ -58,7 +62,7 @@ class Inference:
 
 class FluxTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
-    class Config(Trainer.Config):
+    class Config(TPUTrainerConfig):
         # Overwrite parent class tokenizer
         tokenizer: FluxTokenizerContainer.Config = (  # pyrefly: ignore [bad-override]
             field(default_factory=FluxTokenizerContainer.Config)
@@ -81,6 +85,43 @@ class FluxTrainer(Trainer):
                 )
 
     def __init__(self, config: Config):
+        flux_cfg = getattr(config, "flux", None)
+        random_dataset = bool(getattr(flux_cfg, "random_dataset", False))
+        if random_dataset:
+            from torchtitan.models.flux.random_loader import RandomDataloader
+
+            img_size = getattr(flux_cfg, "img_size", None) or 256
+            max_t5_len = getattr(config.tokenizer, "max_t5_encoding_len", 512)
+            # RandomDataloader produces pre-encoded latents and text embeddings;
+            # compute bsz from microbatch token count and latent sequence len.
+            from torchtitan.models.flux.utils import (
+                IMAGE_LATENT_SIZE_RATIO,
+                PATCH_HEIGHT,
+                PATCH_WIDTH,
+            )
+
+            latent_tokens = (img_size // IMAGE_LATENT_SIZE_RATIO // PATCH_HEIGHT) * (
+                img_size // IMAGE_LATENT_SIZE_RATIO // PATCH_WIDTH
+            )
+            tokens_per_sample = latent_tokens + max_t5_len
+            bsz = max(
+                1,
+                config.training.num_tokens_per_microbatch_per_dp_rank
+                // tokens_per_sample,
+            )
+            config.tokenizer = replace(
+                config.tokenizer,
+                t5_tokenizer_path=_LOCAL_TOKENIZER_PATH,
+                clip_tokenizer_path=_LOCAL_TOKENIZER_PATH,
+                test_mode=True,
+            )
+            config.dataloader = RandomDataloader.Config(
+                bsz=bsz,
+                max_steps=config.training.steps,
+                img_size=img_size,
+                max_t5_len=max_t5_len,
+            )
+
         super().__init__(config)
 
         # Flux samples diffusion noise and timesteps during each model step, so
@@ -103,6 +144,12 @@ class FluxTrainer(Trainer):
             if self.engine.parallelism_context.dp_shard_enabled
             else torch.float32
         )
+
+        if random_dataset:
+            self.autoencoder = None
+            self.clip_encoder = None
+            self.t5_encoder = None
+            return
 
         # load components
         model_args = config.model

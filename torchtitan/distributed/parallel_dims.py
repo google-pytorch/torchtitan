@@ -27,5 +27,3 @@ __all__ = [
     "unfold_dp_axes",
     "unfold_dp_axis",
 ]
-
-sys.modules[__name__] = _parallelism_context

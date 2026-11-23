@@ -31,7 +31,7 @@ class ParallelStrategy(enum.Enum):
 
 
 def _determine_parallel_strategy(
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
     train_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUTrainerConfig,
 ) -> ParallelStrategy:
   """Determine parallel strategy based on config."""
@@ -60,7 +60,7 @@ def _determine_parallel_strategy(
 
 def parallelize_conformer(
     model: nn.Module,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
     train_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUTrainerConfig,
 ) -> nn.Module:
   """Apply parallelism and activation checkpointing to Conformer."""
@@ -69,7 +69,7 @@ def parallelize_conformer(
     raise RuntimeError("Tensor Parallelism is not supported for Conformer yet")
 
   # Apply activation checkpointing if enabled
-  if train_config.activation_checkpoint is not None:
+  if train_config.activation_remat is not None:
     apply_ac(model)
 
   strategy = _determine_parallel_strategy(parallel_dims, train_config)

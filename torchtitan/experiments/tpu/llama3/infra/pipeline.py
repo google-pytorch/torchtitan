@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def pipeline_llama(
     model: nn.Module,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
     job_config: torchtitan.trainer.Trainer.Config,
     device: torch.device,
     model_args: BaseModel.Config,

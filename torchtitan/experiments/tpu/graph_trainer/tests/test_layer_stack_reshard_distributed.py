@@ -38,7 +38,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
 )
 from torchtitan.experiments.tpu.graph_trainer.tests import test_layer_stack
 from torchtitan.experiments.tpu.components.layer_loop import tpu_model_class
-from torchtitan.models.llama3 import build_model_config as model_registry
+from torchtitan.experiments.tpu.llama3 import model_registry
 
 
 SEED = 1234

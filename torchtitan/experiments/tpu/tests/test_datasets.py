@@ -11,7 +11,7 @@ from absl.testing import absltest
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.experiments.tpu.components import datasets
-from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.components.data.text_datasets import DATASETS
 
 logger = logging.getLogger(__name__)
 

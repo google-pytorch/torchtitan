@@ -804,6 +804,7 @@ def _testmodel(
     num_mtp_layers: int = 0,
     *,
     seq_len: int,
+    parallelism: ParallelismConfig,
 ) -> DeepSeekV3Model.Config:
     dim = 16
     n_layers = 2
@@ -816,6 +817,7 @@ def _testmodel(
     num_experts = 4
     n_dense_layers = 1
 
+    enable_sp = parallelism.enable_sequence_parallel
     layers = _build_dsv3_layers(
         n_layers=n_layers,
         n_dense_layers=n_dense_layers,
@@ -846,19 +848,30 @@ def _testmodel(
             beta_slow=1.0,
             original_seq_len=4096,
         ),
+        enable_sp=enable_sp,
+        enable_ep=parallelism.expert_parallel_degree > 1,
     )
     return DeepSeekV3Model.Config(
         vocab_size=vocab_size,
         max_context_length=seq_len,
         dim=dim,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        tok_embeddings=VocabParallelEmbedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+            sharding_config=token_embedding_sharding_config(enable_sp=enable_sp),
         ),
-        norm=RMSNorm.Config(normalized_shape=dim, eps=1e-6, param_init=_NORM_INIT),
+        norm=RMSNorm.Config(
+            normalized_shape=dim,
+            eps=1e-6,
+            param_init=_NORM_INIT,
+            sharding_config=norm_sharding_config(enable_sp=enable_sp),
+        ),
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
+            sharding_config=lm_head_sharding_config(),
         ),
         layers=layers,
         mtp_layers=_build_mtp_layers(
@@ -866,6 +879,7 @@ def _testmodel(
             layers[-1],
             dim=dim,
             num_mtp_layers=num_mtp_layers,
+            enable_sp=enable_sp,
         ),
     )
 

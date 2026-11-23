@@ -73,7 +73,7 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     stable_grouped_reduce,
 )
 from torchtitan.models.common.activation import Softmax
-from torchtitan.models.common.linear import RouterGateLinear
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.deepseek_v3.moe import DeepSeekV3Router
 
@@ -222,13 +222,13 @@ def _router(num_expert_groups: int | None) -> TokenChoiceTopKRouter:
     if num_expert_groups is None:
         return TokenChoiceTopKRouter.Config(
             num_experts=_EXPERTS,
-            gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
+            gate=Linear.Config(in_features=_DIM, out_features=_EXPERTS),
             top_k=_TOP_K,
             score_func=Softmax.Config(),
         ).build()
     return DeepSeekV3Router.Config(
         num_experts=_EXPERTS,
-        gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
+        gate=Linear.Config(in_features=_DIM, out_features=_EXPERTS),
         num_expert_groups=num_expert_groups,
         num_limited_groups=1,
         top_k=_TOP_K,

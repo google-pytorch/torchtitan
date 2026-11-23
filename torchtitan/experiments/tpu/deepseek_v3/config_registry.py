@@ -1,3 +1,4 @@
+from torchtitan.config.parallelism import ParallelismConfig
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -8,10 +9,9 @@ from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import default_adamw
+from torchtitan.experiments.tpu.components.optim import default_adamw
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.config.configs import (
-    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
@@ -25,7 +25,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
-from torchtitan.models.deepseek_v3 import build_model_config as model_registry
+from torchtitan.experiments.tpu.deepseek_v3 import model_registry
 from torchtitan.components.optim import Optim
 
 
@@ -48,14 +48,13 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,
-          max_context_length=2048,
           steps=10,
       ),
       parallelism=ParallelismConfig(
           expert_parallel_degree=1,
       ),
       checkpointer=None,
-      activation_checkpoint=DefaultActivationRematConfig(),
+      activation_remat=DefaultActivationRematConfig(),
   )
 
 

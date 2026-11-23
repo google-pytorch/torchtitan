@@ -38,7 +38,7 @@ import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_work
 import torchtitan.observability.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
-ParallelDims = torchtitan.distributed.ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 logger = logging.getLogger(__name__)
 
 

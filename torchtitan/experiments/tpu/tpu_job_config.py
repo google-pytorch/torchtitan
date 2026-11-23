@@ -194,29 +194,24 @@ class LossKernelConfig:
 
 def _FluxModelConfigTypes() -> tuple[type, ...]:  # pylint: disable=invalid-name
   """Flux sizes its context from the image size (``_apply_flux_img_size``)."""
-  from torchtitan.models.flux.model.model import FluxModel  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.flux.model import FluxModel  # pylint: disable=g-import-not-at-top
 
   return (FluxModel.Config,)
 
 
 def align_model_context_length(config) -> None:
-  """Sizes the model config to ``training.max_context_length``.
+  """Shrinks every RoPE cache on ``config.model`` to ``model.max_context_length``.
 
-  Upstream #4908 requires ``model.max_context_length`` to equal
-  ``training.max_context_length`` (its recipes pass ``seq_len`` when building
-  the flavor). The TPU recipes build upstream flavors at the flavor's full
-  context and pick the training length in ``training`` -- including from the
-  command line (``--training.max_context_length=32`` in the tests) -- so
-  align the model here and shrink every RoPE cache to it (pre-d771abb0
-  behaviour; a cache built for the flavor's full context ran llama3-70b on
-  tpu7x-2x2x4 out of program HBM). Caches are never grown.
+  Upstream #5779 removed ``training.max_context_length`` in favor of
+  ``model.max_context_length``. Shrink every RoPE cache to that length so
+  flavors built with a larger RoPE cache don't OOM HBM; caches are never grown.
   """
   model_config = config.model
-  max_context_length = config.training.max_context_length
-  if model_config is None or max_context_length <= 0:
+  if model_config is None:
     return
-  if getattr(model_config, "max_context_length", None) is not None:
-    model_config.max_context_length = max_context_length
+  max_context_length = getattr(model_config, "max_context_length", None) or 0
+  if max_context_length <= 0:
+    return
   from torchtitan.models.common.rope import RoPE  # pylint: disable=g-import-not-at-top
 
   traverse = getattr(model_config, "traverse", None)
@@ -237,8 +232,10 @@ def align_model_context_length(config) -> None:
 # kernel, LoRA, per-model toggles). The truly lane-specific runtime knobs
 # (``tpu_config`` for torch_tpu, ``jax_config`` for jax, ``torchax_config`` for
 # torchax) live on the subclasses below.
-@dataclasses.dataclass(kw_only=True, slots=True)
-class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
+@dataclasses.dataclass(kw_only=True)
+class BaseTPUTrainerFields:
+  """Non-slotted mixin holding TPU-specific trainer config fields."""
+
   xla_flags: tpu_flags.FlagMap = dataclasses.field(
       default_factory=tpu_flags.FlagMap
   )
@@ -264,13 +261,17 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
       default_factory=LossKernelConfig
   )
 
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config, BaseTPUTrainerFields):
+
   def __post_init__(self):
     # Upstream d771abb0 validates CUDA-graph capturability in
     # `Trainer.Config.__post_init__`, and rejects any MoE token dispatcher it
     # does not recognize -- which is all of the TPU ones. There is no CUDA
     # graph to capture in this lane, so opt out before the check runs. Must
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
-    self.training.disable_cuda_graphs = True
+    self.training.disable_accelerator_graphs = True
     if not isinstance(self.model, _FluxModelConfigTypes()):
       align_model_context_length(self)
     if (

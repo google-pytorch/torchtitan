@@ -1,5 +1,12 @@
 import torchtitan.models.common as common_models
+from torchtitan.models.common.embedding import VocabParallelEmbedding as Embedding
+from torchtitan.experiments.tpu.components.attention import (
+    make_tpu_model_registry,
+    use_tpu_sdpa,
+)
 import torchtitan.models.llama3.flavors as llama3_models
+
+model_registry = make_tpu_model_registry(llama3_models.build_model_config)
 
 from .infra.parallelize import parallelize_llama
 
@@ -17,7 +24,7 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
       max_context_length=512,
       dim=dim,
       vocab_size=128,
-      tok_embeddings=common_models.Embedding.Config(
+      tok_embeddings=Embedding.Config(
           num_embeddings=128,
           embedding_dim=dim,
           param_init=llama3_models._EMBEDDING_INIT,
@@ -37,7 +44,8 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
           n_heads=n_heads,
           n_kv_heads=n_heads,
           hidden_dim=4 * dim,
-          attn_backend=attn_backend,
+          attn_backend="flex" if attn_backend == "sdpa" else attn_backend,
+          enable_sp=False,
           rope=common_models.ComplexRoPE.Config(
               dim=dim // n_heads,
               max_context_length=512,
@@ -57,8 +65,15 @@ def _upstream_flavor(
   #4913 moved the table to `flavors.MODEL_FLAVORS`. Passing the flavor's own
   `max_context_length` reproduces what the old callable produced.
   """
+  from torchtitan.config.parallelism import ParallelismConfig
+
   build_config, max_context_length = llama3_models.MODEL_FLAVORS[flavor]
-  return build_config(attn_backend=attn_backend, seq_len=max_context_length)
+  cfg = build_config(
+      attn_backend="flex" if attn_backend == "sdpa" else attn_backend,
+      seq_len=max_context_length,
+      parallelism=ParallelismConfig(),
+  )
+  return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 llama3_configs = {

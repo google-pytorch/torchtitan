@@ -62,6 +62,8 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
     align_model_context_length,
+    BaseTPUTrainerFields,
+    TPUConfig,
     TPUTrainerConfig,
 )
 from torchtitan.models.base.model import BaseModel
@@ -238,7 +240,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             return [(microbatch_groups[0][0],)]
         from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 
-        with set_unflatten_seq_len(self.config.training.max_context_length):
+        with set_unflatten_seq_len(self.config.model.max_context_length):
             return TrainingEngine._preprocess_microbatch_groups(
                 self, microbatch_groups
             )
@@ -259,7 +261,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             )
         from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 
-        with set_unflatten_seq_len(self.config.training.max_context_length):
+        with set_unflatten_seq_len(self.config.model.max_context_length):
             if not self._optimizer_in_graph:
                 return TrainingEngine._forward_backward_body(
                     self,
@@ -461,7 +463,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             parallel_dims=self.parallel_dims,
             parallelism=self.config.parallelism,
             max_num_documents=self.max_num_documents,
-            max_context_length=self.config.training.max_context_length,
+            max_context_length=self.config.model.max_context_length,
         )
         self.ntokens_seen += (
             self.config.training.num_tokens_per_microbatch_per_dp_rank
@@ -558,12 +560,19 @@ class TpuGraphTrainer(GraphTrainer):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(GraphTrainer.Config, TPUTrainerConfig):
+    class Config(GraphTrainer.Config, BaseTPUTrainerFields):
         compile: TpuGraphTrainerCompileConfig = field(
             default_factory=TpuGraphTrainerCompileConfig
         )
+        tpu_config: TPUConfig = field(default_factory=TPUConfig)
 
         def __post_init__(self) -> None:
+            if self.model is not None:
+                from torchtitan.experiments.graph_trainer.common_utils import (
+                    disable_inplace_wgrad_accum,
+                )
+
+                disable_inplace_wgrad_accum(self.model)
             if self.compile is None:
                 # Upstream ``Trainer.Config.compile`` is optional; the graph
                 # trainer always needs its compile policy.
@@ -609,14 +618,37 @@ class TpuGraphTrainer(GraphTrainer):
             elif hasattr(model_source, "_model_config_cls"):
                 model_config_cls = getattr(model_source, "_model_config_cls")
             else:
-                model_config_cls = type(model_source("debugmodel"))
+                import inspect
+
+                if "parallelism" in inspect.signature(model_source).parameters:
+                    model_config_cls = type(
+                        model_source("debugmodel", parallelism=base_config.parallelism)
+                    )
+                else:
+                    model_config_cls = type(model_source("debugmodel"))
+            from torchtitan.config import derive
+            from torchtitan.trainer import Trainer as BaseTrainer
+
+            trainer_field_names = {
+                f.name for f in dataclasses.fields(BaseTrainer.Config)
+            }
+            plain_base = BaseTrainer.Config(
+                **{
+                    f.name: getattr(base_config, f.name)
+                    for f in dataclasses.fields(base_config)
+                    if f.name in trainer_field_names
+                }
+            )
+            graph_cfg = to_graph_trainer_config(plain_base, model_config_cls)
+            tpu_extra = {
+                f.name: getattr(base_config, f.name)
+                for f in dataclasses.fields(base_config)
+                if f.name not in trainer_field_names
+                and f.name in {cf.name for cf in dataclasses.fields(cls)}
+            }
             config = cast(
                 TpuGraphTrainer.Config,
-                to_graph_trainer_config(
-                    base_config,
-                    model_config_cls,
-                    target_cls=cls,
-                ),
+                derive(graph_cfg, cls, **tpu_extra),
             )
             maybe_use_maxtext_flops(base_config, config)
             return config

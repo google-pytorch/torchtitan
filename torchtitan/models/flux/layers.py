@@ -113,32 +113,19 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     out = torch.einsum("...n,d->...nd", pos, omega)
-    # Return cos and sin separately to avoid tiny dimensions
-    cos = torch.cos(out).float()
-    sin = torch.sin(out).float()
-    return torch.stack([cos, sin], dim=-1) # Just pass cos and sin together
+    out = torch.stack(
+        [torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1
+    )
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.float()
+
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    # freqs_cis has shape (..., d/2, 2), where [..., 0] is cos and [..., 1] is sin
-    cos = freqs_cis[..., 0]
-    sin = freqs_cis[..., 1]
-
-    # xq shape: (..., d). We reshape to (..., d/2, 2)
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
-
-    xq_0, xq_1 = xq_[..., 0], xq_[..., 1]
-    xk_0, xk_1 = xk_[..., 0], xk_[..., 1]
-
-    xq_out_0 = xq_0 * cos - xq_1 * sin
-    xq_out_1 = xq_0 * sin + xq_1 * cos
-
-    xk_out_0 = xk_0 * cos - xk_1 * sin
-    xk_out_1 = xk_0 * sin + xk_1 * cos
-
-    xq_out = torch.stack([xq_out_0, xq_out_1], dim=-1).reshape(*xq.shape).type_as(xq)
-    xk_out = torch.stack([xk_out_0, xk_out_1], dim=-1).reshape(*xk.shape).type_as(xk)
-    return xq_out, xk_out
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
 class EmbedND(Module):
@@ -158,7 +145,7 @@ class EmbedND(Module):
         n_axes = ids.shape[-1]
         emb = torch.cat(
             [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-2,
+            dim=-3,
         )
 
         return emb.unsqueeze(2)
@@ -254,9 +241,7 @@ class SelfAttention(Module):
         self, x: Tensor, pe: Tensor, *, attention_metadata: VarlenAttentionMetadata
     ) -> Tensor:
         qkv = self.qkv(x)
-        B, L, _ = qkv.shape
-        qkv = qkv.view(B, L, 3, self.num_heads, -1)
-        q, k, v = torch.unbind(qkv, dim=2)
+        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
         q, k = apply_rope(q, k, pe)
         x = _varlen_attention(
@@ -383,18 +368,18 @@ class DoubleStreamBlock(Module):
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
         img_qkv = self.img_attn.qkv(img_modulated)
-        B, L, _ = img_qkv.shape
-        img_qkv = img_qkv.view(B, L, 3, self.num_heads, -1)
-        img_q, img_k, img_v = torch.unbind(img_qkv, dim=2)
+        img_q, img_k, img_v = rearrange(
+            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads
+        )
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
         txt_qkv = self.txt_attn.qkv(txt_modulated)
-        B, L, _ = txt_qkv.shape
-        txt_qkv = txt_qkv.view(B, L, 3, self.num_heads, -1)
-        txt_q, txt_k, txt_v = torch.unbind(txt_qkv, dim=2)
+        txt_q, txt_k, txt_v = rearrange(
+            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads
+        )
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
         # run actual attention
@@ -434,8 +419,7 @@ class SingleStreamBlock(Module):
     class Config(Module.Config):
         hidden_size: int
         num_heads: int
-        lin_qkv: Linear.Config
-        lin_mlp: Linear.Config
+        linear1: Linear.Config
         linear2: Linear.Config
         modulation: Modulation.Config
         norm: QKNorm.Config
@@ -454,8 +438,7 @@ class SingleStreamBlock(Module):
 
         self.mlp_hidden_dim = int(config.hidden_size * config.mlp_ratio)
         # qkv and mlp_in
-        self.lin_qkv = config.lin_qkv.build()
-        self.lin_mlp = config.lin_mlp.build()
+        self.linear1 = config.linear1.build()
         # proj and mlp_out
         self.linear2 = config.linear2.build()
 
@@ -482,13 +465,11 @@ class SingleStreamBlock(Module):
     ) -> Tensor:
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
-        # TODO(b/517661974): Add support for loading split linear layer weights.
-        qkv = self.lin_qkv(x_mod)
-        mlp = self.lin_mlp(x_mod)
+        qkv, mlp = torch.split(
+            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
+        )
 
-        B, L, _ = qkv.shape
-        qkv = qkv.view(B, L, 3, self.num_heads, -1)
-        q, k, v = torch.unbind(qkv, dim=2)
+        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
 
         # compute attention

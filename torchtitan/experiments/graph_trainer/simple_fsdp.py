@@ -224,8 +224,10 @@ def _register_parametrization(
     if not param_names:
         return
     param_name_to_property = {}
+    parametrizations = []
     for param_name in param_names:
         parametrization = parametrization_init(param_name)
+        parametrizations.append(parametrization)
         param_name_to_property[param_name] = property(
             lambda self, pn=param_name, p=parametrization: p(self._parameters[pn])
         )
@@ -238,6 +240,7 @@ def _register_parametrization(
     # so that pickle/GraphPickler can resolve it during serialization.
     sys.modules[module_cls.__module__].__dict__[module_cls.__name__] = module_cls
     module.__class__ = module_cls
+    module._simple_fsdp_parametrization_list = parametrizations
 
 
 class _BuildUnshardedTensorFunction(torch.autograd.Function):
@@ -510,7 +513,7 @@ def data_parallel(
     device_mesh: DeviceMesh,
     mode: str = "replicate",
     mp_policy: MixedPrecisionPolicy | None = None,
-    shard_dim: int = 0,
+    shard_dim: int | dict[str, int] = 0,
     # Model-parallel (TP/EP) mesh used to construct DTensor parameters on the
     # full mesh.
     # TODO: Unify this with device_mesh as a global data- and model-parallel mesh.
@@ -531,6 +534,8 @@ def data_parallel(
     elif mode not in ("replicate", "fully_shard"):
         raise ValueError(f"Unsupported mode {mode}")
 
+    template_dim = 0 if isinstance(shard_dim, dict) else shard_dim
+
     if param_shard_placements is None:
         # An earlier data_parallel call may have parametrized submodules such
         # as EP experts. Inspect raw parameters without running ReplicateComputation.
@@ -540,7 +545,7 @@ def data_parallel(
     def get_param_sharding(param: nn.Parameter) -> tuple[Placement, ...]:
         if mode == "replicate":
             return (Replicate(),)
-        placement = param_shard_placements.get(param, Shard(shard_dim))
+        placement = param_shard_placements.get(param, Shard(template_dim))
         if mode == "fully_shard":
             return (placement,)
         return (Replicate(), placement)
@@ -554,24 +559,53 @@ def data_parallel(
 
         param_non_dp_mesh_types = {}
         param_shardings: dict[str, tuple[Placement, ...]] = {}
+        mod_shard_dim = (
+            shard_dim
+            if isinstance(shard_dim, dict)
+            else getattr(mod, "_fsdp_shard_dim", shard_dim)
+        )
 
         for p_name, p in params_dict.items():
             if p is not None:
                 param_sharding = param_shardings[p_name] = get_param_sharding(p)
             if p is not None and p.numel() > 0:
+                dim = (
+                    mod_shard_dim[p_name]
+                    if isinstance(mod_shard_dim, dict)
+                    else mod_shard_dim
+                )
+                if isinstance(p, DTensor) and dim != template_dim:
+                    # Under EP/TP, `ReplicateComputation` re-wraps the parameter
+                    # with `param_sharding`, which carries `template_dim` and so
+                    # would drop this axis.
+                    raise NotImplementedError(
+                        f"{p_name} is already a DTensor, so sharding it on dim "
+                        f"{dim} would be dropped on the EP/TP path"
+                    )
                 p, non_dp_mesh_types = _prepare_spmd_parameter_for_fsdp(
                     p,
                     p_name,
                     non_dp_mesh,
                 )
                 param_non_dp_mesh_types[p_name] = non_dp_mesh_types
+                # Check if the parameter is smaller than the device mesh dimension.
+                # If so, replicate it instead of sharding it.
+                actual_sharding = [
+                    Shard(dim) if isinstance(pl, Shard) else pl for pl in param_sharding
+                ]
+                for i, placement in enumerate(actual_sharding):
+                    if isinstance(placement, Shard) and p.shape[placement.dim] < device_mesh.size(i):
+                        actual_sharding[i] = Replicate()
+                actual_sharding = tuple(actual_sharding)
+                param_shardings[p_name] = actual_sharding
+
                 distribute_tensor_func = (
                     _distribute_dtensor if isinstance(p, DTensor) else distribute_tensor
                 )
                 mod.register_parameter(
                     p_name,
                     nn.Parameter(
-                        distribute_tensor_func(p, device_mesh, param_sharding),
+                        distribute_tensor_func(p, device_mesh, actual_sharding),
                         requires_grad=p.requires_grad,
                     ),
                 )

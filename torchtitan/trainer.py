@@ -565,7 +565,6 @@ class Trainer(Configurable):
             **collect_aux_loss_metrics(parallelism_context),
             **loss_metrics,
         }
-        extra_metrics.update(get_moe_load_balancing_metrics(engine.model_parts))
         self.metrics_processor.log(
             engine.num_completed_steps,
             global_avg_loss,

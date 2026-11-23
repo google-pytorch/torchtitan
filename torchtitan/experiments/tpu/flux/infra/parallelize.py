@@ -8,7 +8,7 @@ import torchtitan.trainer
 
 def parallelize_flux(
     model: nn.Module,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
     job_config: torchtitan.trainer.Trainer.Config,
 ) -> nn.Module:
   """Parallelizes the Flux model based on the provided configuration.
@@ -24,7 +24,7 @@ def parallelize_flux(
   # For now, we delegate to the native implementation.
   # If TPU-specific optimizations are needed, we can implement them here.
   return model.parallelize(
-      ac_config=job_config.activation_checkpoint,
+      ac_config=job_config.activation_remat,
       compile_config=job_config.compile,
       dump_folder="",
       parallel_dims=parallel_dims,

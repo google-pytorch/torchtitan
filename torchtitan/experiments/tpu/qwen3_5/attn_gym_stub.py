@@ -73,3 +73,5 @@ class _AttnGymStubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
 if "attn_gym" not in sys.modules and not importlib.util.find_spec("attn_gym"):
   sys.meta_path.insert(0, _AttnGymStubFinder())
+elif not importlib.util.find_spec("attn_gym.linear.gdn.impl.cudnn"):
+  sys.meta_path.append(_AttnGymStubFinder())

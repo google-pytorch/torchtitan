@@ -1,3 +1,4 @@
+from torchtitan.experiments.tpu.components.optim import default_adamw
 # Copyright 2026 Google LLC
 """TPU job configurations for Mamba-3 models."""
 
@@ -56,7 +57,7 @@ def mamba3_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("2.7B"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=3e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=100,
               decay_ratio=0.8,
@@ -66,10 +67,9 @@ def mamba3_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 262144,
-          max_context_length=262144,
           steps=1000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_remat.FullActivationRematConfig(),
+      activation_remat=activation_remat.FullActivationRematConfig(),
   )

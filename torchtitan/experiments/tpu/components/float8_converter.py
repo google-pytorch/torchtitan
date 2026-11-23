@@ -16,7 +16,17 @@ from torchtitan.config.transform.converter import ModelConfigConverter
 from torchtitan.config.transform.quantization import _validate_quantizable_linear
 from torchtitan.experiments.tpu.components.float8 import Float8Linear
 from torchtitan.models.common.linear import Linear
-from torchtitan.quantization.utils import get_quantized_linear, module_filter_fn
+from torchtitan.quantization.utils import get_quantized_linear
+
+
+def module_filter_fn(
+    mod: Linear.Config,
+    fqn: str,
+    filter_fqns: list[str],
+) -> bool:
+  """Return whether ``mod`` at ``fqn`` should be quantized."""
+  del mod
+  return not any(f in fqn for f in filter_fqns)
 
 logger = logging.getLogger(__name__)
 

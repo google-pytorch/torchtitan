@@ -74,8 +74,8 @@ def _defer_parametrization_during_init(model: nn.Module) -> None:
 def parallelize_hf_transformers_tpu(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
-    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,

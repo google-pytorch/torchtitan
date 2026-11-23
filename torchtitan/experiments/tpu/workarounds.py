@@ -183,7 +183,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
             _causal += 1
         else:
           replacements.append((parent_module, child_name, child_module))
-      elif "FlexAttention" in cls_name:
+      elif "FlexAttention" in cls_name or "FlexInnerAttention" in cls_name:
         replacements.append((parent_module, child_name, child_module))
 
   # Apply replacements

@@ -43,9 +43,19 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.graph_pp.partition import (
     _forward_mutations_to_materialize,
 )
-from torchtitan.experiments.graph_trainer.graph_pp.utils import (
-    is_mutation_node,
-)
+
+
+def is_mutation_node(node: torch.fx.Node) -> bool:
+  """Return whether ``node`` writes to one of its aliased arguments."""
+  if node.op != "call_function":
+    return False
+  schema = getattr(node.target, "_schema", None)
+  if schema is None:
+    return False
+  return any(
+      arg.alias_info is not None and arg.alias_info.is_write
+      for arg in schema.arguments
+  )
 from torchtitan.experiments.tpu.graph_trainer.collectives import (
     chain_boundary,
     classify_fsdp_roles,

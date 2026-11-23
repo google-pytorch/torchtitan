@@ -55,15 +55,18 @@ def get_maxtext_decoder_nparams_and_flops(
         # MaxText halves the usual non-causal attention FLOPs for causal masks.
         forward_attention_flops += 2 * seq_len * n_heads * head_dim
 
-        moe = layer.moe
+        moe = getattr(layer, "moe", None)
         if moe is None:
             feed_forward = layer.feed_forward
-            if not isinstance(feed_forward, FeedForward.Config):
+            if isinstance(feed_forward, MoE.Config):
+                moe = feed_forward
+            elif isinstance(feed_forward, FeedForward.Config):
+                # SwiGLU has two input projections (stacked in w13 as [2, F, D])
+                # and one output projection.
+                forward_weight_flops += 6 * dim * feed_forward.w13.out_features
+                continue
+            else:
                 raise ValueError("MaxText decoder FLOPs require a SwiGLU FFN")
-            # SwiGLU has two input projections (stacked in w13 as [2, F, D])
-            # and one output projection.
-            forward_weight_flops += 6 * dim * feed_forward.w13.out_features
-            continue
 
         if not isinstance(moe, MoE.Config) or moe.shared_experts is not None:
             raise ValueError(
@@ -73,7 +76,7 @@ def get_maxtext_decoder_nparams_and_flops(
         # Upstream d771abb0 moved the grouped experts behind `RoutedExperts`.
         experts_hidden_dim = (
             moe.routed_experts.inner_experts.hidden_dim
-            if moe.routed_experts.inner_experts is not None
+            if getattr(moe.routed_experts, "inner_experts", None) is not None
             else moe.routed_experts.w13.out_features
         )
         forward_weight_flops += (

@@ -10,7 +10,39 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.attention import FlexInnerAttention, InnerAttention
+
+
+def use_tpu_sdpa(model_config):
+  """Replace ``FlexInnerAttention.Config`` with ``ScaledDotProductInnerAttention.Config``."""
+  for _, cfg, parent, attr in list(model_config.traverse(FlexInnerAttention.Config)):
+    del cfg
+    replacement = ScaledDotProductInnerAttention.Config()
+    if parent is None:
+      model_config = replacement
+    elif isinstance(parent, list):
+      parent[attr] = replacement
+    else:
+      setattr(parent, attr, replacement)
+  return model_config
+
+
+def make_tpu_model_registry(upstream_build_fn):
+  """Wrap an upstream ``build_model_config`` to default ``parallelism`` and support ``sdpa``."""
+
+  def _build(flavor: str, **kwargs):
+    from torchtitan.config.parallelism import ParallelismConfig
+
+    if kwargs.get("parallelism") is None:
+      kwargs["parallelism"] = ParallelismConfig()
+    attn_backend = kwargs.get("attn_backend")
+    if attn_backend == "sdpa":
+      kwargs["attn_backend"] = "flex"
+      cfg = upstream_build_fn(flavor, **kwargs)
+      return use_tpu_sdpa(cfg)
+    return upstream_build_fn(flavor, **kwargs)
+
+  return _build
 
 AttentionMasksType = Any
 

@@ -1,3 +1,4 @@
+from torchtitan.experiments.tpu.components.optim import default_adamw
 """Stacking a decoder's layer weights must change storage and nothing else.
 
 Every check here is against an unstacked model built the same way, because the
@@ -46,7 +47,7 @@ from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_s
 from torchtitan.models.qwen3 import flavors as qwen3_models
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss
-from torchtitan.models.llama3 import build_model_config as model_registry
+from torchtitan.experiments.tpu.llama3 import model_registry
 from torchtitan.models.qwen3 import build_model_config as qwen3_registry
 
 

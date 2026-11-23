@@ -15,7 +15,7 @@ import torch
 from torchao.float8.config import e4m3_dtype
 from torchao.float8.float8_utils import amax_to_scale, to_fp8_saturated
 
-from .._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 
 
 __all__: list[str] = []

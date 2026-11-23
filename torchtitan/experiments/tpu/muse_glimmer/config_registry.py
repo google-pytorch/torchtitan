@@ -4,9 +4,9 @@ from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import default_adamw
+from torchtitan.experiments.tpu.components.optim import default_adamw
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.configs import TrainingConfig
+from torchtitan.config.configs import PrecisionConfig, TrainingConfig
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
@@ -104,14 +104,13 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * _DEBUGMODEL_CONTEXT_LENGTH,
-          max_context_length=_DEBUGMODEL_CONTEXT_LENGTH,
           steps=10,
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(use_simple_fsdp=True),
       checkpointer=None,
-      activation_checkpoint=DefaultActivationRematConfig(),
+      activation_remat=DefaultActivationRematConfig(),
   )
 
 
@@ -162,11 +161,10 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
           lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
           max_norm=1.0,
       ),
-      training=TrainingConfig(
+precision=PrecisionConfig(reduce_dtype="float32"),
+            training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * _30B_CONTEXT_LENGTH,
-          max_context_length=_30B_CONTEXT_LENGTH,
           steps=30,
-          mixed_precision_reduce="float32",
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -176,7 +174,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
           data_parallel_shard_degree=-1,
       ),
       checkpointer=None,
-      activation_checkpoint=DefaultActivationRematConfig(),
+      activation_remat=DefaultActivationRematConfig(),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # the other TPU recipes.
       xla_flags=tpu_flags.merge_flags(

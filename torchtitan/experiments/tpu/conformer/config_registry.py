@@ -1,10 +1,8 @@
+from torchtitan.experiments.tpu.components.optim import default_adamw
 import os
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import (
-    default_adamw,
-    OptimizersContainer,
-)
+from torchtitan.components.optim.optimizer import OptimizersContainer
 from torchtitan.components.validate import Validator
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -12,7 +10,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 # `TPUTrainerConfig().<field>.__class__`. Upstream d771abb0 made
 # `model_spec` a required field, so the no-arg `TPUTrainerConfig()` that
 # idiom relied on now raises.
-from torchtitan.config import TrainingConfig
+from torchtitan.config import PrecisionConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.tpu_job_config import (
     ConformerConfig,
@@ -45,18 +43,17 @@ def conformer_test() -> TPUTrainerConfig:
       dataloader=c4_test_dataloader(),
       tokenizer=HuggingFaceTokenizer.Config(),
       validator=Validator.Config(),
-      training=TrainingConfig(
+precision=PrecisionConfig(param_dtype="bfloat16"),
+            training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=768 * 512,
-          max_context_length=512,
           steps=10,
           dtype="float32",
-          mixed_precision_param="bfloat16",
       ),
       parallelism=ParallelismConfig(
           data_parallel_shard_degree=-1,
           data_parallel_replicate_degree=1,
       ),
-      activation_checkpoint=FullActivationRematConfig(),
+      activation_remat=FullActivationRematConfig(),
       compile=TpuTrainerCompileConfig(
           enable=False,
           backend="tpu",
@@ -80,7 +77,6 @@ def conformer_debugmodel() -> TPUTrainerConfig:
   config.model = _conformer_model_config("debugmodel")
   config.training = config.training.__class__(
       num_tokens_per_microbatch_per_dp_rank=4 * 128,
-      max_context_length=128,
       steps=3,
       dtype="float32",
       mixed_precision_param="bfloat16",

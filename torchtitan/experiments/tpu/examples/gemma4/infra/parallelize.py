@@ -17,14 +17,13 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
 from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
-from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    GroupedExperts,
+    TpuGroupedExperts,
+)
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.models.common.moe import (
-    GroupedExperts,
-    MoE,
-    configure_moe_aux_loss_reduction,
-)
+from torchtitan.models.common.moe import MoE
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ def _apply_compile_gemma4(
 def _parallelize_gemma4(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
@@ -86,8 +85,6 @@ def _parallelize_gemma4(
   )
 
   model._parallelize(parallel_dims)
-
-  configure_moe_aux_loss_reduction(model, parallel_dims)
 
   if ac_config is not None:
     _apply_ac_gemma4(model, ac_config, dump_folder=dump_folder)
@@ -125,7 +122,7 @@ def _parallelize_gemma4(
 
 def configure_gemma4_simple_fsdp_shard_dims(
     model: nn.Module,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
 ) -> None:
   """Use divisible hidden axes for uneven Gemma4 parameters under SimpleFSDP."""
   fsdp_degree = parallel_dims.dp_shard
@@ -195,8 +192,8 @@ def configure_gemma4_simple_fsdp_shard_dims(
 def parallelize_gemma4(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
-    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,

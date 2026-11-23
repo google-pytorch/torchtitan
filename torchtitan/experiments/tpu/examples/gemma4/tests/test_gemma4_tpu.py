@@ -72,7 +72,7 @@ from torchtitan.models.common.attention import (
     QKVLinear,
 )
 from torchtitan.models.common.param_init import skip_param_init
-from torchtitan.models.common.linear import Linear, RouterGateLinear
+from torchtitan.models.common.linear import Linear, Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 import transformers
@@ -131,7 +131,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
         inner_experts = layer.moe.routed_experts.inner_experts
         self.assertIsInstance(inner_experts, TpuGroupedExperts.Config)
         self.assertEqual(inner_experts.activation, "gelu_tanh")
-        self.assertIsInstance(layer.moe.router.gate, RouterGateLinear.Config)
+        self.assertIsInstance(layer.moe.router.gate, Linear.Config)
 
   def test_config_registry_valid(self):
     for fn in (

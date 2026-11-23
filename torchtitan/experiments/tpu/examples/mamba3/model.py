@@ -32,6 +32,7 @@ class Mamba3Config(_BaseConfig):
   """Configuration for Mamba-3 architecture."""
 
   vocab_size: int = 128256
+  max_context_length: int = 4096
   d_model: int = 2560
   n_layers: int = 64
   n_heads: int = 80

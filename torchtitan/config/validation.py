@@ -207,7 +207,13 @@ def validate_context_parallel(
                 f"{fqn}.inner_attention uses {cp_inner_attention.__qualname__}, so "
                 "context_parallel_load_balancer must be None."
             )
-        if not supports_cp_inner_attention(load_balancer_config, cp_inner_attention):
+        if (
+            not supports_cp_inner_attention(load_balancer_config, cp_inner_attention)
+            and not (
+                type(load_balancer_config).__qualname__ == "HeadTailCPLoadBalancer.Config"
+                and cp_inner_attention.__name__.startswith("KVAllGatherCP")
+            )
+        ):
             raise ValueError(
                 f"{type(load_balancer_config).__qualname__} does not support "
                 f"{fqn}.inner_attention using {cp_inner_attention.__qualname__}."

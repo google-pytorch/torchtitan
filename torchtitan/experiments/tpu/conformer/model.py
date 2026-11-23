@@ -23,6 +23,7 @@ class ConformerModelArgs(BaseModel.Config):
   num_heads: int = 8
   kernel_size: int = 31
   max_seq_len: int = 2048  # Added to match train_minimal expectations
+  max_context_length: int = 2048
   use_splash: bool = False
   use_vmap_bwd: bool = False
 

@@ -35,11 +35,15 @@ from torchtitan.experiments.tpu.components import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
-from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.common.attention import VarlenAttentionMetadata as VarlenMetadata
 from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.common.activation import SiLU, UnaryActivationFn
 from torchtitan.models.common.norm import GatedRMSNorm
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
+from torchtitan.models.common.attention.gdn import (
+    GDN as GatedDeltaNet,
+    GDNKernel as GatedDeltaKernel,
+    InnerGDN as InnerGatedDeltaNet,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -714,7 +718,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     a_TH = self.in_proj_a(x_TD)
     b_TH = self.in_proj_b(x_TD)
 
-    output_THV = self.inner_gated_delta_net(
+    output_THV = self.inner_attention(
         query_TC,
         key_TC,
         value_TC,

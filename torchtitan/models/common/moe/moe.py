@@ -788,7 +788,11 @@ class MoE(FeedForward):
             expert_counts = {
                 "moe": self.num_experts,
                 "router": self.router.num_experts,
-                "routed_experts": self.routed_experts.w13.group_size,
+                "routed_experts": (
+                    self.routed_experts.w13.group_size
+                    if self.routed_experts.w13 is not None
+                    else self.routed_experts.num_experts
+                ),
             }
             if len(set(expert_counts.values())) != 1:
                 raise ValueError(

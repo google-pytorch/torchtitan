@@ -66,6 +66,12 @@ class MaxTextTpuGraphTrainerQwen3Model(TpuGraphTrainerQwen3Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TpuGraphTrainerQwen3Model.Config):
+        def build_flops_estimator(self, model: nn.Module, *, seq_len: int):
+            _, flops_per_token = get_maxtext_decoder_nparams_and_flops(
+                self, model, seq_len
+            )
+            return lambda _inputs: flops_per_token
+
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
@@ -117,11 +123,15 @@ def model_registry(
     *,
     seq_len: int | None = None,
     attn_backend: str = "flex",
+    parallelism=None,
 ) -> TpuGraphTrainerQwen3Model.Config:
+    from torchtitan.config.parallelism import ParallelismConfig  # pylint: disable=g-import-not-at-top
+
     base = graph_trainer_model_registry(
         flavor,
         seq_len=seq_len,
         attn_backend=attn_backend,
+        parallelism=parallelism or ParallelismConfig(),
     )
     return TpuGraphTrainerQwen3Model.Config(
         **{

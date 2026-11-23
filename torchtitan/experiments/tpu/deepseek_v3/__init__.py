@@ -5,7 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import torchtitan.models.common as common_models
+from torchtitan.models.common.embedding import VocabParallelEmbedding as Embedding
 import torchtitan.models.deepseek_v3.flavors as deepseek_v3_models
+from torchtitan.experiments.tpu.components.attention import (
+    make_tpu_model_registry,
+    use_tpu_sdpa,
+)
+
+model_registry = make_tpu_model_registry(deepseek_v3_models.build_model_config)
 def parallelize_deepseekv3(model, **kwargs):
   return model.parallelize(**kwargs)
 
@@ -40,7 +47,9 @@ def _testmodel(
       num_shared_experts=2,
       router_top_k=2,
       router_score_func=common_models.Softmax.Config(),
-      attn_backend=attn_backend,
+      attn_backend="flex" if attn_backend == "sdpa" else attn_backend,
+      enable_sp=False,
+      enable_ep=False,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
           max_context_length=128,
@@ -57,7 +66,7 @@ def _testmodel(
       max_context_length=128,
       vocab_size=vocab_size,
       dim=dim,
-      tok_embeddings=common_models.Embedding.Config(
+      tok_embeddings=Embedding.Config(
           num_embeddings=vocab_size,
           embedding_dim=dim,
           param_init=deepseek_v3_models._EMBEDDING_INIT,
@@ -99,7 +108,9 @@ def _testmodel_moe(
       num_shared_experts=2,
       router_top_k=2,
       router_score_func=common_models.Softmax.Config(),
-      attn_backend=attn_backend,
+      attn_backend="flex" if attn_backend == "sdpa" else attn_backend,
+      enable_sp=False,
+      enable_ep=False,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
           max_context_length=128,
@@ -116,7 +127,7 @@ def _testmodel_moe(
       max_context_length=128,
       vocab_size=vocab_size,
       dim=dim,
-      tok_embeddings=common_models.Embedding.Config(
+      tok_embeddings=Embedding.Config(
           num_embeddings=vocab_size,
           embedding_dim=dim,
           param_init=deepseek_v3_models._EMBEDDING_INIT,
@@ -142,11 +153,15 @@ def _upstream_flavor(flavor: str, attn_backend: str):
   keyword-only argument of the builder. Passing the flavor's own
   `max_context_length` reproduces what the old callable produced.
   """
+  from torchtitan.config.parallelism import ParallelismConfig
+
   build_config, max_context_length = deepseek_v3_models.MODEL_FLAVORS[flavor]
-  return build_config(
-      attn_backend=attn_backend,
+  cfg = build_config(
+      attn_backend="flex" if attn_backend == "sdpa" else attn_backend,
       seq_len=max_context_length,
+      parallelism=ParallelismConfig(),
   )
+  return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 deepseekv3_configs = {

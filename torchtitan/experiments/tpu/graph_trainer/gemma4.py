@@ -44,7 +44,6 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     configure_gemma4_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
-from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 
 
 class TpuGraphTrainerGemma4Model(Gemma4Model):
@@ -136,8 +135,6 @@ def parallelize_gemma4(
   annotate_module_fqns(model)
 
   model._parallelize(parallel_dims)
-
-  configure_moe_aux_loss_reduction(model, parallel_dims)
 
   # Apply simple_fsdp unconditionally. The `fsdp` mesh always exists with a
   # real backend (see ParallelDims._mesh_exist), even at degree 1, so that

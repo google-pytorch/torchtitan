@@ -62,7 +62,6 @@ def _flux_recipe(flavor: str, *, max_t5_encoding_len: int) -> FluxTrainer.Config
         encoder=FluxEncoderConfig(
             autoencoder_path="assets/hf/FLUX.1-dev/ae.safetensors",
         ),
-        tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=100),
         model=build_model_config(
             flavor,

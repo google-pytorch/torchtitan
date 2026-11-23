@@ -13,6 +13,22 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
 
 
+class _DiscardedAuxLossMixin:
+  """Avoid mutating aux_loss accumulator buffers inside scan."""
+
+  def _accumulate_expert_counts(self, counts_E: torch.Tensor) -> torch.Tensor:
+    return self._reduce_token_partials(counts_E, include_dp_axis=True)
+
+  def __getattr__(self, name: str):
+    value = super().__getattr__(name)
+    if name != "instance_acc":
+      return value
+    return torch.zeros_like(value)
+
+
+_DISCARDED_AUX_LOSS_SUBCLASSES: dict[type, type] = {}
+
+
 class TpuDiscardedTokenCounterRouter(TokenChoiceTopKRouter):
   """`TokenChoiceTopKRouter` that hands out a throwaway in place of its counter.
 
@@ -24,6 +40,21 @@ class TpuDiscardedTokenCounterRouter(TokenChoiceTopKRouter):
   @dataclass(kw_only=True, slots=True)
   class Config(TokenChoiceTopKRouter.Config):
     pass
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+    if self.aux_loss is not None:
+      cls = type(self.aux_loss)
+      if not issubclass(cls, _DiscardedAuxLossMixin):
+        sub_cls = _DISCARDED_AUX_LOSS_SUBCLASSES.get(cls)
+        if sub_cls is None:
+          sub_cls = type(
+              f"TpuDiscarded{cls.__name__}",
+              (_DiscardedAuxLossMixin, cls),
+              {},
+          )
+          _DISCARDED_AUX_LOSS_SUBCLASSES[cls] = sub_cls
+        self.aux_loss.__class__ = sub_cls
 
   def __getattr__(self, name: str):
     value = super().__getattr__(name)

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def configure_qwen_simple_fsdp_shard_dims(
     model: nn.Module,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
 ) -> None:
   """Use divisible hidden axes for uneven Qwen parameters under SimpleFSDP."""
   fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp

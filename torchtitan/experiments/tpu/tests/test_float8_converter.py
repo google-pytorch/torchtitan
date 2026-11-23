@@ -7,10 +7,9 @@ from torchao.float8.config import Float8LinearConfig
 from torchao.float8.config import ScalingGranularity
 from torchtitan.experiments.tpu.components.float8 import Float8Linear
 from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter
-from torchtitan.experiments.tpu.llama3 import config_registry
+from torchtitan.experiments.tpu.llama3 import config_registry, model_registry
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.llama3 import build_model_config as model_registry
 
 
 def _converted(model_config) -> tuple[list[str], list[str]]:

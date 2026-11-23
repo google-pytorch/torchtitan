@@ -23,7 +23,7 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.linear import (
     ColumnParallelLinear,
     Linear,
-    RouterGateLinear,
+    Linear,
     RowParallelLinear,
 )
 from torchtitan.experiments.tpu.components.grouped_experts import (
@@ -155,7 +155,7 @@ def _make_moe_config(
                 eps=norm_eps,
                 elementwise_affine=False,
             ),
-            gate=RouterGateLinear.Config(
+            gate=Linear.Config(
                 in_features=dim,
                 out_features=num_experts,
                 param_init=param_init["linear_out"],

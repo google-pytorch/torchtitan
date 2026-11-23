@@ -975,6 +975,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     # pylint: disable=g-import-not-at-top
     from torchtitan.experiments.tpu.kernels.ragged_gather_tc import (
         roe_compute_routing,
+        roe_gather_out_2d,
         roe_gather_row_scales,
         roe_sort_gather,
         safe_gather_block_size,
@@ -1010,11 +1011,16 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           top_k=self.top_k,
           requested_block_size=self.roe_reduce_block_size,
       )
+      # The 2D gather stages each block in a second VMEM buffer, so it fits
+      # half as many rows per block.
       gather_block = min(
           safe_gather_block_size(
               hidden_dim=hidden_dim,
               itemsize=x_TD.element_size(),
               requested_block_size=self.roe_gather_block_size,
+              out_2d=roe_gather_out_2d(
+                  cap, x_TD.element_size(), self.roe_zero_pad_tail
+              ),
           ),
           cap,
       )

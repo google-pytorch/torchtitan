@@ -52,6 +52,10 @@ class TPUConfig:
   ep_capacity_factor: float | None = None
   ep_token_chunks: int | None = None
   ep_max_inflight_chunks: int | None = None
+  # False sums each layer's cross-chunk expert dWeights in BF16 instead of FP32.
+  ep_chunk_dw_fp32: bool | None = None
+  # False switches paired W1+W3 Pallas grouped matmuls to unpaired under EP.
+  ep_paired_grouped_mm: bool | None = None
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]

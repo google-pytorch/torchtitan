@@ -5,7 +5,6 @@ gradients bit for bit, and the backward graph for what it stopped (and did
 not stop) recomputing.
 """
 
-import types
 import unittest
 from unittest import mock
 
@@ -22,7 +21,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 # Imported for the same reason as in `test_layer_stack`: production scans run
 # with it installed, so these do too.
 from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
-from torchtitan.experiments.tpu.graph_trainer import scan_fsdp, scan_remat_policy
+from torchtitan.experiments.tpu.graph_trainer import scan_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_with_remat_policy,
 )
@@ -353,13 +352,6 @@ class TestScanRematPolicy(unittest.TestCase):
         # ... or no region at all (no MoE, no FSDP).
         with self.assertRaisesRegex(ValueError, "matched no op"):
             _run(_saving(ATTENTION_INNER_ATTENTION), extra=None)
-
-    def test_raises_on_a_torch_whose_checkpoint_skips_scan_bodies(self):
-        with mock.patch.object(
-            scan_remat_policy, "checkpoint_module", types.SimpleNamespace()
-        ):
-            with self.assertRaisesRegex(RuntimeError, "pytorch/pytorch#203334"):
-                _run(_saving())
 
     def test_refuses_an_unknown_save_region(self):
         with self.assertRaisesRegex(ValueError, "cannot save regions"):

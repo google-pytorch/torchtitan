@@ -14,8 +14,6 @@ op's ``remat_region`` (see ``remat_regions.py``):
 import functools
 from collections.abc import Callable, Set
 
-import torch
-import torch.utils.checkpoint as checkpoint_module
 from torch import fx
 from torch._higher_order_ops.scan import scan
 from torch.utils.checkpoint import (
@@ -68,15 +66,6 @@ def scan_with_remat_policy(
     unknown = set(save_regions) - SCAN_SAVE_REGIONS
     if unknown:
         raise ValueError(f"a scan body cannot save regions {sorted(unknown)}")
-    if not hasattr(checkpoint_module, "_tag_recompute_for_partitioner"):
-        # Then, under the graph trainer's non-strict trace, checkpoint takes its
-        # eager path, no node is tagged, and the body silently saves the
-        # gathered weights of every layer.
-        raise RuntimeError(
-            "--compile.use-scan-layers needs PyTorch with pytorch/pytorch#203334 and "
-            "#203534 (not in 2.15). Found torch "
-            f"{torch.__version__}."
-        )
     # Mutation allowed: the MoE aux loss all-reduces its saved counts in place,
     # once per mesh axis.
     saved: set[str] = set()

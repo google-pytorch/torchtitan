@@ -65,6 +65,33 @@ EpTransport = Literal[
 ]
 
 
+def _is_tracing(tensor: torch.Tensor) -> bool:
+  """Whether ``tensor`` is being traced by Dynamo or make_fx / AOT."""
+  return (
+      torch.compiler.is_compiling()
+      or isinstance(tensor, torch._subclasses.FakeTensor)
+      or get_proxy_mode() is not None
+  )
+
+
+def _clone_repeated_tensors(
+    first: torch.Tensor, tensors: list[torch.Tensor]
+) -> list[torch.Tensor]:
+  """``tensors`` with every repeat of ``first`` or of an earlier entry cloned.
+
+  Compares with ``is``, which Dynamo traces for tensors; ``id()`` of a tensor
+  created inside a compiled region is unsupported under ``fullgraph=True``.
+  """
+  out = list(tensors)
+  for i in range(len(out)):
+    repeated = out[i] is first
+    for j in range(i):
+      repeated = repeated or out[i] is out[j]
+    if repeated:
+      out[i] = out[i].clone()
+  return out
+
+
 def _wait(tensor: torch.Tensor) -> torch.Tensor:
   """Waits on a functional collective's result."""
   if isinstance(tensor, AsyncCollectiveTensor):
@@ -91,11 +118,7 @@ def _ep_all_gather_impl(
           f" group_name; got pg={pg!r}"
       )
     return torch.tpu.ops.all_gather_dim(src, 0, group=pg)
-  if (
-      pg is not None
-      and get_proxy_mode() is None
-      and not isinstance(src, torch._subclasses.FakeTensor)
-  ):
+  if pg is not None and not _is_tracing(src):
     return _wait(all_gather_single(src, gather_dim=0, group=ep_mesh))
   raise NotImplementedError(
       "Ring-of-Experts EP all_gather needs a TPU process group with"
@@ -123,11 +146,7 @@ def _ep_reduce_scatter_sum_impl(
           f" group_name; got pg={pg!r}"
       )
     return torch.tpu.ops.reduce_scatter_dim(src, 0, group=pg, reduce_op="sum")
-  if (
-      pg is not None
-      and get_proxy_mode() is None
-      and not isinstance(src, torch._subclasses.FakeTensor)
-  ):
+  if pg is not None and not _is_tracing(src):
     return _wait(
         reduce_scatter_single(src, reduceOp="sum", scatter_dim=0, group=ep_mesh)
     )
@@ -217,11 +236,7 @@ def _ragged_all_to_all_impl(
     )
 
   # Off TPU: a slow eager reference built from all-gathers, for CPU/gloo tests.
-  if (
-      ep_mesh is not None
-      and get_proxy_mode() is None
-      and not isinstance(src, torch._subclasses.FakeTensor)
-  ):
+  if ep_mesh is not None and not _is_tracing(src):
     ep_size = ep_mesh.size()
     if ep_size <= 1:
       num_updates = input_offsets.numel()
@@ -718,10 +733,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         if self._ep_rank_holder_ref is not None
         else None
     )
-    if getattr(holder, "collect_ep_drop_stats", False) or (
-        get_proxy_mode() is None
-        and not isinstance(x, torch._subclasses.FakeTensor)
-    ):
+    if getattr(holder, "collect_ep_drop_stats", False) or not _is_tracing(x):
       self.last_dropped_count = dropped_count
 
   def enable_row_scale_dispatch(self) -> None:
@@ -787,9 +799,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       ):
         return rank_buf
 
-    if get_proxy_mode() is not None or isinstance(
-        x, torch._subclasses.FakeTensor
-    ):
+    if _is_tracing(x):
       # A traced graph must read the rank from the owner's buffer, a graph
       # input, so that every rank traces the same program. A constant would
       # bake this rank's index into the graph, so fail instead under EP > 1.
@@ -834,8 +844,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     if (
         self.ep_mesh is not None
         and pg is not None
-        and get_proxy_mode() is None
-        and not isinstance(local_counts_E, torch._subclasses.FakeTensor)
+        and not _is_tracing(local_counts_E)
     ):
       return _wait(
           all_gather_single(local_counts_E, gather_dim=0, group=self.ep_mesh)
@@ -861,17 +870,26 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       bwd_recv_sizes: torch.Tensor,
       pg,
   ) -> torch.Tensor:
+    # Combine sizes reuse dispatch tensors (e.g. comb_recv_sizes is
+    # disp_send_sizes), and torch.compile rejects an autograd.Function that
+    # receives the same tensor twice ("duplicate tensor input").
+    size_args = _clone_repeated_tensors(
+        operand,
+        [
+            fwd_input_offsets,
+            fwd_send_sizes,
+            fwd_output_offsets,
+            fwd_recv_sizes,
+            bwd_input_offsets,
+            bwd_send_sizes,
+            bwd_output_offsets,
+            bwd_recv_sizes,
+        ],
+    )
     return _RaggedAllToAll.apply(
         operand,
         output_rows,
-        fwd_input_offsets,
-        fwd_send_sizes,
-        fwd_output_offsets,
-        fwd_recv_sizes,
-        bwd_input_offsets,
-        bwd_send_sizes,
-        bwd_output_offsets,
-        bwd_recv_sizes,
+        *size_args,
         self.ep_mesh,
         pg,
     )
@@ -1596,13 +1614,7 @@ class TpuRoutedExperts(RoutedExperts):
     # layer returns drop stats from the step (dropless graphs are unchanged).
     record_eager_drops = isinstance(
         self.token_dispatcher, TpuAllToAllTokenDispatcher
-    ) and (
-        self.collect_ep_drop_stats
-        or (
-            get_proxy_mode() is None
-            and not isinstance(x_TD, torch._subclasses.FakeTensor)
-        )
-    )
+    ) and (self.collect_ep_drop_stats or not _is_tracing(x_TD))
     for chunk_idx, (x_c, scores_c, ids_c) in enumerate(
         zip(x_chunks, score_chunks, id_chunks)
     ):
@@ -1708,7 +1720,12 @@ class TpuRoutedExperts(RoutedExperts):
             for d in range(min(num_chunks, num_tokens), 0, -1)
             if num_tokens % d == 0
         )
-        if (num_tokens, num_chunks) not in self._warned_chunk_snap:
+        # Dynamo cannot trace the set mutation or the logger call; make_fx
+        # and eager run them as Python.
+        if (
+            not torch.compiler.is_compiling()
+            and (num_tokens, num_chunks) not in self._warned_chunk_snap
+        ):
           self._warned_chunk_snap.add((num_tokens, num_chunks))
           logger.warning(
               "%d tokens are not divisible by num_token_chunks=%d; using %d"

@@ -626,7 +626,9 @@ def validate_gated_delta_context_parallel(model: Any, parallelism: Any) -> None:
 
   Registered with ``validate_tpu_context_parallel``. With CP on, every
   GatedDeltaNet must run ``CPTpuInnerGatedDeltaNet`` with the recipe's load
-  balancer and head counts divisible by ``cp``.
+  balancer and head counts divisible by ``cp``. Expert parallelism combines
+  with CP under SimpleFSDP, where its parity is tested
+  (``test_ep_parity_distributed``); CP + EP under FSDP2 is rejected.
 
   Args:
     model: The model config.
@@ -640,10 +642,14 @@ def validate_gated_delta_context_parallel(model: Any, parallelism: Any) -> None:
     raise NotImplementedError(
         "GatedDeltaNet context parallelism does not support tensor parallelism."
     )
-  if delta_nets and parallelism.expert_parallel_degree > 1:
+  if (
+      delta_nets
+      and parallelism.expert_parallel_degree > 1
+      and not parallelism.use_simple_fsdp
+  ):
     raise NotImplementedError(
-        "Qwen3.5 context parallelism with expert parallelism is not validated"
-        " yet; use expert_parallel_degree=1 with context parallelism."
+        "Qwen3.5 context parallelism with expert parallelism is validated with"
+        " SimpleFSDP only; set parallelism.use_simple_fsdp."
     )
   if delta_nets and getattr(model, "vision_encoder", None) is not None:
     raise NotImplementedError(

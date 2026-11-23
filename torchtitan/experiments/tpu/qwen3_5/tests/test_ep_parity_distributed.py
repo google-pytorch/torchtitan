@@ -81,6 +81,21 @@ _PARITY_ARGS = [
     "--training.num_tokens_per_microbatch_per_dp_rank=256",
     "--parallelism.use_simple_fsdp",
 ]
+# CP on TPU: the Tokamax Splash kernel on 128-token blocks. The debug model's
+# RoPE table holds 256 positions, and each of the two CP ranks gets 128 of
+# them, the shortest the Splash kernel takes (as in
+# test_train_minimal_distributed's qwen3_5 CP cases).
+_CP_SPLASH_ARGS = [
+    "--training.max_context_length=256",
+    "--training.num_tokens_per_microbatch_per_dp_rank=512",
+    "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+    "--splash_attention_kernel.sa_block_q=128",
+    "--splash_attention_kernel.sa_block_kv=128",
+    "--splash_attention_kernel.sa_block_kv_compute=128",
+    "--splash_attention_kernel.sa_block_q_dkv=128",
+    "--splash_attention_kernel.sa_block_kv_dkv=128",
+    "--splash_attention_kernel.sa_block_kv_dkv_compute=128",
+]
 # Same tolerances as the dense qwen3_5_simplefsdp parity case.
 _PARITY_TOLERANCES = dict(
     loss_atol=5e-3,
@@ -212,6 +227,49 @@ class EpParityDistributedTest(
         **_PARITY_TOLERANCES,
     )
 
+  @parameterized.named_parameters(
+      ("_ep2_ulysses", "qwen35_moe_debugmodel_ulysses_cp2", 2),
+      ("_ep2_all_gather", "qwen35_moe_debugmodel_allgather_cp2", 2),
+      # EP = 4 > top_k = 2: `auto` takes ragged_all_to_all, and EP spans the
+      # whole dp_shard x cp group of 4 devices. CPU only for now: the EP = 4
+      # ragged_all_to_all cases above fail on the TPU CI image (also on main).
+      ("_ep4_ulysses_cpu", "qwen35_moe_debugmodel_ulysses_cp2", 4),
+  )
+  def test_qwen3_5_moe_ep_cp2_matches_single_device(
+      self, config: str, ep_degree: int
+  ):
+    """EP with context parallelism (CP = 2) against the CPU reference.
+
+    Head-parallel GatedDeltaNet CP and CP full attention shard each sequence
+    over the CP group, and EP dispatches every rank's token shard over the EP
+    group, which ``ParallelDims`` carves out of ``dp_shard * cp``. On TPU the
+    run is compiled per block with the Splash kernel (eager TPU CP with
+    ``dp_shard > 1`` is unreliable, see ``parallelize_qwen3_5``); on CPU it
+    runs eagerly over gloo.
+    """
+    on_tpu = (
+        self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU
+    )
+    if on_tpu and ep_degree > 2:
+      self.skipTest("EP = 4 ragged_all_to_all fails on the TPU CI image.")
+    if self.num_devices % 4:
+      # EP comes out of dp_shard * cp, i.e. all devices here.
+      self.skipTest("EP x CP=2 needs a multiple of 4 devices.")
+    self._run_trainer_distributed_parity_test(
+        config_args=[
+            "--module=torchtitan.experiments.tpu.qwen3_5",
+            f"--config={config}",
+            *_PARITY_ARGS,
+            f"--parallelism.expert_parallel_degree={ep_degree}",
+            *(_CP_SPLASH_ARGS if on_tpu else []),
+        ],
+        data_parallel_shard_degree=None,
+        tensor_parallel_degree=1,
+        context_parallel_degree=2,
+        enable_compile=on_tpu,
+        cpu_config_fn=_CPU_CONFIG_FN,
+        **_PARITY_TOLERANCES,
+    )
 
 if __name__ == "__main__":
   absltest.main()

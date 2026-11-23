@@ -33,10 +33,6 @@ import torch.distributed.distributed_c10d as c10d
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from torchtitan.experiments.tpu.components.remat_regions import (
-    annotate_region,
-    FSDP_GATHER,
-)
 from torchtitan.tools.logging import logger
 
 
@@ -228,12 +224,6 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
     """
     if spec is None:
         return shard
-    # The region makes the scan body recompute the gather in backward.
-    with annotate_region(FSDP_GATHER):
-        return _gather_slice(shard, spec)
-
-
-def _gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec) -> torch.Tensor:
     shard_dtype = shard.dtype
     out_dtype = spec.param_dtype or shard_dtype
     bw_op_dtype = spec.reduce_dtype or out_dtype

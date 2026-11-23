@@ -346,6 +346,8 @@ class TpuTrainersSplitOptimizersTest(_FakeTwoRankTestCase):
           trainer.config = config
           trainer.model_parts = [model]
           trainer.optimizers = optimizers
+          # TpuGraphTrainer's in-graph optimizer check reads this.
+          trainer.gradient_accumulation_steps = 1
           hook = config.model_spec.post_optimizer_build_fn
           if hook is not None:
             hook(optimizers, trainer.model_parts, mock.sentinel.parallel_dims)

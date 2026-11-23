@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.override import override
@@ -253,8 +254,9 @@ def chunked_gated_delta(
   Work within each chunk is expressed as batched matrix multiplications over
   all chunks at once, with the UT transform as one batched triangular solve;
   only the inter-chunk state recurrence is sequential over
-  ``seq_len / chunk_size`` steps, and each step is three matmuls. Applies Q/K
-  L2 normalization and ``1 / sqrt(key_head_dim)`` query scaling in fp32.
+  ``seq_len / chunk_size`` steps, and each step is three matmuls
+  (``_chunk_recurrence``, checkpointed under torch.compile). Applies Q/K L2
+  normalization and ``1 / sqrt(key_head_dim)`` query scaling in fp32.
 
   With ``segment_ids``, the state restarts from zero at the first token of
   every document, as in upstream's ``cu_seqlens`` kernels, through masks of
@@ -353,16 +355,76 @@ def chunked_gated_delta(
   k_decayed_t = (k * update_decay.unsqueeze(-1)).transpose(-1, -2)
   chunk_decay = chunk_decay.unsqueeze(-1)
 
-  state = torch.zeros(bs, n_heads, d_k, d_v, dtype=q.dtype, device=q.device)
+  loop_inputs = (wq, u, qk, k_decayed_t, chunk_decay)
+  if _checkpoint_chunk_loop():
+    # Backward re-runs the loop from its five inputs instead of receiving
+    # tensors of every chunk. The loop has no random ops.
+    out = torch.utils.checkpoint.checkpoint(
+        _chunk_recurrence,
+        *loop_inputs,
+        use_reentrant=False,
+        preserve_rng_state=False,
+    )
+  else:
+    out = _chunk_recurrence(*loop_inputs)
+  out = out.reshape(bs, n_heads, -1, d_v)[:, :, :seq_len]
+  return out.transpose(1, 2).contiguous().to(out_dtype)
+
+
+def _checkpoint_chunk_loop() -> bool:
+  """Whether ``chunked_gated_delta`` checkpoints its chunk loop.
+
+  Only while torch.compile traces a forward that needs gradients. Compiled
+  under selective AC, the loop's matmul outputs would otherwise go from the
+  forward graph to the backward graph, a few more with every chunk: the policy
+  saves matmul outputs, and the gated RMSNorm after the recurrence reads its
+  output in backward. With the checkpoint, the backward re-runs the loop from
+  its five inputs instead. Compiled without AC the same happens; compiled
+  under full AC nothing changes.
+
+  Not in eager mode: there selective AC's policy still caches the matmul
+  outputs inside a checkpoint, and full AC already re-runs the whole block, so
+  the checkpoint would add one more run of the loop and save nothing. Not
+  under GraphTrainer's make_fx capture either, which is not torch.compile and
+  applies its own memory policy to the captured step.
+  """
+  return torch.compiler.is_compiling() and torch.is_grad_enabled()
+
+
+def _chunk_recurrence(
+    wq: torch.Tensor,
+    u: torch.Tensor,
+    qk: torch.Tensor,
+    k_decayed_t: torch.Tensor,
+    chunk_decay: torch.Tensor,
+) -> torch.Tensor:
+  """The inter-chunk state recurrence of ``chunked_gated_delta``.
+
+  For each chunk, with ``S`` the state entering it (zero for the first one):
+  ``v_new = U - W S``, the output ``exp(g) Q S + QK v_new`` and the next state
+  ``S * chunk_decay + K^T v_new``. Rows ``[:chunk]`` of ``wq`` are ``W`` and
+  rows ``[chunk:]`` are ``exp(g) Q``, so one matmul gives both products with
+  ``S``.
+
+  Args:
+    wq: ``(bs, n_heads, num_chunks, 2 * chunk, d_k)``.
+    u: ``(bs, n_heads, num_chunks, chunk, d_v)``.
+    qk: ``(bs, n_heads, num_chunks, chunk, chunk)``, causal.
+    k_decayed_t: ``(bs, n_heads, num_chunks, d_k, chunk)``.
+    chunk_decay: ``(bs, n_heads, num_chunks, 1, 1)``.
+
+  Returns:
+    ``(bs, n_heads, num_chunks, chunk, d_v)`` output.
+  """
+  bs, n_heads, num_chunks, chunk, d_v = u.shape
+  state = wq.new_zeros(bs, n_heads, wq.shape[-1], d_v)
   outs = []
   for i in range(num_chunks):
     wq_state = wq[:, :, i] @ state
     v_new = u[:, :, i] - wq_state[..., :chunk, :]
     outs.append(wq_state[..., chunk:, :] + qk[:, :, i] @ v_new)
     state = state * chunk_decay[:, :, i] + k_decayed_t[:, :, i] @ v_new
-
-  out = torch.stack(outs, dim=2).reshape(bs, n_heads, -1, d_v)[:, :, :seq_len]
-  return out.transpose(1, 2).contiguous().to(out_dtype)
+  return torch.stack(outs, dim=2)
 
 
 def per_row_segment_ids(

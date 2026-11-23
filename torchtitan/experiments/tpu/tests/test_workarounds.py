@@ -687,7 +687,11 @@ class WorkaroundsTest(parameterized.TestCase):
     act.wait.assert_called_once_with()
 
   def test_tpu_selective_ac_recomputes_saved_collectives(self):
-    """TPUSelectiveAC is core SelectiveAC minus the collectives core saves."""
+    """TPUSelectiveAC saves core SelectiveAC's ops minus the collectives.
+
+    By default it also saves the Pallas splash forward, matched by name, which
+    set equality does not see; test_activation_checkpoint.py covers that.
+    """
     from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
     from torchtitan.experiments.tpu.components.activation_checkpoint import (
         TPUSelectiveAC,
@@ -701,9 +705,12 @@ class WorkaroundsTest(parameterized.TestCase):
     }
     core_ops = SelectiveAC.Config().build().get_save_ops()
     self.assertLessEqual(collectives, core_ops)
-    self.assertEqual(
-        TPUSelectiveAC.Config().build().get_save_ops(), core_ops - collectives
-    )
+    no_splash = TPUSelectiveAC.Config(save_pallas_attention=False)
+    self.assertEqual(no_splash.build().get_save_ops(), core_ops - collectives)
+    default_ops = TPUSelectiveAC.Config().build().get_save_ops()
+    self.assertEqual(set(default_ops), core_ops - collectives)
+    for op in collectives:
+      self.assertNotIn(op, default_ops)
 
     # CP parallelize functions switch plain SelectiveAC (keeping its fields)
     # and leave every other AC config alone.

@@ -110,6 +110,19 @@ def _recurrent_gated_delta_reference(
   return torch.stack(outs, dim=1)
 
 
+def _chunk_loop_inputs(num_chunks: int) -> tuple[torch.Tensor, ...]:
+  """CPU inputs of ``gated_delta._chunk_recurrence``: chunks of 8 tokens."""
+  bs, n_heads, chunk, d_k, d_v = 1, 2, 8, 16, 16
+  shape = (bs, n_heads, num_chunks)
+  return (
+      torch.randn(*shape, 2 * chunk, d_k) * 0.3,
+      torch.randn(*shape, chunk, d_v),
+      torch.randn(*shape, chunk, chunk).tril() * 0.3,
+      torch.randn(*shape, d_k, chunk) * 0.3,
+      torch.rand(*shape, 1, 1),
+  )
+
+
 def _packed_positions(doc_lens: tuple[int, ...]) -> torch.Tensor:
   """Positions of documents of ``doc_lens`` tokens packed into one row."""
   return torch.cat([torch.arange(n) for n in doc_lens])
@@ -779,6 +792,159 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertLessEqual(
           _relative_l2_error(a_t, e_t), 1e-4, msg=f"compiled {name}"
       )
+
+  def test_chunked_gated_delta_checkpoint_changes_no_value(self):
+    """Tests that checkpointing the chunk loop changes no bit (CPU).
+
+    The checkpoint is only taken under torch.compile; here it is forced on in
+    eager mode and compared with the plain loop.
+    """
+    torch.manual_seed(0)
+    shape = (2, 160, 4)  # 3 chunks of 64, the last one padded.
+    q, k, v = (torch.randn(*shape, 32) for _ in range(3))
+    g = -F.softplus(torch.randn(*shape))
+    beta = torch.sigmoid(torch.randn(*shape))
+    grad = torch.randn(*shape, 32)
+
+    def run(checkpoint_loop):
+      leaves = [x.clone().requires_grad_() for x in (q, k, v, g, beta)]
+      with mock.patch.object(
+          gated_delta, "_checkpoint_chunk_loop", return_value=checkpoint_loop
+      ) as gate:
+        out = gated_delta.chunked_gated_delta(*leaves)
+      gate.assert_called_once_with()
+      return [out, *torch.autograd.grad(out, leaves, grad)]
+
+    checkpointed = run(True)
+    plain = run(False)
+    names = ("out", "dq", "dk", "dv", "dg", "dbeta")
+    for name, a_t, e_t in zip(names, checkpointed, plain, strict=True):
+      self.assertTrue(torch.equal(a_t, e_t), msg=name)
+
+  def test_chunked_gated_delta_eager_runs_the_loop_once_per_forward(self):
+    """Tests that eager mode adds no run of the chunk loop.
+
+    Eager, the loop is not checkpointed: selective AC would still cache its
+    matmul outputs, and full AC already re-runs the block, so a checkpoint
+    would only add a run in backward. Each policy runs the loop once in the
+    forward and once more for each recompute it does itself.
+    """
+    # pylint: disable=g-import-not-at-top
+    from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+    from torchtitan.experiments.tpu.components.activation_checkpoint import (
+        TPUSelectiveAC,
+    )
+    # pylint: enable=g-import-not-at-top
+
+    class Block(torch.nn.Module):
+
+      def forward(self, *inputs):
+        return F.silu(gated_delta.chunked_gated_delta(*inputs))
+
+    torch.manual_seed(0)
+    shape = (1, 192, 2)  # 3 chunks of 64.
+    q, k, v = (torch.randn(*shape, 16) for _ in range(3))
+    g = -F.softplus(torch.randn(*shape))
+    beta = torch.sigmoid(torch.randn(*shape))
+    loop = gated_delta._chunk_recurrence  # pylint: disable=protected-access
+    policies = {
+        "no AC": (None, 1),
+        "FullAC": (FullAC.Config(), 2),
+        "SelectiveAC": (SelectiveAC.Config(), 2),
+        "TPUSelectiveAC": (TPUSelectiveAC.Config(), 2),
+    }
+    for name, (ac_config, want_runs) in policies.items():
+      with self.subTest(policy=name):
+        block = Block()
+        if ac_config is not None:
+          block = ac_config.build()._wrap_block(block)  # pylint: disable=protected-access
+        leaves = [x.clone().requires_grad_() for x in (q, k, v, g, beta)]
+        with mock.patch.object(
+            gated_delta, "_chunk_recurrence", side_effect=loop
+        ) as runs:
+          block(*leaves).sum().backward()
+        self.assertEqual(runs.call_count, want_runs)
+        self.assertTrue(all(x.grad is not None for x in leaves))
+
+  def test_chunked_gated_delta_saved_tensors_do_not_grow_with_seq_len(self):
+    """Tests what a compiled selective-AC block hands its backward.
+
+    Selective AC saves matmul outputs and recomputes the rest. The chunk
+    loop's output feeds an op whose backward reads it (the gated RMSNorm;
+    silu here), so without the checkpoint a compiled block hands its backward
+    a few more matmul outputs with every 64-token chunk. Under torch.compile
+    the loop is checkpointed, and the count is the same at every length,
+    under core ``SelectiveAC`` and ``TPUSelectiveAC``. Compiled with
+    aot_autograd and the min-cut partitioner, as test_cp_attention.py models
+    torch-tpu's split compile.
+    """
+    # pylint: disable=g-import-not-at-top
+    from functorch.compile import min_cut_rematerialization_partition
+    from torch._dynamo.backends.common import aot_autograd
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+    from torchtitan.experiments.tpu.components.activation_checkpoint import (
+        TPUSelectiveAC,
+    )
+    # pylint: enable=g-import-not-at-top
+
+    self.addCleanup(torch._dynamo.reset)  # pylint: disable=protected-access
+
+    class Block(torch.nn.Module):
+
+      def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+      def forward(self, *inputs):
+        return F.silu(self.fn(*inputs))
+
+    def saved_tensors(fn, ac_config, inputs):
+      torch._dynamo.reset()  # pylint: disable=protected-access
+      graphs = []
+
+      def capture(gm, _):
+        graphs.append(gm)
+        return gm
+
+      backend = aot_autograd(
+          fw_compiler=capture,
+          bw_compiler=capture,
+          partition_fn=min_cut_rematerialization_partition,
+      )
+      block = ac_config.build()._wrap_block(Block(fn))  # pylint: disable=protected-access
+      leaves = [x.requires_grad_() for x in inputs]
+      compiled = torch.compile(block, backend=backend, fullgraph=True)
+      compiled(*leaves).sum().backward()
+      return sum(
+          1
+          for node in graphs[-1].graph.nodes
+          if node.op == "placeholder" and not node.name.startswith("tangents")
+      )
+
+    def gdn_inputs(seq_len):
+      shape = (1, seq_len, 2)
+      q, k, v = (torch.randn(*shape, 16) for _ in range(3))
+      g = -F.softplus(torch.randn(*shape))
+      return q, k, v, g, torch.sigmoid(torch.randn(*shape))
+
+    torch.manual_seed(0)
+    for ac_config in (SelectiveAC.Config(), TPUSelectiveAC.Config()):
+      with self.subTest(policy=type(ac_config).__qualname__):
+        counts = [
+            saved_tensors(
+                gated_delta.chunked_gated_delta, ac_config, gdn_inputs(n)
+            )
+            for n in (128, 512)  # 2 and 8 chunks.
+        ]
+        self.assertEqual(counts[0], counts[1])
+        # Negative control: the loop without the checkpoint, 2 and 8 chunks.
+        loop_counts = [
+            saved_tensors(
+                gated_delta._chunk_recurrence, ac_config, _chunk_loop_inputs(n)  # pylint: disable=protected-access
+            )
+            for n in (2, 8)
+        ]
+        self.assertGreater(loop_counts[1], loop_counts[0])
 
   def test_causal_conv_silu_compiles_fullgraph(self):
     """Tests causal_conv_silu under torch.compile(fullgraph=True).

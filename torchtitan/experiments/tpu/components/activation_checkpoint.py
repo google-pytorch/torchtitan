@@ -49,14 +49,41 @@ class TPUSelectiveAC(SelectiveAC):
 
   TODO: Save the collectives again once torch-tpu accepts a wait on a saved
   tensor.
+
+  Like upstream's default save set, which holds every attention op it knows
+  about (SDPA, flex attention, varlen attention), the save set also holds the
+  Pallas splash-attention forward (output + logsumexp, matched by name), so
+  backward runs only the splash backward kernel instead of re-running the
+  forward kernel first. Measured on Llama-3.2-1B / 4x v6e, the recomputed
+  splash forward ran 32 times per step (16 layers, twice) and the duplicate
+  cost 81 ms of an 840 ms step. Saving it costs one attention output plus its
+  logsumexp per layer (``bf16[1, H, T, D]`` + ``f32[1, H, T]``: ~69 MB per
+  layer at T=16384, H=32, D=64), the same trade upstream makes for SDPA.
+  ``save_pallas_attention=False`` recomputes it instead. A core
+  ``SelectiveAC.Config`` passed to this policy directly saves it too.
+
+  Saving or recomputing an op runs the same op on the same inputs. On CPU the
+  values are bit-identical; on TPU a recomputed op is compiled into the
+  backward program, where XLA may fuse it differently, so results can differ
+  by rounding.
   """
 
   @dataclass(kw_only=True, slots=True)
   class Config(SelectiveAC.Config):
-    pass
+    save_pallas_attention: bool = True
+    """Save the Pallas splash-attention forward (output + logsumexp).
+
+    On by default, as upstream saves SDPA, flex and varlen attention. False
+    recomputes the splash forward in backward.
+    """
 
   def get_save_ops(self) -> set:
-    return super().get_save_ops() - _SAVED_COLLECTIVES
+    config = self.config
+    save_ops = super().get_save_ops() - _SAVED_COLLECTIVES
+    # A core SelectiveAC.Config has no field: it gets the default.
+    if getattr(config, "save_pallas_attention", True):
+      save_ops = _SaveOpsIncludingPallasAttention(save_ops)
+    return save_ops
 
 
 def tpu_selective_ac_config(ac_config: Any) -> Any:
@@ -82,6 +109,9 @@ class _SaveOpsIncludingPallasAttention(set):
   configuration (``pallas::splash_attn_fwd_<sha16>``), so it cannot be named in
   a static set -- and it is registered lazily, on the first call, which is
   after the AC wrapper is built. Match it by name instead.
+
+  Unions, differences and copies keep the name match, so a subclass can return
+  ``super().get_save_ops() | {op}`` or ``- {op}`` without losing it.
   """
 
   def __contains__(self, op) -> bool:
@@ -89,26 +119,22 @@ class _SaveOpsIncludingPallasAttention(set):
       return True
     return _PALLAS_ATTENTION_FWD_MARKER in _op_name(op)
 
+  def _keep_match(self, result):
+    return result if result is NotImplemented else type(self)(result)
 
-class AttentionSavingSelectiveAC(SelectiveAC):
-  """``SelectiveAC`` that also saves the attention output on TPU.
+  def __or__(self, other):
+    return self._keep_match(super().__or__(other))
 
-  Upstream's default save set already holds every attention implementation it
-  knows about -- the three ``aten::_scaled_dot_product_*`` variants and the
-  flex-attention HOP -- so on GPU the attention output is kept and only cheap
-  ops are recomputed. The TPU lane's attention is a Pallas custom op, which is
-  in none of those lists, so selective AC recomputes it: measured on
-  Llama-3.2-1B / 4x v6e, the splash forward kernel runs 32 times per step (16
-  layers, twice) and the duplicate costs 81 ms of an 840 ms step.
+  __ror__ = __or__
 
-  Saving it costs one attention output plus its logsumexp per layer
-  (``bf16[1, H, T, D]`` + ``f32[1, H, T]``: ~69 MB per layer at T=16384, H=32,
-  D=64), which is the same trade upstream already makes for SDPA.
-  """
+  def __sub__(self, other):
+    return self._keep_match(super().__sub__(other))
 
-  @dataclass(kw_only=True, slots=True)
-  class Config(SelectiveAC.Config):
-    pass
+  def union(self, *others):
+    return type(self)(super().union(*others))
 
-  def get_save_ops(self) -> set:
-    return _SaveOpsIncludingPallasAttention(super().get_save_ops())
+  def difference(self, *others):
+    return type(self)(super().difference(*others))
+
+  def copy(self):
+    return type(self)(self)

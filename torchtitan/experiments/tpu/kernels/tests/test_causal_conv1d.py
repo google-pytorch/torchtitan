@@ -11,6 +11,7 @@ from torch.distributed.tensor import DTensor
 import torch.nn.functional as F
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels import causal_conv1d
+from torchtitan.experiments.tpu.kernels import pallas_vmem
 
 
 def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -153,7 +154,7 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
   def test_ctx8k_strip_on_tpu7x(self):
     """Tests S=8192 bf16 strips on TPU7x (skipped on smaller-VMEM TPUs)."""
     dev = self._require_tpu()
-    gen = causal_conv1d._tpu_generation()  # pylint: disable=protected-access
+    gen = pallas_vmem.tpu_generation()
     if gen is None or gen < 7:
       self.skipTest("S=8192 bf16 causal_conv1d requires TPU >= v7 VMEM.")
     torch.manual_seed(2)
@@ -251,7 +252,7 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertFalse(causal_conv1d.supports(fake_dtensor, w_ok))
     self.assertFalse(causal_conv1d.supports(cpu_x.to(dev), fake_dtensor))
 
-    with mock.patch.object(causal_conv1d, "_tpu_generation", return_value=5):
+    with mock.patch.object(pallas_vmem, "tpu_generation", return_value=5):
       self.assertEqual(
           causal_conv1d._max_supported_seq_len(torch.bfloat16),  # pylint: disable=protected-access
           2048,
@@ -260,7 +261,7 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
           causal_conv1d._max_supported_seq_len(torch.float32),  # pylint: disable=protected-access
           1024,
       )
-    with mock.patch.object(causal_conv1d, "_tpu_generation", return_value=7):
+    with mock.patch.object(pallas_vmem, "tpu_generation", return_value=7):
       self.assertEqual(
           causal_conv1d._max_supported_seq_len(torch.bfloat16),  # pylint: disable=protected-access
           8192,
@@ -282,24 +283,6 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
       self.assertIsNone(
           causal_conv1d._vmem_limit_bytes()  # pylint: disable=protected-access
       )
-
-    saved_cache = list(causal_conv1d._tpu_gen_cache)  # pylint: disable=protected-access
-    self.addCleanup(
-        lambda: (
-            causal_conv1d._tpu_gen_cache.clear(),  # pylint: disable=protected-access
-            causal_conv1d._tpu_gen_cache.extend(saved_cache),  # pylint: disable=protected-access
-        )
-    )
-    for dev_name, expected in (("TPU v5 lite", 5), ("tpu7x", 7), ("other", None)):
-      causal_conv1d._tpu_gen_cache.clear()  # pylint: disable=protected-access
-      fake_tpu = SimpleNamespace(
-          get_device_properties=lambda n=dev_name: SimpleNamespace(name=n)
-      )
-      with mock.patch.object(torch, "tpu", fake_tpu, create=True):
-        self.assertEqual(
-            causal_conv1d._tpu_generation(),  # pylint: disable=protected-access
-            expected,
-        )
 
 
 if __name__ == "__main__":

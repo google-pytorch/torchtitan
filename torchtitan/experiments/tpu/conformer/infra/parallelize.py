@@ -78,8 +78,7 @@ def parallelize_conformer(
 
   # Resolve DeviceMesh and mode based on strategy
   if strategy in (ParallelStrategy.FSDP2, ParallelStrategy.SIMPLEFSDP):
-    # `partial_dtensor` builds a flattened `fsdp` axis into the dense mesh;
-    # `spmd_types` keeps `dp_shard` and `cp` separate, so the shared helper
+    # The mesh keeps `dp_shard` and `cp` separate, so the shared helper
     # flattens them (the same way `apply_simple_fsdp` does for the LLMs).
     fsdp_mesh = get_simple_fsdp_mesh(parallel_dims)
     if parallel_dims.dp_replicate_enabled:

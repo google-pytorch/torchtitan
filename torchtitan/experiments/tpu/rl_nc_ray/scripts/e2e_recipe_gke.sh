@@ -34,7 +34,6 @@ ray job submit \
     --module alphabet_sort \
     --config "$CONFIG" \
     --generator.parallelism.tensor-parallel-degree 8 \
-    --generator.parallelism.spmd_backend spmd_types \
     --trainer.parallelism.tensor-parallel-degree 8 \
     --trainer.parallelism.data_parallel_shard_degree 1 \
     --hf_assets_path "$HF_ASSETS_PATH" \

@@ -1,13 +1,12 @@
+import math
 from dataclasses import dataclass, replace
 
 import torch
 import spmd_types as spmd
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import spmd_mesh_size
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
@@ -131,6 +130,28 @@ class TpuGroupedExperts(GroupedExperts):
             tuple[int, int, int] | None
         ) = None
         use_kernel_native_weight_layout: bool = False
+        # Run all expert GEMMs on FP8 operands through tokamax's
+        # Mosaic GMM/TGMM (MaxText `fp8_full` numerics). W1/W3 run as one
+        # paired GEMM; SwiGLU, its FP8 cast and W2 run as one op on the
+        # unsplit [gate | up], so the BF16 hidden never reaches HBM. Takes
+        # precedence over the BF16 single and paired Pallas paths.
+        use_fp8_grouped_mm: bool = False
+        # (tile_m, tile_k, tile_n) per FP8 GEMM, in each kernel's operand
+        # order -- forward (M, K, N), dInput (M, N, K), dWeight (M, K, N) --
+        # where a zero K/N tile selects the full dimension. W1/W3 run as one
+        # paired GEMM over [W1 | W3], so their N is 2F; the N (forward) and
+        # K-out (dInput) tiles keep each step's VMEM near the unpaired
+        # kernels'. Otherwise these follow MaxText's Qwen3-235B v7x fp8 tiles.
+        fp8_w13_tilings: tuple[
+            tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]
+        ] = ((512, 0, 1536), (512, 0, 2048), (1024, 1024, 0))
+        fp8_w2_tilings: tuple[
+            tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]
+        ] = ((512, 0, 0), (512, 0, 0), (512, 768, 0))
+        # Quantize the routed rows inside the W1/W3 forward GEMM (tokamax
+        # GMM v2) instead of in standalone XLA amax/cast passes. Needs an
+        # FP8 x FP8 MXU (v7x); GMM v2 rejects it on earlier TPUs.
+        fp8_w13_fused_lhs_quant: bool = False
 
     def __init__(self, config: Config):
         if config.activation not in ("silu", "gelu_tanh"):
@@ -171,7 +192,20 @@ class TpuGroupedExperts(GroupedExperts):
         )
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._use_transposed_w2_rhs = False
+        self.use_fp8_grouped_mm = config.use_fp8_grouped_mm
+        self.fp8_w13_tilings = config.fp8_w13_tilings
+        self.fp8_w2_tilings = config.fp8_w2_tilings
+        self.fp8_w13_fused_lhs_quant = config.fp8_w13_fused_lhs_quant
         self._native_sharding_applied = False
+
+        if self.use_fp8_grouped_mm and not self.use_pallas_grouped_mm:
+            raise ValueError("FP8 grouped matmul requires use_pallas_grouped_mm")
+        if self.use_fp8_grouped_mm and self.activation != "silu":
+            # The fused SwiGLU + W2 op always computes silu(gate) * up.
+            raise ValueError(
+                "FP8 grouped matmul supports only the silu activation, got"
+                f" {self.activation!r}"
+            )
 
         if self.use_pallas_paired_grouped_mm:
             if not self.use_pallas_grouped_mm:
@@ -222,6 +256,15 @@ class TpuGroupedExperts(GroupedExperts):
             and parallel_dims.get_optional_mesh("ep") is not None
         ):
             raise ValueError("Paired grouped matmul requires EP=1 exact-row dispatch")
+        # The FP8 path pads by growing the last expert's group, which assumes
+        # the routed rows fill the buffer. Under EP the receive buffer's tail
+        # past sum(num_tokens_per_expert_E) holds stale rows, and the FP8 GMM
+        # leaves output tiles past that sum uninitialized.
+        if (
+            self.use_fp8_grouped_mm
+            and parallel_dims.get_optional_mesh("ep") is not None
+        ):
+            raise ValueError("FP8 grouped matmul requires EP=1 exact-row dispatch")
         super().parallelize(parallel_dims)
 
     @staticmethod
@@ -249,6 +292,8 @@ class TpuGroupedExperts(GroupedExperts):
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
+        *,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``GroupedExperts.forward`` with a configurable activation.
 
@@ -256,19 +301,13 @@ class TpuGroupedExperts(GroupedExperts):
         ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
         silu.
         """
-        if isinstance(self.w1_EFD, DTensor):
-            w1_EFD = self.w1_EFD.to_local()
-            w2_EDF = self.w2_EDF.to_local()
-            w3_EFD = self.w3_EFD.to_local()
+        if weights is not None:
+            w1_EFD, w2_EDF, w3_EFD = weights
         else:
             w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
 
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if (
-            get_spmd_backend() == "spmd_types"
-            and spmd.is_type_checking()
-            and spmd_mesh_size("ep") == 1
-        ):
+        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
@@ -285,16 +324,51 @@ class TpuGroupedExperts(GroupedExperts):
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
 
+    def unshard_weights(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the local expert weights (w1, w2, w3) as ``forward`` uses them.
+
+        Reading the parameters runs SimpleFSDP's all-gathers, so EP token
+        chunking calls this once per layer and passes the result to every
+        chunk's ``forward(pre_unsharded_weights=...)``. The weights come in the
+        layout ``forward`` consumes: kernel-native or transposed for the Pallas
+        grouped matmuls, canonical otherwise.
+
+        GraphTrainer's SimpleFSDP bucketing keys the all-gathers on the
+        ``module_fqn`` that ``annotate_module_fqns`` attaches to ``forward``.
+        This second entry point does not go through ``forward``, so the TPU
+        GraphTrainer tags it the same way (``annotate_expert_unshard_fqns``).
+        FSDP2 would reshard after the call returns; chunking rejects it.
+        """
+        if self.use_kernel_native_weight_layout:
+            w1_EKN = self.w1_EDF
+            w2_EKN = self.w2_EFD
+            w3_EKN = self.w3_EDF
+        elif self.use_pallas_grouped_mm:
+            w1_EKN = self.w1_EFD.transpose(-2, -1)
+            w2_EKN = self.w2_EDF.transpose(-2, -1)
+            w3_EKN = self.w3_EFD.transpose(-2, -1)
+        else:
+            return self.w1_EFD, self.w2_EDF, self.w3_EFD
+        if self._use_transposed_w2_rhs:
+            w2_EKN = w2_EKN.transpose(-2, -1)
+        return w1_EKN, w2_EKN, w3_EKN
+
     def forward(
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
         row_scale_R: torch.Tensor | None = None,
+        *,
+        pre_unsharded_weights: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
     ) -> torch.Tensor:
         """Run the experts on expert-sorted rows.
 
         ``row_scale_R``, if given, multiplies each row's hidden activation
-        before the down projection (W2).
+        before the down projection (W2). ``pre_unsharded_weights``, if given,
+        is the output of ``unshard_weights`` and is used instead of the
+        parameters.
         """
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
@@ -302,38 +376,21 @@ class TpuGroupedExperts(GroupedExperts):
         if not self.use_pallas_grouped_mm:
             if row_scale_R is not None:
                 raise ValueError("row_scale_R requires Pallas grouped matmul")
-            if self.activation == "silu":
+            if self.activation == "silu" and pre_unsharded_weights is None:
                 return super().forward(x_RD, num_tokens_per_expert_E)
-            return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
-        def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.to_local() if isinstance(tensor, DTensor) else tensor
-
-        if self.use_kernel_native_weight_layout:
-            w1_EKN = local_tensor(self.w1_EDF)
-            w2_EKN = local_tensor(self.w2_EFD)
-            w3_EKN = local_tensor(self.w3_EDF)
-        else:
-            w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
-            w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
-            w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
-
-        if self._use_transposed_w2_rhs:
-            w2_EKN = w2_EKN.transpose(-2, -1)
+            return self._native_experts_forward(
+                x_RD, num_tokens_per_expert_E, weights=pre_unsharded_weights
+            )
+        w1_EKN, w2_EKN, w3_EKN = (
+            pre_unsharded_weights
+            if pre_unsharded_weights is not None
+            else self.unshard_weights()
+        )
 
         # Match GroupedExperts: expert compute is BF16 even when the surrounding
         # model is FP32, and the final result is restored to the caller's dtype.
         x_bf16 = x_RD.bfloat16()
         tile_m = self.pallas_grouped_mm_tile_m
-        # The kernels need a row count divisible by tile_m. Append zero rows to
-        # the last expert's group: they add nothing to dWeight and are sliced
-        # off the output. A no-op for tile-aligned batches.
-        num_rows = x_bf16.shape[0]
-        pad_rows = -num_rows % tile_m
-        if pad_rows:
-            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
-            num_tokens_per_expert_E = torch.cat(
-                [num_tokens_per_expert_E[:-1], num_tokens_per_expert_E[-1:] + pad_rows]
-            )
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
@@ -342,6 +399,67 @@ class TpuGroupedExperts(GroupedExperts):
             w2_tgmm_tiling = (
                 self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
             )
+        # The kernels need a row count divisible by tile_m and by both dWeight
+        # M tiles. Append zero rows but leave num_tokens_per_expert_E alone:
+        # every kernel skips rows past its sum, so the pad rows add nothing to
+        # dWeight and are sliced off the output. Growing the last expert's
+        # group over them instead would also pull in any rows between that sum
+        # and num_rows, such as the stale tail of a static-size EP receive
+        # buffer. A no-op for aligned batches.
+        if self.use_fp8_grouped_mm:
+            # The FP8 path runs none of the BF16 kernels; it needs the rows
+            # divisible by the M tile of each of its own forward, dInput and
+            # dWeight GEMMs (the W1/W3 dWeight tile is 1024 by default).
+            row_tiles = tuple(
+                max(1, tiling[0])
+                for tiling in (*self.fp8_w13_tilings, *self.fp8_w2_tilings)
+            )
+        else:
+            row_tiles = (tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0]))
+        row_align = math.lcm(*row_tiles)
+        # M tiles that divide each other, like powers of two, need only the
+        # largest tile. Others can need a large multiple of it, all zero rows,
+        # so refuse an lcm past twice the largest.
+        if row_align > 2 * max(row_tiles):
+            raise ValueError(
+                f"Pallas grouped matmul M tiles {row_tiles} would pad the rows "
+                f"to a multiple of their lcm, {row_align}, more than twice the "
+                "largest tile; use M tiles that divide each other"
+            )
+        num_rows = x_bf16.shape[0]
+        pad_rows = -num_rows % row_align
+        if pad_rows:
+            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
+        if self.use_fp8_grouped_mm:
+            if self._use_transposed_w2_rhs:
+                raise NotImplementedError(
+                    "FP8 grouped matmul does not support the transposed W2 RHS"
+                    " used for uneven SimpleFSDP expert sharding"
+                )
+            if row_scale_R is not None:
+                # The fused SwiGLU + W2 op quantizes the hidden inside the
+                # kernel, so there is no BF16 hidden to scale before W2.
+                raise NotImplementedError(
+                    "FP8 grouped matmul does not support row_scale_R; keep the"
+                    " routing-score multiply after the experts"
+                    " (scale_before_down_proj=False)"
+                )
+            # The FP8 kernels still need the pad rows inside the last expert's
+            # group: unlike the BF16 kernels below, they don't zero-initialize
+            # output tiles past sum(num_tokens_per_expert_E). `parallelize`
+            # rejects EP for FP8, so the routed rows fill x_RD and the pad rows
+            # are zeros that add nothing.
+            fp8_tokens_per_expert_E = num_tokens_per_expert_E
+            if pad_rows:
+                fp8_tokens_per_expert_E = torch.cat(
+                    [
+                        num_tokens_per_expert_E[:-1],
+                        num_tokens_per_expert_E[-1:] + pad_rows,
+                    ]
+                )
+            return self._fp8_experts_forward(
+                x_bf16, w1_EKN, w2_EKN, w3_EKN, fp8_tokens_per_expert_E
+            )[:num_rows].type_as(x_RD)
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16
@@ -392,6 +510,44 @@ class TpuGroupedExperts(GroupedExperts):
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
 
+    def _fp8_experts_forward(
+        self,
+        x_RD: torch.Tensor,
+        w1_EKN: torch.Tensor,
+        w2_EKN: torch.Tensor,
+        w3_EKN: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """SwiGLU experts with every GEMM on FP8 operands (BF16 in and out)."""
+        # Imported lazily: the FP8 kernels pull in tokamax and register custom
+        # ops, which costs host memory in every process that imports this
+        # module even when FP8 is off.
+        from torchtitan.experiments.tpu.kernels.fp8_expert_segment_matmul import (
+            fp8_paired_segment_matmul_pallas_2d,
+            fp8_swiglu_segment_matmul_pallas_2d,
+        )
+
+        fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w13_tilings
+        gate_up_RF2 = fp8_paired_segment_matmul_pallas_2d(
+            x_RD,
+            w1_EKN.bfloat16(),
+            w3_EKN.bfloat16(),
+            num_tokens_per_expert_E,
+            fwd_tiling=fwd_tiling,
+            dlhs_tiling=dlhs_tiling,
+            drhs_tiling=drhs_tiling,
+            split=False,
+            fused_lhs_quant=self.fp8_w13_fused_lhs_quant,
+        )
+        fwd_tiling, dlhs_tiling, drhs_tiling = self.fp8_w2_tilings
+        return fp8_swiglu_segment_matmul_pallas_2d(
+            gate_up_RF2,
+            w2_EKN.bfloat16(),
+            num_tokens_per_expert_E,
+            fwd_tiling=fwd_tiling,
+            dlhs_tiling=dlhs_tiling,
+            drhs_tiling=drhs_tiling,
+        )
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):
     """Select the TPU grouped-expert implementation before construction."""

@@ -14,10 +14,9 @@ unflatten sequence length:
 * ``Llama3TransformerBlock`` / ``Qwen3TransformerBlock`` (dense or MoE): view
   the input as [B, L, D], run the block's own ``forward``, view back. The
   block's external [T, D] contract is unchanged.
-* ``GQAttention`` with ``QKVLinear``, ``FusedQKVLinear`` or
-  ``TpuPackedQKVLinear``: accept [B, L, D]; q/k/v are [B, L, H, K],
-  the RoPE cache is fetched by the configured RoPE module and viewed as
-  [B, L, 1, W], and the rotation is that module's own ``apply_rotary_emb`` --
+* ``GQAttention`` with ``FusedQKVLinear`` or ``TpuPackedQKVLinear``: accept
+  [B, L, D]; q/k/v are [B, L, H, K], the RoPE cache is fetched by the
+  configured RoPE module and viewed as [B, L, 1, W], and the rotation is that module's own ``apply_rotary_emb`` --
   so ``real_rope`` and ``bf16_rope`` keep working. Exact ``CosSinRoPE`` uses a
   rotate-half that does not concatenate the FP32 q/k halves (same FP32
   products and sums; bit-exact on CPU).
@@ -45,7 +44,6 @@ import torch
 import torch.nn.functional as F
 import torch_remat as remat
 from torch import nn
-from torch.distributed.tensor import DTensor
 
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.components.unflatten_shim import UnflattenShim
@@ -53,7 +51,6 @@ from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_s
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common import FusedQKVLinear
 from torchtitan.models.common import GQAttention
-from torchtitan.models.common import QKVLinear
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
@@ -63,14 +60,7 @@ from torchtitan.tools.logging import logger
 def _bld_seq_len(x: torch.Tensor) -> int | None:
   """The L of a [T, D] activation's [B, L] split, or None for the [T] path."""
   seq_len = get_unflatten_seq_len()
-  if (
-      x.ndim != 2
-      or seq_len is None
-      or x.shape[0] % seq_len != 0
-      # The partial_dtensor backend runs the fused-QKV split on local tensors
-      # (see `FusedQKVLinear.forward`); leave it on the upstream path.
-      or isinstance(x, DTensor)
-  ):
+  if x.ndim != 2 or seq_len is None or x.shape[0] % seq_len != 0:
     return None
   return seq_len
 
@@ -103,28 +93,33 @@ class _BLDGQAttention(GQAttention):
     # isinstance, not `type(...) is`: SimpleFSDP later swaps parametrized
     # modules to generated subclasses (e.g. `SimpleFSDPQKVLinear_7`).
     # `_attention_eligible` already checked each one keeps the upstream forward.
-    if isinstance(qkv, QKVLinear):
-      return tuple(
-          proj(x).view(b, l, -1, hd) for proj in (qkv.wq, qkv.wk, qkv.wv)
-      )
     if isinstance(qkv, TpuPackedQKVLinear):
       # Same single-split projection as `TpuPackedQKVLinear.forward`.
       packed = qkv.wqkv_packed
-      sizes = (qkv.q_rows, qkv.kv_rows, qkv.kv_rows)
+      sizes = (
+          (qkv.q_rows, qkv.kv_rows)
+          if qkv.k_eq_v
+          else (qkv.q_rows, qkv.kv_rows, qkv.kv_rows)
+      )
       weights = torch.split(packed.weight, sizes, dim=0)
       biases = (
-          (None,) * 3
+          (None,) * len(sizes)
           if packed.bias is None
           else torch.split(packed.bias, sizes, dim=0)
       )
-      return tuple(
+      projs = tuple(
           F.linear(x, w, bias).view(b, l, -1, hd)
           for w, bias in zip(weights, biases)
       )
+      return (projs[0], projs[1], projs[1]) if qkv.k_eq_v else projs
     assert isinstance(qkv, FusedQKVLinear), type(qkv)
     # Same split as `FusedQKVLinear.forward`, with [B, L] leading dims:
     # [B, L, n_kv_heads * R * hd] -> [B, L, n_kv_heads, R, hd] -> q/k/v.
     fused = qkv.wqkv(x).view(b, l, -1, qkv.r_dim, hd)
+    if getattr(qkv.Config, "k_eq_v", False):
+      xq, xk = torch.split(fused, [qkv.heads_per_kv, 1], dim=-2)
+      xk = xk.reshape(b, l, -1, hd)
+      return xq.reshape(b, l, -1, hd), xk, xk
     xq, xk, xv = torch.split(fused, [qkv.heads_per_kv, 1, 1], dim=-2)
     return (
         xq.reshape(b, l, -1, hd),
@@ -226,7 +221,6 @@ class _BLDMoE(nn.Module):
 
 _BLOCK_FORWARDS = (Llama3TransformerBlock.forward, Qwen3TransformerBlock.forward)
 _QKV_FORWARDS = (
-    QKVLinear.forward,
     FusedQKVLinear.forward,
     TpuPackedQKVLinear.forward,
 )

@@ -276,6 +276,25 @@ def qwen35_moe_debugmodel_fused_ce() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen35_moe_debugmodel_pallas_gmm() -> TPUTrainerConfig:
+  """`qwen35_moe_debugmodel` with unpaired Pallas grouped matmuls.
+
+  Canonical weight layout and 256-row tiles, and nothing else from
+  `_use_tpu_moe_kernels`. EP tests that apply routing weights before W2
+  (`--tpu_config.ep_scale_before_down_proj`) use it, since only the Pallas
+  grouped matmuls take per-row scales.
+  """
+  cfg = qwen35_moe_debugmodel()
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+  return cfg
+
+
 def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
   """Debug config for 4-layer hybrid Qwen3.5 MoE with the TPU MoE kernels.
 

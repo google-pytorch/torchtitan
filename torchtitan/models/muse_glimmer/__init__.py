@@ -16,10 +16,14 @@ from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
     Linear,
-    ScaledBiasRowwiseLinear,
+    PartialBiasRowwiseLinear,
 )
-from torchtitan.models.common.attention import QKVLinear, VarlenInnerAttention
-from torchtitan.models.common.config_utils import get_attention_config, make_ffn_config
+from torchtitan.models.common.attention import FusedQKVLinear, VarlenInnerAttention
+from torchtitan.models.common.config_utils import (
+    _fused_qkv_param_init,
+    get_attention_config,
+    make_ffn_config,
+)
 from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.common.vision_encoder import (
@@ -159,17 +163,19 @@ def _build_muse_glimmer_attention(
         n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         dim=dim,
-        qkv_linear=QKVLinear.Config(
+        qkv_linear=FusedQKVLinear.Config(
             head_dim=head_dim,
-            wq=Linear.Config(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            wqkv=Linear.Config(
                 in_features=dim,
-                out_features=n_heads * head_dim,
-                param_init=_LINEAR_INIT,
-            ),
-            wkv=Linear.Config(
-                in_features=dim,
-                out_features=n_kv_heads * head_dim,
-                param_init=_LINEAR_INIT,
+                out_features=(n_heads + 2 * n_kv_heads) * head_dim,
+                param_init=_fused_qkv_param_init(
+                    _LINEAR_INIT,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                ),
             ),
         ),
         wo=Linear.Config(
@@ -251,10 +257,10 @@ def _vision_linear(in_features: int, out_features: int, *, bias: bool) -> Linear
     )
 
 
-def _vision_scaled_bias_rowwise_linear(
+def _vision_partial_bias_rowwise_linear(
     in_features: int, out_features: int
-) -> ScaledBiasRowwiseLinear.Config:
-    return ScaledBiasRowwiseLinear.Config(
+) -> PartialBiasRowwiseLinear.Config:
+    return PartialBiasRowwiseLinear.Config(
         in_features=in_features,
         out_features=out_features,
         bias=True,
@@ -307,14 +313,14 @@ def muse_glimmer_vision_encoder_config(
                 wq=_vision_linear(latent_dim, num_heads * head_dim, bias=True),
                 wk=_vision_linear(latent_dim, num_heads * head_dim, bias=True),
                 wv=_vision_linear(latent_dim, num_heads * head_dim, bias=True),
-                proj=_vision_scaled_bias_rowwise_linear(
+                proj=_vision_partial_bias_rowwise_linear(
                     num_heads * head_dim, latent_dim
                 ),
             ),
             norm2=_vision_layer_norm(latent_dim),
             mlp=VisionMLP.Config(
                 fc1=_vision_linear(latent_dim, mlp_hidden, bias=True),
-                fc2=_vision_scaled_bias_rowwise_linear(mlp_hidden, latent_dim),
+                fc2=_vision_partial_bias_rowwise_linear(mlp_hidden, latent_dim),
                 act_fn=GELU.Config(approximate="none"),
             ),
         ),

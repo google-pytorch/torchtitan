@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
 import torchtitan.experiments.tpu.llama3 as llama3_tpu
-from torchtitan.models.common.attention import GQAttention as Attention, QKVLinear, ScaledDotProductInnerAttention
+from torchtitan.models.common.attention import GQAttention as Attention, ScaledDotProductInnerAttention
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward

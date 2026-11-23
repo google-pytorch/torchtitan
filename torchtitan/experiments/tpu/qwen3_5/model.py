@@ -6,8 +6,14 @@ import torch
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35AttentionMaskDict, Qwen35TransformerBlock
+from torchtitan.models.qwen3_5.model import (
+    Qwen35Attention,
+    Qwen35AttentionMaskDict,
+    Qwen35Model,
+    Qwen35TransformerBlock,
+)
 
 
 class TpuQwen35Attention(Qwen35Attention):
@@ -106,3 +112,25 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
+
+
+class TpuQwen35Model(Qwen35Model):
+  """``Qwen35Model`` whose config wires TPU EP execution."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(Qwen35Model.Config):
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
+      tpu_cfg = getattr(config, "tpu_config", None)
+      use_expert_parallel(
+          self,
+          ep_degree=config.parallelism.expert_parallel_degree,
+          ep_transport=getattr(tpu_cfg, "ep_transport", None),
+          scale_before_down_proj=getattr(
+              tpu_cfg, "ep_scale_before_down_proj", None
+          ),
+          ep_capacity_factor=getattr(tpu_cfg, "ep_capacity_factor", None),
+          num_token_chunks=getattr(tpu_cfg, "ep_token_chunks", None),
+          max_inflight_chunks=getattr(tpu_cfg, "ep_max_inflight_chunks", None),
+      )

@@ -1,6 +1,7 @@
 """Accelerator tests for the MegaBlox expert grouped matmul."""
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 
 from torchtitan.experiments.tpu.testing import base_device_test
@@ -104,6 +105,79 @@ class ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             rtol=8e-3,
             atol=1e-3,
         )
+
+    @parameterized.named_parameters(
+        # (group sizes, row count, tile_m, dWeight M tile, transpose_rhs)
+        # 136 routed rows end 8 rows into the second 128-row tile, and the
+        # third tile holds no routed row at all.
+        ("partial_and_inactive_tiles", [0, 91, 0, 45], 384, 128, 128, False),
+        ("empty_last_group", [0, 91, 45, 0], 384, 128, 128, False),
+        # 300 routed rows: 128-row forward tiles 2 full, 1 partial, 3 empty;
+        # 256-row dWeight tiles 1 full, 1 partial, 1 empty.
+        ("dweight_tile_larger_than_tile_m", [37, 0, 200, 63], 768, 128, 256, False),
+        ("transpose_rhs", [37, 0, 200, 63], 768, 128, 256, True),
+    )
+    def test_rows_past_the_routed_count_are_ignored(
+        self, sizes, num_rows, tile_m, tgmm_tile_m, transpose_rhs
+    ):
+        """Rows past sum(group_sizes) reach no routed row's output or dWeight.
+
+        Under dropless EP the receive buffer has a static worst-case row count
+        and its rows past the routed count hold stale data; here they hold NaN.
+        The reference zeroes them and gives them to the last group instead,
+        the way TpuGroupedExperts used to pad. Zero rows add exactly nothing,
+        so the comparison is bit-exact.
+        """
+        device = self.accelerator_device
+        generator = torch.Generator().manual_seed(0)
+        valid_m = sum(sizes)
+        tail_m = num_rows - valid_m
+        groups, k, n = len(sizes), 128, 256
+
+        def randn(shape):
+            return torch.randn(shape, generator=generator).bfloat16().to(device)
+
+        lhs_valid = randn((valid_m, k))
+        grad_valid = randn((valid_m, n))
+        rhs = randn((groups, n, k) if transpose_rhs else (groups, k, n))
+
+        def run(tail_value, group_sizes):
+            def with_tail(rows):
+                tail = torch.full(
+                    (tail_m, rows.shape[1]),
+                    tail_value,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                return torch.cat([rows, tail])
+
+            lhs = with_tail(lhs_valid).requires_grad_()
+            weights = rhs.clone().requires_grad_()
+            out = expert_segment_matmul.segment_matmul_pallas_2d(
+                lhs,
+                weights,
+                torch.tensor(group_sizes, dtype=torch.int32).to(device),
+                tile_m=tile_m,
+                tgmm_tiling=(tgmm_tile_m, 0, 0),
+                transpose_rhs=transpose_rhs,
+            )
+            grad_lhs, grad_rhs = torch.autograd.grad(
+                out, (lhs, weights), with_tail(grad_valid)
+            )
+            return out[:valid_m], grad_lhs[:valid_m], grad_rhs
+
+        want = run(0.0, sizes[:-1] + [sizes[-1] + tail_m])
+        got = run(float("nan"), sizes)
+
+        for name, actual, expected in zip(("out", "dX", "dW"), got, want):
+            self.assertTrue(bool(torch.isfinite(actual).all()), name)
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=0,
+                atol=0,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
 
 
 if __name__ == "__main__":

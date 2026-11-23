@@ -16,7 +16,8 @@ from torchtitan.experiments.tpu.components.qkv import (
     TpuPackedQKVConverter,
     TpuPackedQKVLinear,
 )
-from torchtitan.models.common.attention import QKVLinear, ScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.models.common.attention import QKVLinear
 from torchtitan.models.common.config_utils import make_gqa_config
 from torchtitan.models.common.rope import CosSinRoPE
 
@@ -36,6 +37,7 @@ def _attention_config():
       wqkv_param_init=init,
       wo_param_init=init,
       inner_attention=ScaledDotProductInnerAttention.Config(),
+      enable_sp=False,
       rope=CosSinRoPE.Config(dim=HEAD_DIM, max_context_length=16, theta=10000.0),
   )
 

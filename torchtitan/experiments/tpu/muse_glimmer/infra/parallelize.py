@@ -211,7 +211,7 @@ def parallelize_muse_glimmer(
               training.mixed_precision_reduce
           ],
           pp_enabled=parallel_dims.pp_enabled,
-          cpu_offload=training.enable_cpu_offload,
+          cpu_offload=parallelism.fsdp_enable_cpu_offloading,
           reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
           dp_mesh_dims=dp_mesh_dims,
           symm_mem_scope=parallelism.fsdp_symm_mem_scope,

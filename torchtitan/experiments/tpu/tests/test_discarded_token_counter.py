@@ -38,6 +38,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
   aux = load_balance_coeff is None
   config = make_moe_config(
       num_experts=_NUM_EXPERTS,
+      enable_sp=False,
       load_balance_coeff=load_balance_coeff,
       router=TokenChoiceTopKRouter.Config(
           num_experts=_NUM_EXPERTS,
@@ -77,7 +78,10 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     for p in moe.parameters():
       nn.init.normal_(p, std=0.02)
 
-    moe(torch.randn(_TOKENS, _DIM))
+    moe(
+        torch.randn(_TOKENS, _DIM),
+        aux_loss_denominator=torch.tensor(_TOKENS, dtype=torch.float32),
+    )
 
     expected = _TOKENS * _TOP_K if coeff is not None else 0
     self.assertEqual(moe.router.tokens_per_expert_E.sum().item(), expected)
@@ -91,7 +95,13 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     overridden.load_state_dict(base.state_dict())
 
     x = torch.randn(_TOKENS, _DIM)
-    torch.testing.assert_close(overridden(x), base(x), rtol=0, atol=0)
+    denom = torch.tensor(_TOKENS, dtype=torch.float32)
+    torch.testing.assert_close(
+        overridden(x, aux_loss_denominator=denom),
+        base(x, aux_loss_denominator=denom),
+        rtol=0,
+        atol=0,
+    )
 
 
 if __name__ == "__main__":

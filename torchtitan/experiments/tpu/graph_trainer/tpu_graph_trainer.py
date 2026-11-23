@@ -103,15 +103,25 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         model_config: Any,
         max_num_documents: int | None,
         output_dir: str,
+        **kwargs: Any,
     ) -> None:
         # Ensure the 'tpu' pass pipeline is registered before the engine
         # validates, traces or compiles anything.
         register_tpu_pipeline()
+        from torchtitan.components.optim import OptimizersContainer  # pylint: disable=g-import-not-at-top
+
+        if hasattr(config, "optim") and not isinstance(
+            config.optim.optimizer, OptimizersContainer.Config
+        ):
+            config.optim.optimizer = OptimizersContainer.Config(
+                optimizers=[config.optim.optimizer]
+            )
         super().__init__(
             config,
             model_config=model_config,
             max_num_documents=max_num_documents,
             output_dir=output_dir,
+            **kwargs,
         )
         self._optimizer_in_graph = config.compile.optimizer_compile == "in_graph"
         self._optimizer_separate_graph = (

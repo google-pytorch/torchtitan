@@ -20,7 +20,7 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
   dim = 64
   n_heads = 8
   n_layers = 1
-  return llama3_models.Llama3Model.Config(
+  cfg = llama3_models.Llama3Model.Config(
       max_context_length=512,
       dim=dim,
       vocab_size=128,
@@ -28,15 +28,20 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
           num_embeddings=128,
           embedding_dim=dim,
           param_init=llama3_models._EMBEDDING_INIT,
+          sharding_config=llama3_models.token_embedding_sharding_config(
+              enable_sp=False
+          ),
       ),
       norm=common_models.RMSNorm.Config(
           normalized_shape=dim,
           param_init=llama3_models._NORM_INIT,
+          sharding_config=llama3_models.norm_sharding_config(enable_sp=False),
       ),
       lm_head=common_models.Linear.Config(
           in_features=dim,
           out_features=128,
           param_init=llama3_models._LINEAR_INIT,
+          sharding_config=llama3_models.lm_head_sharding_config(),
       ),
       layers=llama3_models._build_llama3_layers(
           n_layers=n_layers,
@@ -52,6 +57,7 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
           ),
       ),
   )
+  return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 def _upstream_flavor(

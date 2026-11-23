@@ -35,7 +35,7 @@ from torchtitan.experiments.transformers_modeling_backend import (
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TpuTrainerCompileConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
-from torchtitan.components.validate import Validator
+from torchtitan.components.validator import Validator
 from torchtitan.experiments.tpu.components.datasets import TPUGrainDataLoader
 from torchtitan.experiments.transformers_modeling_backend.tokenizer import HFBackendTokenizer
 from torchtitan.components.data.text_datasets import DATASETS
@@ -270,7 +270,7 @@ def _tpu_hf_config(
       # attention output, as upstream's default set already does for every
       # attention implementation it knows about (SDPA variants, flex).
       activation_remat=(
-          AttentionSavingDefaultActivationRematConfig() if save_attention
+          AttentionSavingSelectiveAC.Config() if save_attention
           else DefaultActivationRematConfig()
       ),
   )

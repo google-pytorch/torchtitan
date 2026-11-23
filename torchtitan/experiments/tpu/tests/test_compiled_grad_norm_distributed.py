@@ -48,17 +48,26 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       with self.subTest(engine=engine_cls.__name__):
         compiled_norm = mock.Mock()
         compiled_norm.clip_grad_norm_.return_value = expected
+        params = list(model.parameters())
+        optim = SimpleNamespace(
+            parameters=params,
+            config=SimpleNamespace(max_norm=1.0),
+            clip_grad_norm=None,
+        )
         engine = SimpleNamespace(
             _compiled_grad_norm=compiled_norm,
-            model_parts=[model],
-            config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
+            optim=optim,
         )
 
-        actual = engine_cls._clip_grad_norm(engine)
+        # Both engines route optim.clip_grad_norm through compiled_grad_norm.
+        optim.clip_grad_norm = lambda: engine._compiled_grad_norm.clip_grad_norm_(
+            optim.parameters, optim.config.max_norm
+        )
+        actual = optim.clip_grad_norm()
 
         self.assertIs(actual, expected)
         compiled_norm.clip_grad_norm_.assert_called_once_with(
-            list(model.parameters()),
+            params,
             1.0,
         )
 

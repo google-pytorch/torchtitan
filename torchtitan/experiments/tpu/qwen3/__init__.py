@@ -33,7 +33,7 @@ def _testmodel_moe(
     head_dim = 16
     n_layers = 3
     vocab_size = 2048
-    return Qwen3Model.Config(
+    cfg = Qwen3Model.Config(
         max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
         vocab_size=vocab_size,
         dim=dim,
@@ -68,6 +68,7 @@ def _testmodel_moe(
         ),
         # pytype: enable=wrong-keyword-args
     )
+    return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 

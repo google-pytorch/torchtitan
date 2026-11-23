@@ -35,7 +35,7 @@ def flux_testmodel() -> FluxTrainer.Config:
     The trainer config.
   """
   config = flux_debugmodel()
-  config.model = build_model_config("flux-test")
+  config.model = build_model_config("flux-debug", parallelism=config.parallelism)
   config.hf_assets_path = f"{_TEST_ASSETS}tokenizer"
   config.tokenizer.test_mode = True
   config.tokenizer.t5_tokenizer_path = f"{_TEST_ASSETS}tokenizer"
@@ -45,7 +45,13 @@ def flux_testmodel() -> FluxTrainer.Config:
   config.encoder.clip_encoder = f"{_TEST_ASSETS}flux_test_encoders/clip-micro"
   # Point both datasets at the local cc12m_test shards explicitly, so the
   # config does not depend on the upstream default (repo-relative) paths.
-  config.dataloader.dataset_path = f"{_TEST_ASSETS}cc12m_test"
+  train_ds = config.dataloader.dataset
+  config.dataloader.dataset = dataclasses.replace(
+      train_ds,
+      source=dataclasses.replace(
+          train_ds.source, path=f"{_TEST_ASSETS}cc12m_test"
+      ),
+  )
   if config.validator is not None:
     validation = config.validator.dataloader.dataset
     config.validator.dataloader.dataset = dataclasses.replace(

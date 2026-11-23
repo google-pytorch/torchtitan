@@ -8,12 +8,16 @@ import unittest
 
 from einops import rearrange
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torchtitan.models.flux.flavors import (
     _make_double_block_config,
     _make_single_block_config,
 )
-from torchtitan.models.flux.model.layers import (
+from torchtitan.models.common.attention import VarlenAttentionMetadata
+from torchtitan.models.flux.layers import (
+    _varlen_attention,
     apply_rope,
     DoubleStreamBlock,
     EmbedND,
@@ -23,21 +27,44 @@ from torchtitan.models.flux.model.layers import (
 
 
 # --- Original (Reference) Implementation ---
-def self_attention_forward_ref(module, x: Tensor, pe: Tensor) -> Tensor:
+class _CpuSdpaInnerAttention(nn.Module):
+    def forward(self, q, k, v, *, attention_metadata=None, **kwargs):
+        del attention_metadata, kwargs
+        return (
+            F.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),
+                k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0),
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+
+
+def self_attention_forward_ref(
+    module, x: Tensor, pe: Tensor, attention_metadata: VarlenAttentionMetadata
+) -> Tensor:
     qkv = module.qkv(x)
     q, k, v = rearrange(
         qkv, "B L (K H D) -> K B L H D", K=3, H=module.num_heads
     )
     q, k = module.norm(q, k, v)
     q, k = apply_rope(q, k, pe)
-    x = module.inner_attention(q, k, v, is_causal=False)
+    x = _varlen_attention(
+        module.inner_attention, q, k, v, attention_metadata=attention_metadata
+    )
     x = rearrange(x, "B L H D -> B L (H D)")
     x = module.proj(x)
     return x
 
 
 def double_stream_block_forward_ref(
-    module, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor
+    module,
+    img: Tensor,
+    txt: Tensor,
+    vec: Tensor,
+    pe: Tensor,
+    attention_metadata: VarlenAttentionMetadata,
 ) -> tuple[Tensor, Tensor]:
     img_mod1, img_mod2 = module.img_mod(vec)
     txt_mod1, txt_mod2 = module.txt_mod(vec)
@@ -66,7 +93,9 @@ def double_stream_block_forward_ref(
     v = torch.cat((txt_v, img_v), dim=1)
 
     q, k = apply_rope(q, k, pe)
-    attn = module.inner_attention(q, k, v, is_causal=False)
+    attn = _varlen_attention(
+        module.inner_attention, q, k, v, attention_metadata=attention_metadata
+    )
     attn = rearrange(attn, "B L H D -> B L (H D)")
 
     txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
@@ -86,12 +115,19 @@ def double_stream_block_forward_ref(
 
 
 def single_stream_block_forward_ref(
-    module, x: Tensor, vec: Tensor, pe: Tensor
+    module,
+    x: Tensor,
+    vec: Tensor,
+    pe: Tensor,
+    attention_metadata: VarlenAttentionMetadata,
 ) -> Tensor:
     mod, _ = module.modulation(vec)
     x_mod = (1 + mod.scale) * module.pre_norm(x) + mod.shift
-    qkv = module.lin_qkv(x_mod)
-    mlp = module.lin_mlp(x_mod)
+    qkv, mlp = torch.split(
+        module.linear1(x_mod),
+        [3 * module.hidden_size, module.mlp_hidden_dim],
+        dim=-1,
+    )
 
     q, k, v = rearrange(
         qkv, "B L (K H D) -> K B L H D", K=3, H=module.num_heads
@@ -100,7 +136,9 @@ def single_stream_block_forward_ref(
 
     # compute attention
     q, k = apply_rope(q, k, pe)
-    attn = module.inner_attention(q, k, v, is_causal=False)
+    attn = _varlen_attention(
+        module.inner_attention, q, k, v, attention_metadata=attention_metadata
+    )
     attn = rearrange(attn, "B L H D -> B L (H D)")
 
     # compute activation in mlp stream, cat again and run second linear layer
@@ -148,6 +186,15 @@ class TestFluxRearrangeEquivalence(unittest.TestCase):
             num_heads=self.num_heads,
             mlp_ratio=4.0,
         )
+        cu_seq = torch.arange(
+            0, (self.bsz + 1) * self.seqlen, self.seqlen, dtype=torch.int32
+        )
+        self.attention_metadata = VarlenAttentionMetadata(
+            cu_seq_q=cu_seq,
+            cu_seq_k=cu_seq,
+            max_q=self.seqlen,
+            max_k=self.seqlen,
+        )
 
     def test_rearrange_vs_unbind_standalone(self):
         """Directly test the rearrange vs view+unbind tensor manipulation."""
@@ -170,20 +217,37 @@ class TestFluxRearrangeEquivalence(unittest.TestCase):
     def test_self_attention_equivalence(self):
         """Test SelfAttention equivalence between reference rearrange and optimized unbind implementations."""
         attn_opt = self.double_cfg.img_attn.build()
+        attn_opt.inner_attention = _CpuSdpaInnerAttention()
 
-        out_ref = self_attention_forward_ref(attn_opt, self.x, self.pe)
-        out_opt = attn_opt(self.x, self.pe)
+        out_ref = self_attention_forward_ref(
+            attn_opt, self.x, self.pe, self.attention_metadata
+        )
+        out_opt = attn_opt(
+            self.x, self.pe, attention_metadata=self.attention_metadata
+        )
 
         torch.testing.assert_close(out_ref, out_opt, atol=0.0, rtol=0.0)
 
     def test_double_stream_block_equivalence(self):
         """Test DoubleStreamBlock equivalence between reference rearrange and optimized unbind implementations."""
         block_opt = DoubleStreamBlock(self.double_cfg)
+        block_opt.inner_attention = _CpuSdpaInnerAttention()
 
         img_ref, txt_ref = double_stream_block_forward_ref(
-            block_opt, self.img, self.txt, self.vec, self.pe
+            block_opt,
+            self.img,
+            self.txt,
+            self.vec,
+            self.pe,
+            self.attention_metadata,
         )
-        img_opt, txt_opt = block_opt(self.img, self.txt, self.vec, self.pe)
+        img_opt, txt_opt = block_opt(
+            self.img,
+            self.txt,
+            self.vec,
+            self.pe,
+            attention_metadata=self.attention_metadata,
+        )
 
         torch.testing.assert_close(img_ref, img_opt, atol=0.0, rtol=0.0)
         torch.testing.assert_close(txt_ref, txt_opt, atol=0.0, rtol=0.0)
@@ -191,11 +255,17 @@ class TestFluxRearrangeEquivalence(unittest.TestCase):
     def test_single_stream_block_equivalence(self):
         """Test SingleStreamBlock equivalence between reference rearrange and optimized unbind implementations."""
         block_opt = SingleStreamBlock(self.single_cfg)
+        block_opt.inner_attention = _CpuSdpaInnerAttention()
 
         out_ref = single_stream_block_forward_ref(
-            block_opt, self.x, self.vec, self.pe
+            block_opt, self.x, self.vec, self.pe, self.attention_metadata
         )
-        out_opt = block_opt(self.x, self.vec, self.pe)
+        out_opt = block_opt(
+            self.x,
+            self.vec,
+            self.pe,
+            attention_metadata=self.attention_metadata,
+        )
 
         torch.testing.assert_close(out_ref, out_opt, atol=0.0, rtol=0.0)
 

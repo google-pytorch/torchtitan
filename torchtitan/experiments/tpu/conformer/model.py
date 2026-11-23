@@ -32,7 +32,7 @@ class ConformerModelArgs(BaseModel.Config):
     if hasattr(train_config, "training"):
       # Upstream d771abb0 renamed training.seq_len ->
       # training.max_context_length.
-      self.max_seq_len = train_config.training.max_context_length
+      self.max_seq_len = train_config.model.max_context_length
     if isinstance(train_config, TPUTrainerConfig):
       self.use_splash = (
           train_config.splash_attention_kernel.use_splash_attention_kernel

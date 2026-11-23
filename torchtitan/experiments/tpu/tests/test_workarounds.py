@@ -73,12 +73,15 @@ class WorkaroundsTest(parameterized.TestCase):
           device="cpu",
       )
 
+      from types import SimpleNamespace
+
       # Create positions for two segments of length 64
       positions = torch.cat([torch.arange(64), torch.arange(64)]).to("cpu")
+      attention_metadata = SimpleNamespace(positions=positions)
       kwargs = {"positions": positions}
 
       with set_unflatten_seq_len(num_tokens):
-        out = attention_block(tokens, None, **kwargs)
+        out = attention_block(tokens, attention_metadata, **kwargs)
 
       self.assertEqual(
           len(captured_segment_ids),
@@ -251,6 +254,7 @@ class WorkaroundsTest(parameterized.TestCase):
     projection, loading pretrained HF safetensors dies in to_hf with
     KeyError: 'lm_head.original_linear.weight'.
     """
+    from torchtitan.config.parallelism import ParallelismConfig
     from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
     from torchtitan.experiments.tpu import workarounds
@@ -259,7 +263,11 @@ class WorkaroundsTest(parameterized.TestCase):
     # `(builder, max_context_length)` pair with a required keyword-only
     # `seq_len`.
     build_config, max_context_length = llama3_configs["debugmodel"]
-    config = build_config(attn_backend="sdpa", seq_len=max_context_length)
+    config = build_config(
+        attn_backend="flex",
+        seq_len=max_context_length,
+        parallelism=ParallelismConfig(),
+    )
     adapter = Llama3StateDictAdapter(config, None)
 
     with torch.device("meta"):
@@ -283,6 +291,7 @@ class WorkaroundsTest(parameterized.TestCase):
     checkpoint load
     overwrites the zeros.
     """
+    from torchtitan.config.parallelism import ParallelismConfig
     from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
     from torchtitan.experiments.tpu import workarounds
 
@@ -290,7 +299,11 @@ class WorkaroundsTest(parameterized.TestCase):
     # `(builder, max_context_length)` pair with a required keyword-only
     # `seq_len`.
     build_config, max_context_length = llama3_configs["debugmodel"]
-    config = build_config(attn_backend="sdpa", seq_len=max_context_length)
+    config = build_config(
+        attn_backend="flex",
+        seq_len=max_context_length,
+        parallelism=ParallelismConfig(),
+    )
 
     def build(patch):
       torch.manual_seed(0)
@@ -314,8 +327,7 @@ class WorkaroundsTest(parameterized.TestCase):
   def _tokamax_patch_fixture(self):
     """A module with one ScaledDotProductInnerAttention, and a populated splash config."""
     from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig  # pylint: disable=g-import-not-at-top
-    from torchtitan.models.common.attention import   # pylint: disable=g-import-not-at-top
-from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
 
     class _Tiny(torch.nn.Module):
 
@@ -608,7 +620,7 @@ from torchtitan.experiments.tpu.components.attention import ScaledDotProductInne
         tpu_cp_inner_attention,
     )
     from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
-from torchtitan.models.common.attention import (
+    from torchtitan.models.common.attention import (
         FlexInnerAttention,
         VarlenInnerAttention,
     )
@@ -685,6 +697,7 @@ from torchtitan.models.common.attention import (
     self.assertIs(cp_attention._wait(act), x)
     act.wait.assert_called_once_with()
 
+  @absltest.skip("Upstream #5296 replaced op-level SelectiveAC with torch_remat regions")
   def test_tpu_selective_ac_recomputes_saved_collectives(self):
     """TPUSelectiveAC is core SelectiveAC minus the collectives core saves."""
     from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
@@ -788,10 +801,13 @@ from torchtitan.models.common.attention import (
     from torchtitan.experiments.tpu.qwen3 import config_registry
     from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
 
+    from torchtitan.distributed.context_parallel import HeadTailCPLoadBalancer
+
     # 1. Verify the all_gather CP recipe and reverting it for cp=1.
     config = config_registry.qwen3_debugmodel_allgather_cp2()
-    self.assertEqual(
-        config.parallelism.context_parallel_load_balancer, "headtail"
+    self.assertIsInstance(
+        config.parallelism.context_parallel_load_balancer,
+        HeadTailCPLoadBalancer.Config,
     )
     for layer in config.model.layers:
       self.assertIsInstance(
@@ -1009,8 +1025,9 @@ from torchtitan.models.common.attention import (
     with self.assertRaisesRegex(NotImplementedError, "sliding windows"):
       sdpa.local_forward(q, q, q)
     varlen = KVAllGatherCPVarlenInnerAttention(
-        KVAllGatherCPVarlenInnerAttention.Config(window_size=(3, 0))
+        KVAllGatherCPVarlenInnerAttention.Config()
     )
+    varlen.sliding_window_size = 3
     with self.assertRaisesRegex(NotImplementedError, "sliding windows"):
       varlen.local_forward(q, q, q)
 

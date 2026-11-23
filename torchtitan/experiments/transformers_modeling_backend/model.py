@@ -389,6 +389,8 @@ class HFTransformerModel(BaseModel):
             for attr_name, value in explicit_overrides.items():
                 if attr_name not in self._tt_to_hf_attribute_map:
                     self._titan_injected_model_args[attr_name] = value
+            if not hasattr(self, "max_context_length"):
+                self.max_context_length = getattr(self, "max_seq_len", 2048)
 
         def _configure_hf_attention(self):
             """Configure HuggingFace attention to route through flex attention.
@@ -839,12 +841,19 @@ class HFTransformerModel(BaseModel):
 
         # Convert ModuleList to ModuleDict to preserve original indices
         # This ensures state dict keys match checkpoint keys
-        if isinstance(self.model.model.layers, nn.ModuleList):
+        if hasattr(self.model, "model") and isinstance(
+            self.model.model.layers, nn.ModuleList
+        ):
             self.model.model.layers = SliceableModuleDict(
                 {str(i): layer for i, layer in enumerate(self.model.model.layers)}
             )
 
-        for layer in self.model.model.layers.values():
+        layers_iter = (
+            self.model.model.layers.values()
+            if hasattr(self.model, "model")
+            else ()
+        )
+        for layer in layers_iter:
             # Detect MoE layers by checking for gate/router and experts sub-modules.
             # Gemma4 has router/experts as siblings of the dense MLP at the
             # layer level (not inside ``mlp``).

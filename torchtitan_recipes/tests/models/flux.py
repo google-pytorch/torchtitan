@@ -100,8 +100,8 @@ def flux_debugmodel() -> FluxTrainer.Config:
             steps=10,
             disable_accelerator_graphs=True,
         ),
-        dataloader=TPUGrainDataLoader.Config(
-            dataset="cc12m-test",
+        dataloader=GrainDataLoader.Config(
+            dataset=training_dataset,
             collator=FluxCollator.Config(),
             streaming_shuffle_buffer_size=128,
         ),

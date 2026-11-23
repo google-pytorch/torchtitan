@@ -3,7 +3,7 @@ import os
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optim.optimizer import OptimizersContainer
-from torchtitan.components.validate import Validator
+from torchtitan.components.validator import Validator
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 # NOTE: these are named directly rather than reached via
@@ -47,7 +47,6 @@ precision=PrecisionConfig(param_dtype="bfloat16"),
             training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=768 * 512,
           steps=10,
-          dtype="float32",
       ),
       parallelism=ParallelismConfig(
           data_parallel_shard_degree=-1,
@@ -75,10 +74,9 @@ def conformer_debugmodel() -> TPUTrainerConfig:
   """Conformer debug model configuration for TPU."""
   config = conformer_test()
   config.model = _conformer_model_config("debugmodel")
+  config.precision = PrecisionConfig(param_dtype="bfloat16")
   config.training = config.training.__class__(
       num_tokens_per_microbatch_per_dp_rank=4 * 128,
       steps=3,
-      dtype="float32",
-      mixed_precision_param="bfloat16",
   )
   return config

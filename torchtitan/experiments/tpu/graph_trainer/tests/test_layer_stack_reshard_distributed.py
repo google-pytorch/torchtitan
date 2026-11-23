@@ -29,10 +29,12 @@ from torchtitan.components.optim.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
 )
-from torchtitan.config import derive
-from torchtitan.config.configs import TrainingConfig
+from torchtitan.config import derive, PrecisionConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.graph_trainer.common_utils import (
+    apply_simple_fsdp,
+    disable_inplace_wgrad_accum,
+)
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
@@ -51,10 +53,10 @@ def _layer_loop(config):
 
 def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
     """The trainer's build order, at an arbitrary data-parallel width."""
-    # ParallelDims reads the accelerator type at import; there is none here.
-    import torchtitan.distributed.parallel_dims as parallel_dims_module
+    # ParallelismContext reads the accelerator type at import; there is none here.
+    import torchtitan.distributed.parallelism_context as pc_module
 
-    parallel_dims_module.device_type = "cpu"
+    pc_module.device_type = "cpu"
 
     parallel_dims = ParallelDims(
         dp_replicate=1,
@@ -64,6 +66,7 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         pp=1,
         ep=1,
         world_size=world_size,
+        enable_sequence_parallel=False,
     )
     # The rewrite `apply_tpu_graph_trainer_model_transforms` applies.
     # Both arms get one, so stacking is the only difference; a stock `Decoder`
@@ -73,15 +76,17 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         if stacked
         else _layer_loop
     )
+    from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
+    model_cfg = use_tpu_sdpa(model_registry("debugmodel", attn_backend="flex"))
+    disable_inplace_wgrad_accum(model_cfg)
     with torch.device("meta"):
-        model = convert(
-            model_registry("debugmodel", attn_backend="sdpa")
-        ).build()
+        model = convert(model_cfg).build()
     model = apply_simple_fsdp(
         model,
-        parallel_dims=parallel_dims,
-        training=TrainingConfig(
-            mixed_precision_param="float32", mixed_precision_reduce="float32"
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(
+            param_dtype="float32", reduce_dtype="float32"
         ),
     )
     model.to_empty(device="cpu")

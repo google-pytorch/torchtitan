@@ -65,18 +65,25 @@ def prepare_model_config(
     ``dp_degree`` overrides the DP degree derived from ``WORLD_SIZE`` (the
     minimal trainers know their batch mesh).
     """
-    from torchtitan.models.common.config_utils import (
-        moe_load_balance_aux_loss_configs,
-        update_moe_aux_loss_configs,
-    )
-
     model_config = config.model
     if dp_degree is None:
-        dims = ParallelDims.from_config(
-            config.parallelism, int(os.environ.get("WORLD_SIZE", "1"))
-        )
-        dp_degree = dims.dp_replicate * dims.dp_shard
-    max_context_length = config.training.max_context_length
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        p = config.parallelism
+        dp_rep = p.data_parallel_replicate_degree
+        dp_shard = p.data_parallel_shard_degree
+        if dp_shard < 0:
+            other = (
+                dp_rep
+                * p.context_parallel_degree
+                * p.tensor_parallel_degree
+                * p.pipeline_parallel_degree
+            )
+            dp_shard = max(1, world_size // max(1, other))
+        dp_degree = dp_rep * dp_shard
+    max_context_length = (
+        getattr(config.model, "max_context_length", None)
+        or getattr(config.model, "max_seq_len", 2048)
+    )
     local_global_batch_size = (
         config.training.num_tokens_per_microbatch_per_dp_rank // max_context_length
     ) * dp_degree
@@ -94,17 +101,6 @@ def prepare_model_config(
             local_global_batch_size=local_global_batch_size,
             global_batch_size=global_batch_size,
         )
-        return
-    layers = getattr(model_config, "layers", None)
-    if not layers or not moe_load_balance_aux_loss_configs(layers):
-        return
-    update_moe_aux_loss_configs(
-        layers,
-        pp_enabled=config.parallelism.pipeline_parallel_degree > 1,
-        local_global_batch_size=local_global_batch_size,
-        global_batch_size=global_batch_size,
-        seq_len=max_context_length,
-    )
 
 
 class Trainer(Configurable):

@@ -153,7 +153,7 @@ class TPUHFTransformerModel(HFTransformerModel):
       HFTransformerModel.Config.load_hf_config(
           self,
           hf_model_id=hf_model_id,
-          max_context_length=config.training.max_context_length,
+          max_context_length=config.model.max_context_length,
           deterministic=config.debug.deterministic,
       )
       if hasattr(config.loss, "global_vocab_size"):

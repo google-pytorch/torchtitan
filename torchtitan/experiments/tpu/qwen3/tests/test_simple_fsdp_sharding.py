@@ -59,6 +59,7 @@ def _parallel_dims(fsdp_degree: int) -> ParallelDims:
       pp=1,
       ep=1,
       world_size=fsdp_degree,
+      enable_sequence_parallel=False,
   )
 
 

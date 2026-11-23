@@ -363,7 +363,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     """Tests the 30B recipes: upstream model/data settings, 4x4x4 flags."""
     config = getattr(config_registry, name)()
     self.assertLen(config.model.layers, 52)
-    self.assertEqual(config.training.max_context_length, 16384)
+    self.assertEqual(config.model.max_context_length, 16384)
     self.assertEqual(
         config.training.num_tokens_per_microbatch_per_dp_rank, 16384
     )
@@ -398,7 +398,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
         _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
     )
     self.assertEqual(
-        config.optim.optimizer.implementation, optimizer_implementation
+        config.optim.optimizer.fused, optimizer_implementation == "fused"
     )
 
   @parameterized.parameters(

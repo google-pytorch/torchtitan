@@ -240,6 +240,10 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     tt_config.lm_head.out_features = 2048
     tt_config.enable_weight_tying = not is_moe
     tt_config.layers = tt_config.layers[:4]
+    if is_moe:
+      for layer in tt_config.layers:
+        if hasattr(layer.feed_forward, "router"):
+          layer.feed_forward.router.aux_loss = None
     adapter = Qwen35StateDictAdapter(tt_config, None)
 
     tt_model = tt_config.build()
@@ -986,7 +990,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
   def test_gated_delta_net_isolates_batch_sequences(self):
     """Tests that B=2 packed sequences in GatedDeltaNet equal two B=1 runs."""
     config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128)
-    gdn = config.layers[0].delta_net.build()
+    gdn = config.layers[0].attention.build()
     gdn.init_states(buffer_device=torch.device("cpu"))
     gdn = gdn.to(self.accelerator_device)
 
@@ -1029,7 +1033,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
   def test_gated_delta_net_isolates_packed_documents(self):
     """Tests that documents packed into GatedDeltaNet rows equal single runs."""
     config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128)
-    gdn = config.layers[0].delta_net.build()
+    gdn = config.layers[0].attention.build()
     gdn.init_states(buffer_device=torch.device("cpu"))
     gdn = gdn.to(self.accelerator_device)
 
@@ -1084,7 +1088,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     # Config.reset_at_documents=False (pretraining) ignores positions in both
     # forward and backward: whole rows match gdn(x, positions=None).
     gdn_no_reset_cfg = dataclasses.replace(
-        config.layers[0].delta_net,
+        config.layers[0].attention,
         document_resets=gated_delta.GatedDeltaDocumentResets.Config(
             enabled=False
         ),
@@ -1166,7 +1170,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
   def test_gated_delta_net_document_ids_reach_conv_and_recurrence(self):
     """Tests that the kernel's document ids drive the conv and recurrence."""
     config = qwen3_5_tpu.model_registry("debugmodel", seq_len=128)
-    gdn = config.layers[0].delta_net.build()
+    gdn = config.layers[0].attention.build()
     gdn.init_states(buffer_device=torch.device("cpu"))
     gdn = gdn.to(self.accelerator_device)
     dev = self.accelerator_device
@@ -1181,7 +1185,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       expected = gdn(x, positions=merged)
       uncapped = gdn(x, positions=positions)
       with mock.patch.object(
-          gdn.inner_gated_delta_net.kernel,
+          gdn.inner_attention.kernel,
           "document_ids",
           autospec=True,
           side_effect=functools.partial(
@@ -1240,9 +1244,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         cfg,
     )
     kernels = [
-        layer.delta_net.inner_gated_delta_net.kernel
+        layer.attention.inner_attention.kernel
         for layer in cfg.model.layers
-        if layer.delta_net is not None
+        if isinstance(layer.attention, gated_delta.TpuGatedDeltaNet.Config)
     ]
     self.assertLen(kernels, 30)
     for kernel_cfg in kernels:
@@ -1481,23 +1485,26 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertLen(moe_35b.layers, 40)
     self.assertEqual(moe_35b.dim, 2048)
     self.assertEqual(moe_35b.vocab_size, 248320)
-    attn_layers = [l for l in moe_35b.layers if l.attention is not None]
+    attn_layers = [
+        l
+        for l in moe_35b.layers
+        if isinstance(l.attention, tpu_model.TpuQwen35Attention.Config)
+    ]
     self.assertLen(attn_layers, 10)
     self.assertEqual(attn_layers[0].attention.head_dim, 256)
     self.assertEqual(attn_layers[0].attention.n_heads, 16)
     self.assertEqual(attn_layers[0].attention.n_kv_heads, 2)
-    self.assertEqual(moe_35b.layers[0].moe.num_experts, 256)
-    self.assertEqual(moe_35b.layers[0].moe.router.top_k, 8)
+    self.assertEqual(moe_35b.layers[0].feed_forward.num_experts, 256)
+    self.assertEqual(moe_35b.layers[0].feed_forward.router.top_k, 8)
 
     for flavor in ("debugmodel", "debugmodel_moe", "35B-A3B"):
       with self.subTest(flavor=flavor):
         model_cfg = qwen3_5_tpu.model_registry(flavor)
-        self.assertIsNone(model_cfg.vision_encoder)
         for layer in model_cfg.layers:
           self.assertIsInstance(
               layer, tpu_model.TpuQwen35TransformerBlock.Config
           )
-          if layer.attention is not None:
+          if isinstance(layer.attention, tpu_model.TpuQwen35Attention.Config):
             self.assertIsInstance(
                 layer.attention, tpu_model.TpuQwen35Attention.Config
             )
@@ -1507,23 +1514,23 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
             )
           else:
             self.assertIsInstance(
-                layer.delta_net, gated_delta.TpuGatedDeltaNet.Config
+                layer.attention, gated_delta.TpuGatedDeltaNet.Config
             )
             self.assertIsInstance(
-                layer.delta_net.inner_gated_delta_net,
+                layer.attention.inner_attention,
                 gated_delta.TpuInnerGatedDeltaNet.Config,
             )
             self.assertIsInstance(
-                layer.delta_net.norm, gated_delta.TpuRMSNormGated.Config
+                layer.attention.norm, gated_delta.TpuRMSNormGated.Config
             )
             for conv in (
-                layer.delta_net.conv_q,
-                layer.delta_net.conv_k,
-                layer.delta_net.conv_v,
+                layer.attention.conv_q,
+                layer.attention.conv_k,
+                layer.attention.conv_v,
             ):
               self.assertIn("weight", conv.param_init or {})
-          if layer.moe is not None:
-            self.assertIsNone(layer.moe.load_balance_coeff)
+          if hasattr(layer.feed_forward, 'routed_experts'):
+            self.assertIsNone(layer.feed_forward.load_balance_coeff)
 
     with self.assertRaisesRegex(ValueError, "attn_backend='sdpa'"):
       qwen3_5_tpu.model_registry("debugmodel", attn_backend="flex")
@@ -1539,7 +1546,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       model_config: The model config to check.
       tile_m: The expected grouped-matmul and dWeight row tile.
     """
-    num_moe = sum(layer.moe is not None for layer in model_config.layers)
+    num_moe = sum(hasattr(layer.feed_forward, 'routed_experts') for layer in model_config.layers)
     experts = [
         c for _, c, _, _ in model_config.traverse(TpuGroupedExperts.Config)
     ]
@@ -1573,9 +1580,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     """Tests the 35B-A3B recipe, also as parsed from the command line."""
     cfg = config_registry.qwen35_moe_35b()
     self.assertLen(cfg.model.layers, 40)
-    self.assertEqual(cfg.training.dtype, "float32")
-    self.assertEqual(cfg.training.mixed_precision_param, "bfloat16")
-    self.assertEqual(cfg.training.mixed_precision_reduce, "float32")
+    self.assertEqual(cfg.precision.param_dtype, "bfloat16")
+    self.assertEqual(cfg.precision.reduce_dtype, "float32")
     self.assertTrue(cfg.parallelism.use_simple_fsdp)
     self.assertEqual(cfg.parallelism.fsdp_reshard_after_forward, "always")
     self.assertTrue(cfg.compile.compile_grad_norm)
@@ -1607,7 +1613,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       model = cfg.model.build()
     self.assertLen(model.layers, 40)
     self.assertIsInstance(
-        model.layers["0"].moe.routed_experts.inner_experts, TpuGroupedExperts
+        model.layers["0"].feed_forward.routed_experts.inner_experts, TpuGroupedExperts
     )
 
     parsed = ConfigManager().parse_args([
@@ -1755,9 +1761,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertEqual(resets(re_enabled_cfg), [True] * 30)
     for layer in re_enabled_cfg.model.layers:
-      if layer.delta_net is not None:
+      if isinstance(layer.attention, gated_delta.TpuGatedDeltaNet.Config):
         self.assertEqual(
-            type(layer.delta_net.inner_gated_delta_net.kernel).__qualname__,
+            type(layer.attention.inner_attention.kernel).__qualname__,
             "TokamaxGatedDeltaKernel.Config",
         )
     self.assertEqual(
@@ -1778,9 +1784,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(
         bench_cfg.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
     )
-    self.assertEqual(bench_cfg.training.dtype, "float32")
-    self.assertEqual(bench_cfg.training.mixed_precision_param, "bfloat16")
-    self.assertEqual(bench_cfg.training.mixed_precision_reduce, "float32")
+    self.assertEqual(bench_cfg.precision.param_dtype, "bfloat16")
+    self.assertEqual(bench_cfg.precision.reduce_dtype, "float32")
     self.assertEqual(bench_cfg.metrics.log_freq, 5)
     self.assertEqual(
         bench_cfg.xla_flags, {"xla_enable_hlo_sharding_v3": "false"}
@@ -1810,7 +1815,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertTrue(compile_cfg.compile_grad_norm)
     self.assertFalse(bench_cfg.tpu_config.enable_amp)
     self.assertFalse(bench_cfg.tpu_config.enable_mfu_benchmark)
-    self.assertEqual(bench_cfg.optim.optimizer.implementation, "fused")
+    self.assertTrue(bench_cfg.optim.optimizer.fused)
     self.assertTrue(
         bench_cfg.splash_attention_kernel.use_splash_attention_kernel
     )
@@ -1827,9 +1832,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     # Apply both recipe overrides (`tokamax_gated_delta` imports KDA lazily).
     apply_overrides(bench_cfg.override, bench_cfg)
     gdn_kernels = [
-        layer.delta_net.inner_gated_delta_net.kernel
+        layer.attention.inner_attention.kernel
         for layer in bench_cfg.model.layers
-        if layer.delta_net is not None
+        if isinstance(layer.attention, gated_delta.TpuGatedDeltaNet.Config)
     ]
     self.assertLen(gdn_kernels, 30)
     for kernel_cfg in gdn_kernels:
@@ -1839,7 +1844,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     with torch.device("meta"):
       meta_model = bench_cfg.model.build()
     workarounds._check_fused_loss_logit_transform(meta_model, bench_cfg)  # pylint: disable=protected-access
-    inner_experts = meta_model.layers["0"].moe.routed_experts.inner_experts
+    inner_experts = meta_model.layers["0"].feed_forward.routed_experts.inner_experts
     self.assertIsInstance(inner_experts, TpuGroupedExperts)
 
     # 35B-A3B parameter and MFU accounting. Active params exclude the input
@@ -1847,11 +1852,12 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     # 6 * active params, plus 10 quadratic attention layers
     # (6 * 16 heads * (256 + 256) * seq_len each), plus 30 delta-rule layers
     # (6 * 3 * 32 value heads * 128 * 128 each).
-    seq_len = bench_cfg.training.max_context_length
+    seq_len = bench_cfg.model.max_context_length
     self.assertEqual(seq_len, 2048)
-    total_params, flops_per_token = (
-        bench_cfg.model.get_nparams_and_flops(meta_model, seq_len)
-    )
+    total_params = sum(p.numel() for p in meta_model.parameters())
+    flops_per_token = bench_cfg.model.build_flops_estimator(
+        meta_model, seq_len=seq_len
+    )({"input": torch.empty(1, dtype=torch.long)})
     self.assertEqual(total_params, 34_660_610_688)
     self.assertEqual(
         flops_per_token,
@@ -1865,12 +1871,12 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         "--module=torchtitan.experiments.tpu.qwen3_5",
         "--config=qwen35_moe_35b_split_tokamax_benchmark",
         "--training.steps=20",
-        "--training.max_context_length=8192",
+        "--model.max_context_length=8192",
         "--training.num_tokens_per_microbatch_per_dp_rank=65536",
     ])
     self.assertIsInstance(parsed, TpuGraphTrainer.Config)
     self.assertEqual(parsed.training.steps, 20)
-    self.assertEqual(parsed.training.max_context_length, 8192)
+    self.assertEqual(parsed.model.max_context_length, 8192)
     self.assertEqual(
         parsed.training.num_tokens_per_microbatch_per_dp_rank, 65536
     )
@@ -1907,7 +1913,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(resets(parsed_rl), [True] * 30)
     first_gdn_kernel = parsed_rl.model.layers[
         0
-    ].delta_net.inner_gated_delta_net.kernel
+    ].attention.inner_attention.kernel
     self.assertEqual(
         type(first_gdn_kernel).__qualname__, "TokamaxGatedDeltaKernel.Config"
     )
@@ -1943,9 +1949,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     """Tests ``use_tpu_modules`` wiring and ``TpuRMSNormGated`` dispatch/fallback."""
     cfg = config_registry.qwen35_moe_35b_split_tokamax_benchmark()
     norms = [
-        layer.delta_net.norm
+        layer.attention.norm
         for layer in cfg.model.layers
-        if layer.delta_net is not None
+        if isinstance(layer.attention, gated_delta.TpuGatedDeltaNet.Config)
     ]
     self.assertLen(norms, 30)
     for norm_cfg in norms:

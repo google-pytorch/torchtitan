@@ -697,52 +697,6 @@ class Gemma4Model(Decoder):
                     "Context parallelism is not supported for Gemma4 on TPU yet."
                 )
 
-            if hasattr(config_utils, "moe_load_balance_aux_loss_configs"):
-                if config_utils.moe_load_balance_aux_loss_configs(self.layers):
-                    missing = [
-                        name
-                        for name in (
-                            "local_global_batch_size",
-                            "global_batch_size",
-                        )
-                        if kwargs.get(name) is None
-                    ]
-                    if missing:
-                        raise ValueError(
-                            "MoELoadBalanceAuxLoss is configured, so "
-                            "update_from_config needs "
-                            f"{' and '.join(missing)} (in samples, as Trainer "
-                            "passes them)."
-                        )
-                    config_utils.update_moe_aux_loss_configs(
-                        self.layers,
-                        pp_enabled=parallelism.pipeline_parallel_degree > 1,
-                        local_global_batch_size=kwargs[
-                            "local_global_batch_size"
-                        ],
-                        global_batch_size=kwargs["global_batch_size"],
-                        seq_len=max_context_length,
-                    )
-            else:
-                local_global_batch_size = kwargs.get(
-                    "local_global_batch_size",
-                    config.training.num_tokens_per_microbatch_per_dp_rank
-                    // max_context_length,
-                )
-                global_batch_size = kwargs.get("global_batch_size")
-                if global_batch_size is None:
-                    global_batch_size = config.training.num_tokens_per_train_step
-                    if global_batch_size > 0:
-                        global_batch_size //= max_context_length
-                if global_batch_size < 0:
-                    global_batch_size = local_global_batch_size
-                config_utils.update_moe_aux_loss_configs(
-                    self.layers,
-                    pp_enabled=parallelism.pipeline_parallel_degree > 1,
-                    local_global_batch_size=local_global_batch_size,
-                    global_batch_size=global_batch_size,
-                )
-
             for layer in self.layers:
                 assert isinstance(layer, Gemma4TransformerBlock.Config)
                 attn = layer.attention

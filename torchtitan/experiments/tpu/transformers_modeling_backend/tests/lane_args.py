@@ -14,11 +14,11 @@ def lane_config_args(config: str, hf_model: str, *, steps: int, extra=None) -> l
       f"--module={MODULE}",
       f"--config={config}",
       f"--hf_model={hf_model}",
-      "--optimizer.implementation=foreach",
+      "--optimizer.foreach=true",
       "--hf_assets_path=tests/assets/tokenizer",
-      "--training.max_context_length=128",
+      "--model.max_context_length=128",
       f"--training.steps={steps}",
-      "--training.mixed_precision_param=float32",
-      "--training.mixed_precision_reduce=float32",
+      "--precision.param_dtype=float32",
+      "--precision.reduce_dtype=float32",
       "--training.num_tokens_per_microbatch_per_dp_rank=256",  # 2 x 128
   ] + list(extra or [])

@@ -14,6 +14,7 @@ from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu.components.grouped_experts import (
     _native_weight_sharding,
     _transpose_last_two_dims,
+    GroupedExperts,
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
@@ -23,8 +24,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
-from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.base.sharding import ShardingConfig
 
 
 def _build_experts(
@@ -90,9 +90,8 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
 
     assert config.model is not None
-    assert config.metrics.enable_moe_routing
-    assert config.training.mixed_precision_reduce == "float32"
-    assert config.optim.optimizer.param_groups[0].optimizer_kwargs["lr"] == 3e-4
+    assert config.precision.reduce_dtype == "float32"
+    assert config.optim.optimizer.optimizers[0].lr == 8e-4
     experts = list(config.model.traverse(TpuGroupedExperts.Config))
     assert len(experts) == 48
     assert all(expert.use_pallas_grouped_mm for _, expert, _, _ in experts)

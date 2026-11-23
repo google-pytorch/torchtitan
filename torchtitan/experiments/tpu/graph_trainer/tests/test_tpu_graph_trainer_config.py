@@ -122,8 +122,8 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuRoutedExperts,
 )
 from torchtitan.models.common import ComplexRoPE, Linear
-from torchtitan.models.common.moe import MoE, MoELoadBalanceAuxLoss
-from torchtitan.models.llama3 import build_model_config as llama3_model_registry
+from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss, MoE
+from torchtitan.experiments.tpu.llama3 import model_registry as llama3_model_registry
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -183,9 +183,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with torch.device("meta"):
       model = graph_config.model.build()
     self.assertIsInstance(model, GraphTrainerQwen3Model)
-    return graph_config.model.get_nparams_and_flops(
-        model, seq_len=2048
-    )[1]
+    return graph_config.model.build_flops_estimator(model, seq_len=2048)(
+        {"input": torch.empty(1, 1)}
+    )
 
   def test_qwen3_graph_config_reports_torchtitan_flops_by_default(
       self,
@@ -230,8 +230,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with torch.device("meta"):
       unstacked_model, scanned_model = unstacked.build(), scanned.build()
     self.assertEqual(
-        scanned.get_nparams_and_flops(scanned_model, seq_len=4096),
-        unstacked.get_nparams_and_flops(unstacked_model, seq_len=4096),
+        scanned.get_parameter_counts(scanned_model),
+        unstacked.get_parameter_counts(unstacked_model),
+    )
+    self.assertEqual(
+        scanned.build_flops_estimator(scanned_model, seq_len=4096)(
+            {"input": torch.empty(1, 1)}
+        ),
+        unstacked.build_flops_estimator(unstacked_model, seq_len=4096)(
+            {"input": torch.empty(1, 1)}
+        ),
     )
 
   @parameterized.parameters(False, True)
@@ -255,8 +263,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(runs_layer_loop(model), scanned)
     # The MaxText FLOP accounting the registry installed must survive it.
     self.assertEqual(
-        graph_config.model.get_nparams_and_flops(model, seq_len=2048),
-        plain.get_nparams_and_flops(plain_model, seq_len=2048),
+        graph_config.model.get_parameter_counts(model),
+        plain.get_parameter_counts(plain_model),
+    )
+    self.assertEqual(
+        graph_config.model.build_flops_estimator(model, seq_len=2048)(
+            {"input": torch.empty(1, 1)}
+        ),
+        plain.build_flops_estimator(plain_model, seq_len=2048)(
+            {"input": torch.empty(1, 1)}
+        ),
     )
 
   def test_scanning_allows_the_moe_recipe(self) -> None:
@@ -330,14 +346,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     # Upstream #4895: Trainer.Config.compile is a LocalCompileConfig that only
     # names inductor regions; the TorchTPU block-compile policy and execution
     # controls stay on the TorchTPU lane.
-    self.assertIs(type(config.compile), LocalCompileConfig)
-    self.assertFalse(hasattr(config.compile, "enable"))
-    self.assertFalse(hasattr(config.compile, "components"))
-    self.assertEqual(config.compile.regions, [])
-    self.assertFalse(
-        hasattr(config.compile, "materialize_forward_before_backward")
-    )
-    self.assertFalse(hasattr(config.compile, "optimizer_compile"))
+    self.assertFalse(hasattr(config, "compile"))
+    self.assertIs(type(config.model.local_compile), LocalCompileConfig)
 
   @parameterized.named_parameters(
       ("generic", LocalCompileConfig(regions=[])),
@@ -711,7 +721,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_8b_maxtext_parity()
 
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(config.precision.reduce_dtype, "bfloat16")
     self.assertFalse(config.compile.use_scan_layers)
     self.assertIn(
         "torchtitan.experiments.tpu.overrides.bf16_rope"
@@ -756,12 +766,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertLen(
         list(config.model.traverse(TpuPackedQKVLinear.Config)), 64
     )
-    self.assertEqual(config.training.max_context_length, 4096)
+    self.assertEqual(config.model.max_context_length, 4096)
     self.assertEqual(
         config.training.num_tokens_per_microbatch_per_dp_rank, 8 * 4096
     )
     self.assertEqual(config.training.num_tokens_per_train_step, 1024 * 4096)
-    self.assertEqual(config.training.mixed_precision_reduce, reduce_dtype)
+    self.assertEqual(config.precision.reduce_dtype, reduce_dtype)
     self.assertEqual(config.parallelism, zero3.parallelism)
     self.assertEqual(config.tpu_config, zero3.tpu_config)
     self.assertEqual(
@@ -820,7 +830,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
-    self.assertEqual(config.optim.optimizer.implementation, "fused")
+    opt = (
+        config.optim.optimizer.optimizers[0]
+        if hasattr(config.optim.optimizer, "optimizers")
+        else config.optim.optimizer
+    )
+    self.assertTrue(opt.fused)
     self.assertTrue(
         config.splash_attention_kernel.use_tokamax_splash_attention_kernel
     )
@@ -938,7 +953,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
   def test_fsdp_allreduce_slice_allows_bf16_reductions(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
-    config.training.mixed_precision_reduce = "bfloat16"
+    config.precision.reduce_dtype = "bfloat16"
 
     apply_tpu_graph_trainer_model_transforms(config)
 
@@ -982,7 +997,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertTrue(
         all(moe.router.aux_loss is not None for _, moe, _, _ in moes)
     )
-    self.assertFalse(config.metrics.enable_moe_routing)
     # Clearing the coeff leaves a dead in-place write scan also rejects, so the
     # override has to reach every MoE.
     apply_overrides(config.override, config)
@@ -1002,11 +1016,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     for _, moe, _, _ in moes:
       self.assertIsNone(moe.load_balance_coeff)
       aux_loss = moe.router.aux_loss
-      self.assertIsInstance(aux_loss, MoELoadBalanceAuxLoss.Config)
-      assert isinstance(aux_loss, MoELoadBalanceAuxLoss.Config)
-      self.assertEqual(aux_loss.type, "batch_wise")
+      self.assertIsInstance(aux_loss, BatchWiseLoadBalanceLoss.Config)
+      assert isinstance(aux_loss, BatchWiseLoadBalanceLoss.Config)
       self.assertEqual(aux_loss.coeff, 1e-3)
-      self.assertEqual(aux_loss.top_k, moe.router.top_k)
+      self.assertEqual(aux_loss.num_experts, moe.num_experts)
 
   def test_30b_global_aux_recipe_uses_global_batch_aux_loss(self) -> None:
     # 30B-A3B-global-aux (and the fsdp_only recipes derived from it) must get
@@ -1014,17 +1027,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
     assert config.model is not None
-    self.assertTrue(config.metrics.enable_moe_routing)
     moes = list(config.model.traverse(MoE.Config))
     self.assertLen(moes, 48)
     for _, moe, _, _ in moes:
       self.assertIsNone(moe.load_balance_coeff)
       aux_loss = moe.router.aux_loss
-      self.assertIsInstance(aux_loss, MoELoadBalanceAuxLoss.Config)
-      assert isinstance(aux_loss, MoELoadBalanceAuxLoss.Config)
-      self.assertEqual(aux_loss.type, "batch_wise")
+      self.assertIsInstance(aux_loss, BatchWiseLoadBalanceLoss.Config)
+      assert isinstance(aux_loss, BatchWiseLoadBalanceLoss.Config)
       self.assertEqual(aux_loss.coeff, 1e-3)
-      self.assertEqual(aux_loss.top_k, moe.router.top_k)
 
   def test_235b_uses_tuned_tokamax_splash_attention(self) -> None:
     for name, config in (
@@ -1103,10 +1113,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     # num_tokens_per_microbatch_per_dp_rank // max_context_length.
     self.assertEqual(
         config.training.num_tokens_per_microbatch_per_dp_rank
-        // config.training.max_context_length,
+        // config.model.max_context_length,
         16,
     )
-    self.assertEqual(config.training.max_context_length, 4096)
+    self.assertEqual(config.model.max_context_length, 4096)
     self.assertTrue(config.compile.use_scan_layers)
     self.assertEqual(
         config.compile.memory_policy, "full_and_scan_offload"
@@ -1161,8 +1171,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     base = qwen3_moe_235b_scan()
     maxtext = qwen3_moe_235b_scan_maxtext()
 
-    self.assertEqual(base.training.mixed_precision_reduce, "float32")
-    self.assertEqual(maxtext.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(base.precision.reduce_dtype, "float32")
+    self.assertEqual(maxtext.precision.reduce_dtype, "bfloat16")
     self.assertEqual(
         set(maxtext.override.imports) - set(base.override.imports),
         {
@@ -1183,7 +1193,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(len(maxtext.model.layers), len(base.model.layers))
     self.assertEqual(
         maxtext.training.num_tokens_per_microbatch_per_dp_rank
-        // maxtext.training.max_context_length,
+        // maxtext.model.max_context_length,
         16,
     )
     self.assertTrue(maxtext.compile.use_scan_layers)
@@ -1192,10 +1202,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3",
         "--config=qwen3_8b",
-        "--optimizer.implementation=fused",
+        "--optim.optimizer.fused=True",
     ])
 
-    self.assertEqual(config.optim.optimizer.implementation, "fused")
+    opt = (
+        config.optim.optimizer.optimizers[0]
+        if hasattr(config.optim.optimizer, "optimizers")
+        else config.optim.optimizer
+    )
+    self.assertTrue(opt.fused)
 
   def test_qwen3_30b_fsdp_profile_explicitly_uses_zero2(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
@@ -1302,7 +1317,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         config.compile.memory_policy, "full_and_scan_offload"
     )
-    self.assertEqual(config.optim.optimizer.implementation, "fused_opt_states_bf16")
+    opt = (
+        config.optim.optimizer.optimizers[0]
+        if hasattr(config.optim.optimizer, "optimizers")
+        else config.optim.optimizer
+    )
+    self.assertTrue(opt.fused)
+    self.assertEqual(config.optim.optimizer.moment_dtype, "bfloat16")
     self.assertEqual(
         {
             name: config.libtpu_init_flags[name]
@@ -1677,12 +1698,15 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     )
     for field in dataclasses.fields(recipe_model_config):
       if field.name == "max_context_length":
-        # The TPU config aligns the model to training.max_context_length
-        # (upstream #4908 requires them equal); the recipe set its training
-        # length after construction, so only the converted config saw it.
         self.assertEqual(
             graph_model_config.max_context_length,
-            graph_config.training.max_context_length,
+            recipe_model_config.max_context_length,
+        )
+        continue
+      if field.name == "local_compile":
+        self.assertEqual(
+            graph_model_config.local_compile,
+            recipe_model_config.local_compile,
         )
         continue
       self.assertIs(
@@ -1724,7 +1748,7 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
           training=graph_config.training,
           parallelism=graph_config.parallelism,
           compile_config=graph_config.compile,
-          ac_config=graph_config.activation_checkpoint,
+          ac_config=graph_config.activation_remat,
           dump_folder="",
       )
 
@@ -1749,7 +1773,7 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
           training=config.training,
           parallelism=config.parallelism,
           compile_config=config.compile,
-          ac_config=config.activation_checkpoint,
+          ac_config=config.activation_remat,
           dump_folder="",
       )
 

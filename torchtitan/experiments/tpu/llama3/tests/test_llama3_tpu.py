@@ -16,7 +16,7 @@ from torchtitan.models.common.attention import GQAttention as Attention
 from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.embedding import VocabParallelEmbedding as Embedding
-from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.feed_forward import DenseFeedForward as FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import ComplexRoPE

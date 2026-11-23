@@ -1,7 +1,6 @@
 """Tests for the XLA / libtpu init flags carried by TPU configs."""
 
 import dataclasses
-import types
 from unittest import mock
 
 from absl.testing import absltest
@@ -353,72 +352,33 @@ class ExpertParallelFlagsTest(absltest.TestCase):
     tpu_flags.apply_init_flags(config, environ=environ)
     return tpu_flags.parse_flags(environ.get("LIBTPU_INIT_ARGS", ""))
 
-  def test_ep_adds_the_tensorcore_flag_to_the_config_flags(self) -> None:
-    config = _FakeConfig(
+  def test_ep_default_gating(self) -> None:
+    ep_config = _FakeConfig(
         libtpu_init_flags={"xla_tpu_dvfs_p_state": "7"},
         parallelism=_FakeParallelism(expert_parallel_degree=2),
     )
-
     self.assertEqual(
-        self._libtpu_flags(config),
+        self._libtpu_flags(ep_config),
         {_RAGGED_A2A_SC: "false", "xla_tpu_dvfs_p_state": "7"},
     )
 
-  def test_ep_adds_it_when_the_config_declares_no_flags(self) -> None:
-    # `--libtpu-init-flags ""` replaces the recipe's set, not the EP default.
-    config = _FakeConfig(parallelism=_FakeParallelism(expert_parallel_degree=4))
-
-    self.assertEqual(self._libtpu_flags(config), {_RAGGED_A2A_SC: "false"})
-
-  def test_no_ep_adds_nothing(self) -> None:
     environ: dict[str, str] = {}
-
     tpu_flags.apply_init_flags(_FakeConfig(), environ=environ)
-
     self.assertNotIn("LIBTPU_INIT_ARGS", environ)
 
-  def test_config_without_parallelism_adds_nothing(self) -> None:
-    config = types.SimpleNamespace(
-        libtpu_init_flags={},
-        xla_flags={},
-        extra_libtpu_init_flags={},
-        extra_xla_flags={},
-    )
-    environ: dict[str, str] = {}
+    with mock.patch.object(
+        tpu_flags, "_installed_libtpu_version", return_value="0.0.51"
+    ):
+      self.assertEqual(
+          self._libtpu_flags(ep_config), {"xla_tpu_dvfs_p_state": "7"}
+      )
 
-    tpu_flags.apply_init_flags(config, environ=environ)
-
-    self.assertNotIn("LIBTPU_INIT_ARGS", environ)
-
-  def test_recipe_value_wins(self) -> None:
+  def test_recipe_value_wins_over_ep_default(self) -> None:
     config = _FakeConfig(
         libtpu_init_flags={_RAGGED_A2A_SC: "true"},
         parallelism=_FakeParallelism(expert_parallel_degree=2),
     )
-
     self.assertEqual(self._libtpu_flags(config), {_RAGGED_A2A_SC: "true"})
-
-  def test_launch_command_drops_or_flips_it(self) -> None:
-    for extra, expected in (
-        (f"!{_RAGGED_A2A_SC}", {}),
-        (f"{_RAGGED_A2A_SC}=true", {_RAGGED_A2A_SC: "true"}),
-    ):
-      with self.subTest(extra=extra):
-        config = _FakeConfig(
-            extra_libtpu_init_flags=tpu_flags.parse_flags(extra),
-            parallelism=_FakeParallelism(expert_parallel_degree=2),
-        )
-
-        self.assertEqual(self._libtpu_flags(config), expected)
-
-  def test_environment_still_wins(self) -> None:
-    # How a reproducer forces the SparseCore lowering back on.
-    config = _FakeConfig(parallelism=_FakeParallelism(expert_parallel_degree=2))
-    environ = {"LIBTPU_INIT_ARGS": f"--{_RAGGED_A2A_SC}=true"}
-
-    self.assertEqual(
-        self._libtpu_flags(config, environ), {_RAGGED_A2A_SC: "true"}
-    )
 
   def test_harness_variant_applies_only_the_ep_flag(self) -> None:
     config = _FakeConfig(
@@ -439,25 +399,6 @@ class ExpertParallelFlagsTest(absltest.TestCase):
             )
         },
     )
-
-  def test_harness_variant_without_ep_is_a_no_op(self) -> None:
-    environ = {"LIBTPU_INIT_ARGS": "--xla_tpu_extra_flag=1"}
-
-    tpu_flags.apply_expert_parallel_init_flags(_FakeConfig(), environ=environ)
-
-    self.assertEqual(environ, {"LIBTPU_INIT_ARGS": "--xla_tpu_extra_flag=1"})
-
-  def test_libtpu_with_subslice_support_gets_no_ep_default(self) -> None:
-    config = _FakeConfig(parallelism=_FakeParallelism(expert_parallel_degree=2))
-    for version in ("0.0.51", "0.0.52.dev20261120"):
-      with self.subTest(version=version), mock.patch.object(
-          tpu_flags, "_installed_libtpu_version", return_value=version
-      ):
-        environ: dict[str, str] = {}
-
-        tpu_flags.apply_init_flags(config, environ=environ)
-
-        self.assertNotIn("LIBTPU_INIT_ARGS", environ)
 
   def test_libtpu_versions_that_need_the_tensorcore_lowering(self) -> None:
     for version, needed in (

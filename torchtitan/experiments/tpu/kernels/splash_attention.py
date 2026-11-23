@@ -28,7 +28,7 @@ from torchtitan.experiments.tpu.distributed.headtail import (
     make_headtail_splash_mask,
     slice_cp_mask_info,
 )
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 
 logger = logging.getLogger(__name__)
 
@@ -713,6 +713,12 @@ class SplashAttention(nn.Module):
       cp_rank: Optional[torch.Tensor] = None,
       **kwargs,
   ) -> torch.Tensor:
+    attention_metadata = kwargs.pop("attention_metadata", None)
+    if attention_metadata is not None:
+      if segment_ids is None:
+        segment_ids = getattr(attention_metadata, "segment_ids", None)
+      if positions is None:
+        positions = getattr(attention_metadata, "positions", None)
     was_3d = q.dim() == 3
     seq_len = q.shape[0] if was_3d else q.shape[1]
     causal = is_causal if is_causal is not None else self.is_causal

@@ -18,7 +18,7 @@ from torchtitan.observability import metrics
 from torchtitan.components import optim as optimizer
 from torchtitan.components.optim import lr_scheduler
 from torchtitan.config import configs
-from torchtitan.distributed import activation_checkpoint
+from torchtitan.distributed import activation_remat
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.components.optim import Optim
@@ -156,7 +156,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_checkpoint=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -183,7 +183,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_checkpoint=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -210,7 +210,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_checkpoint=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -237,7 +237,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_checkpoint=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -264,7 +264,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_checkpoint=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -291,7 +291,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_checkpoint=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -318,5 +318,5 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.FullAC.Config(),
+      activation_checkpoint=activation_remat.FullActivationRematConfig(),
   )

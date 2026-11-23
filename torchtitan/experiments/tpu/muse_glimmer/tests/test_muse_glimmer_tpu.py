@@ -23,7 +23,7 @@ import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer import attention as tpu_attention
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
 
 

@@ -314,7 +314,8 @@ class WorkaroundsTest(parameterized.TestCase):
   def _tokamax_patch_fixture(self):
     """A module with one ScaledDotProductInnerAttention, and a populated splash config."""
     from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig  # pylint: disable=g-import-not-at-top
-    from torchtitan.models.common.attention import ScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
+    from torchtitan.models.common.attention import   # pylint: disable=g-import-not-at-top
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
 
     class _Tiny(torch.nn.Module):
 
@@ -498,7 +499,7 @@ class WorkaroundsTest(parameterized.TestCase):
     """The Splash patch keeps the CP wrapper and plugs the kernel in as its local attention."""
     from torchtitan.experiments.tpu import workarounds
     from torchtitan.models.common.attention import GQAttention as Attention
-    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
     from torchtitan.experiments.tpu.distributed.cp_attention import tpu_cp_inner_attention
     from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention
     from torchtitan.experiments.tpu.qwen3 import qwen3_configs
@@ -528,7 +529,7 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.experiments.tpu.distributed.cp_attention import tpu_cp_inner_attention
     from torchtitan.experiments.tpu.qwen3 import qwen3_configs
     from torchtitan.models.common.attention import GQAttention as Attention
-    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
 
     cp_cls = tpu_cp_inner_attention(
         ScaledDotProductInnerAttention, "all_gather"
@@ -561,7 +562,7 @@ class WorkaroundsTest(parameterized.TestCase):
         validate_tpu_context_parallel,
     )
     from torchtitan.experiments.tpu.qwen3 import config_registry
-    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
 
     config = config_registry.qwen3_debugmodel_ulysses_cp2()
     self.assertEqual(config.parallelism.context_parallel_degree, 2)
@@ -606,9 +607,9 @@ class WorkaroundsTest(parameterized.TestCase):
         UlyssesCPVarlenInnerAttention,
         tpu_cp_inner_attention,
     )
-    from torchtitan.models.common.attention import (
+    from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.models.common.attention import (
         FlexInnerAttention,
-        ScaledDotProductInnerAttention,
         VarlenInnerAttention,
     )
 
@@ -686,7 +687,7 @@ class WorkaroundsTest(parameterized.TestCase):
 
   def test_tpu_selective_ac_recomputes_saved_collectives(self):
     """TPUSelectiveAC is core SelectiveAC minus the collectives core saves."""
-    from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+    from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
     from torchtitan.experiments.tpu.components.activation_checkpoint import (
         TPUSelectiveAC,
         tpu_selective_ac_config,
@@ -697,20 +698,20 @@ class WorkaroundsTest(parameterized.TestCase):
         c10d.all_to_all_single.default,
         c10d.reduce_scatter_tensor.default,
     }
-    core_ops = SelectiveAC.Config().build().get_save_ops()
+    core_ops = DefaultActivationRematConfig().build().get_save_ops()
     self.assertLessEqual(collectives, core_ops)
     self.assertEqual(
-        TPUSelectiveAC.Config().build().get_save_ops(), core_ops - collectives
+        TPUDefaultActivationRematConfig().build().get_save_ops(), core_ops - collectives
     )
 
     # CP parallelize functions switch plain SelectiveAC (keeping its fields)
     # and leave every other AC config alone.
-    selective = SelectiveAC.Config(preserve_rng_state=True)
+    selective = DefaultActivationRematConfig(preserve_rng_state=True)
     switched = tpu_selective_ac_config(selective)
     self.assertIs(type(switched), TPUSelectiveAC.Config)
     self.assertTrue(switched.preserve_rng_state)
     self.assertIsInstance(switched.build(), TPUSelectiveAC)
-    for other in (None, FullAC.Config(), switched):
+    for other in (None, FullActivationRematConfig(), switched):
       self.assertIs(tpu_selective_ac_config(other), other)
 
   def test_ulysses_cp_repeats_kv_heads(self):
@@ -785,7 +786,7 @@ class WorkaroundsTest(parameterized.TestCase):
     )
     from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
     from torchtitan.experiments.tpu.qwen3 import config_registry
-    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
 
     # 1. Verify the all_gather CP recipe and reverting it for cp=1.
     config = config_registry.qwen3_debugmodel_allgather_cp2()

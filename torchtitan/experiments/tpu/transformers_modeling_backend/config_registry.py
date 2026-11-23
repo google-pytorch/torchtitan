@@ -22,7 +22,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.experiments.tpu.components.activation_checkpoint import AttentionSavingSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
@@ -271,8 +271,8 @@ def _tpu_hf_config(
       # attention output, as upstream's default set already does for every
       # attention implementation it knows about (SDPA variants, flex).
       activation_checkpoint=(
-          AttentionSavingSelectiveAC.Config() if save_attention
-          else SelectiveAC.Config()
+          AttentionSavingDefaultActivationRematConfig() if save_attention
+          else DefaultActivationRematConfig()
       ),
   )
 

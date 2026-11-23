@@ -12,15 +12,15 @@ from torch.distributed.tensor import DTensor, Replicate
 from torch.nn.attention import sdpa_kernel
 
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.components.attention import AttentionMasksType
 from torchtitan.models.common.attention import (
-    AttentionMasksType,
     FlexInnerAttention,
     QKVLinear,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     GQAttention,
-    ScaledDotProductInnerAttention,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock

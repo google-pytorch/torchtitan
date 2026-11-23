@@ -28,8 +28,8 @@ from torch import nn
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.distributed.activation_checkpoint import (
-    ActivationCheckpointingConfig,
+from torchtitan.distributed.activation_remat import (
+    ActivationRematConfig as ActivationCheckpointingConfig,
 )
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
@@ -96,7 +96,7 @@ def parallelize_gemma4(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
-    ac_config: ActivationCheckpointingConfig,
+    ac_config: ActivationRematConfig,
     dump_folder: str,
 ) -> nn.Module:
   """Applies SimpleFSDP (TPU uneven-dim policy) and graph capture to Gemma 4.

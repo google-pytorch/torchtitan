@@ -40,7 +40,7 @@ import logging
 from typing import Any
 
 import torch
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import AttentionMaskInterface, flash_attention_mask
 from transformers.modeling_utils import AttentionInterface

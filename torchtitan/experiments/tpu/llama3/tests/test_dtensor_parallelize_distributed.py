@@ -10,7 +10,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 import torch.nn as nn
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.config.parallelism import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -75,7 +75,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -125,7 +125,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -178,7 +178,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
   def apply_fsdp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,

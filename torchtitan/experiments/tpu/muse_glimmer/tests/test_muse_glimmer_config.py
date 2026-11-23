@@ -25,7 +25,7 @@ from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import paralleliz
 from torchtitan.experiments.tpu.overrides import fused_loss
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import attention as common_attention
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.muse_glimmer import model as upstream_model
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
 

@@ -11,7 +11,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.examples.gemma4 import (
@@ -188,7 +188,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
       ),
@@ -320,7 +320,7 @@ def gemma4_31b() -> TPUTrainerConfig:
           data_parallel_shard_degree=-1,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # Qwen3 and Muse Glimmer recipes.
       xla_flags=tpu_flags.merge_flags(

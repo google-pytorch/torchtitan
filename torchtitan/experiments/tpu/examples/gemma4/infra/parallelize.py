@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.experiments.tpu.components.compile import maybe_regional_inductor_backend
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 def _apply_ac_gemma4(
     model: nn.Module,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig",
     dump_folder: str,
 ) -> None:
   if isinstance(ac_config, SelectiveAC.Config):
@@ -72,7 +72,7 @@ def _parallelize_gemma4(
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig | None",
     dump_folder: str,
     skip_dp: bool = False,
 ) -> nn.Module:
@@ -200,7 +200,7 @@ def parallelize_gemma4(
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig | None",
     dump_folder: str,
     skip_dp: bool = False,
     tpu_compile_mode: str = "layer",

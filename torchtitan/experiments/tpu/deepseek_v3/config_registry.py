@@ -9,7 +9,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optim.optimizer import default_adamw
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -55,7 +55,7 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
           expert_parallel_degree=1,
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
   )
 
 

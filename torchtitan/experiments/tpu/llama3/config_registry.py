@@ -9,7 +9,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optim.optimizer import default_adamw
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -136,7 +136,7 @@ def llama3_debugmodel() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
       validator=None,
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
@@ -197,7 +197,7 @@ def llama3_1b() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
       validator=None,
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
@@ -230,7 +230,7 @@ def llama3_8b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -286,7 +286,7 @@ def llama3_70b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -342,7 +342,7 @@ def llama3_405b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -432,7 +432,7 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           initial_load_in_hf=True,
           initial_load_model_only=True
                  ),
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
       ),

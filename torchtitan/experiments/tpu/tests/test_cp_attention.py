@@ -28,7 +28,7 @@ import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 import torch.nn.functional as F
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu.distributed import cp_attention
 from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
@@ -46,7 +46,7 @@ from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
 from torchtitan.experiments.tpu.qwen3 import config_registry
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 
 _C10D = torch.ops._c10d_functional
 _WAIT = _C10D.wait_tensor.default
@@ -708,8 +708,8 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
           if node.target is _WAIT and node.args[0].op == "placeholder"
       ]
 
-    self.assertNotEmpty(waits_on_saved_tensors(SelectiveAC.Config()))
-    self.assertEmpty(waits_on_saved_tensors(TPUSelectiveAC.Config()))
+    self.assertNotEmpty(waits_on_saved_tensors(DefaultActivationRematConfig()))
+    self.assertEmpty(waits_on_saved_tensors(TPUDefaultActivationRematConfig()))
 
 
 class CPValidationTest(parameterized.TestCase):

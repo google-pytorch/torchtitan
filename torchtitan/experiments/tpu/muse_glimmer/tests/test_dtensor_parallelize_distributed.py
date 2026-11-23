@@ -10,7 +10,7 @@ import torch
 from torch.distributed.tensor import DTensor
 from torchtitan.config.parallelism import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
@@ -81,7 +81,7 @@ def _tp_wrapper(
     # pytype: disable=wrong-arg-types
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -161,7 +161,7 @@ def _verify_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -211,7 +211,7 @@ def _verify_simple_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,

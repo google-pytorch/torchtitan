@@ -5,7 +5,7 @@ from absl.testing import absltest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 import torch.nn as nn
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.config.parallelism import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -66,7 +66,7 @@ def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -110,7 +110,7 @@ def _verify_dtensor_qwen3_tp_backward_worker(
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -160,7 +160,7 @@ def _verify_dtensor_qwen3_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan.models.common.attention import (
+from torchtitan.experiments.tpu.components.attention import (
     AttentionMasksType,
     segment_ids_from_positions,
 )

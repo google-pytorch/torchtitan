@@ -23,7 +23,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 )
 import torchtitan.experiments.tpu.conformer as tpu_conformer
 from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.components.optim import Optim
 
 
@@ -56,7 +56,7 @@ def conformer_test() -> TPUTrainerConfig:
           data_parallel_shard_degree=-1,
           data_parallel_replicate_degree=1,
       ),
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       compile=TpuTrainerCompileConfig(
           enable=False,
           backend="tpu",

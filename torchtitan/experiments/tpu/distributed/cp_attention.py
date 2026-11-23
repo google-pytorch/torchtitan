@@ -42,18 +42,52 @@ from torchtitan.distributed import fsdp as fsdp_mod
 from torchtitan.distributed.context_parallel import (
     _cp_shard_dims,
     HeadTailCPLoadBalancer,
-    prepare_context_parallel_input,
 )
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
+from torchtitan.experiments.tpu.components.attention import (
+    ScaledDotProductInnerAttention,
+    segment_ids_from_positions,
+)
 from torchtitan.experiments.tpu.distributed.headtail import headtail_chunk_order
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common.attention import (
-    BaseAttention,
-    ScaledDotProductInnerAttention,
+    Attention as BaseAttention,
     VarlenInnerAttention,
-    segment_ids_from_positions,
 )
+
+
+def prepare_context_parallel_input(
+    input_dict: dict,
+    input_shardings: dict | None,
+    cp_mesh,
+    load_balancer_type: str | None = "headtail",
+    ptrr_mask_key: str | None = None,
+) -> dict:
+  """Shard named tensors for Context Parallel (TPU CP helper)."""
+  del ptrr_mask_key
+  from torchtitan.distributed.context_parallel import cp_shard as _cp_shard
+
+  if input_shardings is not None:
+    shard_dims = _cp_shard_dims(input_shardings)
+  else:
+    shard_dims = {"input": 0, "labels": 0, "positions": 0}
+  named = {k: v for k, v in input_dict.items() if isinstance(v, torch.Tensor)}
+  shard_names = [n for n in shard_dims if n in named]
+  if not shard_names:
+    return input_dict
+  buffers = tuple(named[n] for n in shard_names)
+  seq_dims = tuple(shard_dims[n] for n in shard_names)
+  sharded_buffers, _ = _cp_shard(
+      cp_mesh,
+      buffers,
+      None,
+      load_balancer_type,
+      input_seq_dims=seq_dims,
+  )
+  for n, buf in zip(shard_names, sharded_buffers):
+    input_dict[n] = buf
+  return input_dict
 from torchtitan.models.common.cp_attention import CPInnerAttention
 
 logger = logging.getLogger(__name__)

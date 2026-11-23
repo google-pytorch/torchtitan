@@ -10,7 +10,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import (
     TPUGrainDataLoader,
@@ -247,7 +247,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(preserve_rng_state=False),
+      activation_checkpoint=DefaultActivationRematConfig(),
       compile=TpuTrainerCompileConfig(enable=False, backend="tpu"),
       validator=None,
       tpu_config=TPUConfig(enable_amp=False),
@@ -349,7 +349,7 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       comm=CommConfig(train_timeout_seconds=600),
-      activation_checkpoint=FullAC.Config(preserve_rng_state=False),
+      activation_checkpoint=FullActivationRematConfig(),
       compile=TpuTrainerCompileConfig(
           enable=False, backend="tpu", compile_grad_norm=True
       ),

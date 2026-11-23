@@ -7,7 +7,7 @@ from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optim.optimizer import default_adamw
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
@@ -111,7 +111,7 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(use_simple_fsdp=True),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
   )
 
 
@@ -176,7 +176,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
           data_parallel_shard_degree=-1,
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # the other TPU recipes.
       xla_flags=tpu_flags.merge_flags(

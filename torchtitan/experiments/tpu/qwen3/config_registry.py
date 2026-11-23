@@ -18,7 +18,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.config.transform import apply_transforms, ContextParallelTransform
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.distributed.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
 from torchtitan.experiments.tpu.components.grouped_experts import (
@@ -55,7 +55,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader, TPUGrainDataLoader
-from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.attention import Attention as BaseAttention
 from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.common.moe import MoE
 from torchtitan_recipes.tests.models.qwen3 import qwen3_30b_a3b_global_aux
@@ -213,7 +213,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
       validator=None,
   )
 
@@ -282,7 +282,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
           use_jax_profiler=False,
@@ -345,7 +345,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_checkpoint=FullActivationRematConfig(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
           use_jax_profiler=True,
@@ -496,7 +496,7 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
       checkpointer=None,
       # GraphTrainer does not apply this eager AC config; its graph
       # rematerialization policy is selected on the final compile config below.
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=DefaultActivationRematConfig(),
       tpu_config=TPUConfig(),
       # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
       # libtpu 0.0.48; see cl/979992733), which segfaults in

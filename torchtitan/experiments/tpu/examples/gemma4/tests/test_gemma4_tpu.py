@@ -66,10 +66,10 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.common.attention import (
     QKVLinear,
-    ScaledDotProductInnerAttention,
-    segment_ids_from_positions,
 )
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear, RouterGateLinear

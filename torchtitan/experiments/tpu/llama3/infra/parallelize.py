@@ -30,7 +30,7 @@ def parallelize_llama(
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig",
     dump_folder: str,
     skip_dp: bool = False,
     tpu_compile_mode: str = "layer",

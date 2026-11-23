@@ -12,6 +12,9 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.attention import QKVLinear
+from torchtitan.experiments.tpu.components.attention import (
+    ScaledDotProductInnerAttention,
+)
 from torchtitan.models.common.config_utils import (
     fused_gate_up_param_init,
     fused_qkv_param_init,
@@ -273,7 +276,11 @@ def _build_gemma4_layers(
                         param_init=p["linear_out"],
                     ),
                     qkv_linear=qkv_linear_cfg,
-                    inner_attention=get_attention_config(attn_backend),
+                    inner_attention=(
+                        ScaledDotProductInnerAttention.Config()
+                        if attn_backend == "sdpa"
+                        else get_attention_config(attn_backend)
+                    ),
                     rope=Gemma4RoPE.Config(
                         dim=layer_head_dim,
                         max_context_length=max_seq_len,

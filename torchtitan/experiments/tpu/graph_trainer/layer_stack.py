@@ -667,6 +667,36 @@ class LayerStack:
             )
         return plan
 
+    def _prequantized_scan_body(self, body, prequant):
+        """``run``'s scan body, plus each layer's pre-quantized FP8 weights.
+
+        Like the plain body in ``run`` -- make every row whole with
+        ``gather_slice``, run the layer, return a scalar y -- but each group in
+        ``prequant`` is also quantized from this rank's shard, gathered in FP8,
+        and passed in as ``<prefix>_q`` / ``<prefix>_scale``. The BF16 gathers
+        stay for their gradient routing.
+        """
+
+        def scan_body(carry, slices):
+            params = {
+                name: gather_slice(
+                    slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
+                )
+                for name in self.names
+            }
+            for prefix, names, spec, quantize in prequant:
+                shard = torch.cat(
+                    [slices[_mangle(n)].detach() for n in names], dim=-1
+                )
+                q, scale = quantize(shard, functools.partial(gather_like, spec=spec))
+                params[f"{prefix}_q"] = q
+                params[f"{prefix}_scale"] = scale
+            out = body(carry, params)
+            # A scalar y, for the reason given in the plain body in ``run``.
+            return out, out.new_zeros(())
+
+        return scan_body
+
     def run(self, h: torch.Tensor, *args, use_scan: bool):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
@@ -758,30 +788,18 @@ class LayerStack:
                     param.to_local() if isinstance(param, DTensor) else param
                 )
 
-            prequant = self._plan_prequantized_gathers(template, layer_shapes)
-
             def scan_body(carry, slices):
                 # `scan` hands the body row i of every stack, under the same
                 # keys, and `gather_slice` makes each row whole.
-                params = {
-                    name: gather_slice(
-                        slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
-                    )
-                    for name in self.names
-                }
-                # Modules that quantize their weights get them pre-quantized:
-                # each rank quantizes its shard and the FP8 layer is gathered.
-                # The BF16 gathers above stay for their gradient routing.
-                for prefix, names, spec, quantize in prequant:
-                    shard = torch.cat(
-                        [slices[_mangle(n)].detach() for n in names], dim=-1
-                    )
-                    q, scale = quantize(
-                        shard, functools.partial(gather_like, spec=spec)
-                    )
-                    params[f"{prefix}_q"] = q
-                    params[f"{prefix}_scale"] = scale
-                out = body(carry, params)
+                out = body(
+                    carry,
+                    {
+                        name: gather_slice(
+                            slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
+                        )
+                        for name in self.names
+                    },
+                )
                 # A `scan` body returns (next_carry, y), and `scan` stacks the y
                 # of every iteration into one `[n_layers, ...]` output. We only
                 # want the last hidden state, which is the carry. Returning `out`
@@ -790,6 +808,13 @@ class LayerStack:
                 # thing away. `scan` does not accept a body with no y, so return
                 # a scalar and drop it.
                 return out, out.new_zeros(())
+
+            # Opt-in FP8 path: modules that define `scan_prequantize_groups`
+            # get their weights quantized per shard and gathered in FP8. With
+            # no such module, `prequant` is empty and the body above runs as is.
+            prequant = self._plan_prequantized_gathers(template, layer_shapes)
+            if prequant:
+                scan_body = self._prequantized_scan_body(body, prequant)
 
             # Budget 0.0 forces the gathered weight to be recomputed in the
             # backward. Left alone, the partitioner saves it -- a collective

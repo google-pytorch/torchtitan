@@ -207,26 +207,7 @@ class TpuGroupedExperts(GroupedExperts):
         self._native_sharding_applied = False
 
         if self.fp8_gather_quantized_weights:
-            if not (
-                self.use_fp8_grouped_mm and self.use_kernel_native_weight_layout
-            ):
-                raise ValueError(
-                    "fp8_gather_quantized_weights needs use_fp8_grouped_mm and "
-                    "the kernel-native weight layout"
-                )
-            # Empty placeholders, replaced per layer through `functional_call`
-            # by the scan body (see `scan_prequantize_groups`).
-            for key in self.scan_prequantize_groups():
-                self.register_buffer(
-                    f"{key}_q",
-                    torch.empty(0, dtype=torch.float8_e4m3fn),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    f"{key}_scale",
-                    torch.empty(0, dtype=torch.float32),
-                    persistent=False,
-                )
+            self._register_prequantized_placeholders()
 
         if self.use_fp8_grouped_mm and not self.use_pallas_grouped_mm:
             raise ValueError("FP8 grouped matmul requires use_pallas_grouped_mm")
@@ -275,20 +256,8 @@ class TpuGroupedExperts(GroupedExperts):
             self._sharding_config = _native_weight_sharding(self._sharding_config)
             self._native_sharding_applied = True
         if self.fp8_gather_quantized_weights and self._sharding_config is not None:
-            # `_distribute_states` needs a placement for every buffer. The
-            # pre-quantized placeholders stay empty and replicated here: the
-            # scan body swaps each layer's gathered FP8 weight in through
-            # `functional_call`. FP8 experts reject EP, so the dense family
-            # applies.
-            state_shardings = dict(self._sharding_config.state_shardings)
-            for key in self.scan_prequantize_groups():
-                for suffix in ("_q", "_scale"):
-                    state_shardings.setdefault(
-                        f"{key}{suffix}",
-                        expert_param_placement_dense(tp_placement=spmd.R),
-                    )
-            self._sharding_config = replace(
-                self._sharding_config, state_shardings=state_shardings
+            self._sharding_config = self._with_prequantized_placements(
+                self._sharding_config
             )
         super()._distribute_states(parallel_dims)
 
@@ -393,6 +362,44 @@ class TpuGroupedExperts(GroupedExperts):
         if self._use_transposed_w2_rhs:
             w2_EKN = w2_EKN.transpose(-2, -1)
         return w1_EKN, w2_EKN, w3_EKN
+
+    # -- FP8 pre-quantized gathers (only with fp8_gather_quantized_weights) --
+
+    def _register_prequantized_placeholders(self) -> None:
+        """Register the empty ``<prefix>_q`` / ``<prefix>_scale`` buffers.
+
+        The scan body replaces them per layer through ``functional_call``
+        (see `scan_prequantize_groups`); outside the scan they stay empty and
+        the FP8 forward quantizes the gathered weight itself.
+        """
+        if not (self.use_fp8_grouped_mm and self.use_kernel_native_weight_layout):
+            raise ValueError(
+                "fp8_gather_quantized_weights needs use_fp8_grouped_mm and "
+                "the kernel-native weight layout"
+            )
+        for key in self.scan_prequantize_groups():
+            self.register_buffer(
+                f"{key}_q", torch.empty(0, dtype=torch.float8_e4m3fn), persistent=False
+            )
+            self.register_buffer(
+                f"{key}_scale", torch.empty(0, dtype=torch.float32), persistent=False
+            )
+
+    def _with_prequantized_placements(self, config: ShardingConfig) -> ShardingConfig:
+        """``config`` plus a replicated placement for each placeholder buffer.
+
+        ``_distribute_states`` needs a placement for every buffer. The
+        placeholders stay empty and replicated; the scan body swaps each
+        layer's gathered FP8 weight in. FP8 experts reject EP, so the dense
+        family applies.
+        """
+        state_shardings = dict(config.state_shardings)
+        for key in self.scan_prequantize_groups():
+            for suffix in ("_q", "_scale"):
+                state_shardings.setdefault(
+                    f"{key}{suffix}", expert_param_placement_dense(tp_placement=spmd.R)
+                )
+        return replace(config, state_shardings=state_shardings)
 
     def scan_prequantize_groups(self) -> dict[str, tuple[str, ...]]:
         """Buffer prefix -> the weights quantized together as one FP8 tensor.

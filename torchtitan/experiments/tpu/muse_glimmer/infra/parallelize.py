@@ -22,7 +22,10 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
 )
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
-from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    configure_simple_fsdp_shard_dims,
+    configure_vocab_module_shard_dim,
+)
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
@@ -37,12 +40,15 @@ def configure_muse_glimmer_simple_fsdp_shard_dims(
     model: nn.Module,
     parallel_dims: torchtitan.distributed.ParallelDims,
 ) -> list[str]:
-  """Selects SimpleFSDP dim 1 for vocab-sized weights with an uneven dim 0.
+  """Selects SimpleFSDP dim 1 for vocab-sized weights with unsuitable dim 0.
 
-  Muse Glimmer's vocab (202048) is not divisible by large FSDP degrees (e.g. 128
-  on tpu7x-4x4x4). ``lm_head`` (and any layer stacks) are handled by the shared
-  ``configure_simple_fsdp_shard_dims``; this adds the same rule for the
-  embedding weight nested inside ``EmbeddingWithNorm``.
+  Moves ``tok_embeddings.embedding`` and ``lm_head`` to dim 1 when dim 0 does
+  not divide ``dp_shard`` (e.g. vocab 202048 at 128 ranks) or when dim 0
+  produces an unaligned, unfoldable 2-D shard (e.g. ``[3157, 6656]`` at 64
+  ranks) while dim 1 yields an 8-row-aligned gather tensor. ``lm_head`` (and
+  any layer stacks) are handled by the shared ``configure_simple_fsdp_shard_dims``;
+  this applies the same rule to the embedding weight nested inside
+  ``EmbeddingWithNorm``.
 
   Args:
     model: The Muse Glimmer model (or a pipeline stage of it).
@@ -68,21 +74,10 @@ def configure_muse_glimmer_simple_fsdp_shard_dims(
     embedding = model.get_submodule(_EMBEDDING_FQN)
   except AttributeError:
     embedding = None  # Absent on this pipeline stage.
-  if embedding is not None:
-    weight = embedding.weight
-    if weight.shape[0] % fsdp_degree != 0:
-      # Same rule as the shared helper: dim 1 must divide, or be narrower than
-      # the FSDP degree (SimpleFSDP then replicates it).
-      if weight.ndim != 2 or (
-          weight.shape[1] % fsdp_degree != 0 and weight.shape[1] >= fsdp_degree
-      ):
-        raise ValueError(
-            f"Cannot FSDP-shard {_EMBEDDING_FQN}.weight with shape "
-            f"{tuple(weight.shape)} over {fsdp_degree} ranks"
-        )
-      # apply_simple_fsdp's documented per-submodule shard-axis hook.
-      setattr(embedding, "_fsdp_shard_dim", 1)
-      hidden_axis_modules.append(_EMBEDDING_FQN)
+  if embedding is not None and configure_vocab_module_shard_dim(
+      embedding, _EMBEDDING_FQN, fsdp_degree
+  ):
+    hidden_axis_modules.append(_EMBEDDING_FQN)
 
   hidden_axis_modules.extend(
       configure_simple_fsdp_shard_dims(model, parallel_dims)
@@ -90,7 +85,7 @@ def configure_muse_glimmer_simple_fsdp_shard_dims(
 
   if hidden_axis_modules:
     logger.info(
-        "Using SimpleFSDP dimension 1 for uneven Muse Glimmer modules: %s",
+        "Using SimpleFSDP dimension 1 for Muse Glimmer modules: %s",
         hidden_axis_modules,
     )
   return hidden_axis_modules

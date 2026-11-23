@@ -12,12 +12,14 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import configure_muse_glimmer_simple_fsdp_shard_dims
 
 
-def _model(*, vocab_size: int, dim: int = 8) -> nn.Module:
+def _model(
+    *, vocab_size: int, dim: int = 8, device: str | None = None
+) -> nn.Module:
   """Mimics Muse Glimmer's vocab-sized module layout."""
   model = nn.Module()
   model.tok_embeddings = nn.Module()
-  model.tok_embeddings.embedding = nn.Embedding(vocab_size, dim)
-  model.lm_head = nn.Linear(dim, vocab_size, bias=False)
+  model.tok_embeddings.embedding = nn.Embedding(vocab_size, dim, device=device)
+  model.lm_head = nn.Linear(dim, vocab_size, bias=False, device=device)
   return model
 
 
@@ -95,6 +97,34 @@ class SimpleFSDPShardingTest(absltest.TestCase):
     vocab_size, dim = 202048, 6656
     self.assertNotEqual(vocab_size % fsdp_degree, 0)
     self.assertEqual(dim % fsdp_degree, 0)
+
+  def test_uses_hidden_axis_for_unaligned_unfoldable_64_way_vocab(self) -> None:
+    # 30B at 64-way FSDP: 202048 / 64 = 3157 (3157 % 8 == 5, k=8, 6656 % 1024
+    # != 0), while dim 1 gives 6656 / 64 = 104 (104 % 8 == 0).
+    model = _model(vocab_size=202048, dim=6656, device="meta")
+
+    modified = configure_muse_glimmer_simple_fsdp_shard_dims(
+        model, _parallel_dims(64)
+    )
+
+    self.assertEqual(modified, ["tok_embeddings.embedding", "lm_head"])
+    self.assertEqual(model.tok_embeddings.embedding._fsdp_shard_dim, 1)
+    self.assertEqual(model.lm_head._fsdp_shard_dim, 1)
+
+  def test_keeps_dim0_when_vocab_shard_is_aligned_or_foldable(self) -> None:
+    # 30B at 8-way (25256 % 8 == 0) and 32-way (6314 % 8 == 2, k=4, 6656 % 512
+    # == 0, foldable by scan_fsdp) stays on dim 0.
+    for fsdp_degree in (8, 32):
+      with self.subTest(fsdp_degree=fsdp_degree):
+        model = _model(vocab_size=202048, dim=6656, device="meta")
+        modified = configure_muse_glimmer_simple_fsdp_shard_dims(
+            model, _parallel_dims(fsdp_degree)
+        )
+        self.assertEmpty(modified)
+        self.assertFalse(
+            hasattr(model.tok_embeddings.embedding, "_fsdp_shard_dim")
+        )
+        self.assertFalse(hasattr(model.lm_head, "_fsdp_shard_dim"))
 
 
 if __name__ == "__main__":

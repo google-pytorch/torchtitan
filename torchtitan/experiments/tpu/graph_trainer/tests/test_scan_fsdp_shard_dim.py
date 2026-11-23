@@ -428,6 +428,44 @@ class TestShardDimPicker(unittest.TestCase):
                 bad, unittest.mock.MagicMock(dp_shard=4096, cp=1)
             )
 
+    def test_configure_simple_fsdp_shard_dims_moves_unfoldable_unaligned_vocab_to_dim_one(
+        self,
+    ):
+        # Muse Glimmer 30B at 64-way FSDP: dim 0 divides (`202048 / 64 = 3157`)
+        # but `3157 % 8 = 5` cannot be folded (`6656 % (8 * 128) != 0`), while
+        # dim 1 yields 104 rows/rank (`104 % 8 == 0` after `movedim(1, 0)`).
+        model = nn.Module()
+        model.tok_embeddings = nn.Embedding(202048, 6656, device="meta")
+        model.lm_head = nn.Linear(6656, 202048, bias=False, device="meta")
+        moved = scan_fsdp.configure_simple_fsdp_shard_dims(
+            model, unittest.mock.MagicMock(dp_shard=64, cp=1)
+        )
+        self.assertEqual(moved, ["tok_embeddings", "lm_head"])
+        self.assertEqual(model.tok_embeddings._fsdp_shard_dim, 1)
+        self.assertEqual(model.lm_head._fsdp_shard_dim, 1)
+
+        # Negative controls stay on dim 0:
+        # - Qwen3-8B `(151936, 4096)` at 128-way: `1187 % 8 = 3`, foldable (`4096 % 1024 == 0`).
+        # - Muse Glimmer `(202048, 6656)` at 32-way: `6314 % 8 = 2`, foldable (`6656 % 512 == 0`).
+        # - `(192, 192)` at 64-way: neither dim 0 nor dim 1 aligns or folds (`3 % 8 = 3`).
+        for vocab, dim, degree in (
+            (151936, 4096, 128),
+            (202048, 6656, 32),
+            (192, 192, 64),
+        ):
+            with self.subTest(vocab=vocab, dim=dim, degree=degree):
+                keep = nn.Module()
+                keep.tok_embeddings = nn.Embedding(vocab, dim, device="meta")
+                keep.lm_head = nn.Linear(dim, vocab, bias=False, device="meta")
+                self.assertEqual(
+                    scan_fsdp.configure_simple_fsdp_shard_dims(
+                        keep, unittest.mock.MagicMock(dp_shard=degree, cp=1)
+                    ),
+                    [],
+                )
+                self.assertFalse(hasattr(keep.tok_embeddings, "_fsdp_shard_dim"))
+                self.assertFalse(hasattr(keep.lm_head, "_fsdp_shard_dim"))
+
     def test_subtile_two_d_gather_and_scatter_fold_minor_axis_to_align_tiles(
         self,
     ):

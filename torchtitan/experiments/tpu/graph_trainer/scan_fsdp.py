@@ -39,6 +39,7 @@ from torchtitan.tools.logging import logger
 __all__ = [
     "ScanFSDPSpec",
     "configure_simple_fsdp_shard_dims",
+    "configure_vocab_module_shard_dim",
     "gather_slice",
     "plan_stacked_gathers",
 ]
@@ -104,6 +105,19 @@ _orig_all_gather_single = funcol.all_gather_single
 _orig_reduce_scatter_single = funcol.reduce_scatter_single
 
 
+def _row_fold_factor(rows: int, cols: int) -> int | None:
+    """Fold factor ``k`` to make 2-D ``[rows, cols]`` 8-row aligned, or None.
+
+    Returns ``1`` when ``rows`` is already a multiple of 8, ``k > 1`` when
+    ``cols`` is divisible by ``k * 128`` so ``_fold_rows`` can align it, and
+    ``None`` when neither holds.
+    """
+    if rows % 8 == 0:
+        return 1
+    k = 8 // math.gcd(rows, 8)
+    return k if cols % (k * 128) == 0 else None
+
+
 def _fold_rows(t: torch.Tensor, k: int) -> torch.Tensor:
     """Views 2-D `t` as `[rows * k, cols // k]`.
 
@@ -150,9 +164,9 @@ def _movedim_all_gather_tensor(
     # Only 2-D shards fold: 1-D norms use 1-D tiles, and 3-D expert slices
     # `[E, D, F]` already tile on `(D, F)`.
     orig_cols = None
-    if t.ndim == 2 and t.shape[0] % 8 != 0:
-        k = 8 // math.gcd(t.shape[0], 8)
-        if t.shape[1] % (k * 128) == 0:
+    if t.ndim == 2:
+        k = _row_fold_factor(t.shape[0], t.shape[1])
+        if k is not None and k > 1:
             orig_cols = t.shape[1]
             t = _fold_rows(t, k)
     out = _orig_all_gather_single(t, gather_dim=0, group=group, tag=tag)
@@ -189,13 +203,9 @@ def _movedim_reduce_scatter_tensor(
         except Exception:  # pylint: disable=broad-except
             group_size = 0
         shard_rows = t.shape[0] // group_size if group_size > 0 else 0
-        if (
-            shard_rows > 0
-            and t.shape[0] % group_size == 0
-            and shard_rows % 8 != 0
-        ):
-            k = 8 // math.gcd(shard_rows, 8)
-            if t.shape[1] % (k * 128) == 0:
+        if shard_rows > 0 and t.shape[0] % group_size == 0:
+            k = _row_fold_factor(shard_rows, t.shape[1])
+            if k is not None and k > 1:
                 orig_cols = t.shape[1]
                 t = _fold_rows(t, k)
     out = _orig_reduce_scatter_single(
@@ -419,15 +429,88 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
     return plan
 
 
+def configure_vocab_module_shard_dim(
+    module: nn.Module,
+    module_fqn: str,
+    fsdp_degree: int,
+) -> bool:
+    """Sets ``_fsdp_shard_dim = 1`` on a 2-D vocab module when dim 0 is unsuitable.
+
+    Moves ``module`` to dim 1 when either:
+    1. ``weight.shape[0] % fsdp_degree != 0`` (dim 0 does not divide evenly); or
+    2. Dim 0 divides evenly but yields an unaligned 2-D shard
+       (``(rows // fsdp_degree) % 8 != 0``) that ``_movedim_all_gather_tensor``
+       cannot fold, while dim 1 divides evenly and produces an 8-row-aligned
+       (or foldable) gather tensor after ``movedim(1, 0)``.
+
+    Args:
+        module: The vocab-sized submodule (e.g. ``tok_embeddings`` or ``lm_head``).
+        module_fqn: Qualified name used in logs and error messages.
+        fsdp_degree: FSDP shard degree (``dp_shard * cp``).
+
+    Returns:
+        True if ``module._fsdp_shard_dim`` was set to 1, False otherwise.
+
+    Raises:
+        ValueError: If dim 0 does not divide ``fsdp_degree`` and dim 1 cannot be
+            sharded or replicated.
+    """
+    weight = getattr(module, "weight", None)
+    if fsdp_degree <= 1 or weight is None:
+        return False
+
+    if weight.shape[0] % fsdp_degree == 0:
+        if weight.ndim != 2:
+            return False
+        if _row_fold_factor(weight.shape[0] // fsdp_degree, weight.shape[1]) is not None:
+            return False
+        if weight.shape[1] % fsdp_degree != 0:
+            return False
+        # Dim-1 gathers transpose `[rows, cols // fsdp]` to `[cols // fsdp, rows]`.
+        if _row_fold_factor(weight.shape[1] // fsdp_degree, weight.shape[0]) is None:
+            return False
+        setattr(module, "_fsdp_shard_dim", 1)
+        return True
+
+    if weight.ndim != 2 or (
+        weight.shape[1] % fsdp_degree != 0 and weight.shape[1] >= fsdp_degree
+    ):
+        raise ValueError(
+            f"Cannot FSDP-shard {module_fqn}.weight with shape "
+            f"{tuple(weight.shape)} over {fsdp_degree} ranks"
+        )
+    # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
+    # also used by LayerStackHolder for stacked layer weights. When
+    # `weight.shape[1] < fsdp_degree` (e.g. Llama 3 8B at 8192 ranks),
+    # `data_parallel` downgrades `Shard(1)` to `Replicate()`.
+    if weight.shape[1] < fsdp_degree:
+        replicated_mib = weight.numel() * weight.element_size() / (1024**2)
+        logger.warning(
+            "%s.weight with shape %s has hidden dim %d < fsdp_degree %d; "
+            "SimpleFSDP will replicate it (%.1f MiB parameter) instead of "
+            "sharding.",
+            module_fqn,
+            tuple(weight.shape),
+            weight.shape[1],
+            fsdp_degree,
+            replicated_mib,
+        )
+    setattr(module, "_fsdp_shard_dim", 1)
+    return True
+
+
 def configure_simple_fsdp_shard_dims(
     model: nn.Module,
     parallel_dims: Any,
 ) -> list[str]:
-    """Picks SimpleFSDP shard axes that divide evenly, for any decoder model.
+    """Picks SimpleFSDP shard axes that divide evenly and align TPU tiles.
 
     Plans an axis per layer stack (calling ``flatten_for`` first if present) and
     moves ``tok_embeddings`` / ``lm_head`` to their hidden axis (dim 1) when the
-    vocabulary does not divide the FSDP degree (e.g. Llama 3's 128,256 over 512+ ranks).
+    vocabulary does not divide the FSDP degree (e.g. Llama 3's 128,256 over 512+
+    ranks) or produces an unaligned, unfoldable 2-D shard while dim 1 yields an
+    8-row-aligned gather tensor (e.g. Muse Glimmer 30B's ``[202048, 6656]`` at
+    64 ranks).
 
     Args:
         model: The model to configure, before ``apply_simple_fsdp``.
@@ -455,34 +538,8 @@ def configure_simple_fsdp_shard_dims(
     hidden_axis_modules: list[str] = []
     for module_fqn in ("tok_embeddings", "lm_head"):
         module = getattr(model, module_fqn, None)
-        if module is None or not hasattr(module, "weight"):
-            continue
-        weight = module.weight
-        if weight.shape[0] % fsdp_degree == 0:
-            continue
-        if weight.ndim != 2 or (
-            weight.shape[1] % fsdp_degree != 0 and weight.shape[1] >= fsdp_degree
+        if module is not None and configure_vocab_module_shard_dim(
+            module, module_fqn, fsdp_degree
         ):
-            raise ValueError(
-                f"Cannot FSDP-shard {module_fqn}.weight with shape "
-                f"{tuple(weight.shape)} over {fsdp_degree} ranks"
-            )
-        # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
-        # also used by LayerStackHolder for stacked layer weights. When
-        # `weight.shape[1] < fsdp_degree` (e.g. Llama 3 8B at 8192 ranks),
-        # `data_parallel` downgrades `Shard(1)` to `Replicate()`.
-        if weight.shape[1] < fsdp_degree:
-            replicated_mib = weight.numel() * weight.element_size() / (1024**2)
-            logger.warning(
-                "%s.weight with shape %s has hidden dim %d < fsdp_degree %d; "
-                "SimpleFSDP will replicate it (%.1f MiB parameter) instead of "
-                "sharding.",
-                module_fqn,
-                tuple(weight.shape),
-                weight.shape[1],
-                fsdp_degree,
-                replicated_mib,
-            )
-        setattr(module, "_fsdp_shard_dim", 1)
-        hidden_axis_modules.append(module_fqn)
+            hidden_axis_modules.append(module_fqn)
     return hidden_axis_modules

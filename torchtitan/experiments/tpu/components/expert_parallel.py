@@ -32,6 +32,8 @@ def use_expert_parallel(
     ep_capacity_factor: float | None = None,
     num_token_chunks: int | None = None,
     max_inflight_chunks: int | None = None,
+    accumulate_chunk_weight_grads_fp32: bool | None = None,
+    paired_grouped_mm: bool | None = None,
 ) -> None:
   """Configures a MoE model config for expert parallelism on TPU.
 
@@ -44,8 +46,8 @@ def use_expert_parallel(
   - turns the all-to-all dispatchers into ``TpuAllToAllTokenDispatcher``,
     sets ``ep_transport`` (see below), and optionally sets
     ``ep_capacity_factor``;
-  - turns off the paired (w1 + w3) Pallas grouped matmul, which
-    ``TpuGroupedExperts.parallelize`` allows only at EP = 1.
+  - keeps the paired (w1 + w3) Pallas grouped matmul where the recipe enabled
+    it, unless ``paired_grouped_mm`` is False.
 
   Args:
     model_config: The model configuration to update in place.
@@ -72,12 +74,15 @@ def use_expert_parallel(
       MoE layer on ``TpuRoutedExperts``.
     max_inflight_chunks: Optional override for the maximum simultaneously live
       EP chunks enforced by ``insert_ep_chunk_barriers``.
+    accumulate_chunk_weight_grads_fp32: Optional override for summing the
+      chunked expert weight gradients across token chunks in FP32 (the
+      ``TpuRoutedExperts`` default) instead of the weight dtype.
+    paired_grouped_mm: ``False`` switches paired Pallas grouped matmuls to the
+      unpaired kernels under EP; ``None`` or ``True`` leaves the recipe's
+      choice. The paired kernel skips rows past the routed count like the
+      unpaired ones, so it is safe on EP's static-size receive buffers.
   """
   if ep_degree > 1:
-    # The paired kernel now zeroes output tiles on their first visit (#182),
-    # which may make it EP-safe, but it stays off under EP as in #6 until it
-    # has its own EP tests.
-
     # TpuRoutedExperts binds the EP rank buffer in `parallelize`.
     for _, experts, parent, field_name in list(
         model_config.traverse(RoutedExperts.Config)
@@ -102,6 +107,10 @@ def use_expert_parallel(
         ep_experts.num_token_chunks = num_token_chunks
       if max_inflight_chunks is not None:
         ep_experts.max_inflight_chunks = max_inflight_chunks
+      if accumulate_chunk_weight_grads_fp32 is not None:
+        ep_experts.accumulate_chunk_weight_grads_fp32 = (
+            accumulate_chunk_weight_grads_fp32
+        )
       # Routing weights before W2 pass `row_scale_R`, which only the Pallas
       # grouped matmuls accept (stock `GroupedExperts` has no such argument).
       # Fail at config time, not in the first forward, and leave the kernel
@@ -117,11 +126,11 @@ def use_expert_parallel(
             " _use_tpu_moe_kernels)"
         )
 
-    # Unpaired Pallas grouped matmuls under EP.
-    for _, group_experts, _, _ in model_config.traverse(
-        TpuGroupedExperts.Config
-    ):
-      group_experts.use_pallas_paired_grouped_mm = False
+    if paired_grouped_mm is False:
+      for _, group_experts, _, _ in model_config.traverse(
+          TpuGroupedExperts.Config
+      ):
+        group_experts.use_pallas_paired_grouped_mm = False
 
     for _, dispatcher, parent, field_name in list(
         model_config.traverse(AllToAllTokenDispatcher.Config)

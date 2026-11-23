@@ -388,12 +388,18 @@ def _get_loss_op_names(
       mutates_args=(),
       schema="(Tensor x, Tensor labels, Tensor weights) -> (Tensor, Tensor)",
   )
-  torch_fwd_fn.register_fake(
-      lambda x, labels, weights: (
-          torch.empty(1, dtype=torch.float32, device=x.device),
-          torch.empty(x.shape[0], dtype=torch.float32, device=x.device),
-      )
-  )
+  @torch_fwd_fn.register_fake
+  def _fwd_fake(x, labels, weights):
+    # Tracing (e.g. GraphTrainer) uses these shapes instead of running the
+    # kernel, so they must match: reduction="none" gives one loss per token.
+    num_rows = x.shape[0]
+    if reduction == "none":
+      loss_shape = (num_rows,)  # one loss per token
+    else:
+      loss_shape = (1,)  # "sum" / "mean": a single loss value
+    loss = torch.empty(loss_shape, dtype=torch.float32, device=x.device)
+    lse = torch.empty((num_rows,), dtype=torch.float32, device=x.device)
+    return loss, lse
 
   torch_bwd_fn = torch.library.custom_op(
       f"pallas::{op_bwd_name}",

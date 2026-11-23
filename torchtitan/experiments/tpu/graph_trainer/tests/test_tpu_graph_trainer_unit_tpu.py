@@ -22,6 +22,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
+from torchtitan.experiments.graph_trainer.trainer import FwdBwdOutputs
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
@@ -110,7 +111,9 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
   def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
     loss = _loss(model, inputs, labels, global_valid_tokens)
     params = [p for _, p in model.named_parameters(remove_duplicate=False)]
-    return [loss, *torch.autograd.grad(loss, params)]
+    grads = list(torch.autograd.grad(loss, params))
+    # Same output structure as make_fwd_bwd_step, which the trainer reads.
+    return FwdBwdOutputs(loss, grads, [], {})
 
   inputs = torch.randint(0, 128, (batch_size, 16), device=device)
   labels = torch.randint(0, 128, (batch_size, 16), device=device)
@@ -384,6 +387,72 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
     self.assertNotEmpty(outputs)
     loss = outputs[0]
     self.assertEqual(loss.ndim, 0, "Loss output must be a scalar tensor.")
+
+  def test_make_fwd_bwd_adamw_fn_returns_loss_metrics(self) -> None:
+    device = self.accelerator_device
+    model = DummyModule().to(device)
+
+    def loss_fn(pred, labels, *, global_valid_tokens):
+      log_prob = pred.mean(dim=-1)
+      loss = torch.nn.functional.cross_entropy(
+          pred.view(-1, 128), labels.view(-1)
+      ) / global_valid_tokens
+      return loss, {"log_prob": log_prob.detach()}
+
+    param_fqns = []
+    for name, p in model.named_parameters():
+      if not p.requires_grad:
+        continue
+      param_fqns.append(name)
+      parent_path, _, leaf = name.rpartition(".")
+      parent = model.get_submodule(parent_path) if parent_path else model
+      parent.register_buffer(
+          f"_optstate_{leaf}_exp_avg", torch.zeros_like(p), persistent=True
+      )
+      parent.register_buffer(
+          f"_optstate_{leaf}_exp_avg_sq", torch.zeros_like(p), persistent=True
+      )
+
+    model.register_buffer(
+        "_optstate_step",
+        torch.zeros((), dtype=torch.float32, device=device),
+        persistent=True,
+    )
+    model.register_buffer(
+        "_optstate_lr",
+        torch.tensor(1e-3, dtype=torch.float32, device=device),
+        persistent=False,
+    )
+
+    fwd_bwd_adamw = tpu_graph_trainer._make_fwd_bwd_adamw_fn(
+        model,
+        loss_fn=loss_fn,
+        param_fqns=param_fqns,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        weight_decay=0.1,
+        max_norm=1.0,
+        capturable=False,
+    )
+
+    inputs = torch.randint(0, 128, (2, 16), device=device)
+    labels = torch.randint(0, 128, (2, 16), device=device)
+    valid_tokens = torch.tensor(32.0, device=device)
+
+    traced_step = make_fx_tracer.minimal_fx_tracer(fwd_bwd_adamw, module=model)(
+        inputs, labels, valid_tokens, {}
+    )
+    outputs = make_fx_tracer.run_traced(traced_step, module=model)(
+        inputs, labels, valid_tokens, {}
+    )
+    self.assertIsInstance(outputs, tpu_graph_trainer.FwdBwdAdamWOutputs)
+    self.assertEqual(outputs.loss.ndim, 0, "Loss output must be a scalar tensor.")
+    self.assertLen(outputs.params, len(param_fqns))
+    self.assertEqual(set(outputs.loss_metrics), {"log_prob"})
+    self.assertEqual(
+        outputs.loss_metrics["log_prob"].shape, model(inputs).mean(dim=-1).shape
+    )
 
 
 class GradAccumulationTest(BaseAcceleratorDeviceTest):

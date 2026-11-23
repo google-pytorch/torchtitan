@@ -346,7 +346,10 @@ class Fp8ExpertSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         with _skip_if_no_fp8_mxu(self):
             out, grads = run(fused=True)
         want, want_grads = run(fused=False)
-        self.assertLess(_rel_err(out, want), 0.02)
+        # The two runs round lhs to e4m3 under different scales, so they differ
+        # by FP8 quantization error (about 0.03 here; each is about 0.04 from
+        # exact FP32), not by rounding differences alone.
+        self.assertLess(_rel_err(out, want), 0.05)
         # The backward is the same op either way.
         for got, ref in zip(grads, want_grads):
             torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=0, atol=0)

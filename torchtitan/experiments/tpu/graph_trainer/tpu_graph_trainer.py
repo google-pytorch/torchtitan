@@ -68,7 +68,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     align_model_context_length,
     TPUTrainerConfig,
 )
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +458,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
-        from torchtitan.protocols.model import BaseModel
+        from torchtitan.models.base.model import BaseModel
 
         assert len(self.model_parts) == 1
         model = self.model_parts[0]

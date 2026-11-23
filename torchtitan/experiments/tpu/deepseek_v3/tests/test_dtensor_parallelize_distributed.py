@@ -5,7 +5,7 @@ from absl.testing import absltest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.testing import base_distributed_device_test

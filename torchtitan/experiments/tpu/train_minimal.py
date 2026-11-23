@@ -307,7 +307,7 @@ class TrainerMinimal:
     """Runs a simple training loop on the specified device."""
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
     from torchtitan.models.common.decoder import Decoder  # pylint: disable=g-import-not-at-top
-    from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
+    from torchtitan.models.base.model import BaseModel  # pylint: disable=g-import-not-at-top
 
     data_iterator = iter(self.dataloader)
     seq_len = self.job_config.training.max_context_length

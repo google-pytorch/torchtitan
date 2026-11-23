@@ -25,7 +25,6 @@ from torchtitan.models.common.attention import (
     GQAttention,
     InnerAttention,
     QKVLinear,
-    ScaledDotProductInnerAttention,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder
@@ -52,7 +51,6 @@ from torchtitan.models.common.moe import (
     BatchWiseLoadBalanceLoss,
     MicrobatchWiseLoadBalanceLoss,
     MoE,
-    MoELoadBalanceAuxLoss,
     RoutedExperts,
     TokenChoiceTopKRouter,
 )
@@ -122,9 +120,7 @@ def get_attention_config(
     emit per-document positions), so every backend here is a masked attention
     backend.
     """
-    if backend == "sdpa":
-        return ScaledDotProductInnerAttention.Config()
-    elif backend == "flex":
+    if backend == "flex":
         return FlexInnerAttention.Config()
     elif backend == "flex_flash":
         from torchtitan.tools.utils import has_cuda_capability
@@ -138,7 +134,11 @@ def get_attention_config(
         )
     elif backend == "varlen":
         return VarlenInnerAttention.Config()
-
+    elif backend == "sdpa":
+        raise ValueError(
+            "sdpa is no longer supported for language models; positions are "
+            "always available so use flex, flex_flash, or varlen."
+        )
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -432,16 +432,6 @@ def make_shared_expert_ffn_config(
     )
 
 
-def make_aux_loss_config(
-    *,
-    type: Literal["sequence_wise", "batch_wise"],
-    coeff: float,
-    top_k: int,
-) -> MoELoadBalanceAuxLoss.Config:
-    """Build a MoELoadBalanceAuxLoss.Config for ``router.aux_loss``."""
-    return MoELoadBalanceAuxLoss.Config(type=type, coeff=coeff, top_k=top_k)
-
-
 def make_moe_config(
     *,
     num_experts: int = 8,
@@ -557,55 +547,4 @@ def make_routed_experts_config(
         ),
         sharding_config=routed_experts_sharding_config(),
     )
-
-
-def moe_load_balance_aux_loss_configs(
-    layers: list,
-) -> list[MoELoadBalanceAuxLoss.Config]:
-    """The ``MoELoadBalanceAuxLoss`` router configs among ``layers``.
-
-    Upstream aux losses (e.g. MicrobatchWiseLoadBalanceLoss) self-normalize and
-    are not included.
-    """
-    configs = []
-    for layer_cfg in layers:
-        moe_cfg = getattr(layer_cfg, "moe", None)
-        aux_loss = getattr(getattr(moe_cfg, "router", None), "aux_loss", None)
-        if isinstance(aux_loss, MoELoadBalanceAuxLoss.Config):
-            configs.append(aux_loss)
-    return configs
-
-
-def update_moe_aux_loss_configs(
-    layers: list,
-    *,
-    pp_enabled: bool,
-    local_global_batch_size: int,
-    global_batch_size: int,
-    seq_len: int,
-) -> None:
-    """Update aux loss configs for all MoE layers from trainer config.
-
-    Call this from each model's ``update_from_config`` to set
-    ``global_batch_size`` for gradient normalization across PP microbatches,
-    gradient accumulation steps, and DP ranks (FSDP sum), and ``seq_len`` so
-    the loss can work on the router's flat ``[T, E]`` outputs. Also validates
-    that batch-wise aux loss is not used with PP or gradient accumulation.
-    """
-    for aux_loss in moe_load_balance_aux_loss_configs(layers):
-        if aux_loss.type == "batch_wise" and pp_enabled:
-            raise ValueError(
-                "batch_wise MoE aux loss is incompatible with pipeline "
-                "parallelism. Use sequence_wise instead."
-            )
-        if aux_loss.type == "batch_wise" and global_batch_size != local_global_batch_size:
-            raise ValueError(
-                "batch_wise MoE aux loss is incompatible with gradient accumulation: "
-                f"global batch is {global_batch_size} sequences but one step covers "
-                f"{local_global_batch_size} (per-rank microbatch x DP degree). Use "
-                "sequence_wise, or set training.num_tokens_per_train_step to "
-                "training.num_tokens_per_microbatch_per_dp_rank * data-parallel degree."
-            )
-        aux_loss.global_batch_size = global_batch_size
-        aux_loss.seq_len = seq_len
 

@@ -6,7 +6,7 @@ import torch.nn as nn
 import torchtitan.components.loss
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 import torchtitan.trainer
 
 logger = logging.getLogger(__name__)

@@ -25,8 +25,9 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.distributed.activation_checkpoint import (
     ActivationCheckpointingConfig,
 )

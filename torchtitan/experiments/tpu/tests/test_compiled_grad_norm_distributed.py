@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from absl.testing import absltest
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
-from torchtitan.config import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu.components import grad_norm
 from torchtitan.experiments.tpu.distributed import distributed

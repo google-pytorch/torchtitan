@@ -14,9 +14,9 @@ from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
 )
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 from torchtitan.config.transform import ModelConfigConverter
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.base.sharding import ShardingConfig
 
 logger = logging.getLogger(__name__)
 

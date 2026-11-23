@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch.nn as nn
 
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3 import (
     build_model_config as graph_trainer_model_registry,
 )
@@ -24,7 +24,7 @@ from torchtitan.experiments.tpu.profiling.mfu_flops import (
 from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 
 
 graph_trainer_parallelize_qwen3 = GraphTrainerQwen3Model.parallelize

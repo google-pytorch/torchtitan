@@ -9,7 +9,7 @@ import unittest
 
 from torch import nn
 
-from torchtitan.config.configs import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     LayerStack,
     STACK_ATTR,

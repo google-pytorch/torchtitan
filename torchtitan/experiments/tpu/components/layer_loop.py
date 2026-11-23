@@ -18,7 +18,7 @@ from torchtitan.models.common.attention import (
     segment_ids_from_positions,
 )
 from torchtitan.models.common.decoder import Decoder
-from torchtitan.protocols.module import ModuleDict
+from torchtitan.models.base.module import ModuleDict
 
 
 __all__ = [

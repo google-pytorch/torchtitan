@@ -14,8 +14,8 @@ from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.examples.mamba3.kernels import mamba3_pallas
 
 try:
-  from torchtitan.protocols import model as model_protocol
-  from torchtitan.protocols import module
+  from torchtitan.models.base import model as model_protocol
+  from torchtitan.models.base import module
   _BaseModel = model_protocol.BaseModel
   _BaseConfig = model_protocol.BaseModel.Config
   _Module = module.Module

@@ -72,7 +72,7 @@ from torchtitan.experiments.tpu.components.layer_loop import (
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 logger = logging.getLogger(__name__)
 

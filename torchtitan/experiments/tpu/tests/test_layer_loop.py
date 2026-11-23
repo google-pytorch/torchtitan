@@ -30,7 +30,7 @@ from torchtitan.models.common import Linear
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
 from torchtitan.models.llama3.model import Llama3Model
-from torchtitan.protocols.module import ModuleDict
+from torchtitan.models.base.module import ModuleDict
 
 BATCH, SEQ = 2, 16
 # Upstream d771abb0 folds `[B, S]` into one packed `[T]` stream.

@@ -4,8 +4,9 @@ import dataclasses
 from dataclasses import dataclass
 
 import torch.nn as nn
-from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,

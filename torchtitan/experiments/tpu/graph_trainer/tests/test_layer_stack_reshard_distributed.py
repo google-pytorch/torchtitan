@@ -31,7 +31,7 @@ from torchtitan.components.optim.utils import (
 )
 from torchtitan.config import derive
 from torchtitan.config.configs import TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,

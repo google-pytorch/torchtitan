@@ -35,7 +35,7 @@ import types
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability.logging import init_logger
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 import torchtitan.train
 import torchtitan.trainer
 from torchtitan.training_engine import TrainingEngine

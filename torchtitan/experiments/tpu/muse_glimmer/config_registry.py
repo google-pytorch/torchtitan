@@ -5,7 +5,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optim.optimizer import default_adamw
-from torchtitan.config.configs import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags

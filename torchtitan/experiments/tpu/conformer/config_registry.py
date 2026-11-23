@@ -12,7 +12,8 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 # `TPUTrainerConfig().<field>.__class__`. Upstream d771abb0 made
 # `model_spec` a required field, so the no-arg `TPUTrainerConfig()` that
 # idiom relied on now raises.
-from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.tpu_job_config import (
     ConformerConfig,
     SplashAttentionKernelConfig,

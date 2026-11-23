@@ -18,7 +18,7 @@ from torchtitan.models.common.decoder_sharding import (
     set_gqa_inner_attention_local_spmd,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.base.sharding import ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan.experiments.tpu.examples.gemma4.model import (

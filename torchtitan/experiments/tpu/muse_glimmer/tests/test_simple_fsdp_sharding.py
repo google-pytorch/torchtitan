@@ -8,7 +8,7 @@ is the only coverage of that fallback.
 
 from absl.testing import absltest
 from torch import nn
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import configure_muse_glimmer_simple_fsdp_shard_dims
 
 

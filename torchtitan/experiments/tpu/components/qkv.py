@@ -15,7 +15,7 @@ from torchtitan.config import derive
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.attention import QKVLinear
 from torchtitan.config.transform import ModelConfigConverter
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 
 class _PackedQKVInit:

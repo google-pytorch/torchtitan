@@ -2,10 +2,10 @@
 """Parallelization strategies for Mamba-3 architecture on TPU."""
 
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.config import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.experiments.tpu.components.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder

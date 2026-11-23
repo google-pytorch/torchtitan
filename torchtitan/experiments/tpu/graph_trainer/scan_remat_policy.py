@@ -74,7 +74,7 @@ def scan_with_remat_policy(
         # gathered weights of every layer.
         raise RuntimeError(
             "--compile.use-scan-layers needs PyTorch with pytorch/pytorch#203334 and "
-            "#203534 (nightly 2.16.0.dev<DATE> or later; not in 2.15). Found torch "
+            "#203534 (not in 2.15). Found torch "
             f"{torch.__version__}."
         )
     # Mutation allowed: the MoE aux loss all-reduces its saved counts in place,

@@ -34,33 +34,43 @@ def _cossin_rope():
 
 
 def _qwen3_block(rope=None):
-  return _build_qwen3_layers(
-      n_layers=1,
-      dim=_DIM,
-      n_heads=4,
-      n_kv_heads=2,
-      head_dim=_HEAD_DIM,
-      hidden_dim=256,
-      attn_backend="sdpa",
-      rope=rope or _cossin_rope(),
-  )[0]
+  from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
+  return use_tpu_sdpa(
+      _build_qwen3_layers(
+          n_layers=1,
+          dim=_DIM,
+          n_heads=4,
+          n_kv_heads=2,
+          head_dim=_HEAD_DIM,
+          hidden_dim=256,
+          attn_backend="flex",
+          rope=rope or _cossin_rope(),
+          enable_sp=False,
+      )[0]
+  )
 
 
 def _llama3_block(real: bool):
+  from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
   rope = ComplexRoPE.Config(
       dim=_HEAD_DIM, max_context_length=_MAX_LEN, theta=500000.0
   )
   if real:
     rope = tpu_real_arithmetic_complex_rope(rope)
-  return _build_llama3_layers(
-      n_layers=1,
-      dim=_DIM,
-      n_heads=4,
-      n_kv_heads=2,
-      hidden_dim=256,
-      attn_backend="sdpa",
-      rope=rope,
-  )[0]
+  return use_tpu_sdpa(
+      _build_llama3_layers(
+          n_layers=1,
+          dim=_DIM,
+          n_heads=4,
+          n_kv_heads=2,
+          hidden_dim=256,
+          attn_backend="flex",
+          rope=rope,
+          enable_sp=False,
+      )[0]
+  )
 
 
 def _packed_qwen3_block():

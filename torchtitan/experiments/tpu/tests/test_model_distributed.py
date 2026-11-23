@@ -44,18 +44,19 @@ def _run_model_distributed(
   if world_size > 1:
     dist_utils.init_distributed(
         train_config.comm,
-        enable_cpu_backend=train_config.training.enable_cpu_offload,
+        enable_cpu_backend=train_config.parallelism.fsdp_enable_cpu_offloading,
         base_folder=train_config.dump_folder,
     )
   setup_logger()
 
   assert train_config.model is not None
   model_args = train_config.model
-  model_args.set_sharding_(train_config.parallelism)
+  if hasattr(model_args, "set_sharding_"):
+    model_args.set_sharding_(train_config.parallelism)
   torchtitan.trainer.prepare_model_config(train_config)
 
   parallelism_config = train_config.parallelism
-  parallel_dims = torchtitan.distributed.ParallelDims(
+  parallel_dims = torchtitan.distributed.parallel_dims.ParallelDims(
       dp_shard=parallelism_config.data_parallel_shard_degree,
       dp_replicate=parallelism_config.data_parallel_replicate_degree,
       cp=parallelism_config.context_parallel_degree,
@@ -63,6 +64,7 @@ def _run_model_distributed(
       pp=parallelism_config.pipeline_parallel_degree,
       ep=parallelism_config.expert_parallel_degree,
       world_size=world_size,
+      enable_sequence_parallel=train_config.parallelism.enable_sequence_parallel,
   )
 
   # Initializing model consistently with the way TorchTitan does it.
@@ -84,7 +86,7 @@ def _run_model_distributed(
       training=train_config.training,
       parallelism=train_config.parallelism,
       compile_config=train_config.compile,
-      ac_config=train_config.activation_checkpoint,
+      ac_config=train_config.activation_remat,
       dump_folder=train_config.dump_folder,
   )
   if isinstance(model, Llama3Model):
@@ -121,7 +123,7 @@ def _run_model_distributed(
   n_steps = train_config.training.steps
   # Upstream replaced seq_len/local_batch_size with a token budget:
   # local_batch_size = num_tokens_per_microbatch_per_dp_rank // max_context_length.
-  seq_len = train_config.training.max_context_length
+  seq_len = train_config.model.max_context_length
   batch_size = (
       train_config.training.num_tokens_per_microbatch_per_dp_rank // seq_len
   )
@@ -309,18 +311,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
     args = [
         f"--module={module}",
         f"--config={config}",
-        "--optimizer.implementation=foreach",
         "--hf_assets_path=tests/assets/tokenizer",
         f"--dataloader.dataset_path={dataset_path}",
         f"--dataloader.dataset={dataset}",
-        "--training.max_context_length=32",
+        "--model.max_context_length=32",
         "--training.steps=3",
     ]
-    # Activation checkpoint configuration refactored to use tyro subcommands.
-    # This must go last as tyro expects all subsequent flags to be part of the
-    # subcommand.
-    args.append("activation-checkpoint:none")
-
+    if module != "torchtitan.experiments.tpu.flux":
+      args.append("--optimizer.foreach=true")
     self._test_train_distributed(
         args,
         data_parallel_shard_degree,

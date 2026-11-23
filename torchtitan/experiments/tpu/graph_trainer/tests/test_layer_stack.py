@@ -10,6 +10,7 @@ loads.
 import copy
 import dataclasses
 import functools
+import inspect
 import itertools
 import unittest
 from unittest.mock import patch
@@ -23,14 +24,15 @@ from torch._functorch import config as functorch_config, partitioners
 from torch._higher_order_ops.scan import ScanAutogradImpl
 from torch.distributed.tensor import DTensor, Shard
 
-from torchtitan.components.optim.optimizer import (
-    default_adamw,
-    OptimizersContainer,
-)
-from torchtitan.config import apply_overrides, derive, OverrideConfig
-from torchtitan.config.configs import TrainingConfig
+from torchtitan.components.optim.optimizer import OptimizersContainer
+from torchtitan.experiments.tpu.components.optim import default_adamw
+from torchtitan.config import apply_overrides, derive, OverrideConfig, PrecisionConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.graph_trainer.common_utils import (
+    apply_simple_fsdp,
+    disable_inplace_wgrad_accum,
+)
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     check_layers_are_stackable,
     LayerStackHolder,
@@ -82,7 +84,13 @@ def _config(registry=model_registry):
     so that stacking is the only difference between them: a stock ``Decoder``
     loops over its layers directly and would ignore the stacks entirely.
     """
-    config = registry("debugmodel", attn_backend="sdpa")
+    from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
+    kwargs = {"attn_backend": "flex"}
+    if "parallelism" in inspect.signature(registry).parameters:
+        kwargs["parallelism"] = ParallelismConfig()
+    config = use_tpu_sdpa(registry("debugmodel", **kwargs))
+    disable_inplace_wgrad_accum(config)
     for layer in config.layers:
         layer.attention.rope = dataclasses.replace(
             layer.attention.rope, max_context_length=TOKENS
@@ -99,6 +107,8 @@ def _moe_config(num_experts: int):
     has something to flatten. Load balancing is off because stacking refuses
     it, and weight tying is off for the reason ``TestQwen3._build`` gives.
     """
+    from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
     config = dataclasses.replace(
         _config(qwen3_registry), enable_weight_tying=False
     )
@@ -111,12 +121,15 @@ def _moe_config(num_experts: int):
         moe_hidden_dim=768,
         num_experts=num_experts,
         top_k=2,
-        load_balance_coeff=None,
-        attn_backend="sdpa",
+        attn_backend="flex",
         rope=CosSinRoPE.Config(
             dim=128, max_context_length=SEQ_LEN, theta=1000000.0
         ),
+        enable_sp=False,
+        enable_ep=False,
     )
+    config = use_tpu_sdpa(config)
+    disable_inplace_wgrad_accum(config)
     return config
 
 
@@ -152,9 +165,10 @@ def _build(
         pp=1,
         ep=1,
         world_size=world_size,
+        enable_sequence_parallel=False,
     )
-    training = TrainingConfig(
-        mixed_precision_param=param_dtype, mixed_precision_reduce="float32"
+    precision = PrecisionConfig(
+        param_dtype=param_dtype, reduce_dtype="float32"
     )
     if stacked or scan:
         convert = functools.partial(with_tpu_stacked_layers, use_scan=scan)
@@ -163,14 +177,15 @@ def _build(
     with torch.device("meta"):
         model = convert(config or _config()).build()
     holders = [m for m in model.modules() if hasattr(m, "flatten_for")]
-    if flatten:
+    if scan or flatten:
         for holder in holders:
-            holder.flatten_for(world_size)
+            if flatten:
+                holder.flatten_for(world_size)
             holder._fsdp_shard_dim = holder.plan_shard_dims(world_size)  # pylint: disable=protected-access
     model = apply_simple_fsdp(
         model,
-        parallel_dims=parallel_dims,
-        training=training,
+        parallelism_context=parallel_dims,
+        precision=precision,
     )
     if flatten:
         # Creates process groups, so every rank runs it, before anything
@@ -190,7 +205,7 @@ def _build(
     return model
 
 
-@patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
+@patch("torchtitan.distributed.parallelism_context.device_type", "cpu")
 class TestLayerStack(unittest.TestCase):
     def setUp(self):
         # Same reason as `TestQwen3.setUp`: a scan body of a different shape
@@ -424,7 +439,9 @@ class TestLayerStack(unittest.TestCase):
         check would not notice the optimizer stepping a view.
         """
         model = _build(stacked=True)
-        optimizers = OptimizersContainer(default_adamw(), model_parts=[model])
+        optimizers = OptimizersContainer.Config(
+            optimizers=[default_adamw()]
+        ).build(model_parts=[model])
 
         assigned = [
             p
@@ -586,9 +603,13 @@ class TestStackable(unittest.TestCase):
             )
 
     def _moe_model(self, load_balance_coeff: float | None):
-        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa")
+        config = qwen3_registry(
+            "debugmodel_moe",
+            attn_backend="flex",
+            parallelism=ParallelismConfig(),
+        )
         for layer in config.layers:
-            layer.moe.load_balance_coeff = load_balance_coeff
+            layer.feed_forward.load_balance_coeff = load_balance_coeff
         with torch.device("meta"):
             return config.build()
 
@@ -604,7 +625,7 @@ class TestStackable(unittest.TestCase):
         check_layers_are_stackable(self._moe_model(None).layers)
 
 
-@patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
+@patch("torchtitan.distributed.parallelism_context.device_type", "cpu")
 class TestQwen3(unittest.TestCase):
     """The same two properties on a second model, to pin that none of this is llama3.
 
@@ -683,16 +704,28 @@ class TestQwen3(unittest.TestCase):
         )
 
     def _moe_config_with_global_batch_aux_loss(self, coeff):
-        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa")
+        from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
+        config = use_tpu_sdpa(
+            qwen3_registry(
+                "debugmodel_moe",
+                attn_backend="flex",
+                parallelism=ParallelismConfig(),
+            )
+        )
+        disable_inplace_wgrad_accum(config)
         config = dataclasses.replace(config, enable_weight_tying=False)
         for layer in config.layers:
             layer.attention.rope = dataclasses.replace(
                 layer.attention.rope, max_context_length=TOKENS
             )
-            layer.moe.load_balance_coeff = None
+            layer.feed_forward.load_balance_coeff = None
             if coeff is not None:
-                layer.moe.router.aux_loss = BatchWiseLoadBalanceLoss.Config(
-                    coeff=coeff
+                layer.feed_forward.router.aux_loss = (
+                    BatchWiseLoadBalanceLoss.Config(
+                        coeff=coeff,
+                        num_experts=layer.feed_forward.num_experts,
+                    )
                 )
         # As in the 235B scan recipe: no `tokens_per_expert_E` write either.
         apply_overrides(
@@ -729,8 +762,12 @@ class TestQwen3(unittest.TestCase):
         no_aux.load_state_dict(copy.deepcopy(plain.state_dict()))
         tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
+        denom = torch.tensor([TOKENS], dtype=torch.float32)
         with set_unflatten_seq_len(SEQ_LEN):
-            outputs = [model(tokens) for model in (plain, scanned, no_aux)]
+            outputs = [
+                model(tokens, aux_loss_denominators=denom)
+                for model in (plain, scanned, no_aux)
+            ]
             for output in outputs:
                 output.sum().backward()
         # Relative Frobenius norm, not elementwise: the bf16 experts leave
@@ -741,7 +778,7 @@ class TestQwen3(unittest.TestCase):
         self.assertLess(output_error, 1e-2)
 
         stacks = getattr(scanned, STACK_ATTR)._parameters
-        gate = "moe.router.gate.weight"
+        gate = "feed_forward.router.gate.weight"
         scan_error, aux_effect = [], []
         for i, (layer, no_aux_layer) in enumerate(
             zip(plain.layers.values(), no_aux.layers.values(), strict=True)

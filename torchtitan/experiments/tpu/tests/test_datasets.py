@@ -211,16 +211,17 @@ class FluxRandomDataloaderTest(absltest.TestCase):
     from unittest import mock
     import datasets as hf_datasets
     from torchtitan.experiments.tpu import train as tpu_train
+    from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
     from torchtitan.models.flux import trainer as flux_trainer
-    from torchtitan.models.flux import build_model_config as model_registry
+    from torchtitan.experiments.tpu.flux import flux_configs
     from torchtitan_recipes.models.flux import flux_dev
     from torchtitan.models.flux.random_loader import RandomDataloader
     from torchtitan.models.flux.tokenizer import FluxTokenizer
     from torchtitan.models.flux.trainer import FluxTrainer
     from torchtitan.trainer import Trainer
 
-    config = flux_dev()
-    config.model = model_registry("flux-test")
+    config = TPUTrainerConfig.derive_from(flux_dev())
+    config.model = flux_configs["flux-debug"]
     config.flux.random_dataset = True
     config.flux.img_size = 1024
     config.training.num_tokens_per_microbatch_per_dp_rank = 9216
@@ -235,7 +236,7 @@ class FluxRandomDataloaderTest(absltest.TestCase):
           dp_world_size=1,
           dp_rank=0,
           tokenizer=trainer_self.tokenizer,
-          max_context_length=cfg.training.max_context_length,
+          max_context_length=cfg.model.max_context_length,
           num_tokens_per_microbatch=(
               cfg.training.num_tokens_per_microbatch_per_dp_rank
           ),
@@ -248,11 +249,6 @@ class FluxRandomDataloaderTest(absltest.TestCase):
 
     with (
         mock.patch.object(Trainer, "__init__", _fake_super_init),
-        # FluxTrainer's default is relative to the repo root; use this file's
-        # tokenizer path, which follows any remapping of test asset paths.
-        mock.patch.object(
-            flux_trainer, "_LOCAL_TOKENIZER_PATH", self._TOKENIZER_PATH
-        ),
         mock.patch.object(
             hf_datasets,
             "load_dataset",

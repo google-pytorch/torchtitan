@@ -6,7 +6,8 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 import torch.nn as nn
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
-from torchtitan.config.parallelism import ParallelismConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
@@ -39,10 +40,8 @@ def _get_qwen3_model_config(model_name: str = "testmodel") -> Qwen3Model.Config:
   vocab_size=2048, max_seq_len=128).
   """
   import copy
-  from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
 
   config = copy.deepcopy(qwen3_tpu.qwen3_configs[model_name])
-  set_qwen3_sharding_config(config, enable_sp=False, enable_ep=False)
   return config
 
 
@@ -154,6 +153,7 @@ def _verify_dtensor_qwen3_fsdp_training_loop_worker(
       pp=1,
       ep=1,
       world_size=world_size,
+      enable_sequence_parallel=False,
   )
 
   def apply_fsdp_wrapper(model):

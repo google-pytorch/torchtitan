@@ -10,6 +10,7 @@ from torchtitan.observability import metrics
 from torchtitan.components import optim as optimizer
 from torchtitan.components.optim import lr_scheduler
 from torchtitan.config import configs
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import activation_remat
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
@@ -69,7 +70,7 @@ def mamba3_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
           num_tokens_per_microbatch_per_dp_rank=8 * 262144,
           steps=1000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
       activation_remat=activation_remat.FullActivationRematConfig(),
   )

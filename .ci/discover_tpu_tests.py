@@ -148,6 +148,71 @@ DISABLED_TESTS = {
     "torchtitan.experiments.jax.tests.test_distributed",
     # TODO: get_peak_flops() rejects 'cpu', so MFU setup raises; make MFU optional.
     "torchtitan.experiments.jax.tests.test_train_distributed",
+    # --- Added in Interval 7 (2026-11-15) ---
+    # Missing optional dependency attn_gym (CUDA/Triton kernels)
+    "tests.rl.unit_tests.cpu.test_batcher",
+    "tests.rl.unit_tests.cpu.test_batcher_actor",
+    "tests.rl.unit_tests.cpu.test_geometry3k",
+    "tests.rl.unit_tests.cpu.test_multiturn_images",
+    "tests.rl.unit_tests.cpu.test_rdma_microbatch",
+    "tests.rl.unit_tests.cpu.test_session_kv_holder",
+    "tests.rl.unit_tests.cpu.test_trainer_loop",
+    "tests.rl.unit_tests.cpu.test_vllm_dist_moe_padding_mask",
+    "tests.rl.unit_tests.cpu.test_vllm_multimodal_wrapper",
+    "tests.rl.unit_tests.cpu.test_vllm_registry",
+    "tests.unit_tests.cpu.components.data.test_mm_dataset_preprocessing",
+    "tests.unit_tests.cpu.components.data.test_mrope_positions",
+    "tests.unit_tests.cpu.components.data.test_packed_vision",
+    "tests.unit_tests.cpu.models.common.test_cp_attention",
+    "tests.unit_tests.cpu.models.common.test_feed_forward",
+    "tests.unit_tests.cpu.models.common.test_multimodal",
+    "tests.unit_tests.cpu.models.common.test_rope",
+    "tests.unit_tests.cpu.models.common.test_rope_cache_tying",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_compressor",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_dsa",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_flops",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_mhc",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_moe",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_mtp",
+    "tests.unit_tests.cpu.models.deepseek_v4.test_deepseek_v4_pipeline",
+    "tests.unit_tests.cpu.models.test_state_dict_adapter",
+    "tests.unit_tests.cpu.recipes.test_deepseek_v4_dist_muon",
+    "tests.unit_tests.cpu.test_deepseek_v4_indexer_loss",
+    # Missing optional dependency torchstore
+    "tests.rl.unit_tests.cpu.test_launcher",
+    # Missing optional dependency vllm
+    "tests.rl.unit_tests.cpu.test_vllm_attention",
+    # Missing optional dependency torch_checkpointing
+    "tests.unit_tests.cpu.components.checkpointer.test_torch_checkpointing",
+    "tests.unit_tests.cpu.recipes.test_muse_spark",
+    "tests.unit_tests.cpu.recipes.test_slake",
+    # Missing renderers.CustomRendererConfig in installed renderers package
+    "tests.unit_tests.cpu.components.test_renderer",
+    "tests.unit_tests.cpu.models.qwen3_5.test_qwen3_5_renderer",
+    "tests.unit_tests.cpu.models.muse_glimmer.test_muse_glimmer_renderer",
+    # Missing optional dependency cutlass
+    "tests.unit_tests.cpu.quantization.test_quantization",
+    # torchtitan.scripts is not an importable package
+    "tests.unit_tests.cpu.scripts.test_download_hf_assets",
+    # Tests removed upstream MoELoadBalanceAuxLoss and collect_moe_routing_metric_tensors
+    "tests.unit_tests.test_moe_aux_loss",
+    # Missing optional dependency dist_moe
+    "torchtitan.experiments.graph_trainer.tests.test_dist_moe",
+    "torchtitan.experiments.graph_trainer.tests.test_graph_pp_runner",
+    # Missing optional attn_gym.linear.gdn.impl.cudnn in installed attn-gym 0.0.8
+    "torchtitan.experiments.graph_trainer.tests.test_inplace_wgrad_accum_config",
+    "tests.unit_tests.cpu.models.common.test_gdn",
+    "tests.unit_tests.cpu.models.common.test_transformer_block",
+    "tests.unit_tests.cpu.models.qwen3_5.test_qwen3_5_mrope_positions",
+    "tests.unit_tests.cpu.models.qwen3_5.test_qwen3_5_state_dict_adapter",
+    "tests.unit_tests.cpu.models.qwen3_6.test_qwen3_6",
+    "tests.unit_tests.cpu.models.qwen3_8.test_qwen3_8",
+    "tests.unit_tests.cpu.models.test_mla_state_dict_adapter",
+    # All tests skipped in TPU image (pytest exit code 5) due to missing optional deps
+    "tests.rl.unit_tests.cpu.test_model_defaults",
+    "tests.rl.unit_tests.cpu.test_rl_dist_moe_recipe",
+    "tests.rl.unit_tests.cpu.test_slake",
+    "tests.rl.unit_tests.cpu.test_verifiers_terminal_bench",
 }
 
 # Upstream GPU-only tests; upstream runs these only on CUDA runners.

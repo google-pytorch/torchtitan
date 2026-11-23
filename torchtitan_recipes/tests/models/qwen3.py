@@ -23,7 +23,6 @@ from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import (
     Adam,
     AdamW,
-    default_adamw,
     LRSchedulersContainer,
     Optim,
     OptimizersContainer,
@@ -462,30 +461,6 @@ def qwen3_30b_a3b(seq_len: int | None = None) -> Trainer.Config:
         checkpointer=None,
         activation_remat=FullActivationRematConfig(),
     )
-
-
-def qwen3_30b_a3b_global_aux(seq_len: int | None = None) -> Trainer.Config:
-    """Qwen3 30B-A3B with a globally-normalized MoE auxiliary loss."""
-    seq_len = 2048 if seq_len is None else seq_len
-    config = qwen3_30b_a3b(seq_len=seq_len)
-    config.model = build_model_config("30B-A3B-global-aux", seq_len=seq_len)
-    config.metrics = MetricsProcessor.Config(log_freq=1, enable_moe_routing=True)
-    config.optim.optimizer = default_adamw(lr=3e-4)
-    config.optim.lr_scheduler = LRSchedulersContainer.Config(
-        warmup_steps=200,
-        total_steps=40000,
-        decay_type="linear",
-        min_lr_factor=0.0,
-    )
-    # 12 sequences per DP rank and 768 sequences per train step. Expressed in
-    # token budgets because upstream d771abb0 replaced local_batch_size /
-    # global_batch_size / seq_len with num_tokens_* fields.
-    config.training.max_context_length = seq_len
-    config.training.num_tokens_per_microbatch_per_dp_rank = 12 * seq_len
-    config.training.num_tokens_per_train_step = 768 * seq_len
-    config.training.steps = 250
-    config.activation_checkpoint = None
-    return config
 
 
 def qwen3_32b(seq_len: int | None = None) -> Trainer.Config:

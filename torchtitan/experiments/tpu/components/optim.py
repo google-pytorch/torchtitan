@@ -1,3 +1,5 @@
+# Copyright 2026 Google LLC
+
 """TPU optimizer config helpers."""
 
 from torchtitan.components.optim import AdamW

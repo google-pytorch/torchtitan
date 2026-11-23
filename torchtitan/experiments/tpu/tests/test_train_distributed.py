@@ -199,7 +199,7 @@ class TrainDistributedTest(
           args=[
               "--training.dtype=bfloat16",
               "--loss_kernel.use_loss_kernel",
-              "--training.max_context_length=1024",
+              "--model.max_context_length=1024",
               "--training.num_tokens_per_microbatch_per_dp_rank=4096",
               "--loss_kernel.loss_b_block_size=128",
               "--loss_kernel.loss_h_block_size=128",
@@ -311,7 +311,7 @@ class TrainDistributedTest(
           args=[
               "--training.dtype=bfloat16",
               "--loss_kernel.use_loss_kernel",
-              "--training.max_context_length=1024",
+              "--model.max_context_length=1024",
               "--training.num_tokens_per_microbatch_per_dp_rank=4096",
               "--loss_kernel.loss_b_block_size=128",
               "--loss_kernel.loss_h_block_size=128",
@@ -411,7 +411,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=512",
+              "--model.max_context_length=512",
               "--training.num_tokens_per_microbatch_per_dp_rank=2048",
               "--splash_attention_kernel.use_splash_attention_kernel",
           ],
@@ -428,7 +428,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=512",
+              "--model.max_context_length=512",
               "--training.num_tokens_per_microbatch_per_dp_rank=2048",
               "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
           ],
@@ -445,7 +445,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
           skip_devices=[
@@ -480,7 +480,7 @@ class TrainDistributedTest(
           # layers actually mask. The token budget keeps 4 sequences per rank.
           args=[
               "--parallelism.no-use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -492,7 +492,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -507,7 +507,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=512",
+              "--model.max_context_length=512",
               "--training.num_tokens_per_microbatch_per_dp_rank=2048",
               "--splash_attention_kernel.use_splash_attention_kernel",
           ],
@@ -526,7 +526,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=512",
+              "--model.max_context_length=512",
               "--training.num_tokens_per_microbatch_per_dp_rank=2048",
               "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
           ],
@@ -545,7 +545,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
           skip_devices=[
@@ -563,7 +563,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=2,
           args=[
               "--parallelism.no-use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -601,7 +601,7 @@ class TrainDistributedTest(
           config="qwen35_moe_debugmodel_tpu_moe_kernels",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          args=["--training.mixed_precision_param=bfloat16"],
+          args=["--precision.param_dtype=bfloat16"],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
@@ -627,7 +627,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
           skip_devices=[
@@ -658,14 +658,14 @@ class TrainDistributedTest(
     default_args = [
         f"--module={module}",
         f"--config={config}",
-        f"--optimizer.implementation={optimizer_implementation}",
+        ("--optimizer.fused=true" if optimizer_implementation == "fused" else "--optimizer.foreach=true" if optimizer_implementation == "foreach" else "--optimizer.foreach=false"),
         f"--dataloader.dataset_path={dataset_path}",
         f"--dataloader.dataset={dataset}",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.max_context_length=128",
+        "--model.max_context_length=128",
         "--training.steps=3",
-        "--training.mixed_precision_param=float32",
-        "--training.mixed_precision_reduce=float32",
+        "--precision.param_dtype=float32",
+        "--precision.reduce_dtype=float32",
         (
             "--training.num_tokens_per_microbatch_per_dp_rank="
             f"{128 if module.endswith('flux') else 512}"

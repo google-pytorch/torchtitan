@@ -17,7 +17,8 @@ from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.deepseek_v3.model import Attention, DeepSeekV3Model, DeepSeekV3TransformerBlock
+from torchtitan.models.deepseek_v3.attention import DeepSeekMLAAttention as Attention
+from torchtitan.models.deepseek_v3.model import DeepSeekV3Model, DeepSeekV3TransformerBlock
 
 
 def _get_model_config(model_name: str = "testmodel") -> DeepSeekV3Model.Config:
@@ -34,7 +35,13 @@ def _get_model_config(model_name: str = "testmodel") -> DeepSeekV3Model.Config:
     - head_dim = 16, rope_theta = 10000.0, kv_lora_rank = 512
     - moe_hidden_dim = 128, num_experts = 8, router_top_k = 2
   """
-  return deepseek_v3_tpu.deepseekv3_configs[model_name]
+  import copy
+
+  cfg = copy.deepcopy(deepseek_v3_tpu.deepseekv3_configs[model_name])
+  for layer in cfg.layers:
+    if hasattr(layer.feed_forward, "router"):
+      layer.feed_forward.router.aux_loss = None
+  return cfg
 
 
 FULL_MODEL_TEST_CONFIGS = [

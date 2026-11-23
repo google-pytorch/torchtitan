@@ -104,7 +104,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
             "--training.num_tokens_per_microbatch_per_dp_rank=32",
-            "--training.max_context_length=16",
+            "--model.max_context_length=16",
             "--compile.mode=fullgraph",
         ]),
     )
@@ -134,7 +134,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
             "--training.num_tokens_per_microbatch_per_dp_rank=32",
-            "--training.max_context_length=16",
+            "--model.max_context_length=16",
             "--compile.mode=fullgraph",
             "--loss-kernel.use-loss-kernel",
         ]),

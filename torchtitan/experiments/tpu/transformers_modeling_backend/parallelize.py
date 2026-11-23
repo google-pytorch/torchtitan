@@ -76,25 +76,35 @@ def parallelize_hf_transformers_tpu(
     *,
     parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
     parallelism_context: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
-    training: torchtitan.config.TrainingConfig,
+    training: torchtitan.config.TrainingConfig | None = None,
+    precision: torchtitan.config.PrecisionConfig | None = None,
     parallelism: torchtitan.config.ParallelismConfig,
-    compile_config: LocalCompileConfig,
-    ac_config,
+    compile_config: LocalCompileConfig | None = None,
+    local_compile: LocalCompileConfig | None = None,
+    ac_config=None,
+    activation_remat=None,
     dump_folder: str,
     tpu_compile_mode: str = "layer",
     **kwargs,
 ) -> nn.Module:
   """Apply TP/AC/compile via the backend, then SimpleFSDP data parallelism."""
+  del training  # unused; precision carries dtype/mixed precision config
   if parallel_dims is None:
     parallel_dims = parallelism_context
   assert parallel_dims is not None
+  if precision is None:
+    precision = torchtitan.config.PrecisionConfig()
+  if compile_config is None:
+    compile_config = local_compile
+  assert compile_config is not None
+  effective_ac = activation_remat if activation_remat is not None else ac_config
   # TODO b/499075866: re-enable CPU offload for TPU torchtitan run.
-  if training.enable_cpu_offload:
+  if parallelism.fsdp_enable_cpu_offloading:
     logger.warning(
         "CPU offload is not supported for TPU torchtitan run, setting it to"
         " False."
     )
-    training.enable_cpu_offload = False
+    parallelism.fsdp_enable_cpu_offloading = False
 
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
@@ -120,11 +130,11 @@ def parallelize_hf_transformers_tpu(
 
   parallelize_hf_transformers(
       model,
-      parallel_dims=parallel_dims,
-      training=training,
+      parallelism_context=parallel_dims,
+      precision=precision,
       parallelism=parallelism,
-      compile_config=effective_compile_config,
-      ac_config=ac_config,
+      local_compile=effective_compile_config,
+      activation_remat=effective_ac,
       dump_folder=dump_folder,
       # With SimpleFSDP this lane wraps data parallelism itself (below); with it
       # off, the shared parallelize applies its own fully_shard in this same

@@ -108,7 +108,7 @@ def _parallelize_gemma4(
           training.mixed_precision_reduce
       ],
       pp_enabled=parallel_dims.pp_enabled,
-      cpu_offload=training.enable_cpu_offload,
+      cpu_offload=parallelism.fsdp_enable_cpu_offloading,
       reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
       ep_degree=parallel_dims.ep,
       edp_mesh=edp_mesh,

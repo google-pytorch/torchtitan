@@ -530,7 +530,6 @@ class Profiler(Configurable):
         }
 
         wait = profile_freq - (active + warmup)
-        from torchtitan.tools.utils import device_type
 
         activities: list[Any] = [torch.profiler.ProfilerActivity.CPU]
         experimental_config = None

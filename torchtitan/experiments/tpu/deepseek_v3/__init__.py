@@ -62,7 +62,7 @@ def _testmodel(
       ),
   )
   # pytype: enable=wrong-keyword-args
-  return deepseek_v3_models.DeepSeekV3Model.Config(
+  cfg = deepseek_v3_models.DeepSeekV3Model.Config(
       max_context_length=128,
       vocab_size=vocab_size,
       dim=dim,
@@ -70,17 +70,26 @@ def _testmodel(
           num_embeddings=vocab_size,
           embedding_dim=dim,
           param_init=deepseek_v3_models._EMBEDDING_INIT,
+          sharding_config=deepseek_v3_models.token_embedding_sharding_config(
+              enable_sp=False
+          ),
       ),
       norm=common_models.RMSNorm.Config(
-          normalized_shape=dim, param_init=deepseek_v3_models._NORM_INIT
+          normalized_shape=dim,
+          param_init=deepseek_v3_models._NORM_INIT,
+          sharding_config=deepseek_v3_models.norm_sharding_config(
+              enable_sp=False
+          ),
       ),
       lm_head=common_models.Linear.Config(
           in_features=dim,
           out_features=vocab_size,
           param_init=deepseek_v3_models._output_linear_init(dim),
+          sharding_config=deepseek_v3_models.lm_head_sharding_config(),
       ),
       layers=layers,
   )
+  return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 def _testmodel_moe(
@@ -123,7 +132,7 @@ def _testmodel_moe(
       ),
   )
   # pytype: enable=wrong-keyword-args
-  return deepseek_v3_models.DeepSeekV3Model.Config(
+  cfg = deepseek_v3_models.DeepSeekV3Model.Config(
       max_context_length=128,
       vocab_size=vocab_size,
       dim=dim,
@@ -131,17 +140,26 @@ def _testmodel_moe(
           num_embeddings=vocab_size,
           embedding_dim=dim,
           param_init=deepseek_v3_models._EMBEDDING_INIT,
+          sharding_config=deepseek_v3_models.token_embedding_sharding_config(
+              enable_sp=False
+          ),
       ),
       norm=common_models.RMSNorm.Config(
-          normalized_shape=dim, param_init=deepseek_v3_models._NORM_INIT
+          normalized_shape=dim,
+          param_init=deepseek_v3_models._NORM_INIT,
+          sharding_config=deepseek_v3_models.norm_sharding_config(
+              enable_sp=False
+          ),
       ),
       lm_head=common_models.Linear.Config(
           in_features=dim,
           out_features=vocab_size,
           param_init=deepseek_v3_models._output_linear_init(dim),
+          sharding_config=deepseek_v3_models.lm_head_sharding_config(),
       ),
       layers=layers,
   )
+  return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 def _upstream_flavor(flavor: str, attn_backend: str):

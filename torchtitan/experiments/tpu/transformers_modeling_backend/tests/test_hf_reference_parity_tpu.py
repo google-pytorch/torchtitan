@@ -88,10 +88,15 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   # Upstream ec953b36: dataloaders yield TrainingMicrobatch objects.
   microbatch = next(iter(trainer.dataloader))
   batch = dict(microbatch.as_input_dict())
-  valid = microbatch.num_valid_tokens
+  valid = getattr(microbatch, "loss_token_counts", None)
   batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-  tokens, labels, extra = wrapper.preprocess_inputs(
-      batch, parallel_dims=trainer.parallel_dims, parallelism=config.parallelism
+  from torchtitan.distributed.parallelism_context import ParallelismContext
+
+  parallelism_context = ParallelismContext(
+      dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+  )
+  tokens, labels, extra, _loss_kwargs = wrapper.preprocess_inputs(
+      batch, parallelism_context=parallelism_context, parallelism=config.parallelism
   )
   if valid is None:
     valid = (labels != IGNORE_INDEX).sum()

@@ -72,12 +72,22 @@ class TpuTrainingEngine(TrainingEngine):
       model_config: Any,
       max_num_documents: int | None,
       output_dir: str,
+      **kwargs: Any,
   ) -> None:
+    from torchtitan.components.optim import OptimizersContainer  # pylint: disable=g-import-not-at-top
+
+    if hasattr(config, "optim") and not isinstance(
+        config.optim.optimizer, OptimizersContainer.Config
+    ):
+      config.optim.optimizer = OptimizersContainer.Config(
+          optimizers=[config.optim.optimizer]
+      )
     super().__init__(
         config,
         model_config=model_config,
         max_num_documents=max_num_documents,
         output_dir=output_dir,
+        **kwargs,
     )
     self._is_tpu_config = isinstance(
         config, tpu_job_config_module.TPUTrainerConfig
@@ -151,12 +161,10 @@ class TpuTrainingEngine(TrainingEngine):
   def _initialize_model(
       self,
       *,
-      compile_config: Any,
       hf_assets_path: str,
       create_seed_checkpoint: bool = False,
   ) -> None:
     super()._initialize_model(
-        compile_config=compile_config,
         hf_assets_path=hf_assets_path,
         create_seed_checkpoint=create_seed_checkpoint,
     )
@@ -318,6 +326,23 @@ def _apply_flux_img_size(
   )
 
 
+def _maybe_enable_min_cost_redistribute(
+    stack: contextlib.ExitStack, parallelism
+) -> None:
+  """Switches DTensor to the min-cost redistribution planner, if requested."""
+  if not parallelism.enable_min_cost_redistribute:
+    return
+
+  from torch.distributed.tensor._redistribute import (  # pylint: disable=g-import-not-at-top
+      _gen_transform_infos,
+      use_min_cost_redistribution_plan,
+  )
+
+  stack.enter_context(use_min_cost_redistribution_plan(True))
+  _gen_transform_infos.cache_clear()
+  logger.info("Using DTensor min-cost (graph-based) redistribution planner.")
+
+
 def start_trainer(
     train_config: tpu_job_config_module.TPUTrainerConfig
     | TpuGraphTrainer.Config,
@@ -392,7 +417,7 @@ def start_trainer(
 
   try:
     with contextlib.ExitStack() as stack:
-      torchtitan.train._maybe_enable_min_cost_redistribute(  # pylint: disable=protected-access
+      _maybe_enable_min_cost_redistribute(
           stack,
           train_config.parallelism,
       )

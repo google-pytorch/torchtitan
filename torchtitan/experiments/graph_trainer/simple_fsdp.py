@@ -591,7 +591,8 @@ def data_parallel(
                 # Check if the parameter is smaller than the device mesh dimension.
                 # If so, replicate it instead of sharding it.
                 actual_sharding = [
-                    Shard(dim) if isinstance(pl, Shard) else pl for pl in param_sharding
+                    Shard(dim) if isinstance(pl, Shard) and dim != template_dim else pl
+                    for pl in param_sharding
                 ]
                 for i, placement in enumerate(actual_sharding):
                     if isinstance(placement, Shard) and p.shape[placement.dim] < device_mesh.size(i):

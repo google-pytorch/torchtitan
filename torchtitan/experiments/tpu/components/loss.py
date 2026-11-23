@@ -174,6 +174,19 @@ class PallasCrossEntropyLoss(components_loss.Loss):
       logger.info("Compiling the Pallas loss function with torch.compile")
       self.fn = torch.compile(self.fn, backend=compile_config.backend)
 
+  def __call__(
+      self,
+      pred: torch.Tensor,
+      labels: torch.Tensor,
+      global_loss_token_counts: torch.Tensor | None = None,
+      **kwargs: Any,
+  ) -> components_loss.LossResult:
+    del kwargs
+    loss = self.fn(pred, labels)
+    if global_loss_token_counts is not None:
+      loss = loss / global_loss_token_counts
+    return loss, {}
+
 
 def _legacy_pallas_loss_config(
     job_config: tpu_job_config_module.TPUTrainerConfig,

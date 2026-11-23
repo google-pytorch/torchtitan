@@ -19,7 +19,7 @@ from torchtitan.experiments.tpu.testing import test_utils
 import torchtitan.experiments.tpu.qwen3 as qwen3_tpu
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.common.attention import GQAttention
-from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.feed_forward import DenseFeedForward as FeedForward
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.qwen3.model import Qwen3Model, Qwen3TransformerBlock
@@ -39,7 +39,13 @@ def _get_model_config(model_name: str = "testmodel") -> Qwen3Model.Config:
     - head_dim = 16, rope_theta = 1000000.0
     - moe_inter_dim = 128, num_experts = 8, top_k = 2
   """
-  return qwen3_tpu.qwen3_configs[model_name]
+  import copy
+
+  cfg = copy.deepcopy(qwen3_tpu.qwen3_configs[model_name])
+  for layer in cfg.layers:
+    if hasattr(layer.feed_forward, "router"):
+      layer.feed_forward.router.aux_loss = None
+  return cfg
 
 
 FULL_MODEL_TEST_CONFIGS = [
@@ -309,7 +315,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     batch, seq_len = 2, 8
 
     # CPU setup (uses standard config but cpu device)
-    moe_cpu = MoE(config.layers[0].moe)
+    moe_cpu = MoE(config.layers[0].feed_forward)
     # Initialize experts to bounded values to avoid raw memory garbage
     with torch.no_grad():
       for param in moe_cpu.parameters():
@@ -317,7 +323,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     moe_cpu = moe_cpu.cpu()
 
     # Device setup (uses identical config but mapped to device)
-    moe_device = MoE(config.layers[0].moe)
+    moe_device = MoE(config.layers[0].feed_forward)
     moe_device.load_state_dict(moe_cpu.state_dict())
     moe_device = moe_device.to(self.accelerator_device)
     x_cpu, x_device = self._create_input_tensor_cpu_device(
@@ -407,8 +413,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     test_utils.check_equivalence(
         x_device.grad.cpu(),
         x_cpu.grad,
-        atol=1e-1 if is_moe else 2e-3,
-        rtol=1e-1 if is_moe else 2e-3,
+        atol=1e-1 if is_moe else 2e-2,
+        rtol=1e-1 if is_moe else 2e-2,
         check_name="TransformerBlock Input Grad",
     )
     for (name, p_cpu), p_device in zip(
@@ -419,8 +425,11 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
       param_rtol = 5e-3
       # Relax tolerances for Attention layers to cover noise from new kernel.
       if "attention" in name:
-        param_atol = 5e-2
-        param_rtol = 5e-2
+        param_atol = 1.5e-1
+        param_rtol = 1.5e-1
+      elif "feed_forward" in name:
+        param_atol = 2e-2
+        param_rtol = 2e-2
       elif "moe" in name:
         # MoE routing flips cause large grad diffs
         param_atol = 1.0

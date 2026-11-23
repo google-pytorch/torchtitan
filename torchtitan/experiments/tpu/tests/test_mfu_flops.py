@@ -54,12 +54,11 @@ class FlopsConventionTest(absltest.TestCase):
 
   def test_qwen3_model_config_reports_torchtitan_flops(self) -> None:
     model_config = tpu_qwen3_model_registry("30B-A3B")
-    self.assertEqual(
-        model_config.get_nparams_and_flops(
-            _build(model_config), seq_len=2048
-        )[1],
-        23_083_044_864,
+    model = _build(model_config)
+    flops = model_config.build_flops_estimator(model, seq_len=2048)(
+        {"input": torch.empty(1, 1)}
     )
+    self.assertEqual(flops, 23_083_044_864)
 
   def test_maxtext_qwen3_config_reports_maxtext_flops(self) -> None:
     model_config = MaxTextQwen3Config.from_qwen3(qwen3_configs["30B-A3B"])

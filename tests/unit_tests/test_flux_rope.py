@@ -9,7 +9,7 @@ import unittest
 from einops import rearrange
 import torch
 from torch import nn, Tensor
-from torchtitan.models.flux.model.layers import apply_rope, EmbedND, rope
+from torchtitan.models.flux.layers import apply_rope, EmbedND, rope
 
 
 # --- Original (Reference) Implementation ---

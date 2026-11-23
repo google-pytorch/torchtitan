@@ -150,8 +150,9 @@ class RayTPUPolicyTrainer(PolicyTrainer):
             
         # TPU does not support fused AdamW natively, so we fallback to the foreach implementation
         config = args[0] if len(args) > 0 else kwargs.get("config")
-        if config is not None:
-            config.optim.optimizer.implementation = "foreach"
+        if config is not None and hasattr(config.optim.optimizer, "foreach"):
+            config.optim.optimizer.fused = False
+            config.optim.optimizer.foreach = True
             
         super().__init__(*args, **kwargs)
         
@@ -177,14 +178,15 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
         patch_varlen_attention(target_device)
 
-        model_spec.model.set_sharding_(config.parallelism)
+        if hasattr(model_spec.model, "set_sharding_"):
+            model_spec.model.set_sharding_(config.parallelism)
         update_from_config = getattr(model_spec.model, "update_from_config", None)
         if update_from_config is not None:
             update_from_config(config=config)
         max_seq_len = model_spec.model.max_seq_len
         # Upstream d771abb0 renamed training.seq_len ->
         # training.max_context_length.
-        seq_len = config.training.max_context_length
+        seq_len = config.model.max_context_length
         if seq_len > max_seq_len:
             raise ValueError(
                 f"Training sequence length {seq_len} exceeds "

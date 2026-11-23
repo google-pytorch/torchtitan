@@ -82,10 +82,10 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     module_cpu = module_class(*module_args, **module_kwargs).cpu()
     init_fn(module_cpu)
     # Create an identical copy on the accelerator device.
-    module_device = (
-        copy.deepcopy(module_cpu)
-        .to(dtype=test_utils.EXPECTED_DEVICE_DTYPE, device=self.accelerator_device)
-    )
+    module_device = copy.deepcopy(module_cpu).to(device=self.accelerator_device)
+    if test_utils.EXPECTED_DEVICE_DTYPE != test_utils.EXPECTED_CPU_DTYPE:
+      for p in module_device.parameters():
+        p.data = p.data.to(dtype=test_utils.EXPECTED_DEVICE_DTYPE)
 
     cpu_weight = next(module_cpu.parameters())
     assert cpu_weight.dtype == test_utils.EXPECTED_CPU_DTYPE, (

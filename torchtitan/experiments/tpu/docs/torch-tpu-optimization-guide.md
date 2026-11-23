@@ -547,8 +547,7 @@ Constraints:
 
 - It is a GraphTrainer compile option, traced with `compile.mode="aot_fx_trace"`: an eager
   `scan` does not run on TPU.
-- It needs PyTorch with pytorch/pytorch#203334 and #203534, which are not in 2.15. On an older
-  PyTorch the first trace raises.
+- It needs PyTorch with pytorch/pytorch#203334 and #203534, which are not in 2.15.
 - Not every parallelism is supported. Data-parallel meshes work, FSDP and HSDP (the 2-D shard x
   replicate mesh) are tested; tensor, context, pipeline and expert parallelism are rejected.
 - The layer body must not mutate its inputs or module state; `scan` raises at trace time. MoE

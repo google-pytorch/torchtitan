@@ -20,7 +20,6 @@ from torchtitan.components.checkpointer import BaseCheckpointManager, Checkpoint
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import ChunkedLossWrapper, Loss
 from torchtitan.components.optim import Optim
-from torchtitan.components.optim.optimizer import configure_moe_routing_metrics
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import (
     CommConfig,
@@ -462,12 +461,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.model_parts = [model]
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
-
-        metrics_cfg = getattr(config, "metrics", None)
-        enable_moe_routing = bool(getattr(metrics_cfg, "enable_moe_routing", False))
-        self._collect_moe_routing_metrics = configure_moe_routing_metrics(
-            self.model_parts, enable_moe_routing
-        )
 
         with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:

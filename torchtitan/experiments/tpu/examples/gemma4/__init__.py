@@ -4,7 +4,7 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.optim import register_moe_load_balancing_hook
+from torchtitan.models.common.moe import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
@@ -26,9 +26,14 @@ from torchtitan.models.common.linear import (
     RouterGateLinear,
     RowParallelLinear,
 )
-from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    TpuGroupedExperts,
+    TpuGroupedExpertsConverter,
+    TpuRoutedExperts,
+)
+from torchtitan.models.common.moe import MicrobatchWiseLoadBalanceLoss
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 from torchtitan.config.transform import (
@@ -140,10 +145,8 @@ def _make_moe_config(
             top_k=top_k,
             score_func=Softmax.Config(),
             route_norm=True,
-            aux_loss=MoELoadBalanceAuxLoss.Config(
-                type="sequence_wise",
+            aux_loss=MicrobatchWiseLoadBalanceLoss.Config(
                 coeff=aux_loss_coeff,
-                top_k=top_k,
             )
             if aux_loss_coeff > 0
             else None,
@@ -159,7 +162,7 @@ def _make_moe_config(
             ),
             param_init=param_init["router"],
         ),
-        routed_experts=RoutedExperts.Config(
+        routed_experts=TpuRoutedExperts.Config(
             inner_experts=TpuGroupedExperts.Config(
                 activation="gelu_tanh",
                 dim=dim,

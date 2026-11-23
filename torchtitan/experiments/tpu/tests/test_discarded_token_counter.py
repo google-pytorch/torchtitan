@@ -1,3 +1,4 @@
+from torchtitan.experiments.tpu.components.grouped_experts import GroupedExperts, TpuRoutedExperts
 """Tests for the discarded MoE token-counter override."""
 
 from absl.testing import absltest
@@ -9,16 +10,19 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
     tpu_discarded_token_counter,
 )
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    GroupedExperts,
+    TpuRoutedExperts,
+)
 from torchtitan.models.common.activation import Softmax
-from torchtitan.models.common.config_utils import make_aux_loss_config, make_moe_config
+from torchtitan.models.common.config_utils import make_moe_config
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
-    GroupedExperts,
+    MicrobatchWiseLoadBalanceLoss,
     MoE,
-    RoutedExperts,
     TokenChoiceTopKRouter,
 )
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
+from torchtitan.models.common.moe.token_dispatcher import LocalTokenDispatcher
 
 
 _NUM_EXPERTS, _TOP_K, _DIM = 4, 2, 8
@@ -43,7 +47,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
               in_features=_DIM, out_features=_NUM_EXPERTS, bias=False
           ),
       ),
-      routed_experts=RoutedExperts.Config(
+      routed_experts=TpuRoutedExperts.Config(
           inner_experts=GroupedExperts.Config(
               dim=_DIM,
               hidden_dim=_DIM,
@@ -59,11 +63,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
     # `aux_loss_coeff` only builds the microbatch-wise loss. The sequence-wise
     # variant this test exercises is a fork addition set as
     # `TokenChoiceTopKRouter.Config.aux_loss`.
-    config.router.aux_loss = make_aux_loss_config(
-        type="sequence_wise", coeff=1e-3, top_k=_TOP_K
-    )
-    config.router.aux_loss.global_batch_size = _BATCH
-    config.router.aux_loss.seq_len = _SEQ
+    config.router.aux_loss = MicrobatchWiseLoadBalanceLoss.Config(coeff=1e-3)
   return config
 
 

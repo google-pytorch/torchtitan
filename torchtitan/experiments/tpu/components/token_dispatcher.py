@@ -34,7 +34,7 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     MOE_ROUTING,
 )
 from torchtitan.models.common.moe import RoutedExperts
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.models.common.moe.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,

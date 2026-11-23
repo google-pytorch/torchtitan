@@ -31,10 +31,6 @@ from torch import nn
 
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.optim.optimizer import (
-    collect_moe_routing_metric_tensors,
-    set_moe_routing_metric_tensors,
-)
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
@@ -432,10 +428,6 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             )
         loss = outputs[0]
         grads = outputs[1 : 1 + len(params)]
-        if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[1 + len(params) :])
-            )
 
         for param, grad in zip(params, grads, strict=True):
             if param.requires_grad and grad is not None:
@@ -539,10 +531,6 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         new_exp_avgs = outputs[1 + n : 1 + 2 * n]
         new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
         new_step = outputs[1 + 3 * n]
-        if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[2 + 3 * n :])
-            )
 
         from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
 
@@ -720,11 +708,7 @@ def _make_fwd_bwd_adamw_fn(
         inputs, labels, global_valid_tokens, extra_kwargs
     ):
         pred = model(inputs, **extra_kwargs)
-        routing_metrics = (
-            collect_moe_routing_metric_tensors([model])
-            if collect_moe_routing_metrics
-            else []
-        )
+        routing_metrics = []
         loss = compute_annotated_loss(
             loss_fn,
             pred,

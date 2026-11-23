@@ -56,8 +56,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 )
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader, TPUGrainDataLoader
 from torchtitan.models.common.attention import Attention as BaseAttention
-from torchtitan.models.common.config_utils import make_aux_loss_config
-from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss, MoE
 from torchtitan_recipes.tests.models.qwen3 import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.observability.profiler import Profiler
@@ -171,9 +170,7 @@ def _use_global_batch_aux_loss(config: TPUTrainerConfig) -> None:
   assert config.model is not None
   for _, moe, _, _ in config.model.traverse(MoE.Config):
     moe.load_balance_coeff = None
-    moe.router.aux_loss = make_aux_loss_config(
-        type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
-    )
+    moe.router.aux_loss = BatchWiseLoadBalanceLoss.Config(coeff=1e-3)
 
 
 def qwen3_debugmodel() -> TPUTrainerConfig:

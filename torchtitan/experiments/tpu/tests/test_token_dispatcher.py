@@ -14,8 +14,8 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     scale_route_weights,
     stable_grouped_reduce,
 )
-from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.experiments.tpu.components.grouped_experts import GroupedExperts
+from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 
 
 def test_scale_route_weights_matches_native_autograd():
@@ -343,7 +343,7 @@ def test_scale_before_down_proj_matches_scaling_the_output():
   counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
 
   def run(scale_before_down_proj):
-    routed = TpuRoutedExperts.Config(
+    routed = TpuTpuRoutedExperts.Config(
         inner_experts=GroupedExperts.Config(
             dim=dim, hidden_dim=hidden, num_experts=num_experts
         ),
@@ -363,7 +363,7 @@ def test_scale_before_down_proj_matches_scaling_the_output():
     torch.testing.assert_close(actual_grad, expected_grad)
 
   with pytest.raises(ValueError, match="enable only one"):
-    TpuRoutedExperts.Config(
+    TpuTpuRoutedExperts.Config(
         inner_experts=GroupedExperts.Config(
             dim=dim, hidden_dim=hidden, num_experts=num_experts
         ),

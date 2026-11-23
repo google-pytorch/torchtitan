@@ -45,7 +45,7 @@ from torchtitan.experiments.tpu.components.layer_loop import tpu_model_class
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.qwen3 import flavors as qwen3_models
 from torchtitan.models.common import CosSinRoPE
-from torchtitan.models.common.config_utils import make_aux_loss_config
+from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss
 from torchtitan.models.llama3 import build_model_config as model_registry
 from torchtitan.models.qwen3 import build_model_config as qwen3_registry
 
@@ -690,12 +690,9 @@ class TestQwen3(unittest.TestCase):
             )
             layer.moe.load_balance_coeff = None
             if coeff is not None:
-                aux_loss = make_aux_loss_config(
-                    type="batch_wise", coeff=coeff, top_k=layer.moe.router.top_k
+                layer.moe.router.aux_loss = BatchWiseLoadBalanceLoss.Config(
+                    coeff=coeff
                 )
-                aux_loss.global_batch_size = TOKENS // SEQ_LEN
-                aux_loss.seq_len = SEQ_LEN
-                layer.moe.router.aux_loss = aux_loss
         # As in the 235B scan recipe: no `tokens_per_expert_E` write either.
         apply_overrides(
             OverrideConfig(imports=[_DISCARDED_TOKEN_COUNTER_OVERRIDE]), config

@@ -1817,7 +1817,8 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
     from types import SimpleNamespace
 
     cfg = gemma4_moe_debug_pallas().model_spec.model
-    # Set E=8 (not divisible by dp_shard=6), D=192 and F=96 (both divisible by 6).
+    # Set E=8 (not divisible by dp_shard=16), D=192 and F=96 (both divisible by
+    # 16, as is every Linear width in the debug model).
     cfg.vocab_size = 192
     cfg.dim = 192
     cfg.tok_embeddings.num_embeddings = 192
@@ -1832,7 +1833,7 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
 
     with torch.device("meta"):
       model = cfg.build()
-    pdims = SimpleNamespace(dp_shard=6, ep_enabled=False)
+    pdims = SimpleNamespace(dp_shard=16, ep_enabled=False)
     configure_gemma4_simple_fsdp_shard_dims(model, pdims)
     for layer in model.layers.values():
       inner = layer.moe.routed_experts.inner_experts
@@ -1876,6 +1877,22 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
       self.assertEqual(getattr(ffn.w3, "_fsdp_shard_dim", None), 1)
       # w2 is (192, 100): dim 0 already divides, so it keeps the default.
       self.assertFalse(hasattr(ffn.w2, "_fsdp_shard_dim"))
+
+  def test_configure_simple_fsdp_shard_dims_rejects_linear_no_axis_divides(self):
+    """A Linear that neither axis can shard evenly is refused, not left to stall."""
+    from types import SimpleNamespace
+
+    cfg = gemma4_moe_debug_pallas().model_spec.model
+    for layer in cfg.layers:
+      # 100 x 100 over 8 ranks: wide enough to shard, but neither axis divides.
+      layer.feed_forward.w1.in_features = 100
+      layer.feed_forward.w1.out_features = 100
+
+    with torch.device("meta"):
+      model = cfg.build()
+    pdims = SimpleNamespace(dp_shard=8, ep_enabled=False)
+    with self.assertRaisesRegex(ValueError, r"feed_forward\.w1\.weight"):
+      configure_gemma4_simple_fsdp_shard_dims(model, pdims)
 
   @parameterized.named_parameters(
       ("untiled_tgmm", (256, 0, 0), (256, 0, 0)),

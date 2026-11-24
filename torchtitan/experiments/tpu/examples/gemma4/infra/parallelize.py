@@ -185,26 +185,26 @@ def configure_gemma4_simple_fsdp_shard_dims(
       setattr(module, "_fsdp_shard_dim", 1)
       hidden_axis_modules.append(module_fqn)
 
-  # Any other bias-free Linear whose output width does not divide the FSDP
-  # degree (26B-A4B shared MLP: 2112 over 128 ranks) would get ragged, partly
-  # empty dim-0 shards. Shard it on the input width instead when that divides.
+  # Any other Linear whose output width does not divide the FSDP degree
+  # (26B-A4B shared MLP: 2112 over 128 ranks) would get uneven dim-0 shards,
+  # which stall the first step on TPU whether or not a rank ends up empty.
+  # Shard it on the input width instead, and refuse a layer neither axis fits.
   for module_fqn, module in model.named_modules():
     if not isinstance(module, nn.Linear) or hasattr(module, "_fsdp_shard_dim"):
       continue
     if any(module_fqn.startswith(f"{stack_fqn}.") for stack_fqn in stack_fqns):
       continue
     weight = module.weight
-    if weight.shape[0] % fsdp_degree == 0:
+    # SimpleFSDP replicates a parameter narrower than the mesh, so only a
+    # width it would actually shard can be uneven.
+    if weight.shape[0] < fsdp_degree or weight.shape[0] % fsdp_degree == 0:
       continue
     if module.bias is not None or weight.shape[1] % fsdp_degree != 0:
-      logger.warning(
-          "%s.weight with shape %s has no axis that divides %d FSDP ranks; "
-          "keeping uneven dim-0 shards",
-          module_fqn,
-          tuple(weight.shape),
-          fsdp_degree,
+      raise ValueError(
+          f"Cannot FSDP-shard {module_fqn}.weight with shape "
+          f"{tuple(weight.shape)} (bias={module.bias is not None}) evenly "
+          f"over {fsdp_degree} ranks"
       )
-      continue
     setattr(module, "_fsdp_shard_dim", 1)
     hidden_axis_modules.append(module_fqn)
 

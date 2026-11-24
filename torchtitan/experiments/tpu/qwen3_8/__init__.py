@@ -130,7 +130,18 @@ def model_registry(
   model_spec = upstream_qwen3_8.model_registry(
       flavor, seq_len=seq_len, attn_backend="sdpa", converters=converters
   )
+  # `to_tpu_model_spec` turns off the expert-bias balancer because HF
+  # checkpoints carry no `expert_bias`. Keep upstream's: its Qwen3.8 recipes
+  # train with it.
+  balance_coeffs = [
+      moe.load_balance_coeff
+      for _, moe, _, _ in model_spec.model.traverse(MoE.Config)
+  ]
   model_spec = to_tpu_model_spec(model_spec)
+  for (_, moe, _, _), coeff in zip(
+      model_spec.model.traverse(MoE.Config), balance_coeffs, strict=True
+  ):
+    moe.load_balance_coeff = coeff
   if num_layers is not None or num_experts is not None:
     scaled_down(model_spec.model, num_layers=num_layers, num_experts=num_experts)
   return model_spec

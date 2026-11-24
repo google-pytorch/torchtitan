@@ -160,8 +160,9 @@ class QKVLinearKeqV(QKVLinear):
     Like :class:`QKVLinear`, but ``wqkv`` holds only Q and K rows:
     ``out_features = (n_heads + n_kv_heads) * head_dim``, split along
     R = heads_per_kv + 1 (Q heads per KV group + K). ``forward`` returns
-    ``(xq, xk, xk)``. Checkpoints expose only ``wq.*`` / ``wk.*`` (no ``wv``),
-    matching the HF checkpoint, which has no ``v_proj`` on these layers.
+    ``(xq, xk, xk)``. Native state dicts keep the packed ``wqkv``; the HF
+    adapter splits it into ``wq`` / ``wk`` (no ``wv``), matching the HF
+    checkpoint, which has no ``v_proj`` on these layers.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -208,52 +209,6 @@ class QKVLinearKeqV(QKVLinear):
         xq = xq.reshape(local_num_tokens, -1, self.head_dim).contiguous()
         xk = xk.reshape(local_num_tokens, -1, self.head_dim).contiguous()
         return xq, xk, xk
-
-    @staticmethod
-    def _split_qkv_on_save(module, state_dict, prefix, local_metadata) -> None:
-        """Split fused ``wqkv`` into ``wq`` / ``wk`` (weight and bias)."""
-        hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
-
-        for param, ndim in (("weight", 4), ("bias", 3)):
-            key = f"{prefix}wqkv.{param}"
-            if key not in state_dict:
-                continue
-            tensor = state_dict.pop(key)
-            if isinstance(tensor, DTensor):
-                tensor = tensor.redistribute(
-                    tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
-                )
-            n_kv = tensor.shape[0] // (r * hd)
-            tail = (tensor.shape[1],) if ndim == 4 else ()
-            w = tensor.reshape(n_kv, r, hd, *tail)
-            state_dict[f"{prefix}wq.{param}"] = (
-                w[:, :hpk].reshape(-1, *tail).contiguous()
-            )
-            state_dict[f"{prefix}wk.{param}"] = (
-                w[:, hpk].reshape(-1, *tail).contiguous()
-            )
-
-    @staticmethod
-    def _merge_qkv_on_load(module, state_dict, prefix, *args) -> None:
-        """Merge ``wq`` / ``wk`` back into fused ``wqkv`` (weight and bias)."""
-        hd, hpk = module.head_dim, module.heads_per_kv
-
-        for param, ndim in (("weight", 4), ("bias", 3)):
-            keys = [f"{prefix}{w}.{param}" for w in ("wq", "wk")]
-            if not all(k in state_dict for k in keys):
-                continue
-            wq, wk = (state_dict.pop(k) for k in keys)
-            if isinstance(wq, DTensor):
-                wq, wk = (
-                    t.redistribute(t.device_mesh, [Replicate()] * t.device_mesh.ndim)
-                    for t in (wq, wk)
-                )
-            n_kv = wk.shape[0] // hd
-            tail = (wq.shape[1],) if ndim == 4 else ()
-            q = wq.reshape(n_kv, hpk, hd, *tail)
-            k = wk.reshape(n_kv, 1, hd, *tail)
-            fused = torch.cat([q, k], dim=1)
-            state_dict[f"{prefix}wqkv.{param}"] = fused.reshape(-1, *tail)
 
 
 class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
@@ -837,8 +792,9 @@ class Gemma4Model(Decoder):
                 if feed_forward is not None:
                     if not isinstance(feed_forward, FeedForward.Config):
                         raise ValueError("Expected FeedForward.Config")
-                    # w13 holds the gate and up projections.
-                    forward_weight_flops += 3 * dim * feed_forward.w13.out_features
+                    # w13 stacks the gate and up projections ([2, F, D]).
+                    hidden_dim = feed_forward.w13.out_features
+                    forward_weight_flops += 6 * dim * hidden_dim
 
                 moe = layer.moe
                 if moe is not None:

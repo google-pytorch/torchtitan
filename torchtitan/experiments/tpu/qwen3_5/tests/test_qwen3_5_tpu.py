@@ -343,12 +343,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         for name, param in hf_model.named_parameters()
         if param.grad is not None
     }
+    # from_hf packs HF's separate gate/up grads into the native stacked w13
+    # layout, exactly as it does for weights (upstream 63c4e9fe).
     expected_tt_grads = adapter.from_hf(hf_grads)
-    # HF has separate gate/up grads; fold them into the fused w13 layout with
-    # the same merge the load hook applies to weights (upstream 150c4f73).
-    for name, module in tt_model.named_modules():
-      if isinstance(module, FeedForward):
-        module._merge_w13_on_load(module, expected_tt_grads, f"{name}.")
     if tt_config.enable_weight_tying:
       expected_tt_grads.pop("lm_head.weight", None)
 

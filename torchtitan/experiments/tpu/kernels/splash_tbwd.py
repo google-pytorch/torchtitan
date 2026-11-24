@@ -17,7 +17,8 @@ dV transposed:
   S     = Q2   [Q, D] @ K^T [D, C]   (K^T latched, shared by the G heads)
   P     = exp2(S - lse2) * mask
           (Q2 = bf16(bf16(Q * scale) * log2(e)): q rounded as the forward
-          rounds it; lse2: the forward's log2-domain logsumexp)
+          rounds it, with one more rounding, bf16(Q * ratio) first, for a
+          non-default scale; lse2: the forward's log2-domain logsumexp)
   dP    = dO   [Q, D] @ V^T [D, C]
   dS    = P * (dP - di)   (di = rowsum(o * dO), once per q block)
   dV^T += dO^T [D, Q] @ P   [Q, C]   (P latched; full-width output)
@@ -41,8 +42,9 @@ arrays are sized to the data-independent bound B * nb * (nb + 1) / 2
   - dQ of one (example, q block) accumulates in VMEM over its run of steps and
     is written once;
   - dK^T / dV^T of one (example, kv head) stay resident in VMEM as [D, S] f32
-    for the whole sequence, and so do K / V; there are no HBM partial sums and
-    no reduction op;
+    for the whole sequence; there are no HBM partial sums and no reduction
+    op. K^T / V^T / K stay resident too, or, when that does not fit
+    (`stream_kv`), are fetched one kv block per step;
   - each step processes all G query heads of its kv head (K^T / V^T / K
     loaded once per step).
 A tile is skipped when its q and kv blocks share no segment id ([min, max]
@@ -65,27 +67,31 @@ Supported shapes
 - S: multiple of 128, q and kv equal length. Tile (q block = kv block) is
   512 if it divides S, else 256, else 128. Upper bound from VMEM (below).
 - B: any; the upper bound comes from SMEM (below).
-- VMEM: K / V and the dK^T / dV^T accumulators stay resident for the whole
-  sequence, so VMEM grows with D * S. This estimate (`_vmem_bytes`, bytes)
-  must stay within the VMEM limit (the core's VMEM less 4 MiB: 60 MiB on
-  TPU7x), with Dl = D rounded up to 128 lanes and kv_buffers = 1 (2 when that
-  fits):
+- VMEM: the dK^T / dV^T accumulators stay resident for the whole sequence,
+  so VMEM grows with D * S. This estimate (`_vmem_bytes`, bytes) must stay
+  within the VMEM limit (the core's VMEM less 4 MiB: 60 MiB on TPU7x), with
+  Dl = D rounded up to 128 lanes, kv_buffers = 1 (2 when that fits) and
+  KV = 4 * D + 2 * Dl + 32 (K^T, V^T [D, *], K [*, Dl] bf16, kv segment ids
+  [8, *] int32):
 
     12 * G * block * D           q^T, dO^T, o^T blocks: bf16, 2 buffers
     + 8 * G * block * Dl         dq block: bf16, 2 buffers, + f32 accumulator
-    + kv_buffers * S * (8 * D    K^T, V^T, dK^T, dV^T blocks: [D, S] bf16
-        + 2 * Dl + 32)           K block: [S, Dl] bf16; kv segment ids: int32
+    + kv_buffers * 4 * S * D     dK^T, dV^T output blocks: [D, S] bf16
     + 8 * S * D                  f32 dK^T, dV^T accumulators
+    + kv_buffers * S * KV        K / V resident for the whole sequence, or
+      2 * block * KV             (stream_kv) one kv block, 2 buffers
     + 1 KiB * G * D + 11 MiB     compiler temporaries (fit to TPU7x compile
                                  reports) + small blocks (q segment ids, lse2)
 
   It is never below the exact block sizes plus a temporaries fit that matched
-  every compile failure seen (D = 128..512, G = 8 / 16, S = 4k..128k). With
-  512 tiles (S a multiple of 512):
-    G = 16, D = 64:  S <= 27136
-    G = 16, D = 128: S <= 11776
-    G = 8,  D = 256: S <= 5632
-    G = 16, D = 256: S <= 1024
+  every compile failure seen (D = 128..512, G = 8 / 16, S = 4k..128k). K / V
+  stay resident when that fits (`_kv_modes`); streaming them costs ~0.3%
+  kernel time (Q235 shape). With 512 tiles (S a multiple of 512), resident /
+  streamed:
+    G = 16, D = 64:  S <= 27136 / 45568
+    G = 16, D = 128: S <= 11776 / 17408
+    G = 8,  D = 256: S <= 5632 / 8192
+    G = 16, D = 256: S <= 1024 / 1024
   Past the real limit Mosaic fails at compile time with RESOURCE_EXHAUSTED.
 - SMEM: the 8 int32 schedule arrays hold every causal tile, so
   8 * 4 * B * nb * (nb + 1) / 2 bytes (nb = S / block) must stay within the
@@ -102,9 +108,10 @@ Other limitations
 The transposed formulation does not depend on the mask: causality lives only
 in `build_schedule` (kj <= qi) and in the kernel's element mask. These are
 unimplemented, not fundamental:
-- Causal attention only. A sliding window needs a band condition in both
-  places; non-causal needs neither condition, and a schedule (SMEM) bound of
-  B * nb * nb tiles. VMEM does not depend on the mask.
+- Causal attention, optionally with a sliding window (band condition in
+  `build_schedule` and the element mask). Non-causal needs neither the causal
+  condition nor its schedule (SMEM) bound: B * nb * nb tiles. VMEM does not
+  depend on the mask, so a window does not lift the sequence-length bound.
 - No context parallelism (kv length must equal q length). The resident
   K / V / dK^T / dV^T and the VMEM estimate would scale with the kv length,
   and the schedule bound with nq * nk tiles; untested.
@@ -173,9 +180,13 @@ _SCHEDULE_KEYS = (
 
 
 def build_schedule(
-    segment_ids_BS: jax.Array, block: int
+    segment_ids_BS: jax.Array, block: int, window: int | None = None
 ) -> dict[str, jax.Array]:
   """Tile schedule [T] for `splash_tbwd_call` from (traced) segment ids [B, S].
+
+  `window`: sliding-window causal attention, each q attends to keys k with
+  q - window <= k <= q (Splash's LocalMask(window_size=(window, 0))); None is
+  plain causal.
 
   Returns:
     num_active: int32 scalar, the number of active tiles (the grid's steps).
@@ -202,16 +213,24 @@ def build_schedule(
   # A causal tile may hold a same-document pair when the [min, max] segment-id
   # ranges of its q block and kv block overlap (as Tokamax's
   # `_segment_block_overlap`; conservative, so ids need not be sorted).
+  in_band_IJ = kj_IJ <= qi_IJ
+  if window is not None:
+    # Some pair within the window: min(q - k) = (qi - kj - 1) * block + 1.
+    in_band_IJ &= (qi_IJ - kj_IJ - 1) * block + 1 <= window
   may_have_live_pairs_BIJ = (
       (max_seg_BI[:, :, None] >= min_seg_BI[:, None, :])
       & (max_seg_BI[:, None, :] >= min_seg_BI[:, :, None])
-      & (kj_IJ <= qi_IJ)
+      & in_band_IJ
   )
   # Every pair is live when both blocks lie inside the same single document,
   # strictly below the diagonal.
   single_doc_BI = min_seg_BI == max_seg_BI
+  fully_in_band_IJ = kj_IJ < qi_IJ
+  if window is not None:
+    # Every pair within the window: max(q - k) = (qi - kj + 1) * block - 1.
+    fully_in_band_IJ &= (qi_IJ - kj_IJ + 1) * block - 1 <= window
   all_pairs_live_BIJ = (
-      (kj_IJ < qi_IJ)
+      fully_in_band_IJ
       & single_doc_BI[:, :, None]
       & single_doc_BI[:, None, :]
       & (min_seg_BI[:, :, None] == min_seg_BI[:, None, :])
@@ -301,7 +320,7 @@ def _kernel(
     qseg_QL_ref: jax.Ref,
     kvseg_8S_ref: jax.Ref,
     # outputs (VMEM blocks)
-    dq_GQD_ref: jax.Ref,
+    dq_GDQ_ref: jax.Ref,
     dkt_DS_ref: jax.Ref,
     dvt_DS_ref: jax.Ref,
     # scratch (VMEM, f32)
@@ -314,6 +333,9 @@ def _kernel(
     group_size: int,
     block: int,
     q_scale: float,
+    q_ratio: float = 1.0,
+    window: int | None = None,
+    stream_kv: bool = False,
 ) -> None:
   del b_ref  # used by the index maps only
   lse2_rows = lse2_GQ if group_size % 8 else lse2_GQ_ref
@@ -354,18 +376,24 @@ def _kernel(
 
   def tile(masked: bool) -> None:
     """All G query heads on the whole tile."""
+    # The tile's kv columns of the [D, S] dK^T / dV^T accumulators.
     kv = pl.ds(kv_start, block)
-    # Shared by all heads: K^T / V^T / K slices and the element mask.
-    kt_DC = k_DS_ref[:, kv]
-    vt_DC = v_DS_ref[:, kv]
-    k_CD = k_SD_ref[kv, :]
+    # Shared by all heads: K^T / V^T / K slices and the element mask. Streamed,
+    # the K / V / kv segment id refs hold just this kv block; resident, the
+    # whole sequence.
+    kv_in = slice(None) if stream_kv else kv
+    kt_DC = k_DS_ref[:, kv_in]
+    vt_DC = v_DS_ref[:, kv_in]
+    k_CD = k_SD_ref[kv_in, :]
     if masked:
       q_pos = q_block * block + lax.broadcasted_iota(
           jnp.int32, (block, block), 0
       )
       k_pos = kv_start + lax.broadcasted_iota(jnp.int32, (block, block), 1)
       qseg_QC = jnp.tile(qseg_QL_ref[...], (1, block // NUM_LANES))
-      mask_QC = (q_pos >= k_pos) & (qseg_QC == kvseg_8S_ref[0:1, kv])
+      mask_QC = (q_pos >= k_pos) & (qseg_QC == kvseg_8S_ref[0:1, kv_in])
+      if window is not None:
+        mask_QC &= q_pos - k_pos <= window
 
     tn = (((0,), (0,)), ((), ()))  # contract dim 0 of both: A^T @ B
     nn = (((1,), (0,)), ((), ()))  # A @ B
@@ -386,7 +414,14 @@ def _kernel(
         # Round q as the forward does before its Q.K (scale in XLA, then the
         # Tokamax kernel's bf16 `q *= LOG2E`), so that P matches lse2. dK
         # below uses the unrounded q.
-        if scale_in_q_dtype:
+        if q_ratio != 1.0:
+          # Non-default scale: the forward rounds q * ratio, then multiplies
+          # by bf16(1 / sqrt(D)) = q_scale / q_ratio (exact) and rounds again.
+          q1_DQ = (qt_DQ.astype(jnp.float32) * q_ratio).astype(q_dtype)
+          qk_DQ = (
+              q1_DQ.astype(jnp.float32) * (q_scale / q_ratio)
+          ).astype(q_dtype)
+        elif scale_in_q_dtype:
           qk_DQ = (qt_DQ * q_scale).astype(q_dtype)
         else:
           qk_DQ = (qt_DQ.astype(jnp.float32) * q_scale).astype(q_dtype)
@@ -426,7 +461,10 @@ def _kernel(
 
   @pl.when(should_write_dq)
   def _():
-    dq_GQD_ref[...] = (dq_GQD_acc[...] * q_scale).astype(dq_GQD_ref.dtype)
+    # dq leaves sequence-minor, like dk^T / dv^T; see transposed_attention_bwd.
+    for g in range(dq_GQD_acc.shape[0]):
+      # Round to bf16 before the transpose: half the XLU work of an f32 one.
+      dq_GDQ_ref[g] = (dq_GQD_acc[g] * q_scale).astype(dq_GDQ_ref.dtype).T
 
   @pl.when(should_write_dkv)
   def _():
@@ -449,6 +487,9 @@ def splash_tbwd_call(
     block: int,
     single_buffer_kv: bool,
     q_scale: float,
+    q_ratio: float = 1.0,
+    window: int | None = None,
+    stream_kv: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """The pallas_call on kernel layouts.
 
@@ -461,9 +502,17 @@ def splash_tbwd_call(
     o_BHDS: forward output, for di = rowsum(o * dO).
     q_scale: the softmax scale exactly as the forward applied it to q (the
       product of its bf16-rounded constants); also scales dq and dk.
+    q_ratio: the forward's first, bf16-rounded multiply of q for a
+      non-default scale (q is rounded after it, then multiplied by
+      q_scale / q_ratio and rounded again); 1.0 at the default scale.
+    window: sliding window (see `build_schedule`); None is plain causal.
+    single_buffer_kv: one buffer (instead of two) for the blocks that change
+      only with the example / kv head.
+    stream_kv: fetch K^T / V^T / K and the kv segment ids one kv block per
+      step instead of keeping them resident for the whole sequence.
 
   Returns:
-    dq [B, H, S, D], dk^T and dv^T [B, N, D, S], in the input dtype.
+    dq^T [B, H, D, S], dk^T and dv^T [B, N, D, S], in the input dtype.
   """
   num_b, num_h, d, s = q_BHDS.shape
   num_kv = k_BNDS.shape[1]
@@ -473,11 +522,6 @@ def splash_tbwd_call(
       h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
   ) -> _BlockIndex:
     return (b[t], h, 0, qi[t])
-
-  def q_head_dim_minor(
-      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, *_: jax.Ref
-  ) -> _BlockIndex:
-    return (b[t], h, qi[t], 0)
 
   def per_kv_head(
       h: jax.Array, t: jax.Array, b: jax.Ref, *_: jax.Ref
@@ -489,35 +533,68 @@ def splash_tbwd_call(
   ) -> _BlockIndex:
     return (b[t], qi[t], 0)
 
+  def kv_seq_minor(
+      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, kj: jax.Ref,
+      *_: jax.Ref
+  ) -> _BlockIndex:
+    return (b[t], h, 0, kj[t])
+
+  def kv_head_dim_minor(
+      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, kj: jax.Ref,
+      *_: jax.Ref
+  ) -> _BlockIndex:
+    return (b[t], h, kj[t], 0)
+
   def kv_segments(
+      h: jax.Array, t: jax.Array, b: jax.Ref, qi: jax.Ref, kj: jax.Ref,
+      *_: jax.Ref
+  ) -> _BlockIndex:
+    return (b[t], 0, kj[t])
+
+  def kv_segments_resident(
       h: jax.Array, t: jax.Array, b: jax.Ref, *_: jax.Ref
   ) -> _BlockIndex:
     return (b[t], 0, 0)
 
-  # The per-(example, kv head) arrays change block only when the example or kv
-  # head does, so their second buffer only prefetches the next example's K / V.
-  # Dropping it (single_buffer_kv) frees VMEM for ~1.5x longer sequences, at ~1%
-  # kernel time (Q235 shape: the DMA at each of the 64 example / kv head changes
-  # is no longer hidden).
+  # The per-(example, kv head) blocks change only when the example or kv head
+  # does, so their second buffer only overlaps the next example's fetch / the
+  # previous one's write-back. Dropping it (single_buffer_kv) frees VMEM for
+  # longer sequences, at ~1% kernel time (Q235 shape).
   resident = dict(pipeline_mode=pl.Buffered(1)) if single_buffer_kv else {}
+
+  if stream_kv:
+    # One kv block per step. Each step's three [block, D] tiles are small next
+    # to its compute (Q235: ~0.4 MiB per ~10 us step), so streaming costs
+    # +0.3% kernel time and frees ~S * KV bytes of VMEM (module docstring).
+    kv_specs = [
+        pl.BlockSpec((None, None, d, block), kv_seq_minor),
+        pl.BlockSpec((None, None, block, d), kv_head_dim_minor),
+        pl.BlockSpec((None, None, d, block), kv_seq_minor),
+    ]
+    kvseg_spec = pl.BlockSpec((None, 8, block), kv_segments)
+  else:
+    kv_specs = [
+        pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
+        pl.BlockSpec((None, None, s, d), per_kv_head, **resident),
+        pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
+    ]
+    kvseg_spec = pl.BlockSpec((None, 8, s), kv_segments_resident, **resident)
   in_specs = [
       pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, g, d, block), q_seq_minor),
-      pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
-      pl.BlockSpec((None, None, s, d), per_kv_head, **resident),
-      pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
+      *kv_specs,
       pl.BlockSpec((None, None, g, block), q_seq_minor),
       pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, block, NUM_LANES), q_segments),
-      pl.BlockSpec((None, 8, s), kv_segments, **resident),
+      kvseg_spec,
   ]
   out_specs = [
-      pl.BlockSpec((None, g, block, d), q_head_dim_minor),
+      pl.BlockSpec((None, g, d, block), q_seq_minor),
       pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
       pl.BlockSpec((None, None, d, s), per_kv_head, **resident),
   ]
   out_shape = [
-      jax.ShapeDtypeStruct((num_b, num_h, s, d), q_BHDS.dtype),
+      jax.ShapeDtypeStruct((num_b, num_h, d, s), q_BHDS.dtype),
       jax.ShapeDtypeStruct((num_b, num_kv, d, s), k_BNDS.dtype),
       jax.ShapeDtypeStruct((num_b, num_kv, d, s), v_BNDS.dtype),
   ]
@@ -548,6 +625,9 @@ def splash_tbwd_call(
           group_size=g,
           block=block,
           q_scale=q_scale,
+          q_ratio=q_ratio,
+          window=window,
+          stream_kv=stream_kv,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=len(_SCHEDULE_KEYS),
@@ -632,19 +712,51 @@ def _num_steps(num_b: int, s: int, block: int) -> int:
 
 
 def _vmem_bytes(
-    d: int, g: int, s: int, block: int, single_buffer_kv: bool
+    d: int,
+    g: int,
+    s: int,
+    block: int,
+    single_buffer_kv: bool,
+    stream_kv: bool,
 ) -> int:
   """Conservative VMEM bytes of one call (formula: module docstring)."""
   kv_buffers = 1 if single_buffer_kv else 2
   d_lanes = _round_up(d, NUM_LANES)
   # q^T, dO^T, o^T: bf16, 2 buffers. dq: bf16, 2 buffers, + f32 accumulator.
   per_step = 12 * g * block * d + 8 * g * block * d_lanes
-  # K^T, V^T, dK^T, dV^T [D, S] and K [S, Dl]: bf16. kv segment ids: int32.
-  per_kv_head = kv_buffers * s * (8 * d + 2 * d_lanes + 32)
+  # K^T, V^T [D, *], K [*, Dl] bf16, kv segment ids [8, *] int32: one kv
+  # block with 2 buffers when streamed, else the whole sequence.
+  kv_inputs = 4 * d + 2 * d_lanes + 32
+  if stream_kv:
+    per_step += 2 * block * kv_inputs
+  # dK^T, dV^T [D, S] bf16.
+  per_kv_head = kv_buffers * s * (4 * d + (0 if stream_kv else kv_inputs))
   dkv_accumulators = 8 * s * d  # f32 dK^T, dV^T
   # Compiler temporaries (fit to TPU7x compile reports) + small blocks.
   other = g * d * 1024 + (11 << 20)
   return per_step + per_kv_head + dkv_accumulators + other
+
+
+def _kv_modes(
+    d: int, g: int, s: int, block: int, stream_kv: bool | None
+) -> tuple[bool, bool]:
+  """(stream_kv, single_buffer_kv): the fastest layout that fits in VMEM.
+
+  K / V stay resident unless they do not fit even single-buffered (or
+  `stream_kv` forces it); then the per-(example, kv head) blocks get two
+  buffers when that fits.
+  """
+  limit = _vmem_limit_bytes()
+  if stream_kv is None:
+    stream_kv = (
+        _vmem_bytes(d, g, s, block, single_buffer_kv=True, stream_kv=False)
+        > limit
+    )
+  single_buffer_kv = (
+      _vmem_bytes(d, g, s, block, single_buffer_kv=False, stream_kv=stream_kv)
+      > limit
+  )
+  return stream_kv, single_buffer_kv
 
 
 def unsupported_reason(
@@ -656,7 +768,7 @@ def unsupported_reason(
   """Why splash_tbwd cannot run q [B, S, H, D] / k, v [B, S, N, D], or None.
 
   Checks the "Supported shapes" in the module docstring. The caller checks the
-  attention itself (causal, no window, no context parallelism) and the
+  attention itself (causal, optionally windowed, no context parallelism) and the
   hardware (`hardware_unsupported_reason`).
   """
   if len(q_shape) != 4 or len(k_shape) != 4:
@@ -686,7 +798,7 @@ def unsupported_reason(
   if block is None:
     return f"needs seq_len a multiple of {BLOCK_SIZES[-1]}; got {s}"
   g = num_h // num_kv
-  vmem = _vmem_bytes(d, g, s, block, single_buffer_kv=True)
+  vmem = _vmem_bytes(d, g, s, block, single_buffer_kv=True, stream_kv=True)
   vmem_limit = _vmem_limit_bytes()
   if vmem > vmem_limit:
     return (
@@ -715,6 +827,9 @@ def transposed_attention_bwd(
     segment_ids_BS: jax.Array | None,
     *,
     q_scale: float,
+    q_ratio: float = 1.0,
+    window: int | None = None,
+    stream_kv: bool | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """dq, dk, dv of causal attention, in the model layout [B, S, heads, D].
 
@@ -723,7 +838,10 @@ def transposed_attention_bwd(
       forward output and output gradient.
     lse2_BHS: the forward's log2-domain logsumexp (see `splash_tbwd_call`).
     segment_ids_BS: document id per token; None means one document per example.
-    q_scale: see `splash_tbwd_call`.
+    q_scale, q_ratio: see `splash_tbwd_call`.
+    window: sliding window (see `build_schedule`); None is plain causal.
+    stream_kv: see `splash_tbwd_call`. None streams only when keeping K / V
+      resident does not fit in VMEM.
 
   Raises:
     ValueError: for shapes outside "Supported shapes" (module docstring).
@@ -743,15 +861,19 @@ def transposed_attention_bwd(
         f" {(num_b, s)}."
     )
   block = block_size(s)
-  single_buffer_kv = (
-      _vmem_bytes(d, num_h // num_kv, s, block, single_buffer_kv=False)
-      > _vmem_limit_bytes()
+  stream_kv, single_buffer_kv = _kv_modes(
+      d, num_h // num_kv, s, block, stream_kv
   )
-  sched = build_schedule(segment_ids_BS, block)
+  sched = build_schedule(segment_ids_BS, block, window)
   seg_BS = segment_ids_BS.astype(jnp.int32)
   # The transposes to sequence-minor lower to bitcasts in the model graph,
-  # where XLA already keeps q / k / v sequence-minor.
-  dq_BHSD, dkt_BNDS, dvt_BNDS = splash_tbwd_call(
+  # where XLA already keeps q / k / v sequence-minor. All three gradients also
+  # come back sequence-minor: a head-dim-minor dq made XLA pick head-dim-minor
+  # layouts for the RoPE tables shared by every layer, and with them for each
+  # layer's RoPE in the forward too, where interleaved RoPE's stride-2 head-dim
+  # slices are ~6x slower (8-layer Muse Glimmer with its sliding-window layers
+  # on splash_tbwd: 1.11 -> 0.98 s per step).
+  dqt_BHDS, dkt_BNDS, dvt_BNDS = splash_tbwd_call(
       sched,
       jnp.transpose(q_BSHD, (0, 2, 3, 1)),
       jnp.transpose(do_BSHD, (0, 2, 3, 1)),
@@ -765,9 +887,12 @@ def transposed_attention_bwd(
       block=block,
       single_buffer_kv=single_buffer_kv,
       q_scale=q_scale,
+      q_ratio=q_ratio,
+      window=window,
+      stream_kv=stream_kv,
   )
   return (
-      jnp.swapaxes(dq_BHSD, 1, 2),
+      jnp.transpose(dqt_BHDS, (0, 3, 1, 2)),
       jnp.transpose(dkt_BNDS, (0, 3, 1, 2)),
       jnp.transpose(dvt_BNDS, (0, 3, 1, 2)),
   )

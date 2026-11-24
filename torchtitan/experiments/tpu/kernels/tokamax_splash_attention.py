@@ -309,6 +309,17 @@ def _make_splash_attention_fn(
   return splash_fn, splash_bwd_fn
 
 
+def _scale_q_ratio(q_tr: jax.Array, ratio: float) -> jax.Array:
+  """q_tr * bf16(ratio), rounded to q's dtype even if XLA keeps excess precision."""
+  ratio = float(np.asarray(ratio, dtype=q_tr.dtype))
+  finfo = jnp.finfo(q_tr.dtype)
+  return jax.lax.reduce_precision(
+      q_tr.astype(jnp.float32) * ratio,
+      exponent_bits=finfo.nexp,
+      mantissa_bits=finfo.nmant,
+  ).astype(q_tr.dtype)
+
+
 def jax_attention_fwd(
     q: jax.Array,
     k: jax.Array,
@@ -387,7 +398,7 @@ def jax_attention_fwd(
   # Apply scaling inside the compiled JAX pipeline
   default_scale = 1.0 / math.sqrt(q.shape[-1])
   if abs(scale - default_scale) > 1e-6:
-    q_tr = q_tr * (scale / default_scale)
+    q_tr = _scale_q_ratio(q_tr, scale / default_scale)
 
   out_tr, logsumexp = splash_fn(q_tr, k_tr, v_tr, segment_ids, cp_rank)
 
@@ -401,16 +412,15 @@ def _transposed_bwd_unsupported_reason(
     k: jax.Array,
     v: jax.Array,
     is_causal: bool,
-    local_window_size: int | None,
 ) -> str | None:
-  """Why splash_tbwd cannot compute this backward, or None if it can."""
-  if not is_causal or local_window_size is not None:
+  """Why splash_tbwd cannot compute this backward, or None if it can.
+
+  Causal attention, with or without a sliding window (local_window_size).
+  """
+  if not is_causal:
     # Not fundamental (see "Other limitations" in splash_tbwd.py), but no
     # model needs it from splash_tbwd yet.
-    return (
-        "it implements causal attention without a window; got"
-        f" is_causal={is_causal}, local_window_size={local_window_size}"
-    )
+    return "it implements causal attention only; got is_causal=False"
   if k.shape[1] != q.shape[1]:
     # Not fundamental either, but splash_tbwd's VMEM / SMEM limits assume
     # kv_seq_len == seq_len (K / V / dK / dV stay resident along the kv
@@ -433,16 +443,31 @@ def _transposed_bwd_unsupported_reason(
 def _forward_q_scale(q: jax.Array, scale: float) -> float:
   """The softmax scale as the forward applies it to q, before the Tokamax kernel.
 
-  jax_attention_fwd multiplies q by scale / default_scale when the scale is not
-  the default, then splash_fn by 1 / sqrt(head_dim); both constants are rounded
-  to q.dtype (bf16(1/sqrt(128)) is 1.1e-4 below the exact value). XLA fuses the
-  two multiplies and rounds q once, so their product (exact in f32) is enough.
+  The product of the forward's constants, each rounded to q.dtype:
+  bf16(1 / sqrt(head_dim)) (splash_fn; bf16(1/sqrt(128)) is 1.1e-4 below the
+  exact value) times bf16(scale / default_scale) when the scale is not the
+  default. The product is exact in f32, but the forward rounds q after each
+  multiply; `_forward_q_ratio` lets splash_tbwd repeat both roundings.
   """
   default_scale = 1.0 / math.sqrt(q.shape[-1])
   q_scale = float(np.asarray(default_scale, dtype=q.dtype))
   if abs(scale - default_scale) > 1e-6:
     q_scale *= float(np.asarray(scale / default_scale, dtype=q.dtype))
   return q_scale
+
+
+def _forward_q_ratio(q: jax.Array, scale: float) -> float:
+  """bf16(scale / default_scale), the forward's first multiply of q; 1.0 at the default scale.
+
+  The forward rounds q * ratio to q.dtype (`_scale_q_ratio`) before splash_fn
+  multiplies by 1 / sqrt(head_dim) and rounds again. Rounding is not
+  associative, so splash_tbwd repeats both roundings rather than one multiply
+  by `_forward_q_scale`; at the default scale it compiles the one-multiply path.
+  """
+  default_scale = 1.0 / math.sqrt(q.shape[-1])
+  if abs(scale - default_scale) <= 1e-6:
+    return 1.0
+  return float(np.asarray(scale / default_scale, dtype=q.dtype))
 
 
 @functools.cache
@@ -497,9 +522,7 @@ def jax_attention_bwd(
   local_window_size_opt = local_window_size if local_window_size != -1 else None
 
   tbwd_reason = (
-      _transposed_bwd_unsupported_reason(
-          q, k, v, is_causal, local_window_size_opt
-      )
+      _transposed_bwd_unsupported_reason(q, k, v, is_causal)
       if use_transposed_bwd
       else None
   )
@@ -512,6 +535,8 @@ def jax_attention_bwd(
     return splash_tbwd.transposed_attention_bwd(
         q, k, v, out, logsumexp, grad_out, segment_ids,
         q_scale=_forward_q_scale(q, scale),
+        q_ratio=_forward_q_ratio(q, scale),
+        window=local_window_size_opt,
     )
 
   # 1. Transpose/Squeeze inputs inside JAX
@@ -552,7 +577,7 @@ def jax_attention_bwd(
 
   default_scale = 1.0 / math.sqrt(q.shape[-1])
   if abs(scale - default_scale) > 1e-6:
-    q_tr = q_tr * (scale / default_scale)
+    q_tr = _scale_q_ratio(q_tr, scale / default_scale)
 
   dq_tr, dk_tr, dv_tr = splash_bwd_fn(
       q_tr, k_tr, v_tr, out_tr, logsumexp, grad_out_tr, segment_ids, cp_rank

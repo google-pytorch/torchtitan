@@ -8,7 +8,8 @@
     bwd_scan(init=[grad], xs=[counter], additional_inputs=[layer_stack, attn_stack])
 
 `RealScanTest` traces a real `scan` instead, to check the pass finds the
-saved carry after the split. The real llama3 case is in test_tpu_host_offload_distributed.py.
+saved carry, and a named save region, after the split. The real llama3 case
+is in test_tpu_host_offload_distributed.py.
 """
 
 import operator
@@ -16,7 +17,6 @@ from unittest import mock
 
 from absl.testing import absltest, parameterized
 import torch
-from torch._higher_order_ops.scan import scan
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
 from torchtitan.experiments.tpu.components import scan_backward_patch
@@ -165,6 +165,47 @@ class ScanOffloadTest(parameterized.TestCase):
         self.assertIs(reload.args[0].target, torch.ops.aten.index_select.default)
         self.assertEqual(reload.args[0].args[0].name, "stack")
 
+    def test_a_named_region_goes_to_host_with_the_layer_input(self):
+        fwd, stack, bwd = self._pair()
+        self.graph.output(bwd)
+
+        gm = self._gm()
+        offload_scan_activations(gm, ("layer_input", ATTENTION_INNER_ATTENTION))
+
+        offloaded = [
+            n.args[0].name for n in _body_of(gm, fwd).graph.nodes
+            if n.target is _OFFLOAD
+        ]
+        self.assertEqual(len(offloaded), 2)
+        reloaded = sorted(
+            n.args[0].args[0].name for n in _body_of(gm, bwd).graph.nodes
+            if n.target is _RELOAD
+        )
+        self.assertEqual(reloaded, ["attn", "stack"])
+
+    def test_a_region_alone_leaves_the_layer_input_on_device(self):
+        fwd, stack, bwd = self._pair()
+        self.graph.output(bwd)
+
+        gm = self._gm()
+        offload_scan_activations(gm, (ATTENTION_INNER_ATTENTION,))
+
+        (reload,) = [
+            n for n in _body_of(gm, bwd).graph.nodes if n.target is _RELOAD
+        ]
+        self.assertEqual(reload.args[0].args[0].name, "attn")
+        (offload,) = [
+            n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
+        ]
+        self.assertIs(offload.args[0].target, torch.ops.aten.mm.default)
+
+    def test_a_region_no_scan_saves_raises(self):
+        fwd, stack, bwd = self._pair()
+        self.graph.output(bwd)
+
+        with self.assertRaisesRegex(RuntimeError, "saves region"):
+            offload_scan_activations(self._gm(), ("feed_forward.w2",))
+
     def test_a_dead_reader_of_the_stack_does_not_block_the_offload(self):
         # Tracing a scan leaves unused element-0 slices of its operands.
         fwd, stack, bwd = self._pair()
@@ -273,6 +314,34 @@ class RealScanTest(parameterized.TestCase):
             n for n in _body_of(gm, fwd).graph.nodes if n.target is _OFFLOAD
         ]
         self.assertIs(offload.args[0], saved)
+
+    def test_a_saved_region_goes_to_host(self):
+        gm, fwd = self._trace(_attention_layer, {ATTENTION_INNER_ATTENTION})
+        attn = [
+            o for o in self._outputs(gm, fwd)
+            if (o.meta.get("custom") or {}).get(REMAT_REGION)
+            == ATTENTION_INNER_ATTENTION
+        ]
+        self.assertTrue(attn)
+
+        offload_scan_activations(gm, (ATTENTION_INNER_ATTENTION,))
+        offloaded = [
+            n.args[0] for n in _body_of(gm, fwd).graph.nodes
+            if n.target is _OFFLOAD
+        ]
+        self.assertEqual(offloaded, attn)
+        (bwd,) = [
+            n for n in gm.graph.find_nodes(op="call_function", target=_SCAN)
+            if n.meta.get("autograd_backward")
+        ]
+        self.assertTrue(
+            any(n.target is _RELOAD for n in _body_of(gm, bwd).graph.nodes)
+        )
+
+    def test_an_unsaved_region_raises(self):
+        gm, _ = self._trace(_attention_layer, frozenset())
+        with self.assertRaisesRegex(RuntimeError, "saves region"):
+            offload_scan_activations(gm, (ATTENTION_INNER_ATTENTION,))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-"""Keep the scan's saved layer input on host between its two loops.
+"""Keep named scan saves on host between the scan's two loops.
 
-The forward scan stacks the layer input it saves for backward into one
+The forward scan stacks each value it saves for backward into one
 ``[n_layers, ...]`` tensor, live until the backward loop ends. This pass adds
 one host copy per iteration inside each loop body, so the device holds one
 row at a time:
@@ -11,8 +11,14 @@ row at a time:
       saved = ao.offload(clone(x))      s     = ao.reload(s)            # device
       return (out, saved, ...)          use(s)
 
-The saved copy is the body output ``clone(x)``, where ``x`` is the carry
-placeholder. Other saved values (attention output, MoE counts) stay in HBM.
+Which saves go to host is chosen by name (``compile.scan_offload``):
+
+* ``layer_input``: the body output ``clone(x)``, where ``x`` is the carry
+  placeholder. Scan saves a body input this way, so no region label can name it.
+* a save region, e.g. ``attention.inner_attention``: the body outputs whose
+  op carries that ``remat_region`` label. ``scan_with_remat_policy`` saves it.
+
+Saves not named stay in HBM.
 
 ``cpu_offload.apply_cpu_offload_pass`` can't do this: it reloads before the
 first backward user, which is the backward scan node, so all rows would land
@@ -35,9 +41,12 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     _full_memory_policy_pass,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
+from torchtitan.experiments.tpu.components.remat_regions import REMAT_REGION
 from torchtitan.tools.logging import logger
 
 _SCAN_HOP = torch.ops.higher_order.scan
+# The ``compile.scan_offload`` name of the saved carry.
+LAYER_INPUT = "layer_input"
 
 
 def _scan_body(gm: torch.fx.GraphModule, scan_node: Node) -> torch.fx.GraphModule:
@@ -59,6 +68,16 @@ def _is_saved_carry(body: torch.fx.GraphModule, node: object) -> bool:
         isinstance(node, Node)
         and node.target is torch.ops.aten.clone.default
         and node.args[0] is _placeholder(body, 0)
+    )
+
+
+def _is_named_save(body: torch.fx.GraphModule, node: object, name: str) -> bool:
+    if name == LAYER_INPUT:
+        return _is_saved_carry(body, node)
+    # Scan returns a saved op output as is, with the op's region label.
+    return (
+        isinstance(node, Node)
+        and (node.meta.get("custom") or {}).get(REMAT_REGION) == name
     )
 
 
@@ -165,7 +184,9 @@ def _reload_body_slice(body: torch.fx.GraphModule, index: int) -> None:
     body.recompile()
 
 
-def _offload_one(gm: torch.fx.GraphModule, fwd_scan: Node, index: int) -> None:
+def _offload_one(
+    gm: torch.fx.GraphModule, fwd_scan: Node, index: int, name: str
+) -> None:
     # A scan node returns what its body returns, so getitem index = body output.
     stacks = [
         u for u in fwd_scan.users
@@ -192,41 +213,52 @@ def _offload_one(gm: torch.fx.GraphModule, fwd_scan: Node, index: int) -> None:
         node.meta["val"] = node.meta["val"].to("cpu")
         pending.extend(u for u in node.users if _is_view(u))
     logger.info(
-        "scan offload: %s %s -> host inside the loop bodies, %.2f GiB",
+        "scan offload: %s %s %s -> host inside the loop bodies, %.2f GiB",
+        name,
         stack.name,
         tuple(stack.meta["val"].shape),
         _tensor_bytes(stack.meta["val"]) / (1024**3),
     )
 
 
-def offload_scan_activations(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-    """Move each forward scan's saved layer input to host, inside the loops.
+def offload_scan_activations(
+    gm: torch.fx.GraphModule, names: tuple[str, ...] = (LAYER_INPUT,)
+) -> torch.fx.GraphModule:
+    """Move each forward scan's saves named in ``names`` to host, inside the loops.
 
-    Raises if there is none: asking for the offload and silently not getting
-    it gives a correct run at the wrong memory.
+    Raises if a name matches no save: asking for the offload and silently not
+    getting it gives a correct run at the wrong memory.
     """
-    found = forward_scans = 0
+    found = dict.fromkeys(names, 0)
+    forward_scans = 0
     for node in gm.graph.find_nodes(op="call_function", target=_SCAN_HOP):
         if _is_backward_node(node):
             continue
         forward_scans += 1
         body = _scan_body(gm, node)
         outs = _outputs(body)
-        saved = [i for i, out in enumerate(outs) if _is_saved_carry(body, out)]
-        if len(saved) > 1:
-            raise RuntimeError(f"scan offload: {node.name} saves its carry twice")
-        for index in saved:
-            _offload_one(gm, node, index)
-            found += 1
+        for name in names:
+            saved = [i for i, o in enumerate(outs) if _is_named_save(body, o, name)]
+            if name == LAYER_INPUT and len(saved) > 1:
+                raise RuntimeError(f"scan offload: {node.name} saves its carry twice")
+            for index in saved:
+                _offload_one(gm, node, index, name)
+                found[name] += 1
     if not forward_scans:
         raise RuntimeError(
             "scan offload found no forward scan; it needs "
             "--compile.use-scan-layers."
         )
-    if not found:
+    if found.get(LAYER_INPUT) == 0:
         raise RuntimeError(
             f"scan offload: {forward_scans} forward scans, none saves its "
             "carry (is the layer input recomputed instead of saved?)"
+        )
+    missing = [name for name, count in found.items() if not count]
+    if missing:
+        raise RuntimeError(
+            f"scan offload: no forward scan saves region(s) {missing} "
+            "(is each one in compile.save_regions?)"
         )
     return gm
 
@@ -237,7 +269,11 @@ def _full_and_scan_offload_memory_policy_pass(
     *,
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
-    """Full recompute, then keep the scan's saved layer input on host."""
+    """Full recompute, then keep the scan's saved layer input on host.
+
+    ``compile.scan_offload`` can only name ``layer_input`` here: full recompute
+    saves no region.
+    """
     _full_memory_policy_pass(gm, config=config)
-    offload_scan_activations(gm)
+    offload_scan_activations(gm, tuple(config.compile.scan_offload))
     return gm

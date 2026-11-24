@@ -49,7 +49,9 @@ def apply_compile(
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    if compile_config is None:
+    # Fork: the TPU compile configs keep an ``enable`` switch (they carry
+    # knobs that apply even when torch.compile is off).
+    if compile_config is None or not getattr(compile_config, "enable", True):
         return
 
     _maybe_enable_async_tp(

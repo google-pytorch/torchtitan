@@ -575,7 +575,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
 
             assert len(microbatch_group) == 1
             microbatch = microbatch_group[0]
-            input_dict = self._to_device(microbatch)
+            input_dict = TrainingEngine._to_device(self, microbatch)
             with sl.log_trace_span("preprocess_inputs"):
                 inputs, labels, extra_kwargs = cast(
                     BaseModel, self.model_parts[0]
@@ -691,7 +691,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def optimizer_step(self) -> torch.Tensor:
         """Validate gradients, then advance optimizer and learning-rate scheduler."""
         current_step = self.num_completed_steps + 1
-        grad_norm = self._clip_grad_norm()
+        # Fork hook (TPU engines compile the norm). Looked up defensively:
+        # upstream's unit tests drive these methods on namespace stubs.
+        clip_grad_norm = getattr(self, "_clip_grad_norm", None)
+        grad_norm = (
+            clip_grad_norm()
+            if clip_grad_norm is not None
+            else TrainingEngine._clip_grad_norm(self)
+        )
         if not self.parallel_dims.pp_enabled or self.pp_has_last_stage:
             loss_mesh = self.parallel_dims.get_optional_mesh("loss")
             if loss_mesh is not None:

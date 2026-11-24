@@ -69,33 +69,37 @@ DISABLED_TESTS = {
     "tests.unit_tests.cpu.test_tokenizer",
     # TODO: mark_dynamic() no longer sets _dynamo_dynamic_range, so the copy assertion is stale.
     "torchtitan.experiments.graph_trainer.tests.test_trace_module",
-    # Missing optional dependency renderers
-    "torchtitan.experiments.rl.tests.test_alphabet_sort",
-    "torchtitan.experiments.rl.tests.test_async_controller",
-    "torchtitan.experiments.rl.tests.test_rollout_recorder",
-    "torchtitan.experiments.rl.tests.test_rollout_utils",
-    "torchtitan.experiments.rl.tests.test_search_r1",
-    "torchtitan.experiments.rl.tests.test_weight_sync",
-    "torchtitan.experiments.rl.tests.test_dapo_math",
-    "torchtitan.experiments.rl.tests.test_muse_glimmer_renderer",
-    "torchtitan.experiments.rl.tests.test_renderer",
-    "torchtitan.experiments.rl.tests.test_rollouter_pool",
-    "torchtitan.experiments.rl.tests.test_rollout_worker",
-    "torchtitan.experiments.rl.tests.test_token_env",
+    # Missing optional dependency renderers (upstream moved experiments/rl
+    # tests to tests/unit_tests/rl)
+    "tests.unit_tests.rl.test_alphabet_sort",
+    "tests.unit_tests.rl.test_async_controller",
+    "tests.unit_tests.rl.test_rollout_recorder",
+    "tests.unit_tests.rl.test_rollout_utils",
+    "tests.unit_tests.rl.test_search_r1",
+    "tests.unit_tests.rl.test_weight_sync",
+    "tests.unit_tests.rl.test_dapo_math",
+    "tests.unit_tests.rl.test_muse_glimmer_renderer",
+    "tests.unit_tests.rl.test_renderer",
+    "tests.unit_tests.rl.test_rollouter_pool",
+    "tests.unit_tests.rl.test_rollout_worker",
+    "tests.unit_tests.rl.test_token_env",
     # Missing optional dependency torchstore
-    "torchtitan.experiments.rl.tests.test_engine_loop",
+    "tests.unit_tests.rl.test_engine_loop",
     # Missing optional dependency monarch
-    "torchtitan.experiments.rl.tests.test_shutdown",
-    "torchtitan.experiments.rl.tests.test_inter_generator_router",
-    "torchtitan.experiments.rl.tests.test_intra_generator_router",
+    "tests.unit_tests.rl.test_shutdown",
+    "tests.unit_tests.rl.test_inter_generator_router",
+    "tests.unit_tests.rl.test_trainer",
+    "tests.unit_tests.rl.test_intra_generator_router",
     # Missing optional dependency vllm
-    "torchtitan.experiments.rl.tests.test_generator",
-    "torchtitan.experiments.rl.tests.test_bitwise_parity",
-    "torchtitan.experiments.rl.tests.test_vllm_otel_stat_logger",
-    "torchtitan.experiments.rl.tests.test_vllm_wrapper",
+    "tests.unit_tests.rl.test_generator",
+    "tests.unit_tests.rl.test_gdn_cudagraph",
+    "tests.unit_tests.rl.test_gdn_graph_metadata",
+    "tests.unit_tests.rl.test_bitwise_parity",
+    "tests.unit_tests.rl.test_vllm_otel_stat_logger",
+    "tests.unit_tests.rl.test_vllm_wrapper",
     # Missing optional dependency verifiers
-    "torchtitan.experiments.rl.tests.test_verifiers",
-    "torchtitan.experiments.rl.tests.test_verifiers_example",
+    "tests.unit_tests.rl.test_verifiers",
+    "tests.unit_tests.rl.test_verifiers_example",
     # Missing optional dependency torch_checkpointing
     "tests.unit_tests.cpu.test_torch_checkpointing",
     # Requires CUDA; upstream runs these tests only on CUDA
@@ -158,6 +162,9 @@ DESELECTED_TESTS = (
     # Upstream test; the fork passes cache_dir= to load_dataset (copy.bara.sky),
     # so the exact-call assertion fails.
     "tests/unit_tests/cpu/components/data/test_grain_data.py::test_hf_explicit_fields_are_passed_to_load_dataset",
+    # Fork keeps EP-disabled routed experts as replicated DTensors (spmd FSDP
+    # rejects plain tensors); upstream asserts no sharding config there.
+    "tests/unit_tests/cpu/test_moe.py::TestMoE::test_moe_without_ep_keeps_routed_weights_replicated",
 )
 
 

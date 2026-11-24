@@ -129,6 +129,9 @@ def configure_gemma4_simple_fsdp_shard_dims(
   if fsdp_degree <= 1:
     return
 
+  stack_fqns = [
+      fqn for fqn, m in model.named_modules() if hasattr(m, "plan_shard_dims")
+  ]
   stacks = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
   for holder in stacks:
     holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
@@ -181,6 +184,29 @@ def configure_gemma4_simple_fsdp_shard_dims(
         )
       setattr(module, "_fsdp_shard_dim", 1)
       hidden_axis_modules.append(module_fqn)
+
+  # Any other bias-free Linear whose output width does not divide the FSDP
+  # degree (26B-A4B shared MLP: 2112 over 128 ranks) would get ragged, partly
+  # empty dim-0 shards. Shard it on the input width instead when that divides.
+  for module_fqn, module in model.named_modules():
+    if not isinstance(module, nn.Linear) or hasattr(module, "_fsdp_shard_dim"):
+      continue
+    if any(module_fqn.startswith(f"{stack_fqn}.") for stack_fqn in stack_fqns):
+      continue
+    weight = module.weight
+    if weight.shape[0] % fsdp_degree == 0:
+      continue
+    if module.bias is not None or weight.shape[1] % fsdp_degree != 0:
+      logger.warning(
+          "%s.weight with shape %s has no axis that divides %d FSDP ranks; "
+          "keeping uneven dim-0 shards",
+          module_fqn,
+          tuple(weight.shape),
+          fsdp_degree,
+      )
+      continue
+    setattr(module, "_fsdp_shard_dim", 1)
+    hidden_axis_modules.append(module_fqn)
 
   if hidden_axis_modules:
     logger.info(

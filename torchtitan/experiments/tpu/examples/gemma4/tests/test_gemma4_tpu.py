@@ -1838,6 +1838,45 @@ class TestGemma4MoEPallasKernels(BaseDeviceTest):
       inner = layer.moe.routed_experts.inner_experts
       self.assertEqual(getattr(inner, "_fsdp_shard_dim", None), 1)
 
+  def test_configure_simple_fsdp_shard_dims_moves_uneven_linears_to_dim_1(self):
+    """A Linear whose output width does not divide the FSDP degree shards on dim 1.
+
+    26B-A4B's shared MLP is 2112 wide, which 128 ranks do not divide; with
+    dim-0 shards the first step stalled on a 4x4x4 slice.
+    """
+    from types import SimpleNamespace
+
+    cfg = gemma4_moe_debug_pallas().model_spec.model
+    # dim=192 divides dp_shard=8; the shared-MLP width 100 does not.
+    cfg.vocab_size = 192
+    cfg.dim = 192
+    cfg.tok_embeddings.num_embeddings = 192
+    cfg.tok_embeddings.embedding_dim = 192
+    cfg.lm_head.in_features = 192
+    cfg.lm_head.out_features = 192
+    for layer in cfg.layers:
+      experts = layer.moe.routed_experts.inner_experts
+      experts.num_experts = 8
+      experts.dim = 192
+      experts.hidden_dim = 96
+      layer.feed_forward.w1.in_features = 192
+      layer.feed_forward.w1.out_features = 100
+      layer.feed_forward.w2.in_features = 100
+      layer.feed_forward.w2.out_features = 192
+      layer.feed_forward.w3.in_features = 192
+      layer.feed_forward.w3.out_features = 100
+
+    with torch.device("meta"):
+      model = cfg.build()
+    pdims = SimpleNamespace(dp_shard=8, ep_enabled=False)
+    configure_gemma4_simple_fsdp_shard_dims(model, pdims)
+    for layer in model.layers.values():
+      ffn = layer.feed_forward
+      self.assertEqual(getattr(ffn.w1, "_fsdp_shard_dim", None), 1)
+      self.assertEqual(getattr(ffn.w3, "_fsdp_shard_dim", None), 1)
+      # w2 is (192, 100): dim 0 already divides, so it keeps the default.
+      self.assertFalse(hasattr(ffn.w2, "_fsdp_shard_dim"))
+
   @parameterized.named_parameters(
       ("untiled_tgmm", (256, 0, 0), (256, 0, 0)),
       ("k_tiled_tgmm", (256, 128, 0), (256, 0, 0)),

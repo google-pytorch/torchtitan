@@ -4,7 +4,11 @@ from unittest import mock
 
 from absl.testing import absltest
 import torch
+import spmd_types as spmd
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
+from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.moe_sharding import expert_param_placement_dense
+from torchtitan.protocols.sharding import ShardingConfig
 
 
 def _fp8_experts_config(**overrides) -> TpuGroupedExperts.Config:
@@ -77,6 +81,37 @@ class TpuGroupedExpertsFp8ConfigTest(absltest.TestCase):
     self.assertEqual(seen["rows"], 1024)
     self.assertEqual(seen["sizes"], [128, 128, 128, 640])
     self.assertEqual(seen["tail"], 0.0)
+
+  def test_prequantized_placeholders_get_a_placement(self):
+    # `Module._distribute_states` raises for any buffer without a placement,
+    # so the empty FP8 placeholders must get one next to the weights'.
+    experts = TpuGroupedExperts(
+        _fp8_experts_config(
+            use_kernel_native_weight_layout=True,
+            fp8_gather_quantized_weights=True,
+        )
+    )
+    weight = expert_param_placement_dense(tp_placement=spmd.R)
+    experts._sharding_config = ShardingConfig(
+        state_shardings={n: weight for n in ("w1_EFD", "w2_EDF", "w3_EFD")}
+    )
+    seen = {}
+
+    def fake_distribute(module, parallel_dims):
+      del parallel_dims
+      seen["states"] = dict(module._sharding_config.state_shardings)
+
+    with mock.patch.object(
+        GroupedExperts, "_distribute_states", fake_distribute
+    ):
+      experts._distribute_states(None)
+    buffers = [name for name, _ in experts.named_buffers(recurse=False)]
+    self.assertCountEqual(
+        buffers, ["fp8_w13_q", "fp8_w13_scale", "fp8_w2_q", "fp8_w2_scale"]
+    )
+    for name in buffers + [n for n, _ in experts.named_parameters()]:
+      self.assertIn(name, seen["states"])
+    self.assertEqual(seen["states"]["fp8_w13_q"], weight)
 
   def test_in_kernel_lhs_quant_is_opt_in(self):
     # GMM v2 in-kernel quantization needs an FP8 x FP8 MXU (v7x), so turning

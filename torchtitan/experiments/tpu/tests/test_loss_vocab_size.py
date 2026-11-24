@@ -117,9 +117,9 @@ class _StopInit(Exception):
 
 
 class TrainerFillsBeforeBaseInitTest(absltest.TestCase):
-  """`Trainer.__init__` builds `loss_fn` from `config.loss` (and binds it into the
-  PP schedule), so both TPU trainers must fill `global_vocab_size` before
-  calling it."""
+  """`Trainer.__init__` has the engine build `loss_fn` from `config.loss` (and
+  bind it into the PP schedule), so both TPU trainers must fill
+  `global_vocab_size` before calling it."""
 
   def _captured_vocab(self, trainer_cls, base_cls, config):
     seen = {}
@@ -135,12 +135,12 @@ class TrainerFillsBeforeBaseInitTest(absltest.TestCase):
 
   def test_tpu_trainer_fills_before_trainer_init(self):
     from torchtitan.experiments.tpu import train as tpu_train
-    import torchtitan.train
+    import torchtitan.trainer
 
     config = config_registry.llama3_debugmodel()
     self.assertIsNone(config.loss.global_vocab_size)
     self.assertEqual(
-        self._captured_vocab(tpu_train.TPUTrainer, torchtitan.train.Trainer, config),
+        self._captured_vocab(tpu_train.TPUTrainer, torchtitan.trainer.Trainer, config),
         config.model_spec.model.vocab_size,
     )
 

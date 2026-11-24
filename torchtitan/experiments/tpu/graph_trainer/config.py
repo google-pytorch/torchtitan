@@ -8,7 +8,9 @@
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Annotated, TYPE_CHECKING, Any, Literal
+
+import tyro
 
 from torch import nn
 from torchtitan.experiments.graph_trainer.configs import (
@@ -29,7 +31,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
 )
 from torchtitan.experiments.tpu.components.layer_loop import builds_layer_loop
 
-from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    sync_compile_components,
+    TPUTrainerConfig,
+)
 
 if TYPE_CHECKING:
   from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
@@ -129,6 +134,15 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   ``"loss"`` unless a separately compiled loss is intentional.
   """
 
+  # Fork: the TPU compile config carries knobs that apply even when
+  # torch.compile is off; upstream removed ``CompileConfig.enable`` in
+  # ec953b36 and uses ``compile is None`` instead.
+  # TODO: move the TPU graph-trainer controls (pass_pipeline, memory_policy,
+  # optimizer_compile, compile_grad_norm, use_scan_layers, graph_split) out of
+  # this config so it can follow upstream's `compile=None` convention, then
+  # drop `enable`, `enabled_components` and the enable/components sync and
+  # validation.
+  enable: bool = False
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"
@@ -175,6 +189,15 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+  # ``components`` to restore when ``enable`` is set; maintained by
+  # ``sync_compile_components``, not a user option.
+  enabled_components: Annotated[list[str] | None, tyro.conf.Suppress] = None
+
+  def __post_init__(self) -> None:
+    super(TpuGraphTrainerCompileConfig, self).__post_init__()
+    # Upstream consumers read "compile is not None and <component> in
+    # components"; keep the fork's explicit switch consistent with that.
+    sync_compile_components(self)
 
 
 def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:

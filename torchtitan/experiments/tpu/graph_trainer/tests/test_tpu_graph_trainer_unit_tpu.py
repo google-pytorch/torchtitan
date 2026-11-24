@@ -106,7 +106,7 @@ def _loss(model: nn.Module, inputs, labels, global_valid_tokens):
 
 
 def _traced_trainer(model: nn.Module, batch_size: int, device):
-  """A bare TpuGraphTrainer holding one traced fwd+bwd step on (batch_size, 16)."""
+  """A bare TpuGraphTrainingEngine holding one traced fwd+bwd step on (batch_size, 16)."""
 
   def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
     loss = _loss(model, inputs, labels, global_valid_tokens)
@@ -117,7 +117,7 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
 
   inputs = torch.randint(0, 128, (batch_size, 16), device=device)
   labels = torch.randint(0, 128, (batch_size, 16), device=device)
-  trainer = object.__new__(tpu_graph_trainer.TpuGraphTrainer)
+  trainer = object.__new__(tpu_graph_trainer.TpuGraphTrainingEngine)
   trainer._traced_step = make_fx_tracer.minimal_fx_tracer(
       fwd_bwd, module=model
   )(inputs, labels, torch.tensor(1.0, device=device), {})
@@ -136,7 +136,9 @@ def _check_grad_accum_step(test, trainer, model, num_microbatches, device):
   for x, y in zip(
       inputs.chunk(num_microbatches), labels.chunk(num_microbatches)
   ):
-    trainer._make_fx_forward_backward_step(model, x, y, tokens, params, {})
+    trainer._make_fx_forward_backward_microbatch(
+        model, x, y, tokens, params, {}
+    )
 
   ref = copy.deepcopy(model)
   ref.zero_grad(set_to_none=True)
@@ -512,8 +514,9 @@ class GradAccumulationTest(BaseAcceleratorDeviceTest):
 
     def fake_init(trainer, config):
       del config
-      trainer.model_parts = []
-      trainer.optimizers = SimpleNamespace(optimizers=[])
+      # Upstream ec953b36: the in-graph switch lives on the engine, the
+      # accumulation count on the loop.
+      trainer.engine = SimpleNamespace(_optimizer_in_graph=True)
       trainer.gradient_accumulation_steps = steps
 
     with mock.patch.object(GraphTrainer, "__init__", fake_init):

@@ -1,7 +1,9 @@
 """TPU job config."""
 
 import dataclasses
-from typing import Literal
+from typing import Annotated, Any, Literal
+
+import tyro
 
 import torchtitan.config
 from torchtitan.experiments.tpu import tpu_flags
@@ -62,10 +64,80 @@ TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]
 TpuTrainerOptimizerCompileMode = Literal["eager", "separate_graph"]
 
 
+def sync_compile_components(compile_config: Any) -> None:
+  """Makes ``components`` (what upstream reads) follow the fork's ``enable``.
+
+  Upstream consumers read "compile is not None and <component> in components"
+  (model parallelize fns, config validation, loss build), so a disabled TPU
+  compile config must present no components. The components asked for are kept
+  in ``enabled_components`` and come back when the config is enabled: tyro
+  builds ``--compile.enable`` from the recipe's default instance, whose
+  ``components`` is already empty when the recipe leaves compile off.
+  """
+  if compile_config.components:
+    compile_config.enabled_components = list(compile_config.components)
+  elif compile_config.enabled_components is None:
+    compile_config.enabled_components = []
+  compile_config.components = (
+      list(compile_config.enabled_components) if compile_config.enable else []
+  )
+
+
+def validate_compile_components(compile_config: Any) -> None:
+  """Raises when ``enable`` and ``components`` of a TPU compile config disagree.
+
+  ``sync_compile_components`` runs when the config is constructed, so
+  assigning ``config.compile.enable`` afterwards leaves ``components`` as it
+  was: set to True, consumers that read ``components`` silently skip
+  torch.compile; set to False, upstream's ``"model" in compile.components``
+  checks still compile. The TPU entry points call this before building a
+  trainer.
+
+  Raises:
+    ValueError: If ``enable`` is set and ``components`` is empty, or ``enable``
+      is unset and ``components`` is not empty.
+  """
+  if compile_config is None or not hasattr(compile_config, "enable"):
+    return
+  how = (
+      " Set compile.enable when the config is constructed (--compile.enable /"
+      " --compile.no-enable, or dataclasses.replace(config.compile,"
+      " enable=...)) instead of assigning it afterwards."
+  )
+  if compile_config.enable and not compile_config.components:
+    raise ValueError(
+        "compile.enable is set but compile.components is empty, so the"
+        " components would not be compiled; list the components to compile."
+        + how
+    )
+  if not compile_config.enable and compile_config.components:
+    raise ValueError(
+        "compile.enable is unset but compile.components is"
+        f" {compile_config.components}, which upstream consumers would still"
+        " compile." + how
+    )
+
+
+def requested_compile_components(compile_config: Any) -> list[str]:
+  """Components ``compile_config`` compiles when enabled."""
+  requested = getattr(compile_config, "enabled_components", None)
+  return list(requested if requested else compile_config.components)
+
+
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
   """Generic compile policy plus regular-Trainer TorchTPU controls."""
 
+  # Upstream ec953b36 dropped ``CompileConfig.enable`` in favour of
+  # ``Trainer.Config.compile`` being ``None``. The TPU compile config also
+  # carries execution controls that apply when torch.compile is off, so it is
+  # always present and keeps the explicit switch.
+  # TODO: move the TorchTPU execution controls
+  # (materialize_forward_before_backward, optimizer_compile, compile_grad_norm)
+  # out of this config so it can follow upstream's `compile=None` convention,
+  # then drop `enable`, `enabled_components` and the enable/components sync
+  # and validation.
+  enable: bool = False
   # TPU model families support different subsets: Llama/Qwen use
   # layer/fullgraph, Conformer uses layer/whole, and redacted uses block/whole.
   mode: TpuTrainerCompileMode = "layer"
@@ -79,6 +151,13 @@ class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
   optimizer_compile: TpuTrainerOptimizerCompileMode = "eager"
   # Compile the DTensor-aware global gradient norm as a separate static graph.
   compile_grad_norm: bool = False
+  # ``components`` to restore when ``enable`` is set; maintained by
+  # ``sync_compile_components``, not a user option.
+  enabled_components: Annotated[list[str] | None, tyro.conf.Suppress] = None
+
+  def __post_init__(self) -> None:
+    super(TpuTrainerCompileConfig, self).__post_init__()
+    sync_compile_components(self)
 
 
 @dataclasses.dataclass
@@ -219,6 +298,20 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # graph to capture in this lane, so opt out before the check runs. Must
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
     self.training.disable_cuda_graphs = True
+    if (
+        self.model_spec is not None
+        and self.parallelism.context_parallel_degree > 1
+    ):
+      # CP recipes apply core ContextParallelTransform with a TPU CP inner
+      # attention; core validates the CP backend, this adds the TPU rules.
+      # Runs before ``super()`` so the strategy-specific sequence-length error
+      # surfaces instead of upstream's generic ring-CP (``2 * cp``) token check.
+      validate_tpu_context_parallel(
+          self.model_spec.model,
+          self.parallelism,
+          training=self.training,
+          splash_attention_kernel=self.splash_attention_kernel,
+      )
     # NOTE: explicit ``super(...)`` (rather than zero-arg ``super()``) is
     # required because ``@dataclass(slots=True)`` replaces the class object
     # after decoration, leaving the ``__class__`` cell that zero-arg
@@ -233,14 +326,6 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
         self.model_spec is not None
         and self.parallelism.context_parallel_degree > 1
     ):
-      # CP recipes apply core ContextParallelTransform with a TPU CP inner
-      # attention; core validates the CP backend, this adds the TPU rules.
-      validate_tpu_context_parallel(
-          self.model_spec.model,
-          self.parallelism,
-          training=self.training,
-          splash_attention_kernel=self.splash_attention_kernel,
-      )
       # The Pallas fused loss tiles each rank's tokens by b_block_size, and a
       # CP rank holds 1 / cp of the data-parallel rank's tokens.
       cp = self.parallelism.context_parallel_degree
@@ -288,17 +373,39 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # inherit merely because they reuse a TorchTPU recipe. Reconstruct the
     # destination's declared/default type and carry only the generic policy.
     if "compile" in values:
-      compile_factory = dst_fields["compile"].default_factory
-      if compile_factory is dataclasses.MISSING:
-        raise TypeError(f"{cls.__name__}.compile must have a default factory")
-      dst_compile = compile_factory()
+      compile_field = dst_fields["compile"]
+      if compile_field.default_factory is not dataclasses.MISSING:
+        dst_compile = compile_field.default_factory()
+      elif compile_field.default is not dataclasses.MISSING:
+        # Upstream ``Trainer.Config.compile`` is ``CompileConfig | None``
+        # (``None`` means no compilation).
+        dst_compile = compile_field.default
+      else:
+        raise TypeError(f"{cls.__name__}.compile must have a default")
       src_compile = values["compile"]
-      if type(src_compile) is not type(dst_compile):
-        values["compile"] = type(dst_compile)(
-            enable=src_compile.enable,
-            components=list(src_compile.components),
-            backend=src_compile.backend,
+      if src_compile is None:
+        # The TPU lanes keep a concrete, always-present policy.
+        values["compile"] = dst_compile
+      elif dst_compile is None:
+        # Upstream's optional generic policy: present means enabled.
+        values["compile"] = (
+            torchtitan.config.CompileConfig(
+                components=requested_compile_components(src_compile),
+                backend=src_compile.backend,
+            )
+            if getattr(src_compile, "enable", True)
+            else None
         )
+      elif type(src_compile) is not type(dst_compile):
+        kwargs = {
+            "components": requested_compile_components(src_compile),
+            "backend": src_compile.backend,
+        }
+        if "enable" in {f.name for f in dataclasses.fields(dst_compile)}:
+          # A plain upstream ``CompileConfig`` has no ``enable``: when it is
+          # present at all, upstream compiles.
+          kwargs["enable"] = getattr(src_compile, "enable", True)
+        values["compile"] = type(dst_compile)(**kwargs)
     return cls(
         **values,
         **overrides,
@@ -314,12 +421,16 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
-    if type(self.compile) is torchtitan.config.CompileConfig:
+    if self.compile is None:
+      # Upstream ``Trainer.Config.compile`` is optional; the TPU lane always
+      # carries its concrete policy (``enable`` defaults to False).
+      self.compile = TpuTrainerCompileConfig()
+    elif type(self.compile) is torchtitan.config.CompileConfig:
       # ``derive_from`` may receive an upstream Trainer.Config. Preserve its
       # generic compile policy while restoring the TPU-specific config type.
       self.compile = TpuTrainerCompileConfig(
-          enable=self.compile.enable,
-          components=list(self.compile.components),
+          enable=getattr(self.compile, "enable", True),
+          components=requested_compile_components(self.compile),
           backend=self.compile.backend,
       )
     if self.compile.compile_grad_norm:

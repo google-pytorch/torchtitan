@@ -68,9 +68,6 @@ from torchtitan.experiments.tpu.components.layer_loop import (
     runs_layer_loop,
     TpuLayerLoop,
 )
-from torchtitan.experiments.tpu.components.remat_regions import (
-    annotate_moe_expert_counts,
-)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.protocols.module import Module
@@ -625,9 +622,6 @@ class LayerStack:
                 "model config has to go through `tpu_model_class` first."
             )
         if use_scan:
-            # The scan body saves the counts by this region; see
-            # `scan_remat_policy`.
-            annotate_moe_expert_counts()
             # Logged because `compile.memory_policy` does not reach the
             # body's nodes; only `save_regions` does. See `scan_remat_policy`.
             has_moe = any(isinstance(m, MoE) for m in model.layers.modules())

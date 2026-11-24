@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import torch_remat as remat
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.fx.traceback import annotate_fn
 
 from torchtitan.distributed.spmd_types import (
     maybe_set_sparse_mesh,
@@ -134,6 +135,9 @@ def _batch_wise_load_balance_loss(
     return (f_i * p_i).sum() * aux_loss_coeff
 
 
+# Labels this all-reduce for TPU scan remat, which saves its result instead of
+# redoing the all-reduce in backward. Metadata only; it does not change what runs.
+@annotate_fn({"remat_region": "moe.expert_counts"})
 def _all_reduce_expert_counts(
     counts: torch.Tensor,
     *,

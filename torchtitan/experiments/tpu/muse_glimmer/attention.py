@@ -28,16 +28,28 @@ through flex ``attention_masks``, and its ``Attention.forward`` never passes
 across documents. ``TpuMuseGlimmerAttention`` forwards ``positions``; the SDPA
 here ANDs its causal/window mask with a same-document mask, and the Splash /
 Tokamax patches turn ``positions`` into ``segment_ids``.
+
+Context parallelism: ``UlyssesCPSlidingWindowScaledDotProductInnerAttention``
+and ``KVAllGatherCPSlidingWindowScaledDotProductInnerAttention`` are its CP
+versions (see ``experiments/tpu/distributed/cp_attention.py``), registered so
+``tpu_cp_inner_attention`` finds them.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel
+from torchtitan.experiments.tpu.distributed.cp_attention import (
+    KVAllGatherCPInnerAttention,
+    UlyssesCPInnerAttention,
+    register_tpu_cp_inner_attention,
+)
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.attention import ScaledDotProductInnerAttention
 from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.models.common.cp_attention import CPInnerAttention
 from torchtitan.models.muse_glimmer.model import Attention
 
 
@@ -213,6 +225,58 @@ class SlidingWindowScaledDotProductInnerAttention(
     if was_3d:
       return out_BLHV.reshape(-1, *out_BLHV.shape[2:])
     return out_BLHV
+
+
+class UlyssesCPSlidingWindowScaledDotProductInnerAttention(
+    UlyssesCPInnerAttention, SlidingWindowScaledDotProductInnerAttention
+):
+  """Ulysses CP over ``SlidingWindowScaledDotProductInnerAttention``.
+
+  Without an attention kernel plugged in, the full-sequence local attention is
+  the sliding-window / packed-document SDPA above, which (unlike plain SDPA)
+  applies its window itself.
+  """
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(
+      CPInnerAttention.Config,
+      SlidingWindowScaledDotProductInnerAttention.Config,
+  ):
+    pass
+
+  def local_forward(self, q_THK, k_THK, v_THV, **kwargs) -> torch.Tensor:
+    return SlidingWindowScaledDotProductInnerAttention.forward(
+        self, q_THK, k_THK, v_THV, **kwargs
+    )
+
+
+class KVAllGatherCPSlidingWindowScaledDotProductInnerAttention(
+    KVAllGatherCPInnerAttention, SlidingWindowScaledDotProductInnerAttention
+):
+  """Load-balanced KV all-gather CP over the sliding-window SDPA."""
+
+  @dataclass(kw_only=True, slots=True)
+  class Config(
+      CPInnerAttention.Config,
+      SlidingWindowScaledDotProductInnerAttention.Config,
+  ):
+    reduce_dtype: Literal["float32", "bfloat16"] = "float32"
+    allow_reference_attention: bool = False
+    """Run ``local_forward`` on TPU without a kernel (tests, tiny models)."""
+
+  def local_forward(self, q, k, v, **kwargs) -> torch.Tensor:
+    # Drop attention_masks so the reference attention applies the segment_ids
+    # document mask: it skips that mask for plain SDPA when attention_masks is
+    # passed (as from GQAttention), but this attention masks documents.
+    kwargs.pop("attention_masks", None)
+    return super().local_forward(q, k, v, **kwargs)
+
+
+register_tpu_cp_inner_attention(
+    SlidingWindowScaledDotProductInnerAttention,
+    UlyssesCPSlidingWindowScaledDotProductInnerAttention,
+    KVAllGatherCPSlidingWindowScaledDotProductInnerAttention,
+)
 
 
 class TpuMuseGlimmerAttention(Attention):

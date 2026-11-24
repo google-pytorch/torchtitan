@@ -1,5 +1,7 @@
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
+from typing import Literal, TypeVar
+
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
@@ -12,11 +14,16 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.config.transform import ContextParallelTransform, apply_transforms
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import (
     TPUGrainDataLoader,
     c4_test_dataloader,
+)
+from torchtitan.experiments.tpu.distributed.cp_attention import (
+    tpu_cp_inner_attention,
+    tpu_cp_load_balancer,
 )
 from torchtitan.experiments.tpu.graph_trainer.config import (
     GraphSplitterConfig,
@@ -33,6 +40,7 @@ from torchtitan.experiments.tpu.components.grouped_experts import (
 )
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
+from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import GatedDeltaNetCPStrategy, GatedDeltaNetContextParallelTransform, ReduceDtype
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -44,6 +52,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
+from torchtitan.models.common.attention import BaseAttention
 
 _TPU_MOE_CONVERTERS = [
     TpuTokenDispatcherConverter.Config(),
@@ -644,3 +653,160 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (tile_m, 0, 2048)
   _use_expert_parallel(cfg, ep_degree=8, num_token_chunks=12)
   return cfg
+
+
+# A TPUTrainerConfig or a subclass (e.g. TpuGraphTrainer.Config).
+_TPUConfigT = TypeVar("_TPUConfigT", bound=TPUTrainerConfig)
+
+
+def _qwen35_cp(
+    config: _TPUConfigT,
+    *,
+    strategy: Literal["ulysses", "all_gather"],
+    cp_degree: int,
+    gated_delta_cp_strategy: GatedDeltaNetCPStrategy = "all_to_all",
+    gated_delta_cp_reduce_dtype: ReduceDtype = "float32",
+) -> _TPUConfigT:
+  """Enables TPU context parallelism for hybrid Qwen3.5.
+
+  As ``qwen3/config_registry.py::_qwen3_cp``, sets the CP degree and the load
+  balancer of ``strategy`` and applies core ``ContextParallelTransform`` with
+  the TPU CP inner attention to the full-attention layers. Also applies
+  ``GatedDeltaNetContextParallelTransform``, which runs the GatedDeltaNet
+  layers head-parallel over the same token layout (``cp_gated_delta``):
+  ``n_key_heads`` and ``n_value_heads`` must be divisible by ``cp_degree``.
+
+  Args:
+    config: The recipe to enable CP on.
+    strategy: The full-attention CP strategy, ``"all_gather"`` (load-balanced KV
+      all-gather) or ``"ulysses"``.
+    cp_degree: The context-parallel degree.
+    gated_delta_cp_strategy: ``GatedDeltaNetContextParallelTransform``'s
+      ``cp_strategy``.
+    gated_delta_cp_reduce_dtype: Its ``cp_reduce_dtype``.
+
+  Returns:
+    A validated copy of ``config`` with CP enabled.
+  """
+  assert config.model_spec is not None
+  load_balancer = tpu_cp_load_balancer(strategy)
+  config.parallelism.context_parallel_degree = cp_degree
+  config.parallelism.context_parallel_load_balancer = load_balancer
+  inner_attention = config.model_spec.model.first_full_attention_backend
+  assert inner_attention is not None
+  return apply_transforms(
+      config,
+      [
+          ContextParallelTransform(
+              inner_attention=tpu_cp_inner_attention(
+                  inner_attention._owner, strategy
+              )
+          ),
+          GatedDeltaNetContextParallelTransform(
+              load_balancer=load_balancer,
+              cp_strategy=gated_delta_cp_strategy,
+              cp_reduce_dtype=gated_delta_cp_reduce_dtype,
+          ),
+      ],
+  )
+
+
+def _allow_reference_attention(cfg: TPUTrainerConfig) -> None:
+  """Lets KV all-gather CP run its plain-PyTorch attention (no Splash)."""
+  assert cfg.model_spec is not None
+  for _, attn, _, _ in cfg.model_spec.model.traverse(BaseAttention.Config):
+    attn.inner_attention.allow_reference_attention = True
+
+
+def qwen35_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 debug model with KV all-gather CP degree 2 (head-parallel GDN).
+
+  The debug model runs without the Splash kernel, so KV all-gather CP opts in
+  to its plain-PyTorch reference attention, which is fine at this size.
+  """
+  cfg = _qwen35_cp(qwen35_debugmodel(), strategy="all_gather", cp_degree=2)
+  _allow_reference_attention(cfg)
+  return cfg
+
+
+def qwen35_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 debug model with Ulysses CP degree 2 (head-parallel GDN)."""
+  return _qwen35_cp(qwen35_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def qwen35_debugmodel_ulysses_cp2_agrs() -> TPUTrainerConfig:
+  """``qwen35_debugmodel_ulysses_cp2``, ``allgather_reducescatter`` GDN CP."""
+  return _qwen35_cp(
+      qwen35_debugmodel(),
+      strategy="ulysses",
+      cp_degree=2,
+      gated_delta_cp_strategy="allgather_reducescatter",
+  )
+
+
+def qwen35_moe_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 MoE debug model with KV all-gather CP degree 2."""
+  cfg = _qwen35_cp(qwen35_moe_debugmodel(), strategy="all_gather", cp_degree=2)
+  _allow_reference_attention(cfg)
+  return cfg
+
+
+def qwen35_moe_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 MoE debug model with Ulysses CP degree 2."""
+  return _qwen35_cp(qwen35_moe_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def _split_tokamax_benchmark_for_cp(cp: int) -> TpuGraphTrainer.Config:
+  """``qwen35_moe_35b_split_tokamax_benchmark`` sized for context parallelism.
+
+  32K-token sequences and 64K tokens per device (a CP group shares one
+  data-parallel rank's tokens, so the per-rank budget is scaled by ``cp``),
+  where CP pays off; Splash's document-aware block skipping is off, as KV
+  all-gather CP cannot use it and at long context it costs more than it saves.
+  Longer contexts set ``--training.max_context_length`` (and, from 64K,
+  ``--splash_attention_kernel.no-sa_use_fused_bwd_kernel``).
+  """
+  cfg = qwen35_moe_35b_split_tokamax_benchmark()
+  cfg.training.max_context_length = 32768
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 65536 * cp
+  cfg.splash_attention_kernel.sa_use_document_aware_block_skipping = False
+  return cfg
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
+    TpuGraphTrainer.Config
+):
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with KV all-gather CP 2."""
+  return _qwen35_cp(
+      _split_tokamax_benchmark_for_cp(2),
+      strategy="all_gather",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2() -> (
+    TpuGraphTrainer.Config
+):
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with Ulysses CP degree 2."""
+  return _qwen35_cp(
+      _split_tokamax_benchmark_for_cp(2),
+      strategy="ulysses",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2_agrs() -> (
+    TpuGraphTrainer.Config
+):
+  """Ulysses CP 2 with the ``allgather_reducescatter`` GatedDeltaNet strategy.
+
+  Reduces in bfloat16. Faster than ``all_to_all`` at long context on CP2, for
+  more HBM (see ``CPTpuGatedDeltaNet``).
+  """
+  return _qwen35_cp(
+      _split_tokamax_benchmark_for_cp(2),
+      strategy="ulysses",
+      cp_degree=2,
+      gated_delta_cp_strategy="allgather_reducescatter",
+      gated_delta_cp_reduce_dtype="bfloat16",
+  )

@@ -1708,9 +1708,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     ])
     self.assertIsInstance(parsed, TpuGraphTrainer.Config)
 
-  def test_graph_trainer_parallelize_rejects_tp_cp_pp(self):
-    """Tests that TP, CP, and PP fail before the model is touched."""
-    for name in ("tp", "cp", "pp"):
+  def test_graph_trainer_parallelize_rejects_tp_pp(self):
+    """Tests that TP and PP fail before the model is touched (CP and EP run)."""
+    for name in ("tp", "pp"):
       enabled = dict(
           tp_enabled=False,
           cp_enabled=False,
@@ -1718,8 +1718,9 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           ep_enabled=False,
       )
       enabled[f"{name}_enabled"] = True
-      with self.subTest(name), self.assertRaisesRegex(
-          NotImplementedError, "TP, CP, or PP"
+      with (
+          self.subTest(name),
+          self.assertRaisesRegex(NotImplementedError, "TP or PP"),
       ):
         gt_qwen3_5.parallelize_qwen3_5(
             None,

@@ -22,12 +22,14 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,
 )
 from torchtitan.experiments.graph_trainer.fsdp_patterns import (
+    _fsdp_param_fqns,
     find_fsdp_reduce_grad_input,
     is_all_gather_into_tensor,
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     _collect_bucketed_fsdp_comms,
 )
+from torchtitan.experiments.tpu.graph_trainer.collectives import op_name
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,27 @@ def _optimization_barrier(*values: torch.Tensor) -> tuple[torch.Tensor, ...]:
 
 def _is_tensor_node(node: torch.fx.Node) -> bool:
     return isinstance(node.meta.get("val"), torch.Tensor)
+
+
+def _is_fsdp_unshard_all_gather(node: torch.fx.Node) -> bool:
+    """Whether ``node`` launches an FSDP unshard the AG barrier should protect.
+
+    Besides the c10d all-gather, SimpleFSDP on TPU gathers a parameter sharded
+    off dim 0 with TorchTPU's single-op dim-d all-gather: a stacked Linear's
+    ``[N, F, D]`` weight (``FeedForward.w13``) shards ``F``. Left out, XLA
+    merges its recompute with the forward gather and the full parameter stays
+    alive from forward to backward (qwen3_8b_zero3: +5.9 GiB peak HBM, the
+    unsharded w13 of every layer). Routed-expert gathers keep their existing
+    scheduling (``expert_all_gathers_under_splash``).
+    """
+    if is_all_gather_into_tensor(node):
+        return True
+    if op_name(node) != "tpu::_all_gather_dim":
+        return False
+    parameter_fqns = _fsdp_param_fqns(node)
+    return bool(parameter_fqns) and not any(
+        _EXPERT_FQN_INFIX in f".{fqn}." for fqn in parameter_fqns
+    )
 
 
 def _is_recomputed(node: torch.fx.Node) -> bool:
@@ -470,7 +493,7 @@ def apply_tpu_remat_fsdp_all_gather_schedule(
             (
                 node
                 for node in recompute_by_region[region_id]
-                if is_all_gather_into_tensor(node)
+                if _is_fsdp_unshard_all_gather(node)
             ),
             key=order.__getitem__,
         )

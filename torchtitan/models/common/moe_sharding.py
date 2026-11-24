@@ -52,6 +52,26 @@ def expert_param_placement_sparse() -> SpmdType:
     )
 
 
+def _expert_param_placement_dense_replicated() -> SpmdType:
+    """Dense-family placement for routed-expert weights when EP is disabled.
+
+    Fork addition: upstream 610bb6f6 leaves EP-disabled routed experts without
+    a ``sharding_config``, so their weights stay plain tensors. Under
+    ``spmd_types`` FSDP (``dp_mesh_dims``) every parameter must already be a
+    DTensor on the full SPMD mesh, which pure-FSDP MoE runs (EP=1, TP=1) on TPU
+    rely on. Replicating over the dense axes keeps them DTensors; FSDP then
+    shards ``dp_shard``/``cp`` post-parallelize like any dense weight.
+    TODO(jerryx99): upstream.
+    """
+    return SpmdType(
+        {
+            DP: spmd.R,
+            CP: spmd.R,
+            TP: spmd.R,
+        }
+    )
+
+
 def _tokens_per_expert_placement(*, enable_ep: bool) -> SpmdType:
     """Placement for the ``tokens_per_expert_E`` buffer.
 
@@ -204,7 +224,14 @@ def _routed_experts_sharding_configs(
     else:
         pre_experts_input_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
         experts_input_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
-        inner_experts_sharding_config = None
+        # Fork: replicated DTensors rather than plain tensors (see
+        # ``_expert_param_placement_dense_replicated``).
+        inner_experts_sharding_config = ShardingConfig(
+            state_shardings={
+                name: _expert_param_placement_dense_replicated()
+                for name in _GROUPED_EXPERT_PARAM_NAMES
+            }
+        )
 
     tokens_per_expert_layout = _tokens_per_expert_placement(enable_ep=enable_ep)
 

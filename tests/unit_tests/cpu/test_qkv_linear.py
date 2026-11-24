@@ -24,6 +24,8 @@ _HEAD_DIM = 8
 _HPK = _N_HEADS // _N_KV_HEADS  # heads_per_kv = 2
 _R_DIM = _HPK + 2  # 4
 _WQKV_OUT = (_N_HEADS + 2 * _N_KV_HEADS) * _HEAD_DIM  # 64
+_WQ_OUT = _N_HEADS * _HEAD_DIM  # 32
+_WK_OUT = _N_KV_HEADS * _HEAD_DIM  # 16
 
 
 def _build_qkv_linear(with_bias: bool = False) -> QKVLinear:

@@ -135,8 +135,8 @@ def _batch_wise_load_balance_loss(
     return (f_i * p_i).sum() * aux_loss_coeff
 
 
-# Labels this all-reduce for TPU scan remat, which saves its result instead of
-# redoing the all-reduce in backward. Metadata only; it does not change what runs.
+# Labels this all-reduce as region "moe.expert_counts", so a remat policy can save
+# its result instead of redoing the all-reduce in backward. Metadata only.
 @annotate_fn({"remat_region": "moe.expert_counts"})
 def _all_reduce_expert_counts(
     counts: torch.Tensor,

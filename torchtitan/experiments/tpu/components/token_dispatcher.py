@@ -659,6 +659,15 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     #   1024 (the Pallas combine backward's block) and never exceeds the worst
     #   case.
     ep_capacity_factor: float | None = None
+    # What happens when routes exceed the `ep_capacity_factor` buffer on
+    # "ragged_all_to_all":
+    # - "drop": they are dropped and counted (static shape, traceable).
+    # - "grow": the buffer doubles until it holds the largest receive count of
+    #   any EP rank, never above the worst case, so nothing is dropped. Every
+    #   rank computes the same size from the gathered expert counts, which it
+    #   reads on the host once per dispatch, so "grow" cannot be traced, and
+    #   at most about log2(ep_size / factor) buffer sizes compile.
+    ep_capacity_overflow: Literal["drop", "grow"] = "drop"
     roe_gather_block_size: int = 1024
     roe_reduce_block_size: int = 896
     roe_zero_pad_tail: bool = False
@@ -690,6 +699,23 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             "ep_capacity_factor must be a finite positive float or None"
             f" (dropless), got {self.ep_capacity_factor!r}"
         )
+    self.ep_capacity_overflow = config.ep_capacity_overflow
+    if self.ep_capacity_overflow not in ("drop", "grow"):
+      raise ValueError(
+          "ep_capacity_overflow must be 'drop' or 'grow', got"
+          f" {self.ep_capacity_overflow!r}"
+      )
+    if self.ep_capacity_overflow == "grow":
+      if self.ep_capacity_factor is None:
+        raise ValueError(
+            "ep_capacity_overflow='grow' needs ep_capacity_factor: without it"
+            " the buffer is already the dropless worst case"
+        )
+      if self.ep_transport not in ("ragged_all_to_all", "all_to_all"):
+        raise ValueError(
+            "ep_capacity_overflow='grow' is implemented for"
+            f" ep_transport='ragged_all_to_all' only, got {self.ep_transport!r}"
+        )
     self.roe_gather_block_size = config.roe_gather_block_size
     self.roe_reduce_block_size = config.roe_reduce_block_size
     self.roe_zero_pad_tail = config.roe_zero_pad_tail
@@ -720,6 +746,27 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       return 1
     cap = max(int(num_routed * self.ep_capacity_factor), 1)
     cap = -(-cap // align_rows) * align_rows
+    return min(cap, worst_case)
+
+  def _ep_grown_capacity(
+      self, cap: int, counts_SDE: torch.Tensor, worst_case: int
+  ) -> int:
+    """Doubles ``cap`` until it holds the largest receive count of any EP rank.
+
+    ``counts_SDE[s, d, e]`` is the number of routes source rank ``s`` sends to
+    local expert ``e`` of rank ``d``, the same on every rank after the count
+    all-gather, so every rank computes the same size. Never above
+    ``worst_case``, which always holds every route.
+    """
+    if _is_tracing(counts_SDE):
+      raise RuntimeError(
+          "ep_capacity_overflow='grow' reads the expert counts on the host and"
+          " cannot be traced; use ep_capacity_overflow='drop' (static shape)"
+          " under tracing"
+      )
+    needed = int(counts_SDE.sum(dim=(0, 2)).max().item())
+    while cap < needed:
+      cap *= 2
     return min(cap, worst_case)
 
   def _record_dropped_count(
@@ -994,6 +1041,12 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     # fallback otherwise, so a capped buffer is rounded up to that multiple:
     # capping never moves the step off the kernel. A multiple of 1024 rows
     # also needs no row padding in the Pallas grouped matmuls.
+    if self.ep_capacity_overflow == "grow":
+      raise ValueError(
+          "ep_capacity_overflow='grow' is implemented for the"
+          " ragged_all_to_all EP transport only; this layer resolved to"
+          " ring_of_experts (set ep_transport='ragged_all_to_all')"
+      )
     cap = self._ep_buffer_capacity(
         num_routed, ep_size, align_rows=SCALE_DSCORE_BLOCK_ROWS
     )
@@ -1216,6 +1269,12 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
               .reshape(ep_size, self.num_experts)
           )
         counts_SDE = all_sizes_SE.view(ep_size, ep_size, e)
+        if is_capped and self.ep_capacity_overflow == "grow":
+          r_static = self._ep_grown_capacity(
+              r_static, counts_SDE, worst_case_rows
+          )
+          # The grown buffer holds every route: nothing to truncate.
+          is_capped = False
         all_send_offsets_SE = (
             all_sizes_SE.cumsum(dim=-1, dtype=torch.int32) - all_sizes_SE
         )

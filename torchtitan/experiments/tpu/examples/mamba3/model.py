@@ -14,8 +14,8 @@ from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.examples.mamba3.kernels import mamba3_pallas
 
 try:
-  from torchtitan.protocols import model as model_protocol
-  from torchtitan.protocols import module
+  from torchtitan.models.base import model as model_protocol
+  from torchtitan.models.base import module
   _BaseModel = model_protocol.BaseModel
   _BaseConfig = model_protocol.BaseModel.Config
   _Module = module.Module
@@ -32,6 +32,7 @@ class Mamba3Config(_BaseConfig):
   """Configuration for Mamba-3 architecture."""
 
   vocab_size: int = 128256
+  max_context_length: int = 4096
   d_model: int = 2560
   n_layers: int = 64
   n_heads: int = 80

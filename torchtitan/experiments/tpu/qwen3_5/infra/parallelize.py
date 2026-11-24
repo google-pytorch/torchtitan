@@ -19,8 +19,8 @@ from torchtitan.distributed.local_compile import LocalCompileConfig
 def parallelize_qwen3_5(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
-    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,

@@ -9,9 +9,10 @@
 from dataclasses import dataclass
 
 import torch
+import torch_remat as remat
 
 from torchtitan.models.common import Linear
-from torchtitan.models.common.moe import _tokens_per_expert, MoE
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.nn_modules import RMSNorm
 
 # Shape suffixes:
@@ -20,7 +21,7 @@ from torchtitan.models.common.nn_modules import RMSNorm
 
 
 class KimiLatentMoE(MoE):
-    """``common/moe.py::MoE`` with Kimi's latent routed-expert path."""
+    """``common/moe/moe.py::MoE`` with Kimi's latent routed-expert path."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(MoE.Config):
@@ -72,20 +73,21 @@ class KimiLatentMoE(MoE):
             padding_mask_T=routed_padding_mask_T,
             **router_kwargs,
         )
-        num_tokens_per_expert_E = (
-            routing_map_TE.sum(dim=0)
-            if routing_map_TE is not None
-            else _tokens_per_expert(expert_ids_TK, self.router.num_experts)
-        )
 
+        routed_down_TD = self.routed_down(routed_x_TD)
+        # The token dispatcher reads the routed_down projection output with bare ops.
+        remat.recompute_needs_tensor(routed_down_TD)
         routed_TD = self.routed_experts(
-            self.routed_down(routed_x_TD),
+            routed_down_TD,
             weights_TK,
             expert_ids_TK,
-            num_tokens_per_expert_E,
+            routing_map_TE,
+            padding_mask_T=routed_padding_mask_T,
         )
+        # routed_norm reads the routed experts' combined output with bare ops.
+        remat.recompute_needs_tensor(routed_TD)
         out_TD = self.routed_up(self.routed_norm(routed_TD))
-        out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
-        if self.shared_experts is not None:
-            out_TD = out_TD + self.shared_experts(x_TD)
-        return self._maybe_all_reduce_moe_output_across_tp(out_TD)
+        # The TP zero-fill and the shared-expert add read the routed_up projection
+        # output with bare ops.
+        remat.recompute_needs_tensor(out_TD)
+        return self._add_shared_experts_and_reduce_across_tp(out_TD, x_TD)

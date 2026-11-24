@@ -13,7 +13,7 @@ from absl.testing import absltest
 from torch import nn
 
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import LayerStackHolder
@@ -59,6 +59,7 @@ def _parallel_dims(fsdp_degree: int) -> ParallelDims:
       pp=1,
       ep=1,
       world_size=fsdp_degree,
+      enable_sequence_parallel=False,
   )
 
 

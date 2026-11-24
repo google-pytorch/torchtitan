@@ -8,7 +8,7 @@
 
 import glob
 import json
-import os as os
+import pickle
 from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,9 +16,6 @@ from typing import Any, Protocol, runtime_checkable
 
 import datasets
 import grain.python as grain
-import tempfile
-cache_dir = tempfile.gettempdir()
-
 from datasets.distributed import split_dataset_by_node
 
 from torchtitan.components.data.types import DatasetIterationPolicy
@@ -36,14 +33,20 @@ class RandomAccessDataSource(Protocol):
         ...
 
 
+@runtime_checkable
+class StreamingDataSource(Protocol):
+    """Unsharded stream whose iteration policy is applied when built."""
+
+    def build_iter_dataset(
+        self, *, dataset_iteration_policy: DatasetIterationPolicy
+    ) -> grain.IterDataset:
+        ...
+
+
 class SourceConfig(Protocol):
     """Builds a random-access or streaming source."""
 
-    def build(
-        self,
-        *,
-        dataset_iteration_policy: DatasetIterationPolicy,
-    ) -> RandomAccessDataSource | grain.IterDataset:
+    def build(self) -> RandomAccessDataSource | StreamingDataSource:
         ...
 
 
@@ -54,13 +57,7 @@ class IndexedJsonlSource(Configurable):
     class Config(Configurable.Config):
         patterns: tuple[str, ...]
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        dataset_iteration_policy: DatasetIterationPolicy,
-    ) -> None:
-        del dataset_iteration_policy
+    def __init__(self, config: Config) -> None:
         self._paths = _file_patterns_to_paths(config.patterns)
         self._path_ids = array("I")
         self._byte_offsets = array("Q")
@@ -103,7 +100,7 @@ class HuggingFaceRandomAccessSource(Configurable):
         load_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
 
         def __post_init__(self) -> None:
-            duplicated = {"split", "name", "revision", "streaming", "cache_dir"} & (
+            duplicated = {"split", "name", "revision", "streaming"} & (
                 self.load_dataset_kwargs.keys()
             )
             if duplicated:
@@ -112,20 +109,13 @@ class HuggingFaceRandomAccessSource(Configurable):
                     f"{sorted(duplicated)}"
                 )
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        dataset_iteration_policy: DatasetIterationPolicy,
-    ) -> None:
-        del dataset_iteration_policy
+    def __init__(self, config: Config) -> None:
         dataset = datasets.load_dataset(
             config.path,
             name=config.name,
             split=config.split,
             revision=config.revision,
             streaming=False,
-            cache_dir=cache_dir,
             **config.load_dataset_kwargs,
         )
         if not isinstance(dataset, datasets.Dataset):
@@ -142,7 +132,7 @@ class HuggingFaceRandomAccessSource(Configurable):
         return self._dataset[index]
 
 
-class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
+class HuggingFaceStreamingSource(Configurable):
     """Provides a DP-sharded Hugging Face stream with cursor checkpointing."""
 
     @dataclass(kw_only=True, slots=True)
@@ -154,7 +144,7 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
         load_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
 
         def __post_init__(self) -> None:
-            duplicated = {"split", "name", "revision", "streaming", "cache_dir"} & (
+            duplicated = {"split", "name", "revision", "streaming"} & (
                 self.load_dataset_kwargs.keys()
             )
             if duplicated:
@@ -163,20 +153,13 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
                     f"{sorted(duplicated)}"
                 )
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        dataset_iteration_policy: DatasetIterationPolicy,
-    ) -> None:
-        super().__init__()
+    def __init__(self, config: Config) -> None:
         dataset = datasets.load_dataset(
             config.path,
             name=config.name,
             split=config.split,
             revision=config.revision,
             streaming=True,
-            cache_dir=cache_dir,
             **config.load_dataset_kwargs,
         )
         if not isinstance(dataset, datasets.IterableDataset):
@@ -190,19 +173,35 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
             raise TypeError(
                 "Hugging Face streaming source does not support exact resume"
             )
-        self._dataset = split_dataset_by_node(
-            dataset,
+        self._dataset = dataset
+
+    def build_iter_dataset(
+        self, *, dataset_iteration_policy: DatasetIterationPolicy
+    ) -> grain.IterDataset:
+        dataset = split_dataset_by_node(
+            self._dataset,
             rank=dataset_iteration_policy.dp_rank,
             world_size=dataset_iteration_policy.dp_world_size,
         )
-        self._repeat = dataset_iteration_policy.repeat
-        self._shuffle = dataset_iteration_policy.shuffle
+        return _HuggingFaceIterDataset(
+            dataset,
+            repeat=dataset_iteration_policy.repeat,
+            shuffle=dataset_iteration_policy.shuffle,
+        )
+
+
+class _HuggingFaceIterDataset(grain.IterDataset):
+    def __init__(
+        self, dataset: datasets.IterableDataset, *, repeat: bool, shuffle: bool
+    ) -> None:
+        super().__init__()
+        self._dataset = dataset
+        self._repeat = repeat
+        self._shuffle = shuffle
 
     def __iter__(self) -> grain.DatasetIterator:
         return _HuggingFaceCursorIterator(
-            self._dataset,
-            repeat=self._repeat,
-            shuffle=self._shuffle,
+            self._dataset, repeat=self._repeat, shuffle=self._shuffle
         )
 
 
@@ -240,10 +239,11 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
         self._epoch = 0
         self._initial_state = dataset.state_dict()
         self._iterator = iter(dataset)
+        self._pending_hf_state: bytes | None = None
 
     def __next__(self) -> dict[str, Any]:
         try:
-            return next(self._iterator)
+            row = next(self._iterator)
         except StopIteration:
             if not self._repeat:
                 raise
@@ -252,17 +252,39 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
                 self._dataset.set_epoch(self._epoch)
             self._dataset.load_state_dict(self._initial_state)
             self._iterator = iter(self._dataset)
-            return next(self._iterator)
+            row = next(self._iterator)
+        # HF has applied any restored cursor once it yields a row.
+        self._pending_hf_state = None
+        return row
 
     def get_state(self) -> dict[str, Any]:
+        # Hugging Face streaming state adds and drops nested keys during
+        # iteration (e.g. examples_iterable.previous_state goes from None to a
+        # dict). DCP flattens nested mappings and requires the same keys at
+        # save and load, so keep that dataset state as one opaque leaf. The
+        # surrounding Grain tree stays structured for other sources.
         return {
             "epoch": self._epoch,
-            "hf": self._dataset.state_dict(),
+            "hf": (
+                self._pending_hf_state
+                if self._pending_hf_state is not None
+                else pickle.dumps(self._dataset.state_dict())
+            ),
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
         self._epoch = state["epoch"]
         if self._shuffle:
             self._dataset.set_epoch(self._epoch)
-        self._dataset.load_state_dict(state["hf"])
+        hf_state = state["hf"]
+        if not isinstance(hf_state, bytes):
+            raise ValueError(
+                "Hugging Face streaming checkpoint state must be opaque bytes"
+            )
+        self._dataset.load_state_dict(pickle.loads(hf_state))
         self._iterator = iter(self._dataset)
+        # HF applies the restored cursor lazily on the next read. Packers can
+        # checkpoint before that read to reconstruct a partially consumed row.
+        # TODO: Remove once datasets.IterableDataset.state_dict() reflects a
+        # loaded-but-unapplied state.
+        self._pending_hf_state = hf_state

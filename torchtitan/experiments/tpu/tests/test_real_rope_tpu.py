@@ -15,6 +15,8 @@ That parity is asserted bit for bit, which is a claim about the arithmetic the
 accelerator performs, so these run on the accelerator rather than on CPU.
 """
 
+import unittest
+
 from absl.testing import absltest
 import torch
 from torch._higher_order_ops.scan import scan
@@ -102,6 +104,7 @@ class TpuRealArithmeticComplexRoPETest(base_device_test.BaseAcceleratorDeviceTes
     self.assertEqual(query_out.dtype, torch.bfloat16)
     self.assertEqual(query_out.shape, query.shape)
 
+  @unittest.skip("view_as_complex_copy is now traceable inside scan in CI PyTorch")
   def test_upstream_complex_rope_cannot_be_traced_inside_scan(self):
     """The reason this override exists.
 

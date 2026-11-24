@@ -84,7 +84,7 @@ class TrainCheckpointVerificationTest(
         "--config", "llama3_debugmodel",
         "--dataloader.dataset_path=tests/assets/c4_test",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.max_context_length=128",
+        "--model.max_context_length=128",
         "--training.num_tokens_per_microbatch_per_dp_rank=512",
         "--debug.deterministic",
         "--debug.seed=42",

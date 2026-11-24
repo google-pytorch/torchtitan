@@ -1,16 +1,17 @@
+from torchtitan.config.parallelism import ParallelismConfig
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import default_adamw
+from torchtitan.experiments.tpu.components.optim import default_adamw
 from torchtitan.config.configs import (
+    PrecisionConfig,
     CommConfig,
-    ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import (
     TPUGrainDataLoader,
@@ -217,7 +218,7 @@ def _use_graph_split(
   )
   # torch_tpu's fused AdamW updates every parameter in one program, computing
   # in FP32 and storing in each parameter buffer's dtype.
-  cfg.optim.optimizer.implementation = "fused"
+  cfg.optim.optimizer.fused = True
   return cfg
 
 
@@ -239,7 +240,6 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 256,
-          max_context_length=256,
           steps=10,
       ),
       dataloader=c4_test_dataloader(),
@@ -247,7 +247,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(preserve_rng_state=False),
+      activation_remat=DefaultActivationRematConfig(),
       compile=TpuTrainerCompileConfig(enable=False, backend="tpu"),
       validator=None,
       tpu_config=TPUConfig(enable_amp=False),
@@ -266,7 +266,7 @@ def qwen35_moe_debugmodel() -> TPUTrainerConfig:
 def qwen35_moe_debugmodel_fused_ce() -> TPUTrainerConfig:
   """Debug config for 4-layer hybrid Qwen3.5 MoE with Pallas fused CE loss."""
   cfg = qwen35_moe_debugmodel()
-  cfg.training.max_context_length = 256
+  cfg.model.max_context_length = 256
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 1024
   _enable_pallas_cross_entropy(
       cfg, b_block_size=1024, h_block_size=128, v_block_size=512
@@ -321,7 +321,7 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
       # Logging syncs the host on the loss; every 5 steps lets the host
       # dispatch the next step while the current one runs.
       metrics=MetricsProcessor.Config(log_freq=5),
-      model=model_registry("35B-A3B", converters=_TPU_MOE_CONVERTERS),
+      model=model_registry("35B-A3B", seq_len=2048, converters=_TPU_MOE_CONVERTERS),
       optim=Optim.Config(
           optimizer=default_adamw(lr=3e-4, implementation="foreach"),
           # A 2-step warmup to the peak LR diverged the randomly initialized
@@ -336,11 +336,10 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
               min_lr_factor=0.1,
           ),
       ),
-      training=TrainingConfig(
+precision=PrecisionConfig(reduce_dtype="float32"),
+            training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=16 * 2048,
-          max_context_length=2048,
           steps=10,
-          mixed_precision_reduce="float32",
       ),
       dataloader=TPUGrainDataLoader.Config(dataset="c4"),
       parallelism=ParallelismConfig(
@@ -349,7 +348,7 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
       ),
       comm=CommConfig(train_timeout_seconds=600),
-      activation_checkpoint=FullAC.Config(preserve_rng_state=False),
+      activation_remat=FullActivationRematConfig(),
       compile=TpuTrainerCompileConfig(
           enable=False, backend="tpu", compile_grad_norm=True
       ),

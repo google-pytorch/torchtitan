@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ class ConformerModelArgs(BaseModel.Config):
   num_heads: int = 8
   kernel_size: int = 31
   max_seq_len: int = 2048  # Added to match train_minimal expectations
+  max_context_length: int = 2048
   use_splash: bool = False
   use_vmap_bwd: bool = False
 
@@ -31,7 +32,7 @@ class ConformerModelArgs(BaseModel.Config):
     if hasattr(train_config, "training"):
       # Upstream d771abb0 renamed training.seq_len ->
       # training.max_context_length.
-      self.max_seq_len = train_config.training.max_context_length
+      self.max_seq_len = train_config.model.max_context_length
     if isinstance(train_config, TPUTrainerConfig):
       self.use_splash = (
           train_config.splash_attention_kernel.use_splash_attention_kernel

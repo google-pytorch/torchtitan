@@ -8,9 +8,10 @@ import functools
 
 import torch
 from torch.distributed.tensor import DTensor
-from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
@@ -19,7 +20,6 @@ from torchtitan.experiments.tpu.testing.base_distributed_device_test import Inpu
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer.infra import parallelize as muse_glimmer_parallelize
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
-from torchtitan.models.muse_glimmer.sharding import set_muse_glimmer_sharding_config
 
 # To use OVERRIDEABLE SDP on TPU, the local batch size must be >= 4, i.e.
 # TEST_BATCH_SIZE / world_size >= 4.
@@ -38,7 +38,6 @@ def _get_model_config() -> MuseGlimmerModel.Config:
   registry entry unchanged. SP is off because the test feeds unsharded inputs.
   """
   config = copy.deepcopy(muse_glimmer_tpu.muse_glimmer_configs["testmodel"])
-  set_muse_glimmer_sharding_config(config, enable_sp=False)
   return config
 
 
@@ -51,6 +50,7 @@ def _parallel_dims(*, world_size: int, tp: int = 1, dp_shard: int = 1) -> Parall
       pp=1,
       ep=1,
       world_size=world_size,
+      enable_sequence_parallel=False,
   )
 
 
@@ -81,7 +81,7 @@ def _tp_wrapper(
     # pytype: disable=wrong-arg-types
     model = muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -161,7 +161,7 @@ def _verify_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -211,7 +211,7 @@ def _verify_simple_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     return muse_glimmer_parallelize.parallelize_muse_glimmer(
         model,
-        ac_config=SelectiveAC.Config(),
+        ac_config=DefaultActivationRematConfig(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
         parallel_dims=parallel_dims,

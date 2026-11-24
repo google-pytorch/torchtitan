@@ -17,7 +17,7 @@ from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpe
 from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.transformers_modeling_backend import model as hf_model
 from torchtitan.models.common.config_utils import make_routed_experts_config
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 
 
 def _reference(x, w1, w2, w3, group_sizes):
@@ -97,7 +97,12 @@ class TokenDispatcherTest(base_device_test.BaseAcceleratorDeviceTest):
     # rows x dim values, which XLA runs at a few percent of HBM bandwidth on
     # TPU; the TPU dispatcher's VJPs gather whole rows.
     cfg = make_routed_experts_config(
-        dim=256, hidden_dim=128, num_experts=4, top_k=2, param_init={},
+        dim=256,
+        hidden_dim=128,
+        num_experts=4,
+        top_k=2,
+        param_init={},
+        enable_ep=False,
     )
     layer = SimpleNamespace(_native_moe_config=cfg)
     model = SimpleNamespace(layers={"0": layer}, _tpu_moe_pallas=False)

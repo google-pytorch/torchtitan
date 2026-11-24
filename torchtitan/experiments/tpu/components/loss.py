@@ -108,7 +108,7 @@ def pallas_cross_entropy_loss(
   return loss_sum - ignored.sum().to(loss_sum.dtype) * math.log(weights.shape[-1])
 
 
-class PallasCrossEntropyLoss(components_loss.BaseLoss):
+class PallasCrossEntropyLoss(components_loss.Loss):
   """Expose fused linear cross entropy through TorchTitan's loss protocol.
 
   Kernel selection and tile sizes live in the loss config rather than the
@@ -125,7 +125,7 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
   """
 
   @dataclass(kw_only=True, slots=True)
-  class Config(components_loss.BaseLoss.Config):
+  class Config(components_loss.Loss.Config):
     implementation: Literal["mosaic_tpu", "xla"] = "mosaic_tpu"
     b_block_size: int = 1024
     h_block_size: int = 512
@@ -173,6 +173,19 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     ):
       logger.info("Compiling the Pallas loss function with torch.compile")
       self.fn = torch.compile(self.fn, backend=compile_config.backend)
+
+  def __call__(
+      self,
+      pred: torch.Tensor,
+      labels: torch.Tensor,
+      global_loss_token_counts: torch.Tensor | None = None,
+      **kwargs: Any,
+  ) -> components_loss.LossResult:
+    del kwargs
+    loss = self.fn(pred, labels)
+    if global_loss_token_counts is not None:
+      loss = loss / global_loss_token_counts
+    return loss, {}
 
 
 def _legacy_pallas_loss_config(

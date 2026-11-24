@@ -267,7 +267,7 @@ class TrainMinimalDistributedTest(
           context_parallel_degree=-1,
           enable_compile=True,
           args=[
-              "--training.max_context_length=1024",
+              "--model.max_context_length=1024",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
               "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
               "--splash_attention_kernel.sa_block_q=128",
@@ -293,7 +293,7 @@ class TrainMinimalDistributedTest(
           context_parallel_degree=-1,
           enable_compile=True,
           args=[
-              "--training.max_context_length=1024",
+              "--model.max_context_length=1024",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
               "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
               "--splash_attention_kernel.sa_block_q=128",
@@ -409,14 +409,14 @@ class TrainMinimalDistributedTest(
         config_args=[
             f"--module=torchtitan.experiments.tpu.{module}",
             f"--config={config}",
-            f"--optimizer.implementation={optimizer_implementation}",
+            ("--optimizer.fused=true" if optimizer_implementation == "fused" else "--optimizer.foreach=true" if optimizer_implementation == "foreach" else "--optimizer.foreach=false"),
             "--hf_assets_path=tests/assets/tokenizer",
             "--dataloader.dataset_path=tests/assets/c4_test",
-            "--training.max_context_length=128",
+            "--model.max_context_length=128",
             "--dataloader.dataset=c4_test",
             "--training.steps=3",
-            "--training.mixed_precision_param=float32",
-            "--training.mixed_precision_reduce=float32",
+            "--precision.param_dtype=float32",
+            "--precision.reduce_dtype=float32",
             "--training.num_tokens_per_microbatch_per_dp_rank=256",
         ]
         + (args or []),

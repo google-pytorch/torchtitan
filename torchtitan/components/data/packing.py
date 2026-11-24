@@ -122,6 +122,7 @@ class _DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         input_parts: list[np.ndarray] = []
         label_parts: list[np.ndarray] = []
         position_parts: list[np.ndarray] = []
+        mask_parts: list[np.ndarray] = []
         num_tokens = 0
 
         while (
@@ -165,6 +166,12 @@ class _DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
             input_parts.append(np.asarray(sequence.input_ids[token_slice]))
             label_parts.append(np.asarray(sequence.labels[token_slice]))
             position_parts.append(np.arange(num_segment_tokens, dtype=np.int64))
+            # Keep padding from an upstream packer marked as padding.
+            mask_parts.append(
+                np.zeros(num_segment_tokens, dtype=np.bool_)
+                if sequence.padding_mask is None
+                else np.asarray(sequence.padding_mask[token_slice], dtype=np.bool_)
+            )
             num_tokens += num_segment_tokens
             self._remainder_offset += num_segment_tokens
             if self._remainder_offset == len(sequence.input_ids):
@@ -178,7 +185,7 @@ class _DocumentAwareConcatThenSplitIterator(grain.DatasetIterator):
         input_ids = np.concatenate(input_parts)
         labels = np.concatenate(label_parts)
         positions = np.concatenate(position_parts)
-        padding_mask = np.zeros(num_tokens, dtype=np.bool_)
+        padding_mask = np.concatenate(mask_parts)
         pad_len = self._num_tokens_per_row - num_tokens
         if pad_len:
             padding_positions = (
@@ -360,13 +367,17 @@ def _text_sequence_to_packing_input(
 ) -> dict[str, np.ndarray]:
     """Convert a `TextSequence` to the array dictionary expected by text packing.
 
-    Missing positions become `0..num_tokens-1`.
+    Positions restart at each document start (a zero position) and every
+    `max_context_length` tokens after it, matching how the other packers split
+    long documents. Missing positions mean the sample is one document.
     """
-    positions = text_sequence.positions
-    if positions is None:
-        positions = (
-            np.arange(len(text_sequence.input_ids), dtype=np.int64) % max_context_length
+    token_indices = np.arange(len(text_sequence.input_ids), dtype=np.int64)
+    document_starts = 0
+    if text_sequence.positions is not None:
+        document_starts = np.maximum.accumulate(
+            np.where(np.asarray(text_sequence.positions) == 0, token_indices, 0)
         )
+    positions = (token_indices - document_starts) % max_context_length
     padding_mask = text_sequence.padding_mask
     if padding_mask is None:
         padding_mask = np.zeros(len(text_sequence.input_ids), dtype=np.bool_)

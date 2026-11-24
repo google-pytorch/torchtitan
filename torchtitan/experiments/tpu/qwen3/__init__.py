@@ -1,4 +1,9 @@
 import torchtitan.models.common as common_models
+from torchtitan.models.common.embedding import VocabParallelEmbedding as Embedding
+from torchtitan.experiments.tpu.components.attention import (
+    make_tpu_model_registry,
+    use_tpu_sdpa,
+)
 import torchtitan.models.qwen3.flavors as qwen3_models
 
 from .infra.parallelize import parallelize_qwen3
@@ -28,12 +33,12 @@ def _testmodel_moe(
     head_dim = 16
     n_layers = 3
     vocab_size = 2048
-    return Qwen3Model.Config(
+    cfg = Qwen3Model.Config(
         max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),
-        tok_embeddings=common_models.Embedding.Config(
+        tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=qwen3_models._EMBEDDING_INIT
         ),
         lm_head=common_models.Linear.Config(
@@ -52,7 +57,9 @@ def _testmodel_moe(
             moe_hidden_dim=128,
             num_experts=8,
             top_k=2,
-            attn_backend=attn_backend,
+            attn_backend="flex" if attn_backend == "sdpa" else attn_backend,
+            enable_sp=False,
+            enable_ep=False,
             rope=common_models.CosSinRoPE.Config(
                 dim=head_dim,
                 max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
@@ -61,6 +68,7 @@ def _testmodel_moe(
         ),
         # pytype: enable=wrong-keyword-args
     )
+    return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 
@@ -74,13 +82,20 @@ def _upstream_flavor(flavor: str, attn_backend: str):
   Passing the flavor's own `max_context_length` reproduces what the old
   callable produced.
   """
+  from torchtitan.config.parallelism import ParallelismConfig
+
   build_config, max_context_length = qwen3_models.MODEL_FLAVORS[flavor]
-  return build_config(attn_backend, seq_len=max_context_length)
+  cfg = build_config(
+      "flex" if attn_backend == "sdpa" else attn_backend,
+      seq_len=max_context_length,
+      parallelism=ParallelismConfig(),
+  )
+  return use_tpu_sdpa(cfg) if attn_backend == "sdpa" else cfg
 
 
 # Model configs by flavor.
 qwen3_configs = {
-    "testmodel": _upstream_flavor("testmodel", "sdpa"),
+    "testmodel": _upstream_flavor("debugmodel", "sdpa"),
     "testmodel_moe": _testmodel_moe("sdpa"),
     "debugmodel": _upstream_flavor("debugmodel", "sdpa"),
     "debugmodel_moe": _upstream_flavor("debugmodel_moe", "sdpa"),
@@ -96,6 +111,6 @@ qwen3_configs = {
 # The TPU lane used to special-case 8B here to build separate Q/K/V projections;
 # it now takes upstream's fused QKV (packed by TpuPackedQKVConverter in the
 # recipes), so the upstream registry is used as is.
-model_registry = qwen3_models.build_model_config
+model_registry = make_tpu_model_registry(qwen3_models.build_model_config)
 
 from .config_registry import *

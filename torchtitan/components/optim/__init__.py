@@ -6,22 +6,8 @@
 
 from .ema import EMA
 from .lr_scheduler import LRSchedulersContainer
-from .optim import Optim
-from .optimizer import (
-    Adam,
-    AdamW,
-    BaseOptimizer,
-    collect_moe_routing_metric_tensors,
-    configure_moe_routing_metrics,
-    default_adamw,
-    DistMuon,
-    get_moe_load_balancing_metrics,
-    OptimizersContainer,
-    ParamGroupConfig,
-    register_moe_load_balancing_hook,
-    register_moe_quantile_balancing_hook,
-    set_moe_routing_metric_tensors,
-)
+from .optim import GradientClipper, Optim
+from .optimizer import Adam, AdamW, BaseOptimizer, DistMuon, OptimizersContainer
 
 __all__ = [
     "Adam",
@@ -29,15 +15,8 @@ __all__ = [
     "BaseOptimizer",
     "DistMuon",
     "EMA",
+    "GradientClipper",
     "LRSchedulersContainer",
     "OptimizersContainer",
-    "ParamGroupConfig",
-    "collect_moe_routing_metric_tensors",
-    "configure_moe_routing_metrics",
-    "default_adamw",
-    "get_moe_load_balancing_metrics",
-    "register_moe_load_balancing_hook",
-    "register_moe_quantile_balancing_hook",
-    "set_moe_routing_metric_tensors",
     "Optim",
 ]

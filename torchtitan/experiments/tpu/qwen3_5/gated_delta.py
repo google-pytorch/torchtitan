@@ -35,10 +35,17 @@ from torchtitan.experiments.tpu.components import unflatten_shim
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
-from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
+from torchtitan.models.common.attention import VarlenAttentionMetadata as VarlenMetadata
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.common.activation import SiLU, UnaryActivationFn
 from torchtitan.models.common.norm import GatedRMSNorm
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
+from torchtitan.models.common.attention.gdn import (
+    GDN as GatedDeltaNet,
+    GDNKernel as GatedDeltaKernel,
+    InnerGDN as InnerGatedDeltaNet,
+    _split_in_proj,
+    maybe_gather_tp_input,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -631,23 +638,6 @@ class GatedDeltaDocumentResets(Configurable):
     self.enabled = config.enabled
 
 
-class GatedDeltaDocumentResets(Configurable):
-  """Leaf config controlling packed-document resets in ``TpuGatedDeltaNet``.
-
-  Kept as its own leaf ``Configurable`` so ``gated_delta_document_resets``
-  targets ``layers.{i}.delta_net.document_resets`` without conflicting with
-  ``tokamax_gated_delta_kernel`` at
-  ``layers.{i}.delta_net.inner_gated_delta_net.kernel`` under ``override``.
-  """
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(Configurable.Config):
-    enabled: bool = True
-
-  def __init__(self, config: Config):
-    self.enabled = config.enabled
-
-
 class TpuGatedDeltaNet(GatedDeltaNet):
   """``GatedDeltaNet`` that passes ``positions`` to its inner module.
 
@@ -694,6 +684,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
       attention_masks: VarlenMetadata | None = None,
       positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    x_TD = maybe_gather_tp_input(self, x_TD)
     num_tokens = x_TD.shape[0]
     if attention_masks is not None:
       cu_seqlens = attention_masks.cu_seq_q
@@ -706,14 +697,20 @@ class TpuGatedDeltaNet(GatedDeltaNet):
           device=x_TD.device,
       )
 
-    query_TC = self.in_proj_q(x_TD)
-    key_TC = self.in_proj_k(x_TD)
-    value_TC = self.in_proj_v(x_TD)
-    gate_TC = self.in_proj_z(x_TD)
-    a_TH = self.in_proj_a(x_TD)
-    b_TH = self.in_proj_b(x_TD)
+    projected_TC = self.in_proj(x_TD)
+    mixed_qkv_TC, a_TH, b_TH, gate_THV = _split_in_proj(
+        projected_TC, self.in_proj_split_sizes, self.value_head_dim
+    )
+    query_TC, key_TC, value_TC = mixed_qkv_TC.split(
+        [
+            self.conv_q.weight.shape[0],
+            self.conv_k.weight.shape[0],
+            self.conv_v.weight.shape[0],
+        ],
+        dim=-1,
+    )
 
-    output_THV = self.inner_gated_delta_net(
+    output_THV = self.inner_attention(
         query_TC,
         key_TC,
         value_TC,
@@ -731,7 +728,6 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         # unless document resets are disabled (pretraining).
         positions=positions if self.reset_at_documents else None,
     )
-    gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)
     out_TD = output_THV.reshape(num_tokens, -1)
     return self.out_proj(out_TD)

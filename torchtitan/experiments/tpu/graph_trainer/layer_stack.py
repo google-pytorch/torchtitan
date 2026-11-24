@@ -72,7 +72,7 @@ from torchtitan.experiments.tpu.components.layer_loop import (
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 logger = logging.getLogger(__name__)
 
@@ -868,6 +868,20 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
                     holder.build_split_meshes()
         return model
 
+    def get_parameter_counts(self, model: nn.Module) -> tuple[int, int]:
+        del model
+        unstacked_config = derive(self, base.Config)
+        with torch.device("meta"):
+            unstacked = unstacked_config.build()
+        return unstacked_config.get_parameter_counts(unstacked)
+
+    def build_flops_estimator(self, model: nn.Module, *, seq_len: int):
+        del model
+        unstacked_config = derive(self, base.Config)
+        with torch.device("meta"):
+            unstacked = unstacked_config.build()
+        return unstacked_config.build_flops_estimator(unstacked, seq_len=seq_len)
+
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
     ) -> tuple[int, int]:
@@ -885,14 +899,24 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
         unstacked_config = derive(self, base.Config)
         with torch.device("meta"):
             unstacked = unstacked_config.build()
-        return unstacked_config.get_nparams_and_flops(unstacked, seq_len)
+        if hasattr(unstacked_config, "get_nparams_and_flops"):
+            return unstacked_config.get_nparams_and_flops(unstacked, seq_len)
+        total_params, _ = unstacked_config.get_parameter_counts(unstacked)
+        flops_per_token = unstacked_config.build_flops_estimator(
+            unstacked, seq_len=seq_len
+        )({"input": torch.empty(1, 1)})
+        return total_params, flops_per_token
 
     name = f"{'Scanned' if use_scan else 'Stacked'}{base.__name__}"
     return model_subclass(
         base,
         base.Config,
         name,
-        config_body={"get_nparams_and_flops": get_nparams_and_flops},
+        config_body={
+            "get_parameter_counts": get_parameter_counts,
+            "build_flops_estimator": build_flops_estimator,
+            "get_nparams_and_flops": get_nparams_and_flops,
+        },
         __init__=__init__,
         parallelize=parallelize,
     )

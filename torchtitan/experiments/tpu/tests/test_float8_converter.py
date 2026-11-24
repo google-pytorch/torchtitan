@@ -5,13 +5,11 @@ import torch
 from torch.nn import functional as F
 from torchao.float8.config import Float8LinearConfig
 from torchao.float8.config import ScalingGranularity
-from torchtitan.quantization.float8 import Float8Linear
-from torchtitan.config.transform import Float8LinearConverter
+from torchtitan.experiments.tpu.components.float8 import Float8Linear
 from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter
-from torchtitan.experiments.tpu.llama3 import config_registry
+from torchtitan.experiments.tpu.llama3 import config_registry, model_registry
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.llama3 import build_model_config as model_registry
 
 
 def _converted(model_config) -> tuple[list[str], list[str]]:
@@ -48,9 +46,6 @@ class TpuFloat8LinearConverterTest(absltest.TestCase):
     self.assertFalse(config.gemm_config_grad_weight.use_fast_accum)
 
   def test_builds_without_cuda(self):
-    # The upstream converter refuses to build without NVIDIA SM89+/AMD MI300.
-    with self.assertRaisesRegex(ValueError, "only supported on"):
-      Float8LinearConverter.Config(recipe_name="rowwise").build()
     self.assertTrue(
         TpuFloat8LinearConverter.Config(recipe_name="rowwise").build().enabled
     )

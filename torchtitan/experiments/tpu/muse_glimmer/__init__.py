@@ -88,18 +88,25 @@ def _testmodel() -> MuseGlimmerModel.Config:
       max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
       window_pattern=[TESTMODEL_WINDOW_SIZE] * 3 + [0],
       output_multiplier=1.0,
-      attn_backend="sdpa",
+      attn_backend="flex",
+      enable_sp=False,
   )
   return use_tpu_attention(config)
 
 
 def _upstream_flavor(flavor: str) -> MuseGlimmerModel.Config:
   """Builds an upstream flavor at its full context length, with TPU attention."""
+  from torchtitan.config.parallelism import ParallelismConfig
+
   build_config, max_context_length = upstream_muse_glimmer.MODEL_FLAVORS[
       flavor
   ]
   return use_tpu_attention(
-      build_config(attn_backend="sdpa", seq_len=max_context_length)
+      build_config(
+          attn_backend="flex",
+          seq_len=max_context_length,
+          parallelism=ParallelismConfig(),
+      )
   )
 
 
@@ -133,11 +140,13 @@ def model_registry(
         f"Unsupported Muse Glimmer flavor on TPU: {flavor!r}. Supported:"
         f" {('testmodel',) + _UPSTREAM_TEXT_FLAVORS}"
     )
+  from torchtitan.config.parallelism import ParallelismConfig
   config = upstream_muse_glimmer.build_model_config(
       flavor,
       seq_len=seq_len,
-      attn_backend="sdpa",
+      attn_backend="flex",
       converters=converters,
+      parallelism=ParallelismConfig(),
   )
   return use_tpu_attention(config)
 

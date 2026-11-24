@@ -25,7 +25,7 @@ from absl.testing import absltest
 from torch.distributed.tensor import DTensor, init_device_mesh, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from torchtitan.config import TrainingConfig
+from torchtitan.config import PrecisionConfig
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
@@ -76,9 +76,9 @@ def _placed_235b(world: int):
     configure_qwen_simple_fsdp_shard_dims(model, _FakeParallelDims(mesh, world))
     yield apply_simple_fsdp(
         model,
-        parallel_dims=_FakeParallelDims(mesh, world),
-        training=TrainingConfig(
-            mixed_precision_param="bfloat16", mixed_precision_reduce="float32"
+        parallelism_context=_FakeParallelDims(mesh, world),
+        precision=PrecisionConfig(
+            param_dtype="bfloat16", reduce_dtype="float32"
         ),
     )
   finally:

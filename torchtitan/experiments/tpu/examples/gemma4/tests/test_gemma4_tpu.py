@@ -66,13 +66,13 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.common.attention import (
     QKVLinear,
-    ScaledDotProductInnerAttention,
-    segment_ids_from_positions,
 )
 from torchtitan.models.common.param_init import skip_param_init
-from torchtitan.models.common.linear import Linear, RouterGateLinear
+from torchtitan.models.common.linear import Linear, Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 import transformers
@@ -131,7 +131,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
         inner_experts = layer.moe.routed_experts.inner_experts
         self.assertIsInstance(inner_experts, TpuGroupedExperts.Config)
         self.assertEqual(inner_experts.activation, "gelu_tanh")
-        self.assertIsInstance(layer.moe.router.gate, RouterGateLinear.Config)
+        self.assertIsInstance(layer.moe.router.gate, Linear.Config)
 
   def test_config_registry_valid(self):
     for fn in (
@@ -154,7 +154,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     ):
       cfg = fn()
       self.assertFalse(cfg.model.enable_weight_tying)
-      self.assertEqual(cfg.optim.optimizer.implementation, "fused")
+      self.assertTrue(cfg.optim.optimizer.fused)
 
   def test_build_flavor_config_weight_tying(self):
     tied = _build_flavor_config("testmodel")
@@ -1045,11 +1045,21 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
       tt_logits = tt_model(
           tokens_dev.view(-1), positions=positions_dev
       ).view(batch_size, seq_len, -1)
-    tt_loss = cross_entropy_loss(tt_logits, labels_dev) / num_tokens
+    tt_loss = (
+        cross_entropy_loss(
+            tt_logits.view(-1, tt_logits.size(-1)), labels_dev.view(-1)
+        )
+        / num_tokens
+    )
     tt_loss.backward()
 
     hf_logits = hf_model(input_ids=tokens_cpu).logits
-    hf_loss = cross_entropy_loss(hf_logits, labels_cpu) / num_tokens
+    hf_loss = (
+        cross_entropy_loss(
+            hf_logits.view(-1, hf_logits.size(-1)), labels_cpu.view(-1)
+        )
+        / num_tokens
+    )
     hf_loss.backward()
 
     labels = dict(
@@ -1253,13 +1263,13 @@ class TestGemma4SplashAttentionParity(BaseDeviceTest):
 
   def test_production_recipes_saturation_token_budgets(self):
     cfg_31b = gemma4_31b()
-    self.assertEqual(cfg_31b.training.max_context_length, 4096)
+    self.assertEqual(cfg_31b.model.max_context_length, 4096)
     self.assertEqual(
         cfg_31b.training.num_tokens_per_microbatch_per_dp_rank, 2 * 4096
     )
 
     cfg_26b = gemma4_26b_a4b()
-    self.assertEqual(cfg_26b.training.max_context_length, 4096)
+    self.assertEqual(cfg_26b.model.max_context_length, 4096)
     self.assertEqual(
         cfg_26b.training.num_tokens_per_microbatch_per_dp_rank, 6 * 4096
     )

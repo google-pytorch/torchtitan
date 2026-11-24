@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.experiments.tpu.components.compile import maybe_regional_inductor_backend
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
@@ -17,21 +17,20 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
 from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
-from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    GroupedExperts,
+    TpuGroupedExperts,
+)
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.models.common.moe import (
-    GroupedExperts,
-    MoE,
-    configure_moe_aux_loss_reduction,
-)
+from torchtitan.models.common.moe import MoE
 
 logger = logging.getLogger(__name__)
 
 
 def _apply_ac_gemma4(
     model: nn.Module,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig",
     dump_folder: str,
 ) -> None:
   if isinstance(ac_config, SelectiveAC.Config):
@@ -68,11 +67,11 @@ def _apply_compile_gemma4(
 def _parallelize_gemma4(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig | None",
     dump_folder: str,
     skip_dp: bool = False,
 ) -> nn.Module:
@@ -86,8 +85,6 @@ def _parallelize_gemma4(
   )
 
   model._parallelize(parallel_dims)
-
-  configure_moe_aux_loss_reduction(model, parallel_dims)
 
   if ac_config is not None:
     _apply_ac_gemma4(model, ac_config, dump_folder=dump_folder)
@@ -111,7 +108,7 @@ def _parallelize_gemma4(
           training.mixed_precision_reduce
       ],
       pp_enabled=parallel_dims.pp_enabled,
-      cpu_offload=training.enable_cpu_offload,
+      cpu_offload=parallelism.fsdp_enable_cpu_offloading,
       reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
       ep_degree=parallel_dims.ep,
       edp_mesh=edp_mesh,
@@ -125,7 +122,7 @@ def _parallelize_gemma4(
 
 def configure_gemma4_simple_fsdp_shard_dims(
     model: nn.Module,
-    parallel_dims: torchtitan.distributed.ParallelDims,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims,
 ) -> None:
   """Use divisible hidden axes for uneven Gemma4 parameters under SimpleFSDP."""
   fsdp_degree = parallel_dims.dp_shard
@@ -195,12 +192,12 @@ def configure_gemma4_simple_fsdp_shard_dims(
 def parallelize_gemma4(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
-    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig | None",
     dump_folder: str,
     skip_dp: bool = False,
     tpu_compile_mode: str = "layer",

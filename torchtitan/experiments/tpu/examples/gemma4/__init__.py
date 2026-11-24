@@ -4,7 +4,7 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.optim import register_moe_load_balancing_hook
+from torchtitan.models.common.moe import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4,
@@ -12,6 +12,9 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.attention import QKVLinear
+from torchtitan.experiments.tpu.components.attention import (
+    ScaledDotProductInnerAttention,
+)
 from torchtitan.models.common.config_utils import (
     fused_gate_up_param_init,
     fused_qkv_param_init,
@@ -20,12 +23,17 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.linear import (
     ColumnParallelLinear,
     Linear,
-    RouterGateLinear,
+    Linear,
     RowParallelLinear,
 )
-from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    TpuGroupedExperts,
+    TpuGroupedExpertsConverter,
+    TpuRoutedExperts,
+)
+from torchtitan.models.common.moe import MicrobatchWiseLoadBalanceLoss
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 from torchtitan.config.transform import (
@@ -137,10 +145,8 @@ def _make_moe_config(
             top_k=top_k,
             score_func=Softmax.Config(),
             route_norm=True,
-            aux_loss=MoELoadBalanceAuxLoss.Config(
-                type="sequence_wise",
+            aux_loss=MicrobatchWiseLoadBalanceLoss.Config(
                 coeff=aux_loss_coeff,
-                top_k=top_k,
             )
             if aux_loss_coeff > 0
             else None,
@@ -149,14 +155,14 @@ def _make_moe_config(
                 eps=norm_eps,
                 elementwise_affine=False,
             ),
-            gate=RouterGateLinear.Config(
+            gate=Linear.Config(
                 in_features=dim,
                 out_features=num_experts,
                 param_init=param_init["linear_out"],
             ),
             param_init=param_init["router"],
         ),
-        routed_experts=RoutedExperts.Config(
+        routed_experts=TpuRoutedExperts.Config(
             inner_experts=TpuGroupedExperts.Config(
                 activation="gelu_tanh",
                 dim=dim,
@@ -273,7 +279,11 @@ def _build_gemma4_layers(
                         param_init=p["linear_out"],
                     ),
                     qkv_linear=qkv_linear_cfg,
-                    inner_attention=get_attention_config(attn_backend),
+                    inner_attention=(
+                        ScaledDotProductInnerAttention.Config()
+                        if attn_backend == "sdpa"
+                        else get_attention_config(attn_backend)
+                    ),
                     rope=Gemma4RoPE.Config(
                         dim=layer_head_dim,
                         max_context_length=max_seq_len,

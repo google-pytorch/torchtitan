@@ -25,7 +25,7 @@ from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import paralleliz
 from torchtitan.experiments.tpu.overrides import fused_loss
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import attention as common_attention
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.muse_glimmer import model as upstream_model
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
 
@@ -363,7 +363,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     """Tests the 30B recipes: upstream model/data settings, 4x4x4 flags."""
     config = getattr(config_registry, name)()
     self.assertLen(config.model.layers, 52)
-    self.assertEqual(config.training.max_context_length, 16384)
+    self.assertEqual(config.model.max_context_length, 16384)
     self.assertEqual(
         config.training.num_tokens_per_microbatch_per_dp_rank, 16384
     )
@@ -398,7 +398,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
         _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
     )
     self.assertEqual(
-        config.optim.optimizer.implementation, optimizer_implementation
+        config.optim.optimizer.fused, optimizer_implementation == "fused"
     )
 
   @parameterized.parameters(

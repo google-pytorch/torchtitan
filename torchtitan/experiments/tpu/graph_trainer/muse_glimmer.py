@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from torch import nn
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.graph_trainer.muse_glimmer.model import GraphTrainerMuseGlimmerModel
 from torchtitan.experiments.tpu import muse_glimmer as tpu_muse_glimmer
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import configure_muse_glimmer_simple_fsdp_shard_dims

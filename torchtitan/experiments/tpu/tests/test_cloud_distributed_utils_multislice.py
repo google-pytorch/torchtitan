@@ -20,7 +20,7 @@ These run on CPU: the functions under test only rewrite an environment dict.
 import unittest
 from unittest import mock
 
-from torchtitan.config.configs import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.distributed import cloud_distributed_utils as cdu
 
 

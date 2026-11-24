@@ -601,14 +601,18 @@ def construct_tpu_transform_passes(
     passes.append(apply_combine_barrier_pass)
 
     if fsdp_barrier_policy != "none":
+        from torchtitan.models.common.moe import MoE  # pylint: disable=g-import-not-at-top
+
         model_config = config.model
         n_layers = len(model_config.layers)
-        # TransformerBlock.Config exposes ``moe`` independently of the concrete
-        # expert implementation, including TPU-converted GroupedExperts.
+        # TransformerBlock.Config exposes ``feed_forward`` independently of
+        # the concrete expert implementation, including TPU-converted experts.
         moe_layer_ids = frozenset(
             index
             for index, layer in enumerate(model_config.layers)
-            if layer.moe is not None
+            if isinstance(getattr(layer, "feed_forward", None), MoE.Config)
+            or getattr(layer, "moe", None) is not None
+            or hasattr(getattr(layer, "feed_forward", None), "routed_experts")
         )
         passes.append(
             functools.partial(

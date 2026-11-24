@@ -25,10 +25,11 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import (
-    ActivationCheckpointingConfig,
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.activation_remat import (
+    ActivationRematConfig as ActivationCheckpointingConfig,
 )
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
@@ -43,7 +44,6 @@ from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     configure_gemma4_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
-from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 
 
 class TpuGraphTrainerGemma4Model(Gemma4Model):
@@ -95,7 +95,7 @@ def parallelize_gemma4(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
-    ac_config: ActivationCheckpointingConfig,
+    ac_config: ActivationRematConfig,
     dump_folder: str,
 ) -> nn.Module:
   """Applies SimpleFSDP (TPU uneven-dim policy) and graph capture to Gemma 4.
@@ -135,8 +135,6 @@ def parallelize_gemma4(
   annotate_module_fqns(model)
 
   model._parallelize(parallel_dims)
-
-  configure_moe_aux_loss_reduction(model, parallel_dims)
 
   # Apply simple_fsdp unconditionally. The `fsdp` mesh always exists with a
   # real backend (see ParallelDims._mesh_exist), even at degree 1, so that

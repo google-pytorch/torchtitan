@@ -19,9 +19,7 @@ from spmd_types import SpmdType
 
 # TODO(acisseJZhong): Move these implementations into TorchTitan to avoid
 # depending on private PyTorch context-parallel APIs.
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
     _HeadTailLoadBalancer,
     _PTRRLoadBalancer,
 )
@@ -36,21 +34,41 @@ from torchtitan.distributed.spmd_types import (
 )
 
 if TYPE_CHECKING:
-    from torchtitan.models.common.attention import (
-        AttentionMasksType,
-        FlexAttentionMetadata,
-    )
+    from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
 __all__ = [
+    "cp_all_gather_tensors",
     "ContextParallelLoadBalancer",
     "HeadTailCPLoadBalancer",
     "PTRRFlexAttentionCPLoadBalancer",
-    "_cp_shard_dims",
-    "cp_shard",
     "get_cp_input_seq_len",
-    "prepare_context_parallel_input",
+    "get_token_fragments",
     "shard_tensors",
+    "supports_cp_inner_attention",
 ]
+
+_TOKEN_DIM = 0
+
+
+def cp_all_gather_tensors(
+    tensors: tuple[torch.Tensor, ...],
+    *,
+    reduce_dtype: torch.dtype,
+) -> tuple[torch.Tensor, ...]:
+    """All-gather token-sharded tensors across the CP mesh axis."""
+    cp_group = spmd_mesh_group(MeshAxisName.CP)
+    if cp_group is None:
+        raise RuntimeError("CP attention requires an active multi-rank CP mesh axis.")
+    return tuple(
+        spmd.redistribute(
+            tensor,
+            cp_group,
+            src=spmd.S(_TOKEN_DIM),
+            dst=spmd.R,
+            backward_options={"op_dtype": reduce_dtype},
+        )
+        for tensor in tensors
+    )
 
 
 class ContextParallelLoadBalancer(Configurable, ABC):
@@ -74,7 +92,7 @@ class HeadTailCPLoadBalancer(ContextParallelLoadBalancer):
         config: Config,
         *,
         seq_len: int,
-        attention_metadata: AttentionMasksType | None,
+        attention_metadata: BlockMask | None,
     ) -> None:
         del config, attention_metadata
         cp_group = spmd_mesh_group(MeshAxisName.CP)
@@ -100,8 +118,6 @@ class HeadTailCPLoadBalancer(ContextParallelLoadBalancer):
         return permutation
 
 
-# TODO(acisseJZhong): Maintain an explicit mapping from each CP load balancer
-# to the CP attention backends it supports, and validate configured pairs.
 class PTRRFlexAttentionCPLoadBalancer(ContextParallelLoadBalancer):
     """Balance FlexAttention tokens with PTRR.
 
@@ -112,47 +128,25 @@ class PTRRFlexAttentionCPLoadBalancer(ContextParallelLoadBalancer):
     class Config(Configurable.Config):
         """Configuration for PTRR context-parallel load balancing."""
 
-        mask_key: str | None = None
-        """Mask used to derive the partition when context metadata is a mapping."""
-
     def __init__(
         self,
         config: Config,
         *,
         seq_len: int,
-        attention_metadata: FlexAttentionMetadata,
+        attention_metadata: BlockMask | None,
     ) -> None:
-        del seq_len
-        mask_key = config.mask_key
+        del config, seq_len
 
         if attention_metadata is None:
             raise ValueError(
-                "PTRR load balancing requires context metadata to be a BlockMask "
-                "or Mapping[str, BlockMask], but got None."
+                "PTRR load balancing requires attention metadata, but got None."
             )
-        if isinstance(attention_metadata, Mapping):
-            if mask_key is None:
-                raise ValueError(
-                    "PTRR load balancing received a Mapping[str, BlockMask] but no "
-                    "mask key was specified. Set "
-                    "PTRRFlexAttentionCPLoadBalancer.Config(mask_key=...) "
-                    "to one of: "
-                    f"{sorted(attention_metadata.keys())}"
-                )
-            if mask_key not in attention_metadata:
-                raise ValueError(
-                    f"PTRR mask key '{mask_key}' is not a key in context metadata. "
-                    f"Available keys: {sorted(attention_metadata.keys())}"
-                )
-            block_mask = attention_metadata[mask_key]
-        else:
-            block_mask = attention_metadata
-        if not isinstance(block_mask, BlockMask):
+        if not isinstance(attention_metadata, BlockMask):
             raise ValueError(
-                "PTRR load balancing requires the selected metadata to be a "
-                f"BlockMask, but got {type(block_mask).__name__}."
+                "PTRR load balancing requires BlockMask metadata, but got "
+                f"{type(attention_metadata).__name__}."
             )
-        self.block_mask = block_mask
+        self.block_mask = attention_metadata
         cp_group = spmd_mesh_group(MeshAxisName.CP)
         if cp_group is None:
             raise RuntimeError(
@@ -166,6 +160,41 @@ class PTRRFlexAttentionCPLoadBalancer(ContextParallelLoadBalancer):
             self.block_mask, self.cp_size
         )._generate_indices()
         return permutation
+
+
+def supports_cp_inner_attention(
+    load_balancer_config: ContextParallelLoadBalancer.Config,
+    cp_inner_attention: type[CPInnerAttention[Any, Any]],
+) -> bool:
+    """Return whether a load balancer supports a CP inner attention."""
+    from torchtitan.models.common.attention.cp_attention import (
+        AllGatherKVFlexInnerAttention,
+        AllGatherKVSlidingWindowFlexInnerAttention,
+        AllGatherKVVarlen,
+    )
+    from torchtitan.models.common.attention.cp_mla import AllGatherKVMLAFlexAttention
+
+    supported_cp_inner_attentions: dict[type, tuple[type, ...]] = {
+        HeadTailCPLoadBalancer: (
+            AllGatherKVFlexInnerAttention,
+            AllGatherKVSlidingWindowFlexInnerAttention,
+            AllGatherKVMLAFlexAttention,
+            AllGatherKVVarlen,
+        ),
+        PTRRFlexAttentionCPLoadBalancer: (
+            AllGatherKVFlexInnerAttention,
+            AllGatherKVSlidingWindowFlexInnerAttention,
+            AllGatherKVMLAFlexAttention,
+        ),
+    }
+    load_balancer_type = load_balancer_config._owner
+    assert load_balancer_type is not None
+    return any(
+        issubclass(cp_inner_attention, supported_cp_inner_attention)
+        for supported_cp_inner_attention in supported_cp_inner_attentions.get(
+            load_balancer_type, ()
+        )
+    )
 
 
 def _cp_shard_dims(input_shardings: dict[str, SpmdType]) -> dict[str, int]:
@@ -202,6 +231,61 @@ def get_cp_input_seq_len(
             f"but got {seq_lens}."
         )
     return next(iter(seq_lens.values()))
+
+
+def get_token_fragments(
+    num_tokens: int,
+    *,
+    cp_size: int,
+    permutation: torch.Tensor | None,
+) -> list[list[tuple[int, int]]]:
+    """Describe each CP rank's global token ranges after input sharding.
+
+    Args:
+        num_tokens: Number of tokens in the global sequence before CP sharding.
+        cp_size: Number of CP ranks sharing the sequence.
+        permutation: Optional global token order applied before splitting the
+            sequence into equal rank-local shards. Its shape must be
+            ``[1, num_tokens]``.
+
+    Returns:
+        One list per CP rank containing maximal half-open global token ranges
+        ``[start, stop)`` in the order they appear in that rank's local shard.
+    """
+    if num_tokens % cp_size:
+        raise ValueError(
+            f"The token count ({num_tokens}) must be divisible by the CP degree "
+            f"({cp_size})."
+        )
+
+    local_num_tokens = num_tokens // cp_size
+    if permutation is None:
+        return [
+            [(rank * local_num_tokens, (rank + 1) * local_num_tokens)]
+            for rank in range(cp_size)
+        ]
+    if permutation.ndim != 2 or permutation.shape != (1, num_tokens):
+        raise ValueError(
+            "CP routing requires a permutation with shape [1, num_tokens], "
+            f"but got {tuple(permutation.shape)}."
+        )
+
+    fragments: list[list[tuple[int, int]]] = []
+    for rank_indices in permutation[0].split(local_num_tokens):
+        token_indices = rank_indices.tolist()
+        rank_fragments: list[tuple[int, int]] = []
+        start = token_indices[0]
+        stop = start + 1
+        for token_idx in token_indices[1:]:
+            if token_idx == stop:
+                stop += 1
+            else:
+                rank_fragments.append((start, stop))
+                start = token_idx
+                stop = token_idx + 1
+        rank_fragments.append((start, stop))
+        fragments.append(rank_fragments)
+    return fragments
 
 
 def _permute_tensor(
@@ -308,144 +392,3 @@ def shard_tensors(
             dst=spmd.S(seq_dim),
         )
     return input_dict
-
-
-def prepare_context_parallel_input(
-    input_dict: dict[str, Any],
-    input_shardings: dict[str, SpmdType] | None,
-    cp_mesh: DeviceMesh,
-    load_balancer_type: str | None = "headtail",
-    ptrr_mask_key: str | None = None,
-) -> dict[str, Any]:
-    """Shard named tensors and attention masks for Context Parallel."""
-    if input_shardings is not None:
-        shard_dims = _cp_shard_dims(input_shardings)
-    else:
-        shard_dims = {"input": 0, "labels": 0, "positions": 0}
-
-    named: dict[str, torch.Tensor] = {
-        k: v for k, v in input_dict.items() if isinstance(v, torch.Tensor)
-    }
-
-    shard_names = [n for n in shard_dims if n in named]
-    if not shard_names:
-        return input_dict
-    buffers = tuple(named[n] for n in shard_names)
-    seq_dims = tuple(shard_dims[n] for n in shard_names)
-
-    attention_masks = input_dict.get("attention_masks", None)
-    sharded_buffers, attention_masks = cp_shard(
-        cp_mesh,
-        buffers,
-        attention_masks,
-        load_balancer_type,
-        input_seq_dims=seq_dims,
-        ptrr_mask_key=ptrr_mask_key,
-    )
-
-    for n, buf in zip(shard_names, sharded_buffers):
-        input_dict[n] = buf
-    if attention_masks is not None:
-        input_dict["attention_masks"] = attention_masks
-    return input_dict
-
-
-def cp_shard(
-    cp_mesh: DeviceMesh,
-    inputs: tuple[torch.Tensor, ...],
-    attention_masks: AttentionMasksType | None,
-    load_balancer_type: str | None = "headtail",
-    input_seq_dims: int | tuple[int, ...] = 0,
-    ptrr_mask_key: str | None = None,
-) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | None]:
-    if isinstance(input_seq_dims, tuple):
-        assert len(input_seq_dims) == len(inputs)
-        seq_dims = input_seq_dims
-    else:
-        seq_dims = tuple(input_seq_dims for _ in inputs)
-    seq_len = inputs[0].size(seq_dims[0])
-    cp_world_size = cp_mesh.size(0)
-
-    load_balancer = None
-    if load_balancer_type:
-        match load_balancer_type:
-            case "headtail":
-                load_balancer = _HeadTailLoadBalancer(
-                    seq_len, cp_world_size, cp_mesh.device_type
-                )
-            case "ptrr":
-                if attention_masks is None:
-                    raise ValueError(
-                        "PTRRLoadBalancer requires attention_masks to be a "
-                        "BlockMask or dict[str, BlockMask], but got None"
-                    )
-                if isinstance(attention_masks, dict):
-                    if ptrr_mask_key is None:
-                        raise ValueError(
-                            "PTRRLoadBalancer received a dict[str, BlockMask] "
-                            "but no mask key was specified. Set "
-                            "--parallelism.context_parallel_ptrr_mask_key to "
-                            f"one of: {sorted(attention_masks.keys())}"
-                        )
-                    if ptrr_mask_key not in attention_masks:
-                        raise ValueError(
-                            f"context_parallel_ptrr_mask_key '{ptrr_mask_key}' "
-                            f"is not a key in attention_masks. Available keys: "
-                            f"{sorted(attention_masks.keys())}"
-                        )
-                    ptrr_mask = attention_masks[ptrr_mask_key]
-                else:
-                    ptrr_mask = attention_masks
-                if not isinstance(ptrr_mask, BlockMask):
-                    raise ValueError(
-                        f"PTRRLoadBalancer requires the mask to be a "
-                        f"BlockMask, but got {type(ptrr_mask)}"
-                    )
-                load_balancer = _PTRRLoadBalancer(ptrr_mask, cp_world_size)
-            case _:
-                raise ValueError(
-                    f"Invalid load_balancer_type '{load_balancer_type}'. "
-                    f"Must be one of: 'headtail', 'ptrr', or None"
-                )
-
-    inputs = cast(
-        tuple[torch.Tensor, ...],
-        _context_parallel_shard(
-            mesh=cp_mesh,
-            buffers=inputs,
-            seq_dims=seq_dims,
-            load_balancer=load_balancer,
-        ),
-    )
-
-    MASK_Q_SEQ_DIM = 2
-    if attention_masks is not None:
-        assert isinstance(attention_masks, (BlockMask, dict))
-        masks: list[BlockMask] = []
-        for mask in (
-            [attention_masks]
-            if isinstance(attention_masks, BlockMask)
-            else attention_masks.values()
-        ):
-            if not isinstance(mask, BlockMask):
-                raise ValueError(
-                    "Context parallelism can only shard BlockMask attention "
-                    f"masks, got {type(mask).__name__} in the mask dict."
-                )
-            masks.append(mask)
-        sharded_masks = _context_parallel_shard(
-            mesh=cp_mesh,
-            buffers=masks,
-            seq_dims=(MASK_Q_SEQ_DIM,) * len(masks),
-            load_balancer=load_balancer,
-        )
-        attention_masks = cast(
-            (BlockMask | dict[str, BlockMask]),
-            (
-                sharded_masks[0]
-                if isinstance(attention_masks, BlockMask)
-                else {k: v for k, v in zip(attention_masks.keys(), sharded_masks)}
-            ),
-        )
-
-    return inputs, attention_masks

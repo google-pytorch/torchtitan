@@ -1,3 +1,4 @@
+from torchtitan.config.parallelism import ParallelismConfig
 from functools import partial
 from typing import cast
 
@@ -6,12 +7,12 @@ from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import default_adamw
+from torchtitan.experiments.tpu.components.optim import default_adamw
 from torchtitan.config.configs import (
-    ParallelismConfig,
+    PrecisionConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.examples.gemma4 import (
@@ -179,7 +180,6 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=4 * 512,
-          max_context_length=512,
           steps=10,
       ),
       dataloader=c4_test_dataloader(),
@@ -188,7 +188,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_remat=FullActivationRematConfig(),
       xla_flags=tpu_flags.merge_flags(
           xla_enable_hlo_sharding_v3=False,
       ),
@@ -226,7 +226,7 @@ def gemma4_moe_testmodel() -> TPUTrainerConfig:
       attn_backend="sdpa",
       enable_weight_tying=False,
   )
-  cfg.training.max_context_length = 128
+  cfg.model.max_context_length = 128
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 4 * 128
   return cfg
 
@@ -292,6 +292,7 @@ def gemma4_31b() -> TPUTrainerConfig:
   model = model_registry(
       "31B", attn_backend="sdpa", enable_weight_tying=False
   )
+  model.max_context_length = 4096
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
@@ -306,11 +307,10 @@ def gemma4_31b() -> TPUTrainerConfig:
           ),
           max_norm=1.0,
       ),
-      training=TrainingConfig(
+precision=PrecisionConfig(reduce_dtype="float32"),
+            training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=2 * 4096,
-          max_context_length=4096,
           steps=15,
-          mixed_precision_reduce="float32",
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -320,7 +320,7 @@ def gemma4_31b() -> TPUTrainerConfig:
           data_parallel_shard_degree=-1,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_remat=FullActivationRematConfig(),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # Qwen3 and Muse Glimmer recipes.
       xla_flags=tpu_flags.merge_flags(
@@ -353,6 +353,7 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
       ],
       enable_weight_tying=False,
   )
+  cfg.model.max_context_length = 4096
   # 26B-A4B routes tokens across 128 experts with top-8 (M_expert = B*T*8/128 =
   # B*T/16 tokens/expert) and has 3.8B active parameters/token (vs. 31B dense),
   # so B=6 at max_context_length=4096 (24,576 tokens/rank, ~1,536 tokens/expert)

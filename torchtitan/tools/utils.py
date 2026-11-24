@@ -5,22 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
-import gc
+import importlib.util
 import logging
 import os
 import subprocess
-import time
 from collections.abc import Generator
-from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 
 import psutil
 import torch
-import torch.distributed as dist
 from torch._utils import _get_available_device_type, _get_device_module
+from torch.nn.attention import (
+    activate_flash_attention_impl,
+    current_flash_attention_impl,
+)
 
-from torchtitan.observability import structured_logger as sl
-
+from torchtitan.observability.logging import warn_once
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +53,43 @@ def get_cuda_flash_attention_impl() -> str | None:
     # torch.compile there, so Hopper (sm90) stays on FA3.
     # https://github.com/pytorch/torchtitan/pull/4413
     if has_cuda_capability(10, 0):
-        return "FA4"
-    if has_cuda_capability(9, 0):
-        return "FA3"
-    return None
+        impl, module = "FA4", "flash_attn.cute"
+    elif has_cuda_capability(9, 0):
+        impl, module = "FA3", "flash_attn_interface"
+    else:
+        return None
+    try:
+        found = importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:  # Parent package `flash_attn` missing.
+        found = False
+    if not found:
+        raise ValueError(
+            f"{impl} is required for Varlen attention, but '{module}' is not installed. "
+            f"Install a compatible {impl} wheel or explicitly select another attention backend."
+        )
+    return impl
+
+
+def activate_cuda_flash_attention_impl() -> None:
+    """Route torch's varlen attention to the FlashAttention build for this GPU."""
+    flash_attention_impl = get_cuda_flash_attention_impl()
+    if flash_attention_impl is not None:
+        # activate_flash_attention_impl() will restore internal global state
+        # and re-run register function, so we want to only call it once.
+        if current_flash_attention_impl() != flash_attention_impl:
+            try:
+                activate_flash_attention_impl(flash_attention_impl)
+            except (ImportError, RuntimeError, ValueError) as error:
+                capability = torch.cuda.get_device_capability()
+                raise RuntimeError(
+                    f"{flash_attention_impl} is required on detected SM "
+                    f"{capability[0]}.{capability[1]}, but activation failed."
+                ) from error
+    else:
+        warn_once(
+            logger,
+            "FA3/FA4 not available on this CUDA architecture, falling back to FA2.",
+        )
 
 
 def has_rocm_capability(major: int, minor: int) -> bool:
@@ -74,9 +107,6 @@ def _patch_cpu_device_module(device_module: ModuleType) -> None:
         return "cpu"
 
     def current_device():
-        # torch.cpu.current_device() returns the string "cpu"; callers need an
-        # index, e.g. torch.device(device_type, current_device()). A process
-        # has exactly one CPU device, so it is always index 0.
         return 0
 
     def get_device_properties(device=None):
@@ -100,31 +130,12 @@ def _patch_cpu_device_module(device_module: ModuleType) -> None:
 
 
 def _use_accelerator_device_apis() -> bool:
-    """Whether torch.accelerator provides the device APIs _TpuDeviceModule calls.
-
-    torch.accelerator first shipped in PyTorch 2.6 with all of them
-    (is_available, device_count, current_device_index, set_device_index,
-    synchronize, current_stream, set_stream), so one of them stands for all.
-    They are correct on any version that has them: torch_tpu's own torch.tpu
-    device APIs are built on torch.accelerator.
-    """
+    """Whether torch.accelerator provides the device APIs _TpuDeviceModule calls."""
     return hasattr(getattr(torch, "accelerator", None), "set_device_index")
 
 
 class _TpuDeviceModule(ModuleType):
-    """``torch.tpu`` as torchtitan calls it, with torch.accelerator-backed APIs.
-
-    torch_tpu marks the ``torch.tpu`` APIs that have a ``torch.accelerator``
-    equivalent as internal (PyTorch >= 2.11): calling them from outside the
-    torch / torch_tpu packages emits a one-time ``InternalApi`` warning naming
-    the replacement. torchtitan reaches them through ``device_module``, so this
-    view routes them to ``torch.accelerator`` and forwards every other attribute
-    to ``torch.tpu`` untouched. It is a separate object rather than a patch on
-    ``torch.tpu`` because torch_tpu calls these same functions on ``torch.tpu``
-    internally (e.g. ``set_device`` from device guards, ``device_count`` from
-    ``is_available``), and their pre-initialization behavior must not change.
-    Only used when ``_use_accelerator_device_apis()`` holds.
-    """
+    """``torch.tpu`` as torchtitan calls it, with torch.accelerator-backed APIs."""
 
     def __init__(self, tpu_module: ModuleType) -> None:
         super().__init__(tpu_module.__name__, tpu_module.__doc__)
@@ -147,10 +158,6 @@ class _TpuDeviceModule(ModuleType):
 
     @staticmethod
     def set_device(device: int | str | torch.device) -> None:
-        # torch.tpu.set_device accepted an index-free "tpu" / torch.device("tpu")
-        # as "this process's device" (a TPU process owns one chip, see
-        # get_local_device). torch.accelerator.set_device_index rejects a
-        # device without an index, so resolve it to the current index first.
         if isinstance(device, str):
             device = torch.device(device)
         if isinstance(device, torch.device) and device.index is None:
@@ -173,17 +180,7 @@ class _TpuDeviceModule(ModuleType):
 
 
 def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
-    """Adds the device-module functions torch_tpu does not provide.
-
-    Returns the module torchtitan should use as ``device_module``: a
-    ``_TpuDeviceModule`` view of ``torch.tpu`` that calls the
-    ``torch.accelerator`` equivalents of torch_tpu's internal device APIs, or
-    ``torch.tpu`` itself when torch.accelerator lacks any of them.
-
-    torch_tpu natively provides get_device_name, get_device_properties,
-    set_device, current_device, device_count and synchronize (routed through
-    torch.accelerator by _TpuDeviceModule where available).
-    """
+    """Adds the device-module functions torch_tpu does not provide."""
 
     def reset_peak_memory_stats(device=None):
         pass
@@ -192,10 +189,6 @@ def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
         pass
 
     def memory_stats(device=None):
-        # torch_tpu exposes memory stats through the modern torch.accelerator
-        # namespace, but torchtitan expects them on the legacy device-module
-        # namespace (torch.tpu). Route them across when that namespace has
-        # them; an older PyTorch without torch.accelerator reports no stats.
         accelerator = getattr(torch, "accelerator", None)
         if accelerator is None or not hasattr(accelerator, "memory_stats"):
             return {}
@@ -215,9 +208,6 @@ def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
 
 
 def get_device_info() -> tuple[str, ModuleType]:
-    # Upstream falls back to "cuda"; this fork falls back to "cpu" so that a
-    # machine with no accelerator -- or one where the accelerator was hidden on
-    # purpose, see experiments/tpu/distributed/device_env.py -- reports what it will run on.
     device_type = _get_available_device_type() or "cpu"
     device_module = _get_device_module(device_type)
     if device_type == "cpu":
@@ -239,13 +229,6 @@ def get_local_device() -> torch.device:
     CUDA_VISIBLE_DEVICES or another backend-specific visible-device mask. When
     exactly one device is visible, target device index 0; otherwise preserve
     the existing LOCAL_RANK mapping.
-
-    cpu and tpu are index-free: a process owns exactly one of them, so
-    LOCAL_RANK is not a device index on those lanes. tpu cannot use the
-    visible-device heuristic below either, because torch.tpu.device_count()
-    reports the host's chip count -- not the process's single addressable chip
-    -- until the PJRT runtime is initialized, which happens after callers of
-    this function have already selected a device.
     """
     if device_type in ["cpu", "tpu"]:
         return torch.device(device_type)
@@ -277,47 +260,10 @@ def get_local_device() -> torch.device:
     return torch.device(device_type, device_index)
 
 
-# used to avoid stragglers in garbage collection
-class GarbageCollection:
-    def __init__(self, gc_freq: int = 1000, debug: bool = False):
-        assert gc_freq > 0, "gc_freq must be a positive integer"
-        self.gc_freq = gc_freq
-        self.debug = debug
-        gc.disable()
-        self.collect("Initial GC collection")
-        if debug:
-            from torch.utils.viz._cycles import warn_tensor_cycles
-
-            if torch.distributed.get_rank() == 0:
-                warn_tensor_cycles()
-
-    @sl.log_trace_span("gc_collect")
-    def run(self, step_count: int) -> bool:
-        """Run a GC cycle if this step should collect. Returns True when a
-        collection actually ran, False otherwise."""
-        if self.debug:
-            self.collect(
-                "Force GC to perform collection to obtain debug information",
-                generation=2,
-            )
-            sl.add_step_tag("gc")
-            return True
-        if step_count > 1 and step_count % self.gc_freq == 0:
-            self.collect("Performing periodic GC collection")
-            sl.add_step_tag("gc")
-            return True
-        return False
-
-    @staticmethod
-    def collect(reason: str, generation: int = 1):
-        begin = time.monotonic()
-        gc.collect(generation)
-        logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
-
-
 # hardcoded BF16 type peak flops for NVIDIA A100, H20, H100, H200, B200 GPU,
 # AMD MI250, MI300X, MI325X, MI350X, MI355X, Intel PVC, and AWS Trainium/Inferentia
-def get_peak_flops(device_name: str) -> float:
+def get_peak_flops(device_name: str) -> float | None:
+    """Return the dense BF16 peak FLOPS per device, or None if it is unknown."""
     try:
         # Run the lspci command and capture the output
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
@@ -396,31 +342,6 @@ def get_peak_flops(device_name: str) -> float:
     elif "l40s" in device_name.casefold():
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
-    elif "tpu" in device_name.lower():
-        # torch_tpu reports "TPU v6e"; older torchtitan builds reported
-        # "tpu-v6e" (and "tpu-7x" for v7). Match both, case-insensitively.
-        tpu_name = device_name.lower().replace("-", " ")
-        if "v4" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v4
-            return 275e12
-        elif "v5e" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v5e
-            return 197e12
-        elif "v5p" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v5p
-            # The quoted number is per chip. We use this number as we assume
-            # megacore is enabled for v5p.
-            return 459e12
-        elif "v6e" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v6e
-            return 918e12
-        elif "v7" in tpu_name or "7x" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/tpu7x
-            # The quoted number is per chip. We halve it for per-core FLOPS.
-            return 2307e12 / 2
-        logger.warning(
-            f"Unrecognized TPU device name: {device_name}, fallback to A100"
-        )
     elif "neuron" in device_name:
         # AWS Trainium/Inferentia: query chip type via torch.neuron
         # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device
@@ -457,48 +378,13 @@ def get_peak_flops(device_name: str) -> float:
             return 2307e12 / 2
         else:
             logger.warning(
-                f"Peak flops undefined for TPU: {device_name}, fallback to A100"
+                f"Peak FLOPS unknown for {device_name}. MFU is not reported."
             )
-            return 312e12
+            return None
 
-    else:  # for other GPU types, assume A100
-        logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
-        return 312e12
-
-
-@dataclass(frozen=True)
-class Color:
-    black = "\033[30m"
-    red = "\033[31m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    blue = "\033[34m"
-    magenta = "\033[35m"
-    cyan = "\033[36m"
-    white = "\033[37m"
-    reset = "\033[39m"
-    orange = "\033[38;2;180;60;0m"
-    turquoise = "\033[38;2;54;234;195m"
-
-
-@dataclass(frozen=True)
-class NoColor:
-    black = ""
-    red = ""
-    green = ""
-    yellow = ""
-    blue = ""
-    magenta = ""
-    cyan = ""
-    white = ""
-    reset = ""
-    orange = ""
-    turquoise = ""
-
-
-assert set(NoColor.__dataclass_fields__.keys()) == set(
-    Color.__dataclass_fields__.keys()
-), "NoColor must have the same fields as Color."
+    else:
+        logger.warning(f"Peak FLOPS unknown for {device_name}. MFU is not reported.")
+        return None
 
 
 @contextlib.contextmanager

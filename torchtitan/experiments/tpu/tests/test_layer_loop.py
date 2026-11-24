@@ -20,7 +20,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     build_decoder_config_for_backend,
 )
 from torchtitan.experiments.tpu.components.layer_loop import (
-    _forward,
+    _forward_embeddings,
     builds_layer_loop,
     runs_layer_loop,
     TpuLayerLoop,
@@ -30,7 +30,7 @@ from torchtitan.models.common import Linear
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.llama3.flavors import MODEL_FLAVORS as llama3_configs
 from torchtitan.models.llama3.model import Llama3Model
-from torchtitan.protocols.module import ModuleDict
+from torchtitan.models.base.module import ModuleDict
 
 BATCH, SEQ = 2, 16
 # Upstream d771abb0 folds `[B, S]` into one packed `[T]` stream.
@@ -46,9 +46,16 @@ def _stock_config():
   # `ScaledDotProductInnerAttention` was left behind on the rank-4 interface and
   # is no longer a valid decoder backend, so go through the helper that builds
   # the flex config and swaps in the `[T]`-native SDPA adapter.
+  from torchtitan.config.parallelism import ParallelismConfig
+  from torchtitan.experiments.tpu.components.attention import use_tpu_sdpa
+
   config = build_decoder_config_for_backend(
-      build_config, "sdpa", seq_len=max_context_length
+      build_config,
+      "flex",
+      seq_len=max_context_length,
+      parallelism=ParallelismConfig(),
   )
+  config = use_tpu_sdpa(config)
   # The flavor defaults to max_context_length=131072; keep the RoPE cache small.
   # It has to hold every packed token, not just one document's worth: with
   # `positions=None` the decoder reads `cache[:T]`, and `T` is `BATCH * SEQ`.
@@ -124,9 +131,10 @@ class ForwardParityTest(parameterized.TestCase):
     model.layers = CONTAINERS[container](model.layers)
     tokens, positions = _tokens(model, with_positions=with_positions)
 
+    h = model.tok_embeddings(tokens)
     with torch.no_grad():
-      expected = Decoder.forward(model, tokens, positions)  # upstream body
-      actual = model(tokens, positions)  # the TPU body
+      expected = Decoder.forward_embeddings(model, h, positions)  # upstream body
+      actual = model.forward_embeddings(h, positions)  # the TPU body
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     if container == "scan_like":
@@ -152,11 +160,11 @@ class ForwardParityTest(parameterized.TestCase):
 
     def grads(fn):
       model.zero_grad(set_to_none=True)
-      fn(model, tokens, positions).float().sum().backward()
-      return [p.grad.clone() for p in model.parameters()]
+      fn(model, model.tok_embeddings(tokens), positions).float().sum().backward()
+      return [p.grad.clone() for p in model.parameters() if p.grad is not None]
 
-    expected = grads(Decoder.forward)
-    actual = grads(type(model).forward)
+    expected = grads(Decoder.forward_embeddings)
+    actual = grads(type(model).forward_embeddings)
     for a, e in zip(actual, expected, strict=True):
       torch.testing.assert_close(a, e, rtol=0, atol=0)
 
@@ -210,18 +218,18 @@ class ForwardStructureTest(absltest.TestCase):
   def test_forward_is_upstream_forward_modulo_the_loop(self) -> None:
     diff = "\n".join(
         difflib.unified_diff(
-            textwrap.dedent(inspect.getsource(Decoder.forward)).splitlines(),
-            textwrap.dedent(inspect.getsource(_forward)).splitlines(),
-            "Decoder.forward",
-            "layer_loop._forward",
+            textwrap.dedent(inspect.getsource(Decoder.forward_embeddings)).splitlines(),
+            textwrap.dedent(inspect.getsource(_forward_embeddings)).splitlines(),
+            "Decoder.forward_embeddings",
+            "layer_loop._forward_embeddings",
             lineterm="",
         )
     )
     self.assertEqual(
-        _blank_the_loop(_forward, _is_tpu_dispatch),
-        _blank_the_loop(Decoder.forward, _is_upstream_loop),
-        "Decoder.forward changed upstream, or the copy drifted; re-sync "
-        f"layer_loop._forward with models/common/decoder.py.\n{diff}",
+        _blank_the_loop(_forward_embeddings, _is_tpu_dispatch),
+        _blank_the_loop(Decoder.forward_embeddings, _is_upstream_loop),
+        "Decoder.forward_embeddings changed upstream, or the copy drifted; re-sync "
+        f"layer_loop._forward_embeddings with models/common/decoder.py.\n{diff}",
     )
 
 
@@ -279,7 +287,7 @@ class ConfigRewriteTest(absltest.TestCase):
       class Config(Llama3Model.Config):
         pass
 
-      def forward(self, *args, **kwargs):
+      def forward_embeddings(self, *args, **kwargs):
         raise AssertionError("never called")
 
     with self.assertRaisesRegex(TypeError, "stock forward"):

@@ -25,8 +25,8 @@ from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
 from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
-from torchtitan.hf_datasets.text_datasets import ChatProcessor
-from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.components.data.text_datasets import ChatProcessor
+from torchtitan.components.data.text_datasets import DATASETS
 
 logger = logging.getLogger(__name__)
 

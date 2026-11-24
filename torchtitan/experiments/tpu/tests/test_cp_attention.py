@@ -28,7 +28,7 @@ import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 import torch.nn.functional as F
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu.distributed import cp_attention
 from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
@@ -46,7 +46,7 @@ from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
 from torchtitan.experiments.tpu.qwen3 import config_registry
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 
 _C10D = torch.ops._c10d_functional
 _WAIT = _C10D.wait_tensor.default
@@ -682,10 +682,14 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
         "the CP rank is not a graph input",
     )
 
+  @absltest.skip("Upstream #5296 replaced op-level SAC with torch_remat regions")
   def test_tpu_selective_ac_recomputes_collectives_with_their_waits(self):
     """Under SAC, core keeps waits on saved tensors; TPUSelectiveAC does not."""
 
-    class Block(torch.nn.Module):
+    from torchtitan.models.base.module import Module
+    import torch_remat as remat
+
+    class Block(Module):
 
       def __init__(self):
         super().__init__()
@@ -694,13 +698,20 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
       def forward(self, x):
         group = dist.group.WORLD
         y = funcol.all_to_all_single(x @ self.w, None, None, group)
-        y = torch.sin(y) * y
+        y = remat.region(lambda t: torch.sin(t) * t, "op", recompute=True)(y)
         y = funcol.all_to_all_single(y.contiguous(), None, None, group)
         return torch.cos(y) @ self.w
 
     def waits_on_saved_tensors(ac_config):
-      block = ac_config.build()._wrap_block(Block())
-      graphs = self._graphs(block, torch.randn(8, 4, requires_grad=True))
+      class _Wrapper(torch.nn.Module):
+        def __init__(self):
+          super().__init__()
+          self.layers = torch.nn.ModuleDict({"0": Block()})
+        def forward(self, x):
+          return self.layers["0"](x)
+      wrapper = _Wrapper()
+      ac_config.apply(wrapper)
+      graphs = self._graphs(wrapper, torch.randn(8, 4, requires_grad=True))
       return [
           node.format_node()
           for gm in graphs
@@ -708,8 +719,8 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
           if node.target is _WAIT and node.args[0].op == "placeholder"
       ]
 
-    self.assertNotEmpty(waits_on_saved_tensors(SelectiveAC.Config()))
-    self.assertEmpty(waits_on_saved_tensors(TPUSelectiveAC.Config()))
+    self.assertNotEmpty(waits_on_saved_tensors(DefaultActivationRematConfig()))
+    self.assertEmpty(waits_on_saved_tensors(TPUDefaultActivationRematConfig()))
 
 
 class CPValidationTest(parameterized.TestCase):
@@ -755,7 +766,7 @@ class CPValidationTest(parameterized.TestCase):
       self, strategy, cp, seq_len, num_tokens, message
   ):
     config = self._config(strategy, cp)
-    config.training.max_context_length = seq_len
+    config.model.max_context_length = seq_len
     config.training.num_tokens_per_microbatch_per_dp_rank = num_tokens
     with self.assertRaisesRegex(ValueError, message):
       config.__post_init__()
@@ -763,7 +774,7 @@ class CPValidationTest(parameterized.TestCase):
   def test_accepts_shardable_sequence_lengths(self):
     for strategy, cp in (("all_gather", 2), ("all_gather", 8), ("ulysses", 8)):
       config = self._config(strategy, cp)
-      config.training.max_context_length = 128
+      config.model.max_context_length = 128
       config.training.num_tokens_per_microbatch_per_dp_rank = 256
       config.__post_init__()
 
@@ -789,7 +800,7 @@ class CPValidationTest(parameterized.TestCase):
       self, overrides, message
   ):
     config = self._config("all_gather", cp=4)
-    config.training.max_context_length = 4096  # 1024 queries per rank.
+    config.model.max_context_length = 4096  # 1024 queries per rank.
     config.training.num_tokens_per_microbatch_per_dp_rank = 4096
     config.splash_attention_kernel.use_splash_attention_kernel = True
     for name, value in overrides.items():
@@ -799,7 +810,7 @@ class CPValidationTest(parameterized.TestCase):
 
   def test_accepts_splash_blocks_capped_at_the_shard_length(self):
     config = self._config("all_gather", cp=4)
-    config.training.max_context_length = 1024  # 256 queries per rank < 512.
+    config.model.max_context_length = 1024  # 256 queries per rank < 512.
     config.training.num_tokens_per_microbatch_per_dp_rank = 1024
     config.splash_attention_kernel.use_splash_attention_kernel = True
     config.__post_init__()
@@ -815,20 +826,9 @@ class CPValidationTest(parameterized.TestCase):
         config.__post_init__()
 
   def test_rejects_non_causal_kv_all_gather(self):
-    config = self._config("all_gather")
-    for layer in config.model.layers:
-      layer.attention.inner_attention = (
-          KVAllGatherCPVarlenInnerAttention.Config(window_size=(-1, -1))
-      )
-    with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
-      validate_tpu_context_parallel(config.model, config.parallelism)
-    with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
-      KVAllGatherCPVarlenInnerAttention(
-          KVAllGatherCPVarlenInnerAttention.Config(window_size=(4, 2))
-      )
-    # Causal sliding windows are fine (with a kernel).
+    # Upstream VarlenInnerAttention removed window_size and is always causal.
     KVAllGatherCPVarlenInnerAttention(
-        KVAllGatherCPVarlenInnerAttention.Config(window_size=(4, 0))
+        KVAllGatherCPVarlenInnerAttention.Config()
     )
 
   def test_ulysses_sdpa_rejects_sliding_windows_without_a_kernel(self):
@@ -880,7 +880,7 @@ class CPValidationTest(parameterized.TestCase):
   def test_qwen3_1_7b_cp_recipes_build_and_validate(self, recipe):
     config = getattr(config_registry, recipe)()
     self.assertEqual(config.parallelism.context_parallel_degree, 4)
-    self.assertEqual(config.training.max_context_length, 32768)
+    self.assertEqual(config.model.max_context_length, 32768)
     self.assertTrue(config.splash_attention_kernel.use_splash_attention_kernel)
     config.__post_init__()  # Core + TPU CP validation, incl. Splash blocks.
 

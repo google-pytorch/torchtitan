@@ -22,7 +22,6 @@ torchtitan/datasets/**/*.model
 # hf assets
 assets/hf/*
 assets/tokenizer/*
-
 # Profiling and debug output
 profiles
 traces

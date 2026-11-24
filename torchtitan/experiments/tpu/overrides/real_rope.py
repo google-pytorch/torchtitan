@@ -58,9 +58,16 @@ class TpuRealArithmeticComplexRoPE(ComplexRoPE):
       inverse: bool = False,
   ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Apply complex RoPE using adjacent-dim pairs, in real arithmetic."""
-    if inverse:
-      rope_cache = rope_cache.conj()
-    cache = torch.view_as_real(rope_cache)
+    if rope_cache.is_complex():
+      if inverse:
+        rope_cache = rope_cache.conj()
+      cache = torch.view_as_real(rope_cache)
+    else:
+      # ComplexRoPE._reshape_cache returns a real (..., dim) view with
+      # adjacent (cos, sin) pairs when torch.compiler.is_compiling().
+      cache = rope_cache.unflatten(-1, (-1, 2))
+      if inverse:
+        cache = torch.cat([cache[..., 0:1], -cache[..., 1:2]], dim=-1)
     cos, sin = cache[..., 0:1], cache[..., 1:2]
 
     def rotate(x: torch.Tensor) -> torch.Tensor:

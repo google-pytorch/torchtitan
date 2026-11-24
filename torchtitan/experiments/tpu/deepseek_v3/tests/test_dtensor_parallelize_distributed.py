@@ -4,8 +4,10 @@ from absl import logging
 from absl.testing import absltest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
+from torchtitan.config import PrecisionConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
@@ -39,13 +41,11 @@ def _get_deepseek_v3_model_config(
   n_dense_layers=3, vocab_size=2048).
   """
   import copy
-  from torchtitan.models.deepseek_v3.sharding import set_deepseek_v3_sharding_config
 
   # See the llama3 test: sharding spec is required by ``Module.parallelize``
   # under spmd_types; deepcopy keeps the registry entry pristine. SP and EP are
   # off because the test feeds unsharded inputs and runs TP only.
   config = copy.deepcopy(deepseek_v3_tpu.deepseekv3_configs[model_name])
-  set_deepseek_v3_sharding_config(config, enable_sp=False, enable_ep=False)
   return config
 
 
@@ -70,12 +70,12 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
-        compile_config=TpuTrainerCompileConfig(enable=False),
-        dump_folder="",
-        parallel_dims=parallel_dims,
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(),
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
-        training=TrainingConfig(),
+        local_compile=LocalCompileConfig(),
+        activation_remat=DefaultActivationRematConfig(),
+        dump_folder="",
     )
     # pytype: enable=wrong-arg-types
 
@@ -115,12 +115,12 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
-        compile_config=TpuTrainerCompileConfig(enable=False),
-        dump_folder="",
-        parallel_dims=parallel_dims,
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(),
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
-        training=TrainingConfig(),
+        local_compile=LocalCompileConfig(),
+        activation_remat=DefaultActivationRematConfig(),
+        dump_folder="",
     )
     # pytype: enable=wrong-arg-types
 
@@ -166,17 +166,18 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
       pp=1,
       ep=1,
       world_size=world_size,
+      enable_sequence_parallel=False,
   )
 
   def apply_fsdp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
-        compile_config=TpuTrainerCompileConfig(enable=False),
-        dump_folder="",
-        parallel_dims=parallel_dims,
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(),
         parallelism=ParallelismConfig(data_parallel_shard_degree=world_size),
-        training=TrainingConfig(),
+        local_compile=LocalCompileConfig(),
+        activation_remat=DefaultActivationRematConfig(),
+        dump_folder="",
     )
     # pytype: enable=wrong-arg-types
 

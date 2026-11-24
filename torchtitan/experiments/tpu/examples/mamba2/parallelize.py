@@ -6,11 +6,11 @@
 """Parallelization strategies for Mamba-2 architecture on TPU."""
 
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.config import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.activation_remat import ActivationRematConfig as ActivationCheckpointingConfig
 from torchtitan.experiments.tpu.components.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.distributed.fsdp import resolve_fsdp_mesh
@@ -62,7 +62,7 @@ def parallelize_mamba2(
       param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
       reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
       pp_enabled=parallel_dims.pp_enabled,
-      cpu_offload=training.enable_cpu_offload,
+      cpu_offload=parallelism.fsdp_enable_cpu_offloading,
       reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
       dp_mesh_dims=dp_mesh_dims,
       symm_mem_scope=parallelism.fsdp_symm_mem_scope,

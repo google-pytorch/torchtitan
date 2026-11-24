@@ -49,14 +49,14 @@ def _train_args(
   args = [
       f"--module={module}",
       f"--config={config}",
-      f"--optimizer.implementation={optimizer_implementation}",
+      ("--optimizer.fused=true" if optimizer_implementation == "fused" else "--optimizer.foreach=true" if optimizer_implementation == "foreach" else "--optimizer.foreach=false"),
       f"--dataloader.dataset_path={dataset_path}",
       f"--dataloader.dataset={dataset}",
       "--hf_assets_path=tests/assets/tokenizer",
-      "--training.max_context_length=128",
+      "--model.max_context_length=128",
       "--training.steps=3",
-      "--training.mixed_precision_param=float32",
-      "--training.mixed_precision_reduce=float32",
+      "--precision.param_dtype=float32",
+      "--precision.reduce_dtype=float32",
       "--training.num_tokens_per_microbatch_per_dp_rank=512",
   ]
   if use_splash_attention_kernel:
@@ -152,7 +152,7 @@ class TpuGraphTrainerDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--parallelism.use_simple_fsdp",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -175,7 +175,7 @@ class TpuGraphTrainerDistributedTest(
               "--parallelism.fsdp_reshard_after_forward=always",
               "--compile.enable_remat_barriers",
               "--compile.fsdp_barrier_policy=interleave",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -191,7 +191,7 @@ class TpuGraphTrainerDistributedTest(
               "--parallelism.fsdp_reshard_after_forward=always",
               "--compile.enable_remat_barriers",
               "--compile.fsdp_barrier_policy=interleave",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -212,7 +212,7 @@ class TpuGraphTrainerDistributedTest(
               "--compile.graph_split.backward_partition_mode=by_layer",
               "--compile.graph_split.backward_layers_per_executable=1",
               "--compile.graph_split.cpu_offload_prefetch_executables=1",
-              "--training.max_context_length=256",
+              "--model.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
@@ -304,7 +304,7 @@ class TpuGraphTrainerDistributedTest(
     module = "torchtitan.experiments.tpu.examples.gemma4"
     # Context 256 > the 128-token sliding window, 4 sequences per rank.
     shape = [
-        "--training.max_context_length=256",
+        "--model.max_context_length=256",
         "--training.num_tokens_per_microbatch_per_dp_rank=1024",
     ]
     layer_compile_args = _train_args(

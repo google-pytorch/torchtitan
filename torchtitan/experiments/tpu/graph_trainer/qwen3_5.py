@@ -4,9 +4,10 @@ import dataclasses
 from dataclasses import dataclass
 
 import torch.nn as nn
-from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.activation_remat import ActivationRematConfig as ActivationCheckpointingConfig
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
@@ -17,7 +18,6 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 from torchtitan.experiments.graph_trainer.model import GraphTrainerModel
 from torchtitan.experiments.tpu import qwen3_5 as tpu_qwen3_5
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
-from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 from torchtitan.models.qwen3_5.model import Qwen35Model
 
 
@@ -93,13 +93,12 @@ def parallelize_qwen3_5(
         "TPU GraphTrainer Qwen3.5 does not support TP, CP, PP or EP."
     )
 
-  if any(layer.moe is not None for layer in model.config.layers):
+  if any(hasattr(layer.feed_forward, "routed_experts") for layer in model.config.layers):
     annotate_moe_ep_regions()
   annotate_module_fqns(model)
 
   model._parallelize(parallel_dims)
 
-  configure_moe_aux_loss_reduction(model, parallel_dims)
   configure_simple_fsdp_shard_dims(model, parallel_dims)
   model = apply_simple_fsdp(
       model, parallel_dims=parallel_dims, training=training

@@ -38,7 +38,7 @@ import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_work
 import torchtitan.observability.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
-ParallelDims = torchtitan.distributed.ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 logger = logging.getLogger(__name__)
 
 
@@ -118,7 +118,7 @@ def build_random_dataloader(train_config, vocab_size, device):
   # Upstream d771abb0 renamed training.seq_len -> training.max_context_length
   # and replaced training.local_batch_size with the token-based
   # training.num_tokens_per_microbatch_per_dp_rank.
-  seq_len = train_config.training.max_context_length
+  seq_len = train_config.model.max_context_length
   local_batch_size = (
       train_config.training.num_tokens_per_microbatch_per_dp_rank // seq_len)
   # Inputs should be token IDs for the embedding layer
@@ -170,7 +170,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   if world_size > 1:
     dist_utils.init_distributed(
         train_config.comm,
-        enable_cpu_backend=train_config.training.enable_cpu_offload,
+        enable_cpu_backend=train_config.parallelism.fsdp_enable_cpu_offloading,
         base_folder=train_config.dump_folder,
     )
     torch.distributed.barrier()
@@ -198,6 +198,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       pp=train_config.parallelism.pipeline_parallel_degree,
       ep=train_config.parallelism.expert_parallel_degree,
       world_size=world_size,
+      enable_sequence_parallel=train_config.parallelism.enable_sequence_parallel,
   )
   logger.info("parallel_dims: %s", parallel_dims)
   train_config.maybe_log()
@@ -258,7 +259,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=tokenizer,
-        max_context_length=train_config.training.max_context_length,
+        max_context_length=train_config.model.max_context_length,
         num_tokens_per_microbatch=(
             train_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
@@ -285,14 +286,14 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
 
   # Upstream d771abb0 renamed training.seq_len -> training.max_context_length.
   model_param_count, _ = model_args.get_nparams_and_flops(
-      model, train_config.training.max_context_length
+      model, train_config.model.max_context_length
   )
   logger.info(
       "Model conformer size: %d total parameters",
       model_param_count,
   )
 
-  if train_config.training.enable_cpu_offload:
+  if train_config.parallelism.fsdp_enable_cpu_offloading:
     logger.info("Materializing model on CPU for CPU offloading")
     model = model.to_empty(device="cpu")
 
@@ -310,7 +311,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         "Moving model to device %s before parallelization (SimpleFSDP flow).",
         device,
     )
-    if not train_config.training.enable_cpu_offload:
+    if not train_config.parallelism.fsdp_enable_cpu_offloading:
       model = model.to_empty(device=device)
     with torch.no_grad():
       model.init_weights()
@@ -335,7 +336,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         "Moving model to device %s after parallelization (Standard flow).",
         device,
     )
-    if not train_config.training.enable_cpu_offload:
+    if not train_config.parallelism.fsdp_enable_cpu_offloading:
       model = model.to_empty(device=device)
     with torch.no_grad():
       model.init_weights()
@@ -352,13 +353,19 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       model_param_count,
   )
 
-  if train_config.optim.optimizer.implementation == "fused":
+  if getattr(train_config.optim.optimizer, "fused", False):
     logger.warning(
         "Fused optimizer is not supported on TPU, changing to foreach."
     )
-    train_config.optim.optimizer.implementation = "foreach"
+    train_config.optim.optimizer.fused = False
+    train_config.optim.optimizer.foreach = True
 
-  optimizer = train_config.optim.optimizer.build(model_parts=[model])
+  from torchtitan.components.optim import OptimizersContainer
+
+  opt_cfg = train_config.optim.optimizer
+  if not isinstance(opt_cfg, OptimizersContainer.Config):
+    opt_cfg = OptimizersContainer.Config(optimizers=[opt_cfg])
+  optimizer = opt_cfg.build(model_parts=[model])
 
   if train_config.compile.optimizer_compile == "separate_graph":
     logger.info("Applying torch.compile to optimizer.step")
@@ -383,7 +390,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       model_param_count,
       num_flops_per_token,
   ) = model_args.get_nparams_and_flops(
-      model, train_config.training.max_context_length
+      model, train_config.model.max_context_length
   )
   metrics_processor.num_flops_per_token = num_flops_per_token
 

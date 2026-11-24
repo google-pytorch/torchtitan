@@ -15,7 +15,7 @@ import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5 import tokamax_gated_delta
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 
 
 def _relative_l2_error(test: torch.Tensor, reference: torch.Tensor) -> float:
@@ -547,9 +547,9 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     torch.manual_seed(0)
     dev = self.accelerator_device
     base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=256)
-    xla_cfg = copy.deepcopy(base_cfg.layers[0].delta_net)
+    xla_cfg = copy.deepcopy(base_cfg.layers[0].attention)
     tok_cfg = copy.deepcopy(xla_cfg)
-    tok_cfg.inner_gated_delta_net.kernel = (
+    tok_cfg.inner_attention.kernel = (
         tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(min_log_decay=-5.0)
     )
 
@@ -576,7 +576,7 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     ).to(dev)
     x_base = torch.randn(
         batch * seq_len,
-        xla_cfg.in_proj_q.in_features,
+        xla_cfg.in_proj.in_features,
         dtype=torch.bfloat16,
         device=dev,
     )
@@ -698,9 +698,9 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     torch.manual_seed(0)
     dev = self.accelerator_device
     base_cfg = qwen3_5_tpu.model_registry("35B-A3B", seq_len=seq_len)
-    xla_cfg = copy.deepcopy(base_cfg.layers[0].delta_net)
+    xla_cfg = copy.deepcopy(base_cfg.layers[0].attention)
     tok_cfg = copy.deepcopy(xla_cfg)
-    tok_cfg.inner_gated_delta_net.kernel = (
+    tok_cfg.inner_attention.kernel = (
         tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
             min_log_decay=min_log_decay
         )
@@ -719,8 +719,8 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
       mod.dt_bias.data = mod.dt_bias.data.float()
 
     decays = []
-    xla_kernel = modules["xla"].inner_gated_delta_net.kernel
-    clamped_kernel = modules["xla_clamped"].inner_gated_delta_net.kernel
+    xla_kernel = modules["xla"].inner_attention.kernel
+    clamped_kernel = modules["xla_clamped"].inner_attention.kernel
     parent_recurrence = gated_delta.TpuGatedDeltaKernel.recurrence
 
     def record(
@@ -739,7 +739,7 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     positions = torch.arange(seq_len).repeat(batch).to(dev)
     x_base = torch.randn(
         batch * seq_len,
-        xla_cfg.in_proj_q.in_features,
+        xla_cfg.in_proj.in_features,
         dtype=dtype,
         device=dev,
     )
@@ -845,8 +845,8 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     state = copy.deepcopy(reference.state_dict())
     tok_config = copy.deepcopy(config)
     for layer in tok_config.layers:
-      if layer.delta_net is not None:
-        layer.delta_net.inner_gated_delta_net.kernel = (
+      if isinstance(layer.attention, gated_delta.TpuGatedDeltaNet.Config):
+        layer.attention.inner_attention.kernel = (
             tokamax_gated_delta.TokamaxGatedDeltaKernel.Config(
                 min_log_decay=min_log_decay
             )
@@ -861,10 +861,10 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
     def train(cfg, clamp_xla: bool = False) -> list[float]:
       model = cfg.build()
       model.load_state_dict(state)
-      model.to(device=dev, dtype=torch.bfloat16)
+      model.to(device=dev)
       for name, param in model.named_parameters():
-        if "A_log" in name or "dt_bias" in name:
-          param.data = param.data.float()
+        if "A_log" not in name and "dt_bias" not in name:
+          param.data = param.data.bfloat16()
       if cfg.enable_weight_tying:
         model.tok_embeddings.weight = model.lm_head.weight
       with contextlib.ExitStack() as stack:

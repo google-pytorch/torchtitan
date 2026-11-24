@@ -18,15 +18,16 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import Shard
 
-from torchtitan.config import TrainingConfig
+from torchtitan.config import PrecisionConfig
 from torchtitan.config.parallelism import FSDPSymmMemScope, ParallelismConfig
 from torchtitan.distributed import ParallelismContext
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     enable_fsdp_symm_mem,
     get_fsdp_reshard_after_forward_policy,
 )
+from torchtitan.distributed.local_compile import LocalCompileConfig
 
 
 logger = logging.getLogger(__name__)
@@ -83,13 +84,12 @@ def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
 def parallelize_hf_transformers(
     model: nn.Module,
     *,
-    parallelism_context: ParallelismContext | None = None,
-    parallel_dims: ParallelismContext | None = None,
-    training: TrainingConfig,
+    parallelism_context: ParallelismContext,
+    precision: PrecisionConfig,
     parallelism: ParallelismConfig,
-    ac_config: ActivationCheckpointingConfig,
+    local_compile: LocalCompileConfig,
+    activation_remat: ActivationRematConfig | None,
     dump_folder: str,
-    skip_dp: bool = False,
     **kwargs: Any,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
@@ -101,19 +101,18 @@ def parallelize_hf_transformers(
     4. Single model._parallelize(parallelism_context) call -- shards states, wraps forward
     5. Apply AC and FSDP
     """
+    # Bind local implementations early; torch.compile traces on first use.
+    local_compile.apply()
     # Flex attention supports FSDP, TP, CP, and PP (in any combination). Under CP
-    # the flex kernel's local SPMD boundary redistributes
-    # k/v from seq-sharded to CP-Replicate (all-gather); see _attach_flex_kernel
-    # in hf_sharding.py. The CP-sharded BlockMask is built and sharded on its Q
-    # axis upstream (trainer, ptrr balancer). Note: the ptrr balancer requires
-    # the number of Q blocks (seq_len / flex BLOCK_SIZE) to be divisible by the
-    # CP degree; too-short sequences raise "num_tasks N must be divisible by
-    # group_size" from the balancer -- this is a CP+ptrr constraint, independent
-    # of PP.
+    # _wrap_flex_kernel_cp all-gathers k/v across the CP axis with an explicit
+    # funcol call inside the flex kernel's local SPMD region (see
+    # _attach_flex_kernel in hf_sharding.py). The CP-sharded BlockMask is built
+    # and sharded on its Q axis upstream (trainer, ptrr balancer). Note: the
+    # ptrr balancer requires the number of Q blocks (seq_len / flex BLOCK_SIZE)
+    # to be divisible by the CP degree; too-short sequences raise "num_tasks N
+    # must be divisible by group_size" from the balancer -- this is a CP+ptrr
+    # constraint, independent of PP.
 
-    if parallelism_context is None:
-        assert parallel_dims is not None
-        parallelism_context = parallel_dims
     # 0. Un-tie embedding/lm_head weights for FSDP compatibility.
     # Some models (Gemma4) share the embedding and lm_head weight
     # (tie_word_embeddings=True). FSDP2 cannot handle parameters shared
@@ -146,7 +145,7 @@ def parallelize_hf_transformers(
 
     # 2. Convert HF modules to Module protocol.
     # The spmd_types backend uses the Module protocol for state distribution,
-    # activation checks, and any TP/EP/CP redistribution.
+    # activation checks, and local SPMD regions.
     from torchtitan.experiments.transformers_modeling_backend.hf_sharding import (
         set_hf_sharding_configs,
     )
@@ -156,30 +155,11 @@ def parallelize_hf_transformers(
 
     convert_hf_to_module(model)
 
-    # 3. Set sharding configs on all non-MoE modules. They assume Llama-style
-    # block names (`self_attn`, `mlp`); with no TP/EP/CP there is nothing to
-    # place, so architectures without those names (e.g. GPT-2's `attn`) skip
-    # this pass and train under data parallelism only. CP needs this pass too:
-    # it attaches the flex kernels that step 3b wraps to all-gather K/V across
-    # the CP axis.
-    needs_sharding_configs = (
-        parallelism_context.tp_enabled
-        or parallelism_context.ep > 1
-        or parallelism_context.cp_enabled
+    # 3. Set sharding configs on all non-MoE modules
+    set_hf_sharding_configs(
+        model,
+        enable_sp=parallelism_context.tp_enabled,
     )
-    llama_style_layers = all(
-        hasattr(layer, "self_attn") for layer in model.layers.values()
-    )
-    if needs_sharding_configs or llama_style_layers:
-        set_hf_sharding_configs(
-            model,
-            enable_sp=parallelism_context.tp_enabled,
-        )
-    else:
-        logger.info(
-            "Skipping HF sharding configs: no TP/EP/CP and the decoder layers "
-            "have no `self_attn` (e.g. GPT-2)."
-        )
 
     # 3b. Under CP, wrap each flex kernel forward to all-gather k/v across
     # the CP axis (on the seq dim). Must run before model._parallelize so the
@@ -191,17 +171,16 @@ def parallelize_hf_transformers(
     # 4. Single parallelize call -- handles TP, EP, MoE, everything
     model._parallelize(parallelism_context)
 
-    if ac_config is not None:
-        ac_config.build(dump_folder=dump_folder).apply(model)
+    if activation_remat is not None:
+        activation_remat.apply(model)
 
-    if not skip_dp:
-        model._apply_fsdp(
-            parallelism_context=parallelism_context,
-            training=training,
-            parallelism=parallelism,
-        )
+    model._apply_fsdp(
+        parallelism_context=parallelism_context,
+        precision=precision,
+        parallelism=parallelism,
+    )
 
-    if training.enable_cpu_offload:
+    if parallelism.fsdp_enable_cpu_offloading:
         logger.info("Applied CPU Offloading to the model")
 
     if parallelism_context.cp_enabled:

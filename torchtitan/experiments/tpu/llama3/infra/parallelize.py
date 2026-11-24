@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 def parallelize_llama(
     model: nn.Module,
     *,
-    parallel_dims: torchtitan.distributed.ParallelDims | None = None,
-    parallelism_context: torchtitan.distributed.ParallelDims | None = None,
+    parallel_dims: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
+    parallelism_context: torchtitan.distributed.parallel_dims.ParallelDims | None = None,
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: LocalCompileConfig,
-    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
+    ac_config: "torchtitan.distributed.activation_remat.ActivationRematConfig",
     dump_folder: str,
     skip_dp: bool = False,
     tpu_compile_mode: str = "layer",
@@ -53,11 +53,11 @@ def parallelize_llama(
     parallel_dims = parallelism_context
   assert parallel_dims is not None
   # TODO b/499075866: re-enable CPU offload for TPU torchtitan run.
-  if training.enable_cpu_offload:
+  if parallelism.fsdp_enable_cpu_offloading:
     logger.warning(
         "CPU offload is not supported for TPU torchtitan run, setting it to False."
     )
-    training.enable_cpu_offload = False
+    parallelism.fsdp_enable_cpu_offloading = False
 
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config

@@ -15,8 +15,8 @@ from torch import nn
 import torch.nn.functional as F
 from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.examples.mamba2.kernels import mamba2_pallas
-from torchtitan.protocols import model as model_protocol
-from torchtitan.protocols import module
+from torchtitan.models.base import model as model_protocol
+from torchtitan.models.base import module
 
 
 class GatedRMSNorm(module.Module):
@@ -35,6 +35,7 @@ class Mamba2Config(model_protocol.BaseModel.Config):
   """Configuration for Mamba-2 architecture."""
 
   vocab_size: int = 128256
+  max_context_length: int = 4096
   d_model: int = 768
   n_layers: int = 24
   n_heads: int = 24

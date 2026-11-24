@@ -25,7 +25,7 @@ pass-specific arguments.
 
 ## Pass Tiers
 
-Graph passes are structured into two tiers:
+Graph passes are structured into three tiers:
 
 1. **Default passes** (`passes.py`, `remove_noop_passes.py`, etc.) — always
    applied. These are numerics-preserving: cleanup, memory policy, bucketing,
@@ -36,9 +36,17 @@ Graph passes are structured into two tiers:
    `config.compile.numerics_changing_optim = True`. These improve performance but may change numerics
    compared to the uncompiled path (e.g. RMSNorm Inductor fusion).
 
+3. **Registered passes** -- opt-in by name via `config.compile.extra_passes`.
+   Registered with `@register_graph_pass` (`registry.py`) from any module,
+   including outside torchtitan. They run on the joint graph after the other
+   GraphTrainer passes and before Inductor compilation. Use them for model-
+   or shape-specialized rewrites such as replacing a subgraph with a
+   handwritten kernel.
+
 When adding a new pass, put it in `performance_passes.py` if it changes
 numerics; otherwise put it in `passes.py` or a dedicated file like
-`remove_noop_passes.py`.
+`remove_noop_passes.py`. Model- or kernel-specific rewrites that only some
+recipes want are registered passes.
 
 ## Memory Policy Framework
 
@@ -133,14 +141,12 @@ python torchtitan/experiments/graph_trainer/tests/integration_tests.py <output_d
 
 ### Debugging Graph Passes
 
-Set `config.compile.debug_graph_passes = True` in a derived recipe to enable
-per-pass instrumentation. Set `config.training.steps = 10` in that recipe for
-the example below:
-timing, before/after tlparse graph dumps, and op-count diff summaries.
-Use with `TORCH_TRACE` and `tlparse` to inspect graphs in the browser.
+Every graph pass is always instrumented: per-pass timing and op-count diff
+summaries are logged, and before/after graphs are dumped to tlparse. Run with
+`TORCH_TRACE` and use `tlparse` to inspect the graphs in the browser.
 
 ```bash
-NGPU=8 MODULE=my_graph_configs CONFIG=llama3_8b_debug_passes ./run_train.sh
+TORCH_TRACE=/tmp/trace NGPU=8 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh
 ```
 
 ### Dumping Graph Modules for Debugging
@@ -300,10 +306,11 @@ NGPU=4 MODULE=my_graph_configs CONFIG=llama3_8b_async_tp4 ./run_train.sh
 ### CUDA Graph Kernel Annotations
 
 The `insert_kernel_annotations_pass` labels CUDA graph kernels with their
-originating `nn.Module` path in profiler traces. It runs automatically in the
-`aot_fx_trace` path (bundled with the cudagraph pass). The profiler passes the
-captured annotations to ``export_chrome_trace``, which bakes them into the trace
-as it writes, so they are merged automatically and no post-processing is needed.
+originating `nn.Module` path in profiler traces. Use
+`construct_cuda_graph_passes` to construct the correctly ordered opt-in pass
+list. The profiler passes the captured annotations to ``export_chrome_trace``,
+which bakes them into the trace as it writes, so they are merged automatically
+and no post-processing is needed.
 
 Requirements: `cuda-python` package and CUDA toolkit/driver >= 13.1
 (or `cuda-compat >= 13.1` on `LD_LIBRARY_PATH`). The pass is a no-op when

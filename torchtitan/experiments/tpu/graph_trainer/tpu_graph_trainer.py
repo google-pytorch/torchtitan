@@ -31,10 +31,6 @@ from torch import nn
 
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.optim.optimizer import (
-    collect_moe_routing_metric_tensors,
-    set_moe_routing_metric_tensors,
-)
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
@@ -66,9 +62,11 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
     align_model_context_length,
+    BaseTPUTrainerFields,
+    TPUConfig,
     TPUTrainerConfig,
 )
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +103,25 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         model_config: Any,
         max_num_documents: int | None,
         output_dir: str,
+        **kwargs: Any,
     ) -> None:
         # Ensure the 'tpu' pass pipeline is registered before the engine
         # validates, traces or compiles anything.
         register_tpu_pipeline()
+        from torchtitan.components.optim import OptimizersContainer  # pylint: disable=g-import-not-at-top
+
+        if hasattr(config, "optim") and not isinstance(
+            config.optim.optimizer, OptimizersContainer.Config
+        ):
+            config.optim.optimizer = OptimizersContainer.Config(
+                optimizers=[config.optim.optimizer]
+            )
         super().__init__(
             config,
             model_config=model_config,
             max_num_documents=max_num_documents,
             output_dir=output_dir,
+            **kwargs,
         )
         self._optimizer_in_graph = config.compile.optimizer_compile == "in_graph"
         self._optimizer_separate_graph = (
@@ -242,7 +250,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             return [(microbatch_groups[0][0],)]
         from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 
-        with set_unflatten_seq_len(self.config.training.max_context_length):
+        with set_unflatten_seq_len(self.config.model.max_context_length):
             return TrainingEngine._preprocess_microbatch_groups(
                 self, microbatch_groups
             )
@@ -263,7 +271,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             )
         from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 
-        with set_unflatten_seq_len(self.config.training.max_context_length):
+        with set_unflatten_seq_len(self.config.model.max_context_length):
             if not self._optimizer_in_graph:
                 return TrainingEngine._forward_backward_body(
                     self,
@@ -432,10 +440,6 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             )
         loss = outputs[0]
         grads = outputs[1 : 1 + len(params)]
-        if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[1 + len(params) :])
-            )
 
         for param, grad in zip(params, grads, strict=True):
             if param.requires_grad and grad is not None:
@@ -458,7 +462,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
-        from torchtitan.protocols.model import BaseModel
+        from torchtitan.models.base.model import BaseModel
 
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
@@ -469,7 +473,7 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             parallel_dims=self.parallel_dims,
             parallelism=self.config.parallelism,
             max_num_documents=self.max_num_documents,
-            max_context_length=self.config.training.max_context_length,
+            max_context_length=self.config.model.max_context_length,
         )
         self.ntokens_seen += (
             self.config.training.num_tokens_per_microbatch_per_dp_rank
@@ -539,10 +543,6 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         new_exp_avgs = outputs[1 + n : 1 + 2 * n]
         new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
         new_step = outputs[1 + 3 * n]
-        if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[2 + 3 * n :])
-            )
 
         from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
 
@@ -570,12 +570,19 @@ class TpuGraphTrainer(GraphTrainer):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(GraphTrainer.Config, TPUTrainerConfig):
+    class Config(GraphTrainer.Config, BaseTPUTrainerFields):
         compile: TpuGraphTrainerCompileConfig = field(
             default_factory=TpuGraphTrainerCompileConfig
         )
+        tpu_config: TPUConfig = field(default_factory=TPUConfig)
 
         def __post_init__(self) -> None:
+            if self.model is not None:
+                from torchtitan.experiments.graph_trainer.common_utils import (
+                    disable_inplace_wgrad_accum,
+                )
+
+                disable_inplace_wgrad_accum(self.model)
             if self.compile is None:
                 # Upstream ``Trainer.Config.compile`` is optional; the graph
                 # trainer always needs its compile policy.
@@ -621,14 +628,37 @@ class TpuGraphTrainer(GraphTrainer):
             elif hasattr(model_source, "_model_config_cls"):
                 model_config_cls = getattr(model_source, "_model_config_cls")
             else:
-                model_config_cls = type(model_source("debugmodel"))
+                import inspect
+
+                if "parallelism" in inspect.signature(model_source).parameters:
+                    model_config_cls = type(
+                        model_source("debugmodel", parallelism=base_config.parallelism)
+                    )
+                else:
+                    model_config_cls = type(model_source("debugmodel"))
+            from torchtitan.config import derive
+            from torchtitan.trainer import Trainer as BaseTrainer
+
+            trainer_field_names = {
+                f.name for f in dataclasses.fields(BaseTrainer.Config)
+            }
+            plain_base = BaseTrainer.Config(
+                **{
+                    f.name: getattr(base_config, f.name)
+                    for f in dataclasses.fields(base_config)
+                    if f.name in trainer_field_names
+                }
+            )
+            graph_cfg = to_graph_trainer_config(plain_base, model_config_cls)
+            tpu_extra = {
+                f.name: getattr(base_config, f.name)
+                for f in dataclasses.fields(base_config)
+                if f.name not in trainer_field_names
+                and f.name in {cf.name for cf in dataclasses.fields(cls)}
+            }
             config = cast(
                 TpuGraphTrainer.Config,
-                to_graph_trainer_config(
-                    base_config,
-                    model_config_cls,
-                    target_cls=cls,
-                ),
+                derive(graph_cfg, cls, **tpu_extra),
             )
             maybe_use_maxtext_flops(base_config, config)
             return config
@@ -720,11 +750,7 @@ def _make_fwd_bwd_adamw_fn(
         inputs, labels, global_valid_tokens, extra_kwargs
     ):
         pred = model(inputs, **extra_kwargs)
-        routing_metrics = (
-            collect_moe_routing_metric_tensors([model])
-            if collect_moe_routing_metrics
-            else []
-        )
+        routing_metrics = []
         loss = compute_annotated_loss(
             loss_fn,
             pred,

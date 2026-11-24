@@ -1,3 +1,4 @@
+from torchtitan.config.parallelism import ParallelismConfig
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -6,12 +7,11 @@
 
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.observability.metrics import MetricsProcessor, TensorBoardLogger
 from torchtitan.components.optim.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optim.optimizer import default_adamw
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.experiments.tpu.components.optim import default_adamw
+from torchtitan.distributed.activation_remat import FullActivationRematConfig, DefaultActivationRematConfig
 from torchtitan.config.configs import (
-    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan.experiments.tpu import tpu_flags
@@ -31,7 +31,7 @@ from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
-from torchtitan.hf_datasets.text_datasets import ChatProcessor
+from torchtitan.components.data.text_datasets import ChatProcessor
 from torchtitan.experiments.graph_trainer.llama3.model import (
     GraphTrainerLlama3Model,
 )
@@ -41,7 +41,7 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.models.llama3 import build_model_config as model_registry
+from torchtitan.experiments.tpu.llama3 import model_registry
 from torchtitan.components.optim import Optim
 
 
@@ -98,7 +98,8 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   )
   # bf16 Adam moments halve the optimizer state, which is 12.7 GiB at 405B and
   # the difference between sequence 8192 fitting and not.
-  graph_config.optim.optimizer.implementation = "fused_opt_states_bf16"
+  graph_config.optim.optimizer.fused = True
+  graph_config.optim.optimizer.moment_dtype = "bfloat16"
   # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
   # libtpu 0.0.48; see cl/979992733), which segfaults in
   # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
@@ -127,7 +128,6 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,
-          max_context_length=2048,
           steps=10,
       ),
       dataloader=c4_test_dataloader(),
@@ -136,7 +136,7 @@ def llama3_debugmodel() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_remat=DefaultActivationRematConfig(),
       validator=None,
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
@@ -188,7 +188,6 @@ def llama3_1b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=4 * 128,
-          max_context_length=128,
           steps=3,
       ),
       dataloader=c4_test_dataloader(),
@@ -197,7 +196,7 @@ def llama3_1b() -> TPUTrainerConfig:
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
       checkpointer=None,
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_remat=DefaultActivationRematConfig(),
       validator=None,
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
@@ -220,7 +219,6 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 8192,
-          max_context_length=8192,
           steps=1000,
       ),
       dataloader=c4_test_dataloader(),
@@ -230,7 +228,7 @@ def llama3_8b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_remat=FullActivationRematConfig(),
       validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -276,7 +274,6 @@ def llama3_70b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 8192,
-          max_context_length=8192,
           steps=1000,
       ),
       dataloader=c4_test_dataloader(),
@@ -286,7 +283,7 @@ def llama3_70b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_remat=FullActivationRematConfig(),
       validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -332,7 +329,6 @@ def llama3_405b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=1 * 8192,
-          max_context_length=8192,
           steps=1000,
       ),
       dataloader=c4_test_dataloader(),
@@ -342,7 +338,7 @@ def llama3_405b() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
       ),
       checkpointer=None,
-      activation_checkpoint=FullAC.Config(),
+      activation_remat=FullActivationRematConfig(),
       validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -400,7 +396,6 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=2 * 8192,
-          max_context_length=8192,
           steps=500,
       ),
       dataloader=GrainDataLoader.Config(
@@ -417,7 +412,7 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       ),
       metrics=MetricsProcessor.Config(
           log_freq=5,
-          enable_tensorboard=True,
+          loggers=[TensorBoardLogger.Config()],
           save_tb_folder="tb_logs/sft_llama3_8b_metamath",
       ),
       parallelism=ParallelismConfig(
@@ -432,7 +427,7 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           initial_load_in_hf=True,
           initial_load_model_only=True
                  ),
-      activation_checkpoint=FullAC.Config(),
+      activation_remat=FullActivationRematConfig(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
       ),

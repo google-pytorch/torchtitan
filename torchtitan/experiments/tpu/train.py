@@ -35,7 +35,7 @@ import types
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability.logging import init_logger
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 import torchtitan.train
 import torchtitan.trainer
 from torchtitan.training_engine import TrainingEngine
@@ -72,12 +72,22 @@ class TpuTrainingEngine(TrainingEngine):
       model_config: Any,
       max_num_documents: int | None,
       output_dir: str,
+      **kwargs: Any,
   ) -> None:
+    from torchtitan.components.optim import OptimizersContainer  # pylint: disable=g-import-not-at-top
+
+    if hasattr(config, "optim") and not isinstance(
+        config.optim.optimizer, OptimizersContainer.Config
+    ):
+      config.optim.optimizer = OptimizersContainer.Config(
+          optimizers=[config.optim.optimizer]
+      )
     super().__init__(
         config,
         model_config=model_config,
         max_num_documents=max_num_documents,
         output_dir=output_dir,
+        **kwargs,
     )
     self._is_tpu_config = isinstance(
         config, tpu_job_config_module.TPUTrainerConfig
@@ -199,7 +209,7 @@ class TpuTrainingEngine(TrainingEngine):
   ):
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
 
-    with set_unflatten_seq_len(self.config.training.max_context_length):
+    with set_unflatten_seq_len(self.config.model.max_context_length):
       return super().forward_backward(
           microbatch_groups=microbatch_groups,
           global_valid_tokens=global_valid_tokens,
@@ -307,15 +317,32 @@ def _apply_flux_img_size(
         dataset=_with_img_size(validator.dataloader.dataset),
     )
   latent = img_size // flux_utils.IMAGE_LATENT_SIZE_RATIO
-  train_config.training.max_context_length = (
+  train_config.model.max_context_length = (
       latent // flux_utils.PATCH_HEIGHT
   ) * (latent // flux_utils.PATCH_WIDTH) + (
       train_config.tokenizer.max_t5_encoding_len
   )
   logger.info(
       f"--flux.img_size={img_size}: max_context_length="
-      f"{train_config.training.max_context_length}"
+      f"{train_config.model.max_context_length}"
   )
+
+
+def _maybe_enable_min_cost_redistribute(
+    stack: contextlib.ExitStack, parallelism
+) -> None:
+  """Switches DTensor to the min-cost redistribution planner, if requested."""
+  if not parallelism.enable_min_cost_redistribute:
+    return
+
+  from torch.distributed.tensor._redistribute import (  # pylint: disable=g-import-not-at-top
+      _gen_transform_infos,
+      use_min_cost_redistribution_plan,
+  )
+
+  stack.enter_context(use_min_cost_redistribution_plan(True))
+  _gen_transform_infos.cache_clear()
+  logger.info("Using DTensor min-cost (graph-based) redistribution planner.")
 
 
 def start_trainer(
@@ -392,7 +419,7 @@ def start_trainer(
 
   try:
     with contextlib.ExitStack() as stack:
-      torchtitan.train._maybe_enable_min_cost_redistribute(  # pylint: disable=protected-access
+      _maybe_enable_min_cost_redistribute(
           stack,
           train_config.parallelism,
       )
@@ -434,7 +461,7 @@ def start_trainer(
         from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
         # Upstream d771abb0 renamed training.seq_len ->
         # training.max_context_length.
-        with set_unflatten_seq_len(train_config.training.max_context_length):
+        with set_unflatten_seq_len(train_config.model.max_context_length):
           trainer.train()
   except Exception:
     if trainer:

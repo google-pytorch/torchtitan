@@ -9,7 +9,6 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any, TypeAlias
 
 import torch
@@ -19,14 +18,17 @@ from torch.distributed.tensor import DTensor, Replicate
 from torch.fx.traceback import annotate, annotate_fn
 from torch.utils._pytree import register_constant, register_pytree_node, tree_map
 
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelismContext
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
+    FSDP_PARAM_FQNS_META,
     MixedPrecisionPolicy,
 )
-from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import MoE
 
 
 logger = logging.getLogger(__name__)
@@ -53,29 +55,6 @@ def _get_graph_modules(
     return modules
 
 
-class GraphTrainerScaledDotProductInnerAttention(ScaledDotProductInnerAttention):
-    """Adapt flat graph-trainer attention inputs to the batched SDPA interface."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(ScaledDotProductInnerAttention.Config):
-        pass
-
-    def forward(
-        self,
-        q_THK: torch.Tensor,
-        k_THK: torch.Tensor,
-        v_THV: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        out_1THV = super().forward(
-            q_THK.unsqueeze(0),
-            k_THK.unsqueeze(0),
-            v_THV.unsqueeze(0),
-            **kwargs,
-        )
-        return out_1THV.squeeze(0)
-
-
 @contextmanager
 def log_timer(label: str):
     start = time.perf_counter()
@@ -84,36 +63,23 @@ def log_timer(label: str):
     logger.info("%s took %.3fs", label, elapsed_s)
 
 
+def disable_inplace_wgrad_accum(model: Module.Config) -> None:
+    """Turn off ``inplace_wgrad_accum`` on every ``Linear`` config in ``model``.
+
+    GraphTrainer traces the backward, which cannot add a WGRAD into
+    ``weight.grad`` in place.
+    """
+    for _, linear_config, _, _ in model.traverse(Linear.Config):
+        linear_config.inplace_wgrad_accum = False
+
+
 def build_decoder_config_for_backend(
     config_builder: Callable, attn_backend: str, **builder_kwargs
 ):
-    """Build a Decoder model config for ``attn_backend``, allowing test-only SDPA.
-
-    ``SDPA`` is not a valid production language-model backend — ``get_attention_config``
-    rejects it because the dataloaders always emit per-document positions and SDPA
-    cannot consume them (it only has a boolean ``is_causal``). The graph_trainer
-    tests, however, use SDPA to exercise *backend-agnostic* graph machinery
-    (precompile-artifact serialization, custom codegen, context parallel, bitwise
-    determinism) without FlexInnerAttention's ``BlockMask``, which is unpicklable (its
-    ``mask_mod`` closures are Python code objects), is not a tensor (so it breaks
-    pipeline-parallel split-backward, which calls ``.requires_grad`` on every stage
-    input), and overflows the fp32 Triton shared-memory limit on large head dims.
-
-    For SDPA we build the flex config (a valid backend) and swap each layer's
-    ``inner_attention`` to ``GraphTrainerScaledDotProductInnerAttention.Config()``.
-    The adapter adds a singleton batch around the flat graph-trainer inputs and
-    delegates to the common batched SDPA implementation. Production code never
-    reaches this path: ``get_attention_config`` still rejects ``sdpa``, so no model
-    registry can construct an SDPA language model outside these tests.
-    """
-    if attn_backend != "sdpa":
-        return config_builder(attn_backend=attn_backend, **builder_kwargs)
-
-    config = config_builder(attn_backend="flex", **builder_kwargs)
-    for layer in config.layers:
-        layer.attention.inner_attention = (
-            GraphTrainerScaledDotProductInnerAttention.Config()
-        )
+    """Build a Decoder config with a supported backend and traceable linears."""
+    config = config_builder(attn_backend=attn_backend, **builder_kwargs)
+    # GraphTrainer traces the backward.
+    disable_inplace_wgrad_accum(config)
     return config
 
 
@@ -212,6 +178,73 @@ _EP_TOKEN_EXCHANGE_WAIT = "EP_token_exchange_wait"
 _NOT_IN_LAYERS = -1
 
 
+def node_argument(
+    node: torch.fx.Node,
+    name: str,
+    position: int,
+    default: Any,
+) -> Any:
+    """Return one FX node argument by schema name or position."""
+    if name in node.kwargs:
+        return node.kwargs[name]
+    if position < len(node.args):
+        return node.args[position]
+    return default
+
+
+def node_tensor_meta(node: torch.fx.Node) -> torch.Tensor | None:
+    """Return a node's tensor value metadata when present."""
+    value = node.meta.get("val")
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def same_tensor_metadata(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+    """Return whether two nodes have the same tensor metadata."""
+    lhs_value = node_tensor_meta(lhs)
+    rhs_value = node_tensor_meta(rhs)
+    return (
+        lhs_value is not None
+        and rhs_value is not None
+        and lhs_value.shape == rhs_value.shape
+        and lhs_value.stride() == rhs_value.stride()
+        and lhs_value.dtype == rhs_value.dtype
+        and lhs_value.device == rhs_value.device
+    )
+
+
+def sole_user(node: torch.fx.Node, expected: torch.fx.Node) -> bool:
+    """Return whether ``expected`` is a node's only user."""
+    return len(node.users) == 1 and expected in node.users
+
+
+def walk_up_unary_chain(
+    output: torch.fx.Node,
+    user: torch.fx.Node,
+    is_passthrough: Callable[[torch.fx.Node], bool],
+) -> tuple[torch.fx.Node, ...] | None:
+    """Walk backward from ``output`` through an exclusive unary chain."""
+    reverse_nodes = []
+    node = output
+    while is_passthrough(node):
+        inputs = node.all_input_nodes
+        if len(inputs) != 1 or not sole_user(node, user):
+            return None
+        reverse_nodes.append(node)
+        user = node
+        node = inputs[0]
+    if not sole_user(node, user):
+        return None
+    return (node, *reversed(reverse_nodes))
+
+
+def parameter_gradient_fqns(node: torch.fx.Node) -> tuple[str, ...]:
+    """Return the parameter identities attached to a gradient node."""
+    custom = node.meta.get("custom", {})
+    return custom.get(PARAMETER_GRADIENT_FQNS_META) or custom.get(
+        FSDP_PARAM_FQNS_META, ()
+    )
+
+
 def compute_parameter_gradients(
     loss: torch.Tensor,
     named_parameters: Iterable[tuple[str, torch.Tensor]],
@@ -245,31 +278,6 @@ def annotate_parameter_gradient(
     """Attach a parameter identity to one gradient in the traced graph."""
     with annotate({PARAMETER_GRADIENT_FQNS_META: (parameter_fqn,)}):
         return torch.ops.aten.alias.default(gradient)
-
-
-def compute_parameter_gradients(
-    loss: torch.Tensor,
-    named_parameters: Iterable[tuple[str, torch.Tensor]],
-) -> tuple[torch.Tensor, ...]:
-    """Compute and identify parameter gradients in the traced graph.
-
-    Each gradient is passed through an annotated ``aten.alias`` immediately
-    after ``torch.autograd.grad`` establishes its parameter correspondence.
-    The alias is a view of the same storage, not a copy or device computation,
-    and keeps the identity available even when an optimizer consumes the
-    gradient inside the graph instead of returning it as a graph output.
-    GraphTrainer moves the FQN set onto the underlying gradient node and
-    erases the markers before later graph passes and backend compilation.
-    """
-    named_parameters = tuple(named_parameters)
-    gradients = torch.autograd.grad(
-        loss, tuple(parameter for _, parameter in named_parameters)
-    )
-    tagged_gradients = []
-    for (parameter_fqn, _), gradient in zip(named_parameters, gradients, strict=True):
-        with annotate({PARAMETER_GRADIENT_FQNS_META: (parameter_fqn,)}):
-            tagged_gradients.append(torch.ops.aten.alias.default(gradient))
-    return tuple(tagged_gradients)
 
 
 def compute_annotated_loss(
@@ -359,7 +367,7 @@ def annotate_module_fqns(model: nn.Module) -> None:
 
 def annotate_graph_trainer_model(model: Decoder) -> None:
     """Attach the annotations consumed by GraphTrainer passes."""
-    if any(getattr(layer, "moe", None) is not None for layer in model.config.layers):
+    if model.config.first_moe is not None:
         annotate_moe_ep_regions()
     annotate_module_fqns(model)
 
@@ -384,7 +392,7 @@ def annotate_moe_ep_regions() -> None:
         return
 
     from torchtitan.models.common.moe import MoE
-    from torchtitan.models.common.token_dispatcher import (
+    from torchtitan.models.common.moe.token_dispatcher import (
         AllToAllTokenDispatcher,
         LocalTokenDispatcher,
     )
@@ -474,6 +482,7 @@ def end_with_pass(passes: list[Callable], names: list[str]) -> bool:
 def get_default_transformer_block_buckets(
     n_layers: int,
     *,
+    num_mtp_layers: int = 0,
     chunked_loss_enabled: bool = False,
     moe_layer_ids: frozenset[int] = frozenset(),
     split_moe_expert_buckets: bool = False,
@@ -481,7 +490,9 @@ def get_default_transformer_block_buckets(
     """Get default transformer block buckets for manual bucketing passes.
 
     Assumes the standard Decoder layout: tok_embeddings, layers.0..N-1,
-    norm, and output (e.g., Llama3, DeepSeekV3, Qwen3).
+    optional mtp_layers.0..M-1, norm, and output (e.g., Llama3,
+    DeepSeekV3, Qwen3). Each MTP block uses its parent scope so auxiliary
+    projections and model-specific submodules stay in the same logical bucket.
     """
     layer_buckets: list[list[str] | str] = []
     for layer_id in range(n_layers):
@@ -492,13 +503,10 @@ def get_default_transformer_block_buckets(
                         f"layers.{layer_id}.attention_norm",
                         f"layers.{layer_id}.attention",
                         f"layers.{layer_id}.ffn_norm",
-                        f"layers.{layer_id}.moe.router",
-                        f"layers.{layer_id}.moe.shared_experts",
+                        f"layers.{layer_id}.feed_forward.router",
+                        f"layers.{layer_id}.feed_forward.shared_experts",
                     ],
-                    [
-                        f"layers.{layer_id}.moe.routed_experts.w13",
-                        f"layers.{layer_id}.moe.routed_experts.w2",
-                    ],
+                    f"layers.{layer_id}.feed_forward.routed_experts",
                 ]
             )
         else:
@@ -511,6 +519,7 @@ def get_default_transformer_block_buckets(
     return [
         "tok_embeddings",
         *layer_buckets,
+        *(f"mtp_layers.{layer_id}" for layer_id in range(num_mtp_layers)),
         final_bucket,
     ]
 
@@ -546,20 +555,9 @@ def get_transformer_block_buckets(model) -> list[list[str] | str]:
     return module_fqns
 
 
-def get_simple_fsdp_mesh(
-    parallelism_context: ParallelismContext | None = None,
-    *,
-    parallel_dims: ParallelismContext | None = None,
-) -> DeviceMesh:
-    """Return the flattened DP-shard/CP mesh used by SimpleFSDP.
-
-    ``dp_shard`` and ``cp`` are separate mesh axes; flatten them (singleton axes
-    included) into one ``fsdp`` axis. ``DeviceMesh._flatten`` returns the
-    existing mesh when called again with the same dims and name.
-    """
-    ctx = parallelism_context if parallelism_context is not None else parallel_dims
-    assert ctx is not None
-    fsdp_mesh = ctx.get_optional_mesh(
+def get_simple_fsdp_mesh(parallelism_context: ParallelismContext) -> DeviceMesh:
+    """Return the flattened DP-shard/CP mesh used by SimpleFSDP."""
+    fsdp_mesh = parallelism_context.get_optional_mesh(
         ["dp_shard", "cp"], include_singleton_axes=True
     )
     assert fsdp_mesh is not None
@@ -569,20 +567,14 @@ def get_simple_fsdp_mesh(
 def apply_simple_fsdp(
     model: nn.Module,
     *,
-    parallelism_context: ParallelismContext | None = None,
-    parallel_dims: ParallelismContext | None = None,
-    training: TrainingConfig,
+    parallelism_context: ParallelismContext,
+    precision: PrecisionConfig,
 ) -> nn.Module:
     """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
 
-    For MoE-enabled models, routed W13 and W2 projections (or ``inner_experts``)
-    are separately wrapped on the EDP mesh when expert parallelism is enabled.
-
-    A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis.
+    For MoE-enabled models, routed W13 and W2 projections are separately
+    wrapped on the EDP mesh when expert parallelism is enabled.
     """
-    if parallelism_context is None:
-        assert parallel_dims is not None
-        parallelism_context = parallel_dims
     fsdp_mesh = get_simple_fsdp_mesh(parallelism_context)
 
     if parallelism_context.dp_replicate_enabled:
@@ -601,8 +593,8 @@ def apply_simple_fsdp(
         dp_mode = "fully_shard"
 
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+        reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
     )
 
     if parallelism_context.ep_enabled and isinstance(model, Decoder):
@@ -614,36 +606,21 @@ def apply_simple_fsdp(
         edp_mesh = parallelism_context.get_optional_mesh(edp_mesh_names)
         assert edp_mesh is not None
 
-        for _, transformer_block in model.layers.items():
+        for transformer_block in model.modules():
             if not isinstance(transformer_block, TransformerBlock):
                 continue
-            moe = getattr(transformer_block, "moe", None)
-            if moe is None:
+            moe = transformer_block.feed_forward
+            if not isinstance(moe, MoE):
                 continue
             routed_experts = moe.routed_experts
-            inner_experts = getattr(routed_experts, "inner_experts", None)
-            num_experts = (
-                inner_experts.num_experts
-                if inner_experts is not None
-                else routed_experts.w13.group_size
-            )
             experts_shard_dim = 0
             if (
                 edp_mesh["edp_shard"].size() * parallelism_context.ep
-                > num_experts
+                > routed_experts.w13.group_size
             ):
                 experts_shard_dim = 1
 
-            if inner_experts is not None:
-                data_parallel(
-                    inner_experts,
-                    edp_mesh,
-                    dp_mode,
-                    mp_policy=mp_policy,
-                    shard_dim=experts_shard_dim,
-                    non_dp_mesh=parallelism_context.get_optional_mesh("ep"),
-                )
-            elif experts_shard_dim == 0:
+            if experts_shard_dim == 0:
                 data_parallel(
                     routed_experts,
                     edp_mesh,
@@ -672,19 +649,6 @@ def apply_simple_fsdp(
                     shard_dim=1,
                     non_dp_mesh=parallelism_context.get_optional_mesh("ep"),
                 )
-
-    # A submodule carrying `_fsdp_shard_dim` is sharded on that axis instead of
-    # the default -- layer stacking sets it, because dim 0 of a stack is the
-    # layer axis. Separate walk, run first: one walk can only use one axis, and
-    # `data_parallel` skips a module it has already sharded.
-    for sub in [m for m in model.modules() if hasattr(m, "_fsdp_shard_dim")]:
-        data_parallel(
-            sub,
-            dp_mesh,
-            dp_mode,
-            mp_policy=mp_policy,
-            shard_dim=sub._fsdp_shard_dim,
-        )
 
     model = data_parallel(
         model,

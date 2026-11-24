@@ -12,26 +12,38 @@ from torch.distributed.tensor import DTensor, Replicate
 from torch.nn.attention import sdpa_kernel
 
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.components.attention import AttentionMasksType
 from torchtitan.models.common.attention import (
-    AttentionMasksType,
     FlexInnerAttention,
     QKVLinear,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     GQAttention,
-    ScaledDotProductInnerAttention,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.common.embedding import Embedding
+from torchtitan.models.common.embedding import VocabParallelEmbedding as Embedding
 from torchtitan.models.common.activation import BinaryActivationFn
-from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.feed_forward import DenseFeedForward as FeedForward
 from torchtitan.models.common.moe import (
-    _tokens_per_expert,
     MoE,
     TokenChoiceTopKRouter,
 )
+
+
+def _tokens_per_expert(
+    topk_expert_ids_BLK: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+  """Count selected routes without materializing a ``(B, L, E)`` map."""
+  return torch.histc(
+      topk_expert_ids_BLK.reshape(-1).float(),
+      bins=num_experts,
+      min=0,
+      max=num_experts,
+  ).to(torch.int64)
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE
 
@@ -415,10 +427,7 @@ class GeGLU(BinaryActivationFn):
     def __init__(self, config: Config) -> None:
         pass
 
-    def __call__(
-        self, gate: torch.Tensor, up: torch.Tensor, **kwargs: Any
-    ) -> torch.Tensor:
-        del kwargs
+    def _activation_fn(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         return F.gelu(gate, approximate="tanh") * up
 
 
@@ -477,6 +486,25 @@ class Gemma4MoE(MoE):
     class Config(MoE.Config):
         pre_feedforward_layernorm_2: RMSNorm.Config | None = None
 
+        def __post_init__(self) -> None:
+            routed_count = (
+                self.routed_experts.w13.group_size
+                if self.routed_experts.w13 is not None
+                else self.routed_experts.num_experts
+            )
+            expert_counts = {
+                "moe": self.num_experts,
+                "router": self.router.num_experts,
+                "routed_experts": routed_count,
+            }
+            if len(set(expert_counts.values())) != 1:
+                raise ValueError(
+                    "MoE expert counts must match: "
+                    + ", ".join(
+                        f"{owner}={count}" for owner, count in expert_counts.items()
+                    )
+                )
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.pre_feedforward_layernorm_2 = (
@@ -501,11 +529,10 @@ class Gemma4MoE(MoE):
         ) = self.router(
             x_TD, self.expert_bias_E, padding_mask_T=padding_mask_T, **router_kwargs
         )
-        num_local_tokens_per_expert_E = (
-            routing_map_TE.sum(dim=0)
-            if routing_map_TE is not None
-            else _tokens_per_expert(topk_expert_ids_TK, self.router.num_experts)
-        )
+        if routing_map_TE is None:
+            routing_map_TE = F.one_hot(
+                topk_expert_ids_TK, num_classes=self.router.num_experts
+            ).any(dim=-2)
 
         # Routed experts receive pre_feedforward_layernorm_2(x_TD).
         x_experts_TD = (
@@ -517,7 +544,7 @@ class Gemma4MoE(MoE):
             x_experts_TD,
             topk_scores_TK,
             topk_expert_ids_TK,
-            num_local_tokens_per_expert_E,
+            routing_map_TE,
         )
 
         shared_out_TD = (
@@ -585,7 +612,9 @@ class Gemma4TransformerBlock(TransformerBlock):
         segment_ids: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del aux_loss_denominator
         h_attn = self.attention(
             self.attention_norm(x),
             attention_masks,
@@ -616,7 +645,7 @@ class Gemma4Model(Decoder):
 
     @classmethod
     def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
-        from torchtitan.components.optim import register_moe_load_balancing_hook
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
 
         register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
@@ -649,7 +678,7 @@ class Gemma4Model(Decoder):
             # after ``set_sharding_``. The TP/EP divisibility checks that
             # used to live in the base now run in ``Decoder.__init__``.
             parallelism = config.parallelism
-            max_context_length = config.training.max_context_length
+            max_context_length = self.max_context_length
             tp = parallelism.tensor_parallel_degree
             if tp > 1:
                 for idx, layer in enumerate(self.layers):
@@ -666,52 +695,6 @@ class Gemma4Model(Decoder):
             if parallelism.context_parallel_degree > 1:
                 raise NotImplementedError(
                     "Context parallelism is not supported for Gemma4 on TPU yet."
-                )
-
-            if hasattr(config_utils, "moe_load_balance_aux_loss_configs"):
-                if config_utils.moe_load_balance_aux_loss_configs(self.layers):
-                    missing = [
-                        name
-                        for name in (
-                            "local_global_batch_size",
-                            "global_batch_size",
-                        )
-                        if kwargs.get(name) is None
-                    ]
-                    if missing:
-                        raise ValueError(
-                            "MoELoadBalanceAuxLoss is configured, so "
-                            "update_from_config needs "
-                            f"{' and '.join(missing)} (in samples, as Trainer "
-                            "passes them)."
-                        )
-                    config_utils.update_moe_aux_loss_configs(
-                        self.layers,
-                        pp_enabled=parallelism.pipeline_parallel_degree > 1,
-                        local_global_batch_size=kwargs[
-                            "local_global_batch_size"
-                        ],
-                        global_batch_size=kwargs["global_batch_size"],
-                        seq_len=max_context_length,
-                    )
-            else:
-                local_global_batch_size = kwargs.get(
-                    "local_global_batch_size",
-                    config.training.num_tokens_per_microbatch_per_dp_rank
-                    // max_context_length,
-                )
-                global_batch_size = kwargs.get("global_batch_size")
-                if global_batch_size is None:
-                    global_batch_size = config.training.num_tokens_per_train_step
-                    if global_batch_size > 0:
-                        global_batch_size //= max_context_length
-                if global_batch_size < 0:
-                    global_batch_size = local_global_batch_size
-                config_utils.update_moe_aux_loss_configs(
-                    self.layers,
-                    pp_enabled=parallelism.pipeline_parallel_degree > 1,
-                    local_global_batch_size=local_global_batch_size,
-                    global_batch_size=global_batch_size,
                 )
 
             for layer in self.layers:

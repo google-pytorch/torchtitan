@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from absl.testing import absltest
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
-from torchtitan.config import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu.components import grad_norm
 from torchtitan.experiments.tpu.distributed import distributed
@@ -34,7 +34,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
   TPUTrainerConfig,
   TpuTrainerCompileConfig,
 )
-from torchtitan.models.llama3 import build_model_config as model_registry
+from torchtitan.experiments.tpu.llama3 import model_registry
 
 
 class CompiledGradNormUnitTest(absltest.TestCase):
@@ -48,17 +48,26 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       with self.subTest(engine=engine_cls.__name__):
         compiled_norm = mock.Mock()
         compiled_norm.clip_grad_norm_.return_value = expected
+        params = list(model.parameters())
+        optim = SimpleNamespace(
+            parameters=params,
+            config=SimpleNamespace(max_norm=1.0),
+            clip_grad_norm=None,
+        )
         engine = SimpleNamespace(
             _compiled_grad_norm=compiled_norm,
-            model_parts=[model],
-            config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
+            optim=optim,
         )
 
-        actual = engine_cls._clip_grad_norm(engine)
+        # Both engines route optim.clip_grad_norm through compiled_grad_norm.
+        optim.clip_grad_norm = lambda: engine._compiled_grad_norm.clip_grad_norm_(
+            optim.parameters, optim.config.max_norm
+        )
+        actual = optim.clip_grad_norm()
 
         self.assertIs(actual, expected)
         compiled_norm.clip_grad_norm_.assert_called_once_with(
-            list(model.parameters()),
+            params,
             1.0,
         )
 

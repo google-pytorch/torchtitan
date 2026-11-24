@@ -543,7 +543,7 @@ def config_to_input_distribution(
 
 def _apply_cpu_splash_reference_patch(model: nn.Module) -> None:
   """Makes CPU ScaledDotProductInnerAttention apply segment_ids/window masks like Splash."""
-  from torchtitan.models.common.attention import (  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.components.attention import (  # pylint: disable=g-import-not-at-top
       ScaledDotProductInnerAttention,
       segment_ids_from_positions,
   )

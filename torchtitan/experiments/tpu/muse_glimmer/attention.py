@@ -41,9 +41,9 @@ from torchtitan.distributed.spmd_types import (
     spmd_dense_sp_enabled,
     spmd_mesh_group,
 )
-from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.common.attention import ScaledDotProductInnerAttention
-from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.components.attention import AttentionMasksType
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions
 from torchtitan.models.muse_glimmer.model import Attention
 
 

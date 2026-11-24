@@ -1,3 +1,4 @@
+from torchtitan.config.parallelism import ParallelismConfig
 """TPU configs for the HuggingFace transformers modeling backend.
 
 These are the GPU registry's configs with three things changed: the config
@@ -17,12 +18,11 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.components.optim import LRSchedulersContainer
 from torchtitan.observability.metrics import MetricsProcessor
-from torchtitan.components.optim import default_adamw
+from torchtitan.experiments.tpu.components.optim import default_adamw
 from torchtitan.config.configs import (
-    ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.experiments.tpu.components.activation_checkpoint import AttentionSavingSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
@@ -35,10 +35,10 @@ from torchtitan.experiments.transformers_modeling_backend import (
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TpuTrainerCompileConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
-from torchtitan.components.validate import Validator
+from torchtitan.components.validator import Validator
 from torchtitan.experiments.tpu.components.datasets import TPUGrainDataLoader
 from torchtitan.experiments.transformers_modeling_backend.tokenizer import HFBackendTokenizer
-from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.components.data.text_datasets import DATASETS
 from torchtitan.components.optim import Optim
 
 from .job_config import TPUTransformersBackendConfig
@@ -145,7 +145,6 @@ def _training_config(*, local_batch_size: int, seq_len: int, steps: int) -> Trai
   """Express the (local_batch_size, seq_len) recipe in the token budget."""
   training = TrainingConfig(steps=steps)
   training.num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len
-  training.max_context_length = seq_len
   return training
 
 
@@ -270,9 +269,9 @@ def _tpu_hf_config(
       # ``save_attention`` swaps in the policy that also keeps the Pallas
       # attention output, as upstream's default set already does for every
       # attention implementation it knows about (SDPA variants, flex).
-      activation_checkpoint=(
+      activation_remat=(
           AttentionSavingSelectiveAC.Config() if save_attention
-          else SelectiveAC.Config()
+          else DefaultActivationRematConfig()
       ),
   )
 

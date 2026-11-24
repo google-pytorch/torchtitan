@@ -8,7 +8,10 @@
 
 from dataclasses import replace
 
-from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
+from torchtitan.components.data import GrainDataLoader
+from torchtitan.components.data.multimodal.mm_collator import MultiModalCollator
+from torchtitan.components.data.multimodal.mm_datasets import MM_DATASETS
+from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import (
     AdamW,
@@ -19,47 +22,36 @@ from torchtitan.components.optim import (
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import (
-    apply_transforms,
-    Float8GroupedLinearConverter,
-    Float8LinearConverter,
-    GroupedLinearLoRAHandler,
-    LinearLoRAHandler,
-    LoRATransform,
-)
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
-from torchtitan.hf_datasets.multimodal.mm_datasets import (
-    MM_DATASETS,
-    MultiModalProcessor,
-)
+from torchtitan.config.transform import apply_transforms, LoRATransform
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.models.common.config_utils import (
     decoder_vocab_size,
     DEFAULT_DEBUG_MODEL_SEQ_LEN,
 )
 
-from torchtitan.models.qwen3_5 import build_model_config, QWEN3_5_SPECIAL_TOKENS
+from torchtitan.models.qwen3_5 import (
+    build_model_config,
+    QWEN3_5_SPECIAL_TOKENS,
+    QWEN3_5_VISION_PROCESSOR_KWARGS,
+)
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
 
-
-def _multimodal_collator_config(
-    dataset_config: SingleDatasetConfig,
-) -> MultiModalCollator.Config:
-    processor_config = dataset_config.processor
-    assert isinstance(processor_config, MultiModalProcessor.Config)
-    return replace(
-        MultiModalCollator.Config(build_mrope_positions=True),
-        patch_size=processor_config.patch_size,
-        temporal_patch_size=processor_config.temporal_patch_size,
-        spatial_merge_size=processor_config.spatial_merge_size,
-    )
+from torchtitan_recipes.tests.datasets.synthetic_multimodal import SYNTHETIC_MM_DATASETS
 
 
 def qwen35_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+    *,
+    attn_backend: str = "flex",
 ) -> Trainer.Config:
-    model_config = build_model_config("debugmodel", seq_len=seq_len)
+    parallelism = ParallelismConfig()
+    model_config = build_model_config(
+        "debugmodel_mm",
+        seq_len=seq_len,
+        attn_backend=attn_backend,
+        parallelism=parallelism,
+    )
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -68,11 +60,13 @@ def qwen35_debugmodel(
         ),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=MultiModalTokenizer.Config(**QWEN3_5_SPECIAL_TOKENS),
+        vision_processor=VisionProcessor.Config(**QWEN3_5_VISION_PROCESSOR_KWARGS),
         metrics=MetricsProcessor.Config(log_freq=1),
         model=model_config,
+        parallelism=parallelism,
         dataloader=GrainDataLoader.Config(
             dataset=MM_DATASETS["cc12m-test"],
-            collator=_multimodal_collator_config(MM_DATASETS["cc12m-test"]),
+            collator=MultiModalCollator.Config(build_mrope_positions=True),
             streaming_shuffle_buffer_size=128,
         ),
         optim=Optim.Config(
@@ -88,12 +82,25 @@ def qwen35_debugmodel(
         ),
         training=TrainingConfig(
             num_tokens_per_microbatch_per_dp_rank=1 * model_config.max_context_length,
-            max_context_length=model_config.max_context_length,
             steps=10,
         ),
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_remat=DefaultActivationRematConfig(),
     )
+
+
+def qwen35_debugmodel_video(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    config = qwen35_debugmodel(seq_len=seq_len)
+    dataset = SYNTHETIC_MM_DATASETS["synthetic-video-text"]
+    config.dataloader = replace(
+        config.dataloader,
+        dataset=dataset,
+        collator=MultiModalCollator.Config(build_mrope_positions=True),
+    )
+    config.training.disable_accelerator_graphs = True
+    return config
 
 
 def qwen35_debugmodel_varlen_attn(
@@ -101,16 +108,34 @@ def qwen35_debugmodel_varlen_attn(
 ) -> Trainer.Config:
     config = qwen35_debugmodel(seq_len=seq_len)
     config.model = build_model_config(
-        "debugmodel", seq_len=seq_len, attn_backend="varlen"
+        "debugmodel_mm",
+        seq_len=seq_len,
+        attn_backend="varlen",
+        parallelism=config.parallelism,
     )
-    config.training.disable_cuda_graphs = True
+    config.training.disable_accelerator_graphs = True
     return config
 
 
 def qwen35_debugmodel_moe(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+    *,
+    parallelism: ParallelismConfig | None = None,
 ) -> Trainer.Config:
-    model_config = build_model_config("debugmodel_moe", seq_len=seq_len)
+    if parallelism is None:
+        parallelism = ParallelismConfig(
+            data_parallel_shard_degree=2,
+            pipeline_parallel_degree=2,
+            num_pp_microbatches=2,
+            expert_parallel_degree=4,
+            tensor_parallel_degree=2,
+        )
+    model_config = build_model_config(
+        "debugmodel_moe_mm",
+        seq_len=seq_len,
+        attn_backend="flex",
+        parallelism=parallelism,
+    )
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -119,11 +144,12 @@ def qwen35_debugmodel_moe(
         ),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=MultiModalTokenizer.Config(**QWEN3_5_SPECIAL_TOKENS),
+        vision_processor=VisionProcessor.Config(**QWEN3_5_VISION_PROCESSOR_KWARGS),
         metrics=MetricsProcessor.Config(log_freq=1),
         model=model_config,
         dataloader=GrainDataLoader.Config(
             dataset=MM_DATASETS["cc12m-test"],
-            collator=_multimodal_collator_config(MM_DATASETS["cc12m-test"]),
+            collator=MultiModalCollator.Config(build_mrope_positions=True),
             streaming_shuffle_buffer_size=128,
         ),
         optim=Optim.Config(
@@ -134,42 +160,25 @@ def qwen35_debugmodel_moe(
         ),
         training=TrainingConfig(
             num_tokens_per_microbatch_per_dp_rank=1 * model_config.max_context_length,
-            max_context_length=model_config.max_context_length,
             steps=10,
-            disable_cuda_graphs=True,
+            disable_accelerator_graphs=True,
         ),
-        parallelism=ParallelismConfig(
-            data_parallel_shard_degree=2,
-            pipeline_parallel_degree=2,
-            num_pp_microbatches=2,
-            expert_parallel_degree=4,
-            tensor_parallel_degree=2,
-        ),
+        parallelism=parallelism,
         checkpointer=None,
-        activation_checkpoint=SelectiveAC.Config(),
+        activation_remat=DefaultActivationRematConfig(),
     )
 
 
-def qwen35_debugmodel_moe_float8_lora(
+def qwen35_debugmodel_moe_lora(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+    *,
+    parallelism: ParallelismConfig | None = None,
 ) -> Trainer.Config:
-    config = qwen35_debugmodel_moe(seq_len=seq_len)
-    config.model = build_model_config(
-        "debugmodel_moe",
-        seq_len=seq_len,
-        converters=[
-            Float8LinearConverter.Config(
-                emulate=False,
-                model_compile_enabled=False,
-            ),
-            Float8GroupedLinearConverter.Config(model_compile_enabled=False),
-        ],
-    )
+    config = qwen35_debugmodel_moe(seq_len=seq_len, parallelism=parallelism)
     return apply_transforms(
         config,
         [
             LoRATransform(
-                handlers=(LinearLoRAHandler(), GroupedLinearLoRAHandler()),
                 rank=8,
                 alpha=16.0,
                 target_modules=["w13", "w2"],

@@ -52,6 +52,7 @@ from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_s
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common import QKVLinear
 from torchtitan.models.common import GQAttention
+from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
@@ -134,12 +135,11 @@ class _BLDGQAttention(GQAttention):
   def forward(
       self,
       x_TD: torch.Tensor,
-      attention_masks,
+      attention_metadata,
       positions: torch.Tensor | None = None,
-      segment_ids: torch.Tensor | None = None,
   ) -> torch.Tensor:
     if x_TD.ndim != 3:
-      return super().forward(x_TD, attention_masks, positions, segment_ids)
+      return super().forward(x_TD, attention_metadata, positions)
     b, l, _ = x_TD.shape
     xq, xk, xv = remat.region(
         self._bld_qkv,
@@ -168,11 +168,10 @@ class _BLDGQAttention(GQAttention):
         xq,
         xk,
         xv,
-        attention_masks=attention_masks,
+        attention_metadata=attention_metadata,
         scale=self.scaling,
         enable_gqa=self.enable_gqa,
         positions=positions,
-        segment_ids=segment_ids,
     )
     remat.recompute_needs_tensor(out)
     out = remat.region(
@@ -188,17 +187,16 @@ class _BLDBlock(nn.Module):
   """Mixin: compute a [T, D]-in/[T, D]-out block on a [B, L, D] view."""
 
   def forward(
-      self, x, attention_masks, positions=None, segment_ids=None, **kwargs
+      self, x, attention_metadata, positions=None, **kwargs
   ):
     seq_len = _bld_seq_len(x)
     if seq_len is None:
-      return super().forward(x, attention_masks, positions, segment_ids, **kwargs)
+      return super().forward(x, attention_metadata, positions, **kwargs)
     num_tokens, dim = x.shape
     out = super().forward(
         x.view(num_tokens // seq_len, seq_len, dim),
-        attention_masks,
+        attention_metadata,
         positions,
-        segment_ids,
         **kwargs,
     )
     return out.reshape(num_tokens, dim)
@@ -257,7 +255,11 @@ def _attention_eligible(attn: nn.Module) -> bool:
       isinstance(attn, GQAttention)
       and _class_forward(attn) in (GQAttention.forward, _BLDGQAttention.forward)
       and _class_forward(attn.qkv_linear) in _QKV_FORWARDS
-      and (attn.rope is None or type(attn.rope).forward is RoPE.forward)
+      and (
+          attn.rope is None
+          or type(attn.rope).forward
+          in (RoPE.forward, ComplexRoPE.forward, CosSinRoPE.forward)
+      )
   )
 
 

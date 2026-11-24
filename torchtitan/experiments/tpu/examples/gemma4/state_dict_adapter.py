@@ -9,7 +9,7 @@ import torch
 from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model, QKVLinearKeqV
-from torchtitan.protocols.state_dict_adapter import StateDictAdapter
+from torchtitan.models.base.state_dict_adapter import StateDictAdapter
 
 # Non-text towers of the multimodal checkpoint, with any leading "model." removed.
 _IGNORED_HF_PREFIXES = (

@@ -11,10 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from torch import nn
-from torchtitan.experiments.graph_trainer.configs import (
-    GraphTrainerCompileConfig,
-    GraphTrainerMemoryPolicy,
-)
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
@@ -47,7 +44,13 @@ TpuGraphTrainerOptimizerCompileMode = Literal[
 # These policies are registered by TPU-only modules, so keep their CLI/config
 # type out of the shared GraphTrainer policy Literal.
 TpuGraphTrainerMemoryPolicy = Literal[
-    GraphTrainerMemoryPolicy,
+    "none",
+    "default",
+    "full",
+    "eager",
+    "min_cut",
+    "sac_and_offload",
+    "sac_and_paged_stash",
     "full_and_offload",
     "full_and_scan_offload",
     "tpu_selective",
@@ -307,6 +310,13 @@ def apply_tpu_graph_trainer_model_transforms(
   afterward. TpuGraphTrainer calls this once, before its base class builds the
   model, so ``compile.use_scan_layers`` can select the scanned model class.
   """
+  if config.model is not None:
+    from torchtitan.experiments.graph_trainer.common_utils import (  # pylint: disable=g-import-not-at-top
+        disable_inplace_wgrad_accum,
+    )
+
+    disable_inplace_wgrad_accum(config.model)
+
   _validate_fsdp_allreduce_slice(config)
   _validate_graph_split(config.compile.graph_split)
 

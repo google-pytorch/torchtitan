@@ -1,13 +1,17 @@
 grain == 0.2.18
 datasets >= 3.6.0, < 4.8.0
+# PyArrow 26 requires NumPy 2; PyTorch CI also covers NumPy 1.x.
+pyarrow < 26
 tensorboard
 wandb
 tokenizers >= 0.15.0
-renderers == 0.1.11
+renderers == 0.1.12
 safetensors
 einops
 pillow
-spmd_types==0.3.2
-attn-gym[linear]==0.0.10
-# Keep this commit pin in sync with pyproject.toml.
-torch_remat @ git+https://github.com/meta-pytorch/remat.git@d302699b1c58f83fa2c7b03bc2593967e9530335
+spmd_types == 0.3.1
+attn-gym[linear,cudnn]==0.0.20
+# TODO: pin a release once torch_remat publishes one with SavedTensorInfo.region
+# (meta-pytorch/remat 6c05e8d), which per-region activation offload needs.
+torch_remat @ git+https://github.com/meta-pytorch/remat.git@6c05e8d8d6895a60dcc02674af0774b28155b5af
+torch_checkpointing == 0.1.1

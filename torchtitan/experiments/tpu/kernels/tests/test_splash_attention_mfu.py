@@ -36,8 +36,8 @@ from torchtitan.experiments.tpu.kernels import splash_attention
 from torchtitan.experiments.tpu.kernels import splash_bias_dropout
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
 from torchtitan.experiments.tpu.testing import base_device_test
-from torchtitan.models.common.attention import ScaledDotProductInnerAttention
-from torchtitan.models.utils import quadratic_attention_flops_per_token
+from torchtitan.experiments.tpu.components.attention import ScaledDotProductInnerAttention
+from torchtitan.models.common.flops import quadratic_attention_flops_per_token
 from torchtitan.tools import utils
 
 _RUN_MFU_BENCHMARK = flags.DEFINE_bool(

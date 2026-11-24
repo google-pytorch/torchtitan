@@ -43,7 +43,7 @@ import torchtitan.trainer
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 JobConfig = torchtitan.trainer.Trainer.Config
-ParallelDims = torchtitan.distributed.ParallelDims
+ParallelDims = torchtitan.distributed.parallel_dims.ParallelDims
 logger = logging.getLogger(__name__)
 
 TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], None]
@@ -101,7 +101,7 @@ class TrainerMinimal:
     if world_size > 1:
       dist_utils.init_distributed(
           job_config.comm,
-          enable_cpu_backend=job_config.training.enable_cpu_offload,
+          enable_cpu_backend=job_config.parallelism.fsdp_enable_cpu_offloading,
           base_folder=job_config.dump_folder,
       )
     else:
@@ -118,6 +118,7 @@ class TrainerMinimal:
         pp=parallelism_config.pipeline_parallel_degree,
         ep=parallelism_config.expert_parallel_degree,
         world_size=self.world_size,
+        enable_sequence_parallel=parallelism_config.enable_sequence_parallel,
     )
 
     logger.info(f"parallel_dims: {self.parallel_dims}")
@@ -177,7 +178,7 @@ class TrainerMinimal:
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=self.tokenizer,
-        max_context_length=job_config.training.max_context_length,
+        max_context_length=job_config.model.max_context_length,
         num_tokens_per_microbatch=(
             job_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
@@ -186,7 +187,8 @@ class TrainerMinimal:
     # As Trainer.__init__: set sharding, then the fork's runtime hooks
     # (MoELoadBalanceAuxLoss batch sizes, TPU-model update_from_config) with
     # the batch mesh's degree as the data-parallel degree.
-    model_config.set_sharding_(job_config.parallelism)
+    if hasattr(model_config, "set_sharding_"):
+      model_config.set_sharding_(job_config.parallelism)
     torchtitan.trainer.prepare_model_config(job_config, dp_degree=batch_degree)
     self.model_config = model_config
 
@@ -213,18 +215,22 @@ class TrainerMinimal:
 
     with (
         torch.device("meta"),
-        utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
+        utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.precision.dtype]),
     ):
       model = model_config.build()
 
     # calculate model size and flops per token
     # Upstream d771abb0 renamed training.seq_len -> training.max_context_length.
-    (
-        model_param_count,
-        _,
-    ) = model_config.get_nparams_and_flops(
-        model, job_config.training.max_context_length
-    )
+    if hasattr(model_config, "get_nparams_and_flops"):
+      model_param_count, _ = model_config.get_nparams_and_flops(
+          model, job_config.model.max_context_length
+      )
+    elif hasattr(model, "get_nparams_and_flops"):
+      model_param_count, _ = model.get_nparams_and_flops(
+          job_config.model.max_context_length
+      )
+    else:
+      model_param_count = sum(p.numel() for p in model.parameters())
 
     logger.info(
         f"Model {type(model).__name__} "
@@ -253,7 +259,7 @@ class TrainerMinimal:
           training=job_config.training,
           parallelism=job_config.parallelism,
           compile_config=job_config.compile,
-          ac_config=job_config.activation_checkpoint,
+          ac_config=job_config.activation_remat,
           dump_folder=job_config.dump_folder,
       )
       if isinstance(model, Llama3Model):
@@ -290,10 +296,15 @@ class TrainerMinimal:
 
     assert (
         self.device.type != "tpu" or
-        job_config.optim.optimizer.implementation != "fused"
+        not getattr(job_config.optim.optimizer, "fused", False)
     ), ("TODO b/45811390 - Fused optimizer not supported on TPU."
-        "You can disable this by setting --optimizer.implementation=foreach")
-    self.optimizers = job_config.optim.optimizer.build(model_parts=[self.model])
+        "You can disable this by setting --optimizer.foreach=true")
+    from torchtitan.components.optim import OptimizersContainer
+
+    opt_cfg = job_config.optim.optimizer
+    if not isinstance(opt_cfg, OptimizersContainer.Config):
+      opt_cfg = OptimizersContainer.Config(optimizers=[opt_cfg])
+    self.optimizers = opt_cfg.build(model_parts=[self.model])
 
     # get_spmd_context sets the process-wide SPMD mesh the spmd_types
     # collectives read, so components such as ChunkedLossWrapper support loss
@@ -307,10 +318,10 @@ class TrainerMinimal:
     """Runs a simple training loop on the specified device."""
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
     from torchtitan.models.common.decoder import Decoder  # pylint: disable=g-import-not-at-top
-    from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
+    from torchtitan.models.base.model import BaseModel  # pylint: disable=g-import-not-at-top
 
     data_iterator = iter(self.dataloader)
-    seq_len = self.job_config.training.max_context_length
+    seq_len = self.job_config.model.max_context_length
 
     try:
 
@@ -533,12 +544,13 @@ def start_trainer(config: JobConfig):
 
   device = utils.get_local_device()
 
-  if config.optim.optimizer.implementation == "fused" and device.type == "tpu":
+  if getattr(config.optim.optimizer, "fused", False) and device.type == "tpu":
     # TODO b/45811390 - Remove this once fused optimizer is supported on TPU.
     logger.warning(
         "Fused optimizer is not supported on TPU, changing to foreach."
     )
-    config.optim.optimizer.implementation = "foreach"
+    config.optim.optimizer.fused = False
+    config.optim.optimizer.foreach = True
 
   import sys
   logger.info("JAX LOADED BEFORE INIT: %s", "jax" in sys.modules)
@@ -555,7 +567,7 @@ def start_trainer(config: JobConfig):
     from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
     # Upstream d771abb0 renamed training.seq_len ->
     # training.max_context_length.
-    with set_unflatten_seq_len(config.training.max_context_length):
+    with set_unflatten_seq_len(config.model.max_context_length):
       trainer.train()
   finally:
     if torch.distributed.is_initialized():

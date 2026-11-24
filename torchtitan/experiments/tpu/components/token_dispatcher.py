@@ -33,8 +33,12 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
     MOE_ROUTING,
 )
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    TpuRoutedExperts as BaseTpuRoutedExperts,
+)
 from torchtitan.models.common.moe import RoutedExperts
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.models.common.moe.token_dispatcher import (
+    _ep_process_group,
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
@@ -270,7 +274,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
       x_TD: torch.Tensor,
   ) -> torch.Tensor:
-    if self.ep_mesh is not None:
+    if _ep_process_group() is not None:
       return super().combine(routed_output_RD, metadata, x_TD)
 
     assert isinstance(metadata, LocalDispatchMetadata)
@@ -291,7 +295,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     )
 
 
-class TpuRoutedExperts(RoutedExperts):
+class TpuRoutedExperts(BaseTpuRoutedExperts):
   """Routed experts that can apply the routing scores before W2.
 
   W2 is linear, so scaling its input rows gives the same result as scaling its
@@ -303,7 +307,7 @@ class TpuRoutedExperts(RoutedExperts):
   """
 
   @dataclass(kw_only=True, slots=True)
-  class Config(RoutedExperts.Config):
+  class Config(BaseTpuRoutedExperts.Config):
     scale_before_down_proj: bool = False
 
   def __init__(self, config: Config):
@@ -368,7 +372,7 @@ class TpuRoutedExpertsConverter(ModelConfigConverter):
   def convert(self, model_config):
     matches = list(model_config.traverse(RoutedExperts.Config))
     for _, config, parent, field_name in matches:
-      if type(config) is not RoutedExperts.Config:
+      if type(config) not in (RoutedExperts.Config, BaseTpuRoutedExperts.Config):
         continue
       replacement = derive(config, TpuRoutedExperts.Config)
       if parent is None:

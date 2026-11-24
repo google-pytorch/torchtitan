@@ -8,7 +8,7 @@ is the only coverage of that fallback.
 
 from absl.testing import absltest
 from torch import nn
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import configure_muse_glimmer_simple_fsdp_shard_dims
 
 
@@ -30,6 +30,7 @@ def _parallel_dims(fsdp_degree: int) -> ParallelDims:
       pp=1,
       ep=1,
       world_size=fsdp_degree,
+      enable_sequence_parallel=False,
   )
 
 
@@ -83,7 +84,14 @@ class SimpleFSDPShardingTest(absltest.TestCase):
   def test_rejects_context_parallelism(self) -> None:
     model = _model(vocab_size=6)
     parallel_dims = ParallelDims(
-        dp_replicate=1, dp_shard=2, cp=2, tp=1, pp=1, ep=1, world_size=4
+        dp_replicate=1,
+        dp_shard=2,
+        cp=2,
+        tp=1,
+        pp=1,
+        ep=1,
+        world_size=4,
+        enable_sequence_parallel=False,
     )
 
     with self.assertRaisesRegex(NotImplementedError, "Context parallelism"):

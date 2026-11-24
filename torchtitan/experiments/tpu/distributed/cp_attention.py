@@ -42,19 +42,53 @@ from torchtitan.distributed import fsdp as fsdp_mod
 from torchtitan.distributed.context_parallel import (
     _cp_shard_dims,
     HeadTailCPLoadBalancer,
-    prepare_context_parallel_input,
 )
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
+from torchtitan.experiments.tpu.components.attention import (
+    ScaledDotProductInnerAttention,
+    segment_ids_from_positions,
+)
 from torchtitan.experiments.tpu.distributed.headtail import headtail_chunk_order
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common.attention import (
-    BaseAttention,
-    ScaledDotProductInnerAttention,
+    Attention as BaseAttention,
     VarlenInnerAttention,
-    segment_ids_from_positions,
 )
-from torchtitan.models.common.cp_attention import CPInnerAttention
+
+
+def prepare_context_parallel_input(
+    input_dict: dict,
+    input_shardings: dict | None,
+    cp_mesh,
+    load_balancer_type: str | None = "headtail",
+    ptrr_mask_key: str | None = None,
+) -> dict:
+  """Shard named tensors for Context Parallel (TPU CP helper)."""
+  del ptrr_mask_key
+  from torchtitan.distributed.context_parallel import cp_shard as _cp_shard
+
+  if input_shardings is not None:
+    shard_dims = _cp_shard_dims(input_shardings)
+  else:
+    shard_dims = {"input": 0, "labels": 0, "positions": 0}
+  named = {k: v for k, v in input_dict.items() if isinstance(v, torch.Tensor)}
+  shard_names = [n for n in shard_dims if n in named]
+  if not shard_names:
+    return input_dict
+  buffers = tuple(named[n] for n in shard_names)
+  seq_dims = tuple(shard_dims[n] for n in shard_names)
+  sharded_buffers, _ = _cp_shard(
+      cp_mesh,
+      buffers,
+      None,
+      load_balancer_type,
+      input_seq_dims=seq_dims,
+  )
+  for n, buf in zip(shard_names, sharded_buffers):
+    input_dict[n] = buf
+  return input_dict
+from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
 logger = logging.getLogger(__name__)
 
@@ -443,12 +477,17 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
 
   def __init__(self, config: Any) -> None:
     super().__init__(config)  # pyrefly: ignore[bad-argument-count]
-    if isinstance(self, VarlenInnerAttention) and self.window_size[1] != 0:
+    window_size = getattr(self, "window_size", None)
+    if (
+        isinstance(self, VarlenInnerAttention)
+        and window_size is not None
+        and window_size[1] != 0
+    ):
       # The head-tail masks (and the reference attention) are causal.
       raise NotImplementedError(
           "KV all-gather CP supports causal attention only, i.e."
           " window_size=(left, 0); got window_size="
-          f"{tuple(self.window_size)}."
+          f"{tuple(window_size)}."
       )
     self.reduce_dtype = TORCH_DTYPE_MAP[config.reduce_dtype]
     self.allow_reference_attention = config.allow_reference_attention
@@ -688,8 +727,9 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
     return out.squeeze(0) if was_3d else out
 
   def _uses_sliding_window(self) -> bool:
-    if isinstance(self, VarlenInnerAttention):
-      return self.window_size[0] >= 0
+    window_size = getattr(self, "window_size", None)
+    if window_size is not None:
+      return window_size[0] >= 0
     # SDPA-based models set the window on the module, not in its config.
     return getattr(self, "sliding_window_size", None) is not None
 
@@ -937,14 +977,16 @@ def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
   )
 
 
-def tpu_cp_load_balancer(strategy: CPStrategy) -> str | None:
+def tpu_cp_load_balancer(
+    strategy: CPStrategy,
+) -> HeadTailCPLoadBalancer.Config | None:
   """Returns the ``context_parallel_load_balancer`` that ``strategy`` needs.
 
   KV All-Gather keeps Q sequence-sharded in head-tail order (see
   ``headtail.py``), which its Splash masks are built for; Ulysses attends over
   the full sequence, so there is no causal imbalance to balance.
   """
-  return "headtail" if strategy == "all_gather" else None
+  return HeadTailCPLoadBalancer.Config() if strategy == "all_gather" else None
 
 
 def _validate_heads(
@@ -984,9 +1026,14 @@ def _validate_sequence_lengths(
     cp: int,
     training: Any,
     splash_attention_kernel: Any | None,
+    model_config: Any | None = None,
 ) -> None:
   """Checks the sequence lengths a strategy can shard (and Splash can tile)."""
-  seq_len = training.max_context_length
+  seq_len = (
+      model_config.max_context_length
+      if model_config is not None and hasattr(model_config, "max_context_length")
+      else training.max_context_length
+  )
   num_tokens = training.num_tokens_per_microbatch_per_dp_rank
   if strategy == "ulysses":
     # Ulysses shards the folded token stream into cp contiguous pieces.
@@ -1128,7 +1175,7 @@ def validate_tpu_context_parallel(
   if training is not None:
     for strategy in sorted(strategies):
       _validate_sequence_lengths(
-          strategy, cp, training, splash_attention_kernel
+          strategy, cp, training, splash_attention_kernel, model_config=model
       )
 
 

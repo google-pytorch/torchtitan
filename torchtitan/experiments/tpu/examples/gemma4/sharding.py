@@ -8,23 +8,76 @@ from torchtitan.experiments.tpu.examples.gemma4.model import (
 )
 from torchtitan.models.common.decoder_sharding import (
     attention_activation_placement,
+    colwise_sharding_config,
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
-    norm_config,
-    set_decoder_sharding_config,
-    set_dense_ffn_sharding,
-    set_gqa_attention_sharding,
-    set_gqa_inner_attention_local_spmd,
+    feed_forward_sharding_config,
+    gqa_attention_sharding_config,
+    inner_attention_local_spmd_sharding_config,
+    lm_head_sharding_config,
+    norm_sharding_config as norm_config,
+    replicated_activation_placement,
+    residual_activation_placement,
+    rowwise_sharding_config,
+    stacked_colwise_sharding_config,
+    token_embedding_sharding_config,
 )
-from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.common.moe.sharding import (
+    moe_sharding_config,
+    routed_expert_linear_sharding_config,
+    routed_experts_sharding_config,
+    router_gate_sharding_config,
+    router_sharding_config,
+)
+from torchtitan.models.base.sharding import ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan.experiments.tpu.examples.gemma4.model import (
         Gemma4Model,
         Gemma4TransformerBlock,
     )
+
+
+def set_decoder_sharding_config(config: "Gemma4Model.Config", *, enable_sp: bool) -> None:
+    if config.tok_embeddings is not None:
+        config.tok_embeddings.sharding_config = token_embedding_sharding_config(enable_sp=enable_sp)
+    if config.norm is not None:
+        config.norm.sharding_config = norm_config(enable_sp=enable_sp)
+    if config.lm_head is not None:
+        config.lm_head.sharding_config = lm_head_sharding_config()
+
+
+def set_gqa_attention_sharding(attention: Gemma4Attention.Config, *, enable_sp: bool) -> None:
+    attention.sharding_config = gqa_attention_sharding_config(enable_sp=enable_sp)
+    in_layout = residual_activation_placement(enable_sp=enable_sp)
+    attention.qkv_linear.wqkv.sharding_config = colwise_sharding_config(input_layout=in_layout)
+    attention.wo.sharding_config = rowwise_sharding_config(
+        output_layout=in_layout
+    )
+
+
+def set_gqa_inner_attention_local_spmd(inner_attention) -> None:
+    inner_attention.sharding_config = inner_attention_local_spmd_sharding_config()
+
+
+def set_dense_ffn_sharding(ffn, *, attn_x_layout, enable_sp: bool) -> None:
+    ffn.sharding_config = feed_forward_sharding_config(enable_sp=enable_sp)
+    ffn.w13.sharding_config = stacked_colwise_sharding_config(input_layout=attn_x_layout)
+    ffn.w2.sharding_config = rowwise_sharding_config(
+        output_layout=attn_x_layout
+    )
+
+
+def set_moe_sharding_config(moe, *, enable_ep: bool, enable_sp: bool) -> None:
+    moe.sharding_config = moe_sharding_config(enable_sp=enable_sp)
+    moe.router.sharding_config = router_sharding_config()
+    moe.router.gate.sharding_config = router_gate_sharding_config()
+    moe.routed_experts.sharding_config = routed_experts_sharding_config()
+    if getattr(moe.routed_experts, "inner_experts", None) is not None:
+        moe.routed_experts.inner_experts.sharding_config = (
+            routed_expert_linear_sharding_config(enable_ep=enable_ep)
+        )
 
 
 def set_gemma4_sharding_config(
@@ -77,16 +130,12 @@ def _set_gemma4_layer_sharding(
     if attention.qk_norm is not None:
         attention.qk_norm.sharding_config = ShardingConfig(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)},
-            in_src_shardings={"input": head_layout},
-            in_dst_shardings={"input": head_layout},
-            out_src_shardings=head_layout,
-            out_dst_shardings=head_layout,
+            input_shardings={"input": head_layout},
+            output_shardings=head_layout,
         )
     attention.v_norm.sharding_config = ShardingConfig(
-        in_src_shardings={"input": head_layout},
-        in_dst_shardings={"input": head_layout},
-        out_src_shardings=head_layout,
-        out_dst_shardings=head_layout,
+        input_shardings={"input": head_layout},
+        output_shardings=head_layout,
     )
 
     # Dense FFN (present on both dense and MoE layers in Gemma4)
@@ -127,15 +176,15 @@ def _set_gemma4_layer_sharding(
                     state_shardings={
                         "weight": dense_param_placement(tp=moe_norm_weight_tp)
                     },
-                    in_src_shardings={"input": moe_in_layout},
-                    out_src_shardings=moe_in_layout,
+                    input_shardings={"input": moe_in_layout},
+                    output_shardings=moe_in_layout,
                 )
             )
         router = layer_cfg.moe.router
         assert isinstance(router, Gemma4Router.Config)
         router.norm.sharding_config = ShardingConfig(
-            in_src_shardings={"input": moe_in_layout},
-            out_src_shardings=moe_in_layout,
+            input_shardings={"input": moe_in_layout},
+            output_shardings=moe_in_layout,
         )
         # Extend the router config set_moe_sharding_config filled in (it
         # carries the tokens_per_expert_E buffer and padding-mask layouts) with

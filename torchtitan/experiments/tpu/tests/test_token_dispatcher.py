@@ -14,8 +14,8 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     scale_route_weights,
     stable_grouped_reduce,
 )
-from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.experiments.tpu.components.grouped_experts import GroupedExperts
+from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 
 
 def test_scale_route_weights_matches_native_autograd():
@@ -245,10 +245,8 @@ def test_ep_combine_delegates_to_standard_dispatcher():
     expected = torch.tensor([1.0])
 
     with (
-        mock.patch.object(
-            TpuAllToAllTokenDispatcher,
-            "ep_mesh",
-            new_callable=mock.PropertyMock,
+        mock.patch(
+            "torchtitan.experiments.tpu.components.token_dispatcher._ep_process_group",
             return_value=object(),
         ),
         mock.patch.object(
@@ -340,7 +338,9 @@ def test_scale_before_down_proj_matches_scaling_the_output():
   x = torch.randn(5, dim, generator=generator, requires_grad=True)
   scores = torch.rand(5, top_k, generator=generator, requires_grad=True)
   expert_ids = torch.randint(0, num_experts, (5, top_k), generator=generator)
-  counts = torch.bincount(expert_ids.reshape(-1), minlength=num_experts)
+  routing_map_TE = torch.nn.functional.one_hot(expert_ids, num_experts).sum(
+      dim=1
+  )
 
   def run(scale_before_down_proj):
     routed = TpuRoutedExperts.Config(
@@ -353,7 +353,7 @@ def test_scale_before_down_proj_matches_scaling_the_output():
         scale_before_down_proj=scale_before_down_proj,
     ).build()
     routed.inner_experts = _SwiGLUExperts(*weights)
-    out = routed(x, scores, expert_ids, counts)
+    out = routed(x, scores, expert_ids, routing_map_TE)
     return out, torch.autograd.grad(out.square().sum(), (x, scores, *weights))
 
   actual, actual_grads = run(True)

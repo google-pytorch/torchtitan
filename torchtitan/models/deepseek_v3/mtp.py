@@ -7,120 +7,100 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import spmd_types as spmd
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import DataParallelMeshDims
 
-from torchtitan.components.loss import CrossEntropyLoss, IGNORE_INDEX
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.components.loss import CrossEntropyLoss, IGNORE_INDEX, Loss
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import FSDPSymmMemScope, ParallelismConfig
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.distributed.parallelism_context import MeshAxisName, ParallelismContext
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
-    current_spmd_mesh,
     spmd_dense_sp_enabled,
     spmd_mesh_group,
 )
+from torchtitan.models.base.model import FlopsEstimator
+from torchtitan.models.base.module import Module, ModuleList
 from torchtitan.models.common.attention import (
-    AttentionMasksType,
-    FlexInnerAttention,
-    VarlenInnerAttention,
+    AttentionMetadataMap,
+    FlexAttentionMetadata,
+    VarlenAttentionMetadata,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.protocols.module import ModuleList
 
 
 def roll_mtp_sequence(
     sequence: torch.Tensor,
     *,
     shift: int,
-    fill_value: int,
+    fill_value: int | bool,
     positions: torch.Tensor | None = None,
     padding_mask: torch.Tensor | None = None,
     return_valid_mask: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Left-roll an MTP sequence while preserving packed-document boundaries.
-
-    MTP depth ``k`` needs the token or label at ``i + k`` for each position
-    ``i``. This helper builds that shifted view along the token axis
-    (dimension 0). Tail positions, and positions that would cross a packed
-    document boundary, are filled instead of wrapped around.
-
-    Args:
-        sequence: Tensor to shift, with shape ``[T, ...]``. Any trailing
-            dimensions are carried along unchanged.
-        shift: Future-token offset to use. ``shift=1`` maps each position to the
-            next token, ``shift=2`` maps to the token after next, and so on.
-            Must be positive and no larger than ``seq_len``.
-        positions: Optional reset-style position IDs with shape ``[T]``. When
-            present, a shifted source position is valid only if
-            ``positions[i + shift] == positions[i] + shift``.
-            This prevents MTP inputs or labels from crossing packed-document
-            boundaries.
-        padding_mask: Optional padding mask with shape ``[T]``. A shifted
-            source position marked as padding is filled and reported invalid.
-        fill_value: Value used for invalid positions. Use token id ``0`` for
-            shifted input tokens and ``IGNORE_INDEX`` for shifted labels.
-        return_valid_mask: If true, also return a boolean mask marking positions
-            where the shifted value came from a valid source position.
-
-    Returns:
-        The shifted tensor. If ``return_valid_mask`` is true, returns
-        ``(shifted, valid_mask)``.
-
-    Example:
-        ``sequence=[A0, A1, A2, B0, B1]`` and
-        ``positions=[0, 1, 2, 0, 1]`` with ``shift=1`` returns
-        ``[A1, A2, fill, B1, fill]``.
-    """
+    """Left-roll an MTP sequence without crossing documents or padding."""
     seq_len = sequence.shape[0]
     if shift <= 0 or shift > seq_len:
         raise ValueError(f"MTP roll shift must be in [1, {seq_len}], got {shift}.")
 
-    rolled = torch.full_like(sequence, fill_value)
+    shifted = torch.full_like(sequence, fill_value)
     valid_mask = torch.zeros_like(sequence, dtype=torch.bool)
-
     source = sequence[shift:]
-    if positions is None:
-        rolled[: seq_len - shift] = source
-        valid_mask[: seq_len - shift] = True
-        if padding_mask is not None:
-            valid_mask[: seq_len - shift] &= ~padding_mask[shift:seq_len]
-            rolled[: seq_len - shift] = torch.where(
-                valid_mask[: seq_len - shift],
-                source,
-                rolled[: seq_len - shift],
-            )
-        if return_valid_mask:
-            return rolled, valid_mask
-        return rolled
-
-    if positions.shape[0] < seq_len:
-        raise ValueError(
-            f"MTP positions need at least {seq_len} tokens, got {positions.shape[0]}."
-        )
-    valid_tokens = positions[shift:seq_len] == positions[: seq_len - shift] + shift
+    valid_tokens = torch.ones_like(source, dtype=torch.bool)
+    if positions is not None:
+        valid_tokens &= positions[shift:seq_len] == positions[: seq_len - shift] + shift
     if padding_mask is not None:
-        valid_tokens &= ~padding_mask[shift:seq_len]
-    # valid_tokens follows positions placement, while valid_mask intentionally
-    # follows sequence placement for the following where.
+        valid_tokens &= ~padding_mask[: seq_len - shift] & ~padding_mask[shift:seq_len]
     with spmd.no_typecheck():
         valid_mask[: seq_len - shift] = valid_tokens
-    rolled[: seq_len - shift] = torch.where(
-        valid_mask[: seq_len - shift],
-        source,
-        rolled[: seq_len - shift],
+    shifted[: seq_len - shift] = torch.where(
+        valid_mask[: seq_len - shift], source, shifted[: seq_len - shift]
     )
+
     if return_valid_mask:
-        return rolled, valid_mask
-    return rolled
+        return shifted, valid_mask
+    return shifted
+
+
+def get_mtp_token_counts(
+    *,
+    target_mask: torch.Tensor,
+    positions: torch.Tensor,
+    padding_mask: torch.Tensor,
+    num_mtp_layers: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return loss-token and routed-token counts for the main and MTP depths."""
+    loss_token_counts = [target_mask.sum()]
+    routing_token_counts = [(~padding_mask).sum()]
+    for depth in range(1, num_mtp_layers + 1):
+        shifted_target_mask = roll_mtp_sequence(
+            target_mask,
+            shift=depth,
+            positions=positions,
+            padding_mask=padding_mask,
+            fill_value=False,
+        )
+        assert isinstance(shifted_target_mask, torch.Tensor)
+        _, routing_mask = roll_mtp_sequence(
+            padding_mask,
+            shift=depth,
+            positions=positions,
+            padding_mask=padding_mask,
+            fill_value=True,
+            return_valid_mask=True,
+        )
+        loss_token_counts.append(shifted_target_mask.sum())
+        routing_token_counts.append(routing_mask.sum())
+    return torch.stack(loss_token_counts), torch.stack(routing_token_counts)
 
 
 class MTPTransformerBlock(TransformerBlock):
@@ -150,23 +130,18 @@ class MTPTransformerBlock(TransformerBlock):
         self.eh_proj = config.eh_proj.build()
         self.mtp_norm = config.mtp_norm.build()
 
-        self.moe_enabled = config.moe is not None
-        if self.moe_enabled:
-            assert config.moe is not None
-            self.moe = config.moe.build()
-        else:
-            assert config.feed_forward is not None
-            self.feed_forward = config.feed_forward.build()
+        self.feed_forward = config.feed_forward.build()
 
     def forward(
         self,
         mtp_input_embed: torch.Tensor,
         prev_embed: torch.Tensor,
         mtp_input_valid_mask: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata | None,
         positions: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ):
         mtp_padding_mask_T = ~mtp_input_valid_mask
         if padding_mask is not None:
@@ -184,15 +159,16 @@ class MTPTransformerBlock(TransformerBlock):
         h = self.eh_proj(
             torch.cat([self.enorm(mtp_input_embed), self.hnorm(prev_embed)], dim=-1)
         )
-        h = h + self.attention(self.attention_norm(h), attention_masks, positions)
-        if self.moe_enabled:
-            h = h + self.moe(
+        h = h + self.attention(self.attention_norm(h), attention_metadata, positions)
+        if isinstance(self.feed_forward, MoE):
+            h = h + self.feed_forward(
                 self.ffn_norm(h),
                 padding_mask_T=mtp_padding_mask_T,
+                aux_loss_denominator=aux_loss_denominator,
             )
         else:
             h = h + self.feed_forward(self.ffn_norm(h))
-        return self.mtp_norm(h)
+        return maybe_gather_tp_input(self.mtp_norm, self.mtp_norm(h))
 
     def _maybe_shard_mtp_valid_mask_across_tp(
         self, mtp_input_valid_mask_T: torch.Tensor
@@ -220,9 +196,32 @@ class MTPDecoder(Decoder):
     shifted token embeddings.
     """
 
+    mtp_layers: ModuleList[MTPTransformerBlock] | None
+
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        mtp_layers: list = field(default_factory=list)
+        mtp_layers: list[MTPTransformerBlock.Config] = field(default_factory=list)
+
+        def build_flops_estimator(
+            self,
+            model: Module,
+            *,
+            seq_len: int,
+            excluded_submodules: tuple[Module | None, ...] = (),
+        ) -> FlopsEstimator:
+            decoder_estimate = super(MTPDecoder.Config, self).build_flops_estimator(
+                model, seq_len=seq_len, excluded_submodules=excluded_submodules
+            )
+            model = cast(MTPDecoder, model)
+            repeated_head_flops_per_token = (
+                6
+                * len(self.mtp_layers)
+                * sum(param.numel() for param in model.lm_head.parameters())
+            )
+            return lambda input_dict: (
+                decoder_estimate(input_dict)
+                + repeated_head_flops_per_token * input_dict["input"].numel()
+            )
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -243,7 +242,7 @@ class MTPDecoder(Decoder):
         self,
         *,
         parallelism_context: ParallelismContext,
-        training: TrainingConfig,
+        precision: PrecisionConfig,
         parallelism: ParallelismConfig,
     ) -> None:
         from torchtitan.distributed.fsdp import (
@@ -256,16 +255,17 @@ class MTPDecoder(Decoder):
         apply_fsdp_to_mtp_decoder(
             self,
             dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+            reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
             pp_enabled=parallelism_context.pp_enabled,
-            cpu_offload=training.enable_cpu_offload,
+            cpu_offload=parallelism.fsdp_enable_cpu_offloading,
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             ep_degree=parallelism_context.ep,
             edp_mesh=edp_mesh,
             dp_mesh_dims=dp_mesh_dims,
             edp_mesh_dims=edp_mesh_dims,
             symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            unshard_in_current_stream=parallelism.fsdp_unshard_in_current_stream,
         )
 
     def preprocess_inputs(
@@ -275,15 +275,17 @@ class MTPDecoder(Decoder):
         parallelism_context: ParallelismContext,
         parallelism: ParallelismConfig,
         max_num_documents: int | None = None,
-        max_context_length: int | None = None,
+        global_routing_token_counts: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[
         torch.Tensor | tuple[torch.Tensor, ...],
         torch.Tensor | tuple[torch.Tensor, ...],
         dict[str, Any],
+        dict[str, Any],
     ]:
         """Prepare aligned pairs before applying CP sharding and annotations."""
         del kwargs
+        loss_kwargs = input_dict.pop("loss_kwargs", {})
         tokens = input_dict["input"]
         labels = input_dict["labels"]
         positions = input_dict.get("positions")
@@ -320,18 +322,16 @@ class MTPDecoder(Decoder):
             input_shardings[f"mtp_input_tokens_{depth}"] = input_shardings["input"]
             input_shardings[f"mtp_labels_{depth}"] = input_shardings["labels"]
             input_shardings[f"mtp_input_valid_mask_{depth}"] = input_shardings["input"]
+        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_dict.update(loss_kwargs)
 
         if positions is not None:
-            inner = self.config.first_full_attention_backend
-            if isinstance(
-                inner, (FlexInnerAttention.Config, VarlenInnerAttention.Config)
-            ):
-                input_dict["attention_masks"] = self.get_attention_masks(
-                    positions=positions,
-                    padding_mask=padding_mask,
-                    max_num_documents=max_num_documents,
-                    max_context_length=max_context_length,
-                )
+            attention_metadata = self._get_attention_metadata(
+                positions=positions,
+                padding_mask=padding_mask,
+                max_num_documents=max_num_documents,
+            )
+            input_dict["attention_metadata"] = attention_metadata
 
         if parallelism_context.cp_enabled:
             input_dict = self._cp_shard(
@@ -344,10 +344,12 @@ class MTPDecoder(Decoder):
             parallelism_context, input_dict, input_shardings
         )
 
+        loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
         main_tokens = input_dict.pop("input")
         main_labels = input_dict.pop("labels")
+        input_dict["aux_loss_denominators"] = global_routing_token_counts
         if self.mtp_layers is None:
-            return main_tokens, main_labels, input_dict
+            return main_tokens, main_labels, input_dict, loss_kwargs
 
         input_tokens = (
             main_tokens,
@@ -360,16 +362,17 @@ class MTPDecoder(Decoder):
         input_dict["mtp_input_valid_masks"] = tuple(
             input_dict.pop(f"mtp_input_valid_mask_{depth}") for depth in depths
         )
-        return input_tokens, loss_labels, input_dict
+        return input_tokens, loss_labels, input_dict, loss_kwargs
 
     def forward(
         self,
         tokens: torch.Tensor | tuple[torch.Tensor, ...],
         positions: torch.Tensor | None = None,
-        attention_masks: AttentionMasksType | None = None,
+        attention_metadata: AttentionMetadataMap | None = None,
         mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
     ):
         if self.mtp_layers is None:
             if not isinstance(tokens, torch.Tensor):
@@ -377,8 +380,9 @@ class MTPDecoder(Decoder):
             return super().forward(
                 tokens,
                 positions,
-                attention_masks,
+                attention_metadata,
                 padding_mask=padding_mask,
+                aux_loss_denominators=aux_loss_denominators,
             )
         if self.tok_embeddings is None:
             raise ValueError("MTP decoder forward requires token embeddings.")
@@ -397,27 +401,62 @@ class MTPDecoder(Decoder):
         # Keep this aligned with Decoder.forward(), but preserve the pre-norm
         # hidden state because MTP consumes the last decoder-layer output.
         h = self.tok_embeddings(main_tokens)
+        if (
+            aux_loss_denominators is not None
+            and aux_loss_denominators.numel() != len(self.mtp_layers) + 1
+        ):
+            raise ValueError("Expected one aux-loss denominator per MTP objective.")
+        with spmd.no_typecheck():
+            main_aux_loss_denominator = (
+                None if aux_loss_denominators is None else aux_loss_denominators[0]
+            )
         for layer in self.layers.values():
-            h = layer(h, attention_masks, positions, padding_mask=padding_mask)
+            layer_attention_metadata = (
+                None
+                if attention_metadata is None
+                else attention_metadata.get(type(layer.attention.inner_attention))
+            )
+            h = layer(
+                h,
+                layer_attention_metadata,
+                positions,
+                padding_mask=padding_mask,
+                aux_loss_denominator=main_aux_loss_denominator,
+            )
 
         prev_depth_hidden = h
-        h = self.norm(h) if self.norm is not None else h
+        h = self._pre_lm_head_norm_and_gather(h)
 
         mtp_outputs = []
-        for layer, depth_tokens, mtp_input_valid_mask in zip(
-            self.mtp_layers,
-            mtp_input_tokens,
-            mtp_input_valid_masks,
-            strict=True,
+        for depth, (layer, depth_tokens, mtp_input_valid_mask) in enumerate(
+            zip(
+                self.mtp_layers,
+                mtp_input_tokens,
+                mtp_input_valid_masks,
+                strict=True,
+            ),
+            1,
         ):
             mtp_input_embed = self.tok_embeddings(depth_tokens)
+            layer_attention_metadata = (
+                None
+                if attention_metadata is None
+                else attention_metadata.get(type(layer.attention.inner_attention))
+            )
+            with spmd.no_typecheck():
+                aux_loss_denominator = (
+                    None
+                    if aux_loss_denominators is None
+                    else aux_loss_denominators[depth]
+                )
             prev_depth_hidden = layer(
                 mtp_input_embed,
                 prev_depth_hidden,
                 mtp_input_valid_mask,
-                attention_masks,
+                layer_attention_metadata,
                 positions,
                 padding_mask=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
             )
             mtp_outputs.append(prev_depth_hidden)
 
@@ -445,7 +484,16 @@ def apply_fsdp_to_mtp_decoder(
     dp_mesh_dims: DataParallelMeshDims | None = None,
     edp_mesh_dims: DataParallelMeshDims | None = None,
     symm_mem_scope: FSDPSymmMemScope = None,
+    *,
+    unshard_in_current_stream: bool = False,
 ) -> None:
+    if unshard_in_current_stream and model.mtp_layers is not None:
+        # tok_embeddings runs once per MTP depth, which the explicit
+        # prefetching chain in apply_fsdp_to_decoder does not model.
+        raise ValueError(
+            "parallelism.fsdp_unshard_in_current_stream is not supported for models "
+            "with MTP layers."
+        )
     mtp_layer_keys = []
     try:
         if model.mtp_layers is not None:
@@ -468,47 +516,73 @@ def apply_fsdp_to_mtp_decoder(
             dp_mesh_dims=dp_mesh_dims,
             edp_mesh_dims=edp_mesh_dims,
             symm_mem_scope=symm_mem_scope,
+            unshard_in_current_stream=unshard_in_current_stream,
         )
     finally:
         for key in mtp_layer_keys:
             del model.layers[key]
 
 
-class MTPLoss(CrossEntropyLoss):
+class MTPCrossEntropyLoss(Loss[tuple[torch.Tensor, ...]]):
     """DeepSeek-V3 weighted multi-term cross-entropy objective."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(CrossEntropyLoss.Config):
+    class Config(Loss.Config):
         mtp_scale: float = 0.3
+        global_vocab_size: int | None = None
 
     def __init__(self, config: Config):
-        super().__init__(config)
+        self.cross_entropy_loss = CrossEntropyLoss(
+            CrossEntropyLoss.Config(global_vocab_size=config.global_vocab_size)
+        )
         self.mtp_scale = config.mtp_scale
 
     def __call__(
         self,
-        pred: torch.Tensor | tuple[torch.Tensor, ...],
-        labels: torch.Tensor | tuple[torch.Tensor, ...],
-        global_valid_tokens: torch.Tensor | None = None,
+        pred: tuple[torch.Tensor, ...],
+        labels: tuple[torch.Tensor, ...],
+        global_loss_token_counts: torch.Tensor | None = None,
         **loss_inputs: Any,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the weighted objective from aligned prediction/label pairs."""
         del loss_inputs
         if not isinstance(pred, tuple) or not isinstance(labels, tuple):
-            raise ValueError("MTPLoss expects prediction and labels tuples.")
+            raise ValueError(
+                "MTPCrossEntropyLoss expects prediction and labels tuples."
+            )
         if len(pred) != len(labels):
             raise ValueError(
-                "MTPLoss requires one labels tensor per prediction, "
+                "MTPCrossEntropyLoss requires one labels tensor per prediction, "
                 f"got {len(pred)} predictions and {len(labels)} labels."
             )
         num_mtp_layers = len(pred) - 1
         if num_mtp_layers <= 0:
             raise ValueError(
-                "MTPLoss expects a main prediction and at least one auxiliary "
+                "MTPCrossEntropyLoss expects a main prediction and at least one auxiliary "
                 "prediction."
             )
         mtp_weight = self.mtp_scale / num_mtp_layers
-        main_loss, _ = super().__call__(pred[0], labels[0])
+        if global_loss_token_counts is not None and global_loss_token_counts.ndim != 1:
+            raise ValueError(
+                "MTPCrossEntropyLoss requires a per-objective "
+                "global_loss_token_counts vector."
+            )
+        if (
+            global_loss_token_counts is not None
+            and global_loss_token_counts.numel() != len(pred)
+        ):
+            raise ValueError(
+                "MTPCrossEntropyLoss requires one denominator per prediction, "
+                f"got {global_loss_token_counts.numel()} for {len(pred)} predictions."
+            )
+        if global_loss_token_counts is None:
+            loss_token_counts: tuple[torch.Tensor | None, ...] = (None,) * len(pred)
+        else:
+            with spmd.no_typecheck():
+                loss_token_counts = tuple(
+                    count.clamp_min(1) for count in global_loss_token_counts.unbind()
+                )
+        main_loss, _ = self.cross_entropy_loss(pred[0], labels[0], loss_token_counts[0])
         mtp_loss = pred[0].new_zeros((), dtype=torch.float32)
         if spmd.is_type_checking():
             mtp_loss = spmd.mutate_type(
@@ -516,15 +590,14 @@ class MTPLoss(CrossEntropyLoss):
                 src=spmd.R,
                 dst={"dp": spmd.P, "cp": spmd.P, "tp": spmd.I},
             )
-        for mtp_pred, mtp_labels in zip(pred[1:], labels[1:], strict=True):
-            depth_loss, _ = super().__call__(mtp_pred, mtp_labels)
+        for depth, (mtp_pred, mtp_labels) in enumerate(
+            zip(pred[1:], labels[1:], strict=True), 1
+        ):
+            depth_loss, _ = self.cross_entropy_loss(
+                mtp_pred,
+                mtp_labels,
+                loss_token_counts[depth],
+            )
             mtp_loss = mtp_loss + depth_loss * mtp_weight
         loss = main_loss + mtp_loss
-        if global_valid_tokens is not None:
-            if current_spmd_mesh() is not None:
-                spmd.assert_type(
-                    global_valid_tokens,
-                    {"dp": spmd.R, "cp": spmd.R, "tp": spmd.I},
-                )
-            loss = loss / global_valid_tokens
         return loss, {}

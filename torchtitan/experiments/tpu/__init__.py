@@ -5,3 +5,4 @@ This package contains TPU-specific training infrastructure, model variants
 """
 
 from torchtitan.experiments.tpu import utils as _tpu_utils
+from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub as _attn_gym_stub  # pylint: disable=unused-import

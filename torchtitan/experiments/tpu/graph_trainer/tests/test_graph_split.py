@@ -921,6 +921,11 @@ class GraphSplitTest(absltest.TestCase):
         for node in graph.graph.nodes:
           if collectives_lib.is_reduce_scatter(node):
             cast = node.args[0]
+            while cast.target in (
+                torch.ops.aten.view.default,
+                torch.ops.aten.reshape.default,
+            ):
+              cast = cast.args[0]
             self.assertEqual(cast.meta["val"].dtype, torch.float32)
             self.assertEqual(
                 cast.all_input_nodes[0].meta["val"].dtype, torch.bfloat16

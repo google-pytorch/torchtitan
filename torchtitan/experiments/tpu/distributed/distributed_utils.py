@@ -39,10 +39,6 @@ def init_single_rank_process_group() -> None:
   """
   if dist.is_initialized():
     return
-  from torchtitan.distributed import utils as dist_utils  # pylint: disable=g-import-not-at-top
-
-  # Same process-wide setup as dist_utils.init_distributed.
-  dist_utils.enable_fp32_matmul_emulation_with_bf16x9()
   torch.autograd.set_multithreading_enabled(False)
   dist.init_process_group(
       backend="gloo", rank=0, world_size=1, store=dist.HashStore()

@@ -73,7 +73,7 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     stable_grouped_reduce,
 )
 from torchtitan.models.common.activation import Softmax
-from torchtitan.models.common.linear import RouterGateLinear
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.deepseek_v3.moe import DeepSeekV3Router
 
@@ -222,13 +222,17 @@ def _router(num_expert_groups: int | None) -> TokenChoiceTopKRouter:
     if num_expert_groups is None:
         return TokenChoiceTopKRouter.Config(
             num_experts=_EXPERTS,
-            gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
+            gate=Linear.Config(
+                in_features=_DIM, out_features=_EXPERTS, inplace_wgrad_accum=False
+            ),
             top_k=_TOP_K,
             score_func=Softmax.Config(),
         ).build()
     return DeepSeekV3Router.Config(
         num_experts=_EXPERTS,
-        gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
+        gate=Linear.Config(
+            in_features=_DIM, out_features=_EXPERTS, inplace_wgrad_accum=False
+        ),
         num_expert_groups=num_expert_groups,
         num_limited_groups=1,
         top_k=_TOP_K,
@@ -242,6 +246,7 @@ class _MoE(nn.Module):
     def __init__(self, dim: int, num_expert_groups: int | None) -> None:
         super().__init__()
         self.router = _router(num_expert_groups)
+        self.router.gate.to(torch.bfloat16)
         self.expert = nn.Parameter(torch.randn(dim, dim) * 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -758,10 +763,10 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         # gradients. Unless they are saved, it re-runs every top-k behind
         # them: three per router with group-limited routing, three layers.
         for save_regions, last_n_layers, recomputed_topks in (
-            (("attention.inner_attention",), {}, 9),
+            (("attention.inner_attention",), {}, 3),
             (_ROUTING_SPLASH, {}, 0),
             # Routing saved in the last layer only: layers 0 and 1 re-run theirs.
-            (("attention.inner_attention",), {"moe.routing": 1}, 6),
+            (("attention.inner_attention",), {"moe.routing": 1}, 2),
         ):
             with self.subTest(save_regions=save_regions, last_n_layers=last_n_layers):
                 torch.manual_seed(0)

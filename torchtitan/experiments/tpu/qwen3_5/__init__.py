@@ -42,9 +42,11 @@ from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
 )
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35TransformerBlock
+from torchtitan.models.common.attention.gdn import GDN as GatedDeltaNet
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model
 from torchtitan.models.qwen3_5.flavors import MODEL_FLAVORS as qwen3_5_configs
+from torchtitan.models.qwen3_5.model import Qwen35Attention
 from torchtitan.config.transform import ModelConfigConverter
 
 __all__ = [
@@ -68,32 +70,36 @@ def use_tpu_modules(config: Qwen35Model.Config) -> Qwen35Model.Config:
     A ``Qwen35Model.Config`` without a vision encoder.
   """
   for i, layer in enumerate(config.layers):
-    if layer.attention is not None:
+    if isinstance(layer.attention, GatedDeltaNet.Config):
+      layer.attention = derive(
+          layer.attention,
+          TpuGatedDeltaNet.Config,
+          inner_attention=derive(
+              layer.attention.inner_attention,
+              TpuInnerGatedDeltaNet.Config,
+              kernel=TpuGatedDeltaKernel.Config(),
+          ),
+          norm=derive(layer.attention.norm, TpuRMSNormGated.Config),
+      )
+      # TPU: SimpleFSDP-safe init; reset_parameters() inits a gathered copy.
+      for conv in (
+          layer.attention.conv_q,
+          layer.attention.conv_k,
+          layer.attention.conv_v,
+      ):
+        conv.param_init = _CONV1D_INIT
+    elif isinstance(layer.attention, Qwen35Attention.Config):
       layer.attention = derive(
           layer.attention,
           TpuQwen35Attention.Config,
           inner_attention=SlidingWindowScaledDotProductInnerAttention.Config(),
       )
-    if layer.delta_net is not None:
-      layer.delta_net = derive(
-          layer.delta_net,
-          TpuGatedDeltaNet.Config,
-          inner_gated_delta_net=TpuInnerGatedDeltaNet.Config(
-              kernel=TpuGatedDeltaKernel.Config()
-          ),
-          norm=derive(layer.delta_net.norm, TpuRMSNormGated.Config),
-      )
-      # TPU: SimpleFSDP-safe init; reset_parameters() inits a gathered copy.
-      for conv in (
-          layer.delta_net.conv_q,
-          layer.delta_net.conv_k,
-          layer.delta_net.conv_v,
-      ):
-        conv.param_init = _CONV1D_INIT
-    if layer.moe is not None:
-      layer.moe.load_balance_coeff = None
+    if hasattr(layer.feed_forward, "load_balance_coeff"):
+      layer.feed_forward.load_balance_coeff = None
     config.layers[i] = derive(layer, TpuQwen35TransformerBlock.Config)
-  return dataclasses.replace(config, vision_encoder=None)
+  if hasattr(config, "vision_encoder"):
+    return dataclasses.replace(config, vision_encoder=None)
+  return config
 
 
 def model_registry(
@@ -102,6 +108,7 @@ def model_registry(
     seq_len: int | None = None,
     attn_backend: str = "sdpa",
     converters: list[ModelConfigConverter.Config] | None = None,
+    parallelism=None,
 ) -> Qwen35Model.Config:
   """Returns a TPU ``Qwen35Model.Config`` for a text-only Qwen3.5 flavor."""
   if attn_backend != "sdpa":
@@ -109,11 +116,15 @@ def model_registry(
         "Qwen3.5 on TPU supports only attn_backend='sdpa', got "
         f"{attn_backend!r}"
     )
+  if parallelism is None:
+    from torchtitan.config.parallelism import ParallelismConfig
+    parallelism = ParallelismConfig()
   config = upstream_qwen3_5.build_model_config(
       flavor,
       seq_len=seq_len,
-      attn_backend="sdpa",
+      attn_backend="flex",
       converters=converters,
+      parallelism=parallelism,
   )
   return use_tpu_modules(config)
 

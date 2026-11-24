@@ -10,8 +10,10 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 import torch.nn as nn
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
+from torchtitan.config import PrecisionConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
@@ -42,16 +44,8 @@ def _get_model_config(model_name: str = "testmodel") -> Llama3Model.Config:
   vocab_size=128, max_seq_len=512).
   """
   import copy
-  from torchtitan.models.llama3.sharding import set_llama3_sharding_config
 
-  # Under spmd_types, ``Module.parallelize`` shards from the config's sharding
-  # spec, which the registry entries do not carry; deepcopy so the shared
-  # registry config is not mutated. Sequence parallel is off because the test
-  # feeds an unsharded input tensor and compares against the CPU reference;
-  # with SP the model expects the sequence axis pre-sharded, which only the
-  # trainer's input pipeline does.
   config = copy.deepcopy(llama3_tpu.llama3_configs[model_name])
-  set_llama3_sharding_config(config, enable_sp=False)
   return config
 
 
@@ -75,12 +69,12 @@ def _verify_dtensor_llama3_tp_forward_worker(
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
-        compile_config=TpuTrainerCompileConfig(enable=False),
-        dump_folder="",
-        parallel_dims=parallel_dims,
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(),
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
-        training=TrainingConfig(),
+        local_compile=LocalCompileConfig(),
+        activation_remat=DefaultActivationRematConfig(),
+        dump_folder="",
     )
     # pytype: enable=wrong-arg-types
 
@@ -125,12 +119,12 @@ def _verify_dtensor_llama3_tp_backward_worker(
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
-        compile_config=TpuTrainerCompileConfig(enable=False),
-        dump_folder="",
-        parallel_dims=parallel_dims,
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(),
         parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
-        training=TrainingConfig(),
+        local_compile=LocalCompileConfig(),
+        activation_remat=DefaultActivationRematConfig(),
+        dump_folder="",
     )
     # pytype: enable=wrong-arg-types
 
@@ -173,17 +167,18 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
       pp=1,
       ep=1,
       world_size=world_size,
+      enable_sequence_parallel=False,
   )
 
   def apply_fsdp_wrapper(model):
     # pytype: disable=wrong-arg-types
     model.parallelize(
-        ac_config=SelectiveAC.Config(),
-        compile_config=TpuTrainerCompileConfig(enable=False),
-        dump_folder="",
-        parallel_dims=parallel_dims,
+        parallelism_context=parallel_dims,
+        precision=PrecisionConfig(),
         parallelism=ParallelismConfig(data_parallel_shard_degree=world_size),
-        training=TrainingConfig(),
+        local_compile=LocalCompileConfig(),
+        activation_remat=DefaultActivationRematConfig(),
+        dump_folder="",
     )
     # pytype: enable=wrong-arg-types
 

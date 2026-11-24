@@ -13,18 +13,18 @@ product, and how EP reuses ranks from the dense mesh.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import os
+import socket
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
-import inspect
 from typing import TYPE_CHECKING
 
-import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.device_mesh import init_device_mesh as torch_init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from torchtitan.tools.utils import device_type
 
@@ -33,50 +33,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-def init_device_mesh(
-    device_type: str,
-    mesh_shape: tuple[int, ...],
-    mesh_dim_names: tuple[str, ...] | None = None,
-    enable_tpu_topo_mesh: bool = False,
-) -> DeviceMesh:
-    if (
-        enable_tpu_topo_mesh
-        and device_type == "tpu"
-        and hasattr(torch, "tpu")
-        and hasattr(torch.tpu, "topology_aware_mesh")
-    ):
-        if "preserve_rank_order" not in inspect.signature(DeviceMesh.__init__).parameters:
-            raise ValueError(
-                "enable_tpu_topo_mesh needs DeviceMesh(preserve_rank_order=...), "
-                f"which torch {torch.__version__} lacks (torch>=2.15 has it). "
-                "Upgrade torch, or pass --parallelism.no-enable_tpu_topo_mesh."
-            )
-        rank_mesh = torch.tpu.topology_aware_mesh(mesh_shape)
-        # ``preserve_rank_order=True`` makes DeviceMesh honour the
-        # topology-aware ordering everywhere: it stops the default process
-        # group from being reused for a permuted world-size mesh dim, and it
-        # passes ``sort_ranks=False`` when creating the per-dimension groups --
-        # including the sub-meshes produced by ``_unflatten``. Without it the
-        # sub-group ranks are sorted ascending, which scrambles the physical
-        # device order and makes XLA fall back from the fast N-D SparseCore
-        # collective strategy to a slow 1-D ring.
-        return DeviceMesh(
-            device_type,
-            rank_mesh,
-            mesh_dim_names=mesh_dim_names,
-            preserve_rank_order=True,
-        )
-
-    return torch_init_device_mesh(
-        device_type, mesh_shape, mesh_dim_names=mesh_dim_names
-    )
-
 
 __all__ = [
     "MeshAxisName",
     "DistributedTopology",
     "ParallelismContext",
-    "ParallelDims",
     "unfold_dp_axis",
     "unfold_dp_axes",
 ]
@@ -146,8 +107,7 @@ class ParallelismContext:
     pp: int
     ep: int
     world_size: int
-    enable_sequence_parallel: bool = True
-    enable_tpu_topo_mesh: bool = False
+    enable_sequence_parallel: bool
     _real_pp_group_for_fake_spmd: dist.ProcessGroup | None = None
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
     # same object instead of re-slicing a submesh on every lookup.
@@ -166,12 +126,12 @@ class ParallelismContext:
     def from_config(
         cls,
         parallelism_config: ParallelismConfig,
-        topology: DistributedTopology | int,
+        topology: DistributedTopology,
+        *,
+        dump_folder: str,
     ) -> ParallelismContext:
         """Construct the parallelism context from config and topology."""
-        if isinstance(topology, int):
-            topology = DistributedTopology(world_size=topology)
-        return cls(
+        parallelism_context = cls(
             dp_replicate=parallelism_config.data_parallel_replicate_degree,
             dp_shard=parallelism_config.data_parallel_shard_degree,
             cp=parallelism_config.context_parallel_degree,
@@ -180,9 +140,47 @@ class ParallelismContext:
             ep=parallelism_config.expert_parallel_degree,
             world_size=topology.world_size,
             enable_sequence_parallel=parallelism_config.enable_sequence_parallel,
-            enable_tpu_topo_mesh=parallelism_config.enable_tpu_topo_mesh,
             _real_pp_group_for_fake_spmd=topology.real_pp_group_for_fake_spmd,
         )
+        if parallelism_config.save_parallelism_folder is not None:
+            parallelism_context.build_mesh()
+            parallelism_context._save_layout(
+                os.path.join(dump_folder, parallelism_config.save_parallelism_folder)
+            )
+        return parallelism_context
+
+    def _save_layout(self, folder: str) -> None:
+        """Write this rank's view of the layout to ``folder/rank_<r>.json``.
+
+        Every rank writes the same fields: where it runs (host, local rank,
+        global rank), the degrees, and its local view of every global mesh.
+        A sliced mesh (e.g. ``loss``) only holds the submesh containing this
+        rank, so the files together give every submesh. No communication. See
+        ``torchtitan/distributed/PARALLELISM_CONTEXT.md`` for the format.
+        """
+        rank = dist.get_rank()
+        layout = {
+            "host": socket.gethostname(),
+            "local_rank": int(os.environ["LOCAL_RANK"]),
+            "global_rank": rank,
+            "world_size": self.world_size,
+            "degrees": {
+                "pp": self.pp,
+                "dp_replicate": self.dp_replicate,
+                "dp_shard": self.dp_shard,
+                "cp": self.cp,
+                "tp": self.tp,
+                "ep": self.ep,
+            },
+            "meshes": {
+                name: {"axis_names": mesh.mesh_dim_names, "mesh": mesh.mesh.tolist()}
+                for name, mesh in self._global_meshes.items()
+            },
+        }
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, f"rank_{rank}.json"), "w") as f:
+            json.dump(layout, f)
+        logger.info(f"Saved parallelism layout to {folder}")
 
     def __post_init__(self):
         self._validate()
@@ -196,17 +194,33 @@ class ParallelismContext:
             self.pp,
             self.ep,
         )
-        for d in (dp_replicate, cp, tp, pp, ep):
-            assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
-        assert dp_shard == -1 or dp_shard >= 1, "dp_shard must -1 or >=1."
+        for name, degree in (
+            ("dp_replicate", dp_replicate),
+            ("cp", cp),
+            ("tp", tp),
+            ("pp", pp),
+            ("ep", ep),
+        ):
+            if degree < 1:
+                raise ValueError(
+                    "Parallelism degree should be >= 1, except for dp_shard. "
+                    f"Got {name}={degree}."
+                )
+        if dp_shard != -1 and dp_shard < 1:
+            raise ValueError(f"dp_shard must be -1 or >= 1. Got {dp_shard}.")
         if dp_shard < 0:
             self.dp_shard = dp_shard = self.world_size // (dp_replicate * cp * tp * pp)
-        assert dp_shard >= 1
+        if dp_shard < 1:
+            raise ValueError(
+                "dp_shard must be >= 1 after resolving dp_shard=-1 from "
+                f"world_size ({self.world_size}). Got dp_shard={dp_shard}."
+            )
 
-        assert dp_replicate * dp_shard * cp * tp * pp == self.world_size, (
-            f"Invalid parallelism: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
-            f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
-        )
+        if dp_replicate * dp_shard * cp * tp * pp != self.world_size:
+            raise ValueError(
+                f"Invalid parallelism: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
+                f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+            )
 
         sparse_region = dp_shard * cp * tp
         if sparse_region % ep != 0:
@@ -269,12 +283,12 @@ class ParallelismContext:
         ):
             """Unflatten the world mesh to create the required mesh axes.
 
-            Uses the fake backend for inactive axes to avoid unnecessary
-            process-group creation.
+            Uses the fake backend for inactive axes and size-1 axes, to avoid
+            unnecessary process-group creation.
             """
             backend_override = {}
             for axis, degree in zip(axis_names, axis_degrees, strict=True):
-                if not self._axis_is_active(axis, degree):
+                if degree == 1 or not self._axis_is_active(axis, degree):
                     backend_override[axis] = "fake"
 
             return world_mesh._unflatten(
@@ -294,10 +308,7 @@ class ParallelismContext:
         edp_shard = self.dp_shard * self.cp * self.tp // self.ep
 
         self._world_mesh = init_device_mesh(
-            device_type,
-            (self.world_size,),
-            mesh_dim_names=("world",),
-            enable_tpu_topo_mesh=self.enable_tpu_topo_mesh,
+            device_type, (self.world_size,), mesh_dim_names=("world",)
         )
         # Two mesh views over the same devices:
         #
@@ -562,18 +573,17 @@ class ParallelismContext:
         access their process groups.
 
         Note:
-            Axes that ``build_mesh`` created with the Fake backend are excluded,
-            because their process groups cannot carry collectives. For example,
-            ``edp_shard`` when EP is disabled: its size is ``dp_shard * cp * tp``,
-            but ``_axis_is_active`` marks it inactive so it is unflattened with a
-            fake backend.
+            Axes that are inactive or have one rank are excluded; ``build_mesh``
+            gives them the Fake backend. For example, ``edp_shard`` when EP is
+            disabled: its size is ``dp_shard * cp * tp``, but ``_axis_is_active``
+            marks it inactive.
 
         Returns:
             dict[str, DeviceMesh]: A dictionary mapping mesh axis names to their
                 corresponding DeviceMesh objects. Only includes meshes where:
                 - ndim == 1 (one-dimensional)
                 - parallelism is enabled (size > 1)
-                - the axis exists, i.e. it is not backed by the Fake backend
+                - the axis has a real process group (not the Fake backend)
 
         Example:
             >>> parallelism_context = ParallelismContext(
@@ -652,6 +662,3 @@ class ParallelismContext:
         # when load balancing is enabled (by default).
         # https://github.com/pytorch/pytorch/blob/4f62dcc/torch/distributed/tensor/experimental/_attention.py#L1246
         return self.tp * (self.cp * 2)
-
-
-ParallelDims = ParallelismContext

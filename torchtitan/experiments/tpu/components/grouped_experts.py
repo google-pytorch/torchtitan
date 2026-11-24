@@ -1,22 +1,25 @@
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import spmd_types as spmd
+import torch.nn as nn
 import torch.nn.functional as F
 
 from torchtitan.config import derive
-from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_size
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
 )
-from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.module import Module
+from torchtitan.models.common.activation import BinaryActivationFn, SwiGLU
+from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.base.module import Module
 from torchtitan.config.transform import ModelConfigConverter
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.base.sharding import ShardingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,142 @@ def _native_weight_sharding(config: ShardingConfig) -> ShardingConfig:
             state_shardings.pop(canonical_name)
         )
     return replace(config, state_shardings=state_shardings)
+
+
+class GroupedExperts(Module):
+    """Unfused grouped experts (w1_EFD, w2_EDF, w3_EFD) retained for TPU."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        hidden_dim: int
+        num_experts: int
+        activation_fn: BinaryActivationFn.Config = field(
+            default_factory=SwiGLU.Config
+        )
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.w1_EFD = nn.Parameter(
+            torch.empty(config.num_experts, config.hidden_dim, config.dim)
+        )
+        self.w2_EDF = nn.Parameter(
+            torch.empty(config.num_experts, config.dim, config.hidden_dim)
+        )
+        self.w3_EFD = nn.Parameter(
+            torch.empty(config.num_experts, config.hidden_dim, config.dim)
+        )
+        self.activation_fn = config.activation_fn.build()
+
+    def forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """Raw expert computation without dispatch/combine."""
+        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
+            for axis in ("dp", "cp"):
+                spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
+
+        gate_RF = self._grouped_mm(
+            A=x_RD.bfloat16(), weight_EOI=self.w1_EFD, offs=offsets_E
+        )
+        up_RF = self._grouped_mm(
+            A=x_RD.bfloat16(), weight_EOI=self.w3_EFD, offs=offsets_E
+        )
+        h_RF = self.activation_fn(torch.stack([gate_RF, up_RF], dim=-2))
+        return self._grouped_mm(
+            A=h_RF, weight_EOI=self.w2_EDF, offs=offsets_E
+        ).type_as(x_RD)
+
+    def _grouped_mm(
+        self, *, A: torch.Tensor, weight_EOI: torch.Tensor, offs: torch.Tensor
+    ) -> torch.Tensor:
+        return torch._grouped_mm(
+            A, weight_EOI.bfloat16().transpose(-2, -1), offs=offs
+        )
+
+
+class TpuRoutedExperts(RoutedExperts):
+    """``RoutedExperts`` subclass that delegates expert compute to ``inner_experts``."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RoutedExperts.Config):
+        w13: GroupedLinear.Config | None = None  # type: ignore[assignment]
+        w2: GroupedLinear.Config | None = None  # type: ignore[assignment]
+        inner_experts: GroupedExperts.Config | None = None
+
+        @property
+        def num_experts(self) -> int:
+            if self.inner_experts is not None:
+                return self.inner_experts.num_experts
+            assert self.w13 is not None
+            return self.w13.group_size
+
+        def __post_init__(self) -> None:
+            if self.inner_experts is not None:
+                if self.token_dispatcher.num_experts != self.inner_experts.num_experts:
+                    raise ValueError(
+                        "token dispatcher and inner_experts must contain the same "
+                        "number of experts"
+                    )
+                return
+            super().__post_init__()
+
+    def __init__(self, config: Config):
+        if config.inner_experts is not None:
+            Module.__init__(self)
+            self.w13 = None  # type: ignore[assignment]
+            self.w2 = None  # type: ignore[assignment]
+            self.inner_experts = config.inner_experts.build()
+            self.activation_fn = config.activation_fn.build()
+            self.output_postprocess = (
+                config.output_postprocess.build()
+                if config.output_postprocess is not None
+                else None
+            )
+            self.token_dispatcher = config.token_dispatcher.build()
+        else:
+            super().__init__(config)
+            self.inner_experts = None
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        routing_map_TE: torch.Tensor,
+        *,
+        padding_mask_T: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.inner_experts is None:
+            return super().forward(
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+                routing_map_TE,
+                padding_mask_T=padding_mask_T,
+            )
+        del padding_mask_T
+        (
+            routed_input_RD,
+            num_global_tokens_per_local_expert_e,
+            metadata,
+        ) = self.token_dispatcher.dispatch(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            routing_map_TE,
+        )
+        with maybe_set_sparse_mesh():
+            routed_output_RD = self.inner_experts(
+                routed_input_RD, num_global_tokens_per_local_expert_e
+            )
+            if self.output_postprocess is not None:
+                routed_output_RD = self.output_postprocess(routed_output_RD)
+        return self.token_dispatcher.combine(routed_output_RD, metadata, x_TD)
 
 
 class TpuGroupedExperts(GroupedExperts):
@@ -409,8 +548,10 @@ class TpuGroupedExpertsConverter(ModelConfigConverter):
                 setattr(parent, field_name, replacement)
             count += 1
 
-        for _, routed_cfg, _, _ in list(model_config.traverse(RoutedExperts.Config)):
-            if routed_cfg.inner_experts is not None or routed_cfg.w13 is None:
+        for _, routed_cfg, parent, field_name in list(
+            model_config.traverse(RoutedExperts.Config)
+        ):
+            if getattr(routed_cfg, "inner_experts", None) is not None or routed_cfg.w13 is None:
                 continue
             w13 = routed_cfg.w13
             w2 = routed_cfg.w2
@@ -435,20 +576,37 @@ class TpuGroupedExpertsConverter(ModelConfigConverter):
                             param_init["w3_EFD"] = val["w3_EFD"]
             if w2.param_init and "weight" in w2.param_init:
                 param_init["w2_EDF"] = w2.param_init["weight"]
-            routed_cfg.inner_experts = TpuGroupedExperts.Config(
-                dim=w13.in_features,
-                hidden_dim=w13.out_features,
-                num_experts=w13.group_size,
+            tpu_routed_cfg = TpuRoutedExperts.Config(
+                token_dispatcher=routed_cfg.token_dispatcher,
                 activation_fn=routed_cfg.activation_fn,
-                param_init=param_init or None,
-                sharding_config=w13.sharding_config,
+                output_postprocess=routed_cfg.output_postprocess,
+                inner_experts=TpuGroupedExperts.Config(
+                    dim=w13.in_features,
+                    hidden_dim=w13.out_features,
+                    num_experts=w13.group_size,
+                    activation_fn=routed_cfg.activation_fn,
+                    param_init=param_init or None,
+                    sharding_config=w13.sharding_config,
+                ),
+                sharding_config=routed_cfg.sharding_config,
             )
-            routed_cfg.w13 = None
-            routed_cfg.w2 = None
+            if parent is None:
+                model_config = tpu_routed_cfg
+            elif isinstance(parent, list):
+                assert isinstance(field_name, int)
+                parent[field_name] = tpu_routed_cfg
+            else:
+                assert isinstance(field_name, str)
+                setattr(parent, field_name, tpu_routed_cfg)
             count += 1
 
         logger.info("Replaced %d GroupedExperts configuration(s) for TPU", count)
         return model_config
 
 
-__all__ = ["TpuGroupedExperts", "TpuGroupedExpertsConverter"]
+__all__ = [
+    "GroupedExperts",
+    "TpuGroupedExperts",
+    "TpuGroupedExpertsConverter",
+    "TpuRoutedExperts",
+]

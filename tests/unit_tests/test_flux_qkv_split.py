@@ -10,7 +10,7 @@ from einops import rearrange
 import torch
 from torch import nn, Tensor
 from torchtitan.models.flux.flavors import _make_single_block_config
-from torchtitan.models.flux.model.layers import (
+from torchtitan.models.flux.layers import (
     apply_rope,
     EmbedND,
     SingleStreamBlock,

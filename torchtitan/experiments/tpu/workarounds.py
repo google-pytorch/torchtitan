@@ -71,6 +71,13 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     k = k.transpose(1, 2).contiguous()
     v = v.transpose(1, 2).contiguous()
 
+    attention_metadata = extra_args.pop("attention_metadata", None)
+    if attention_metadata is not None:
+      if extra_args.get("segment_ids") is None:
+        extra_args["segment_ids"] = getattr(attention_metadata, "segment_ids", None)
+      if extra_args.get("positions") is None:
+        extra_args["positions"] = getattr(attention_metadata, "positions", None)
+
     local_window_size = getattr(self, "sliding_window_size", None)
 
 
@@ -120,6 +127,13 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     # Per-layer mask selection: `sliding_window_size` is None for global and
     # an int for local layers. Models without local layers don't set the
     # attribute at all; default to None (full causal).
+    attention_metadata = kwargs.pop("attention_metadata", None)
+    if attention_metadata is not None:
+      if kwargs.get("segment_ids") is None:
+        kwargs["segment_ids"] = getattr(attention_metadata, "segment_ids", None)
+      if kwargs.get("positions") is None:
+        kwargs["positions"] = getattr(attention_metadata, "positions", None)
+
     local_window_size = getattr(self, "sliding_window_size", None)
 
     # splash_sdpa expects enable_gqa=False as heads are already tiled.
@@ -169,7 +183,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
             _causal += 1
         else:
           replacements.append((parent_module, child_name, child_module))
-      elif "FlexAttention" in cls_name:
+      elif "FlexAttention" in cls_name or "FlexInnerAttention" in cls_name:
         replacements.append((parent_module, child_name, child_module))
 
   # Apply replacements
@@ -236,7 +250,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
   """Patches zero-overhead Tokamax layout-fused splash attention into the model."""
   from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import splash_sdpa as tokamax_splash_sdpa  # pylint: disable=g-import-not-at-top
-  from torchtitan.models.common.attention import segment_ids_from_positions  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.components.attention import segment_ids_from_positions  # pylint: disable=g-import-not-at-top
   import types
 
   # Update core JAX trace compilation configs internally from config registry
@@ -346,6 +360,13 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
           " attention_masks."
       )
 
+    attention_metadata = extra_args.pop("attention_metadata", None)
+    if attention_metadata is not None:
+      if extra_args.get("segment_ids") is None:
+        extra_args["segment_ids"] = getattr(attention_metadata, "segment_ids", None)
+      if extra_args.get("positions") is None:
+        extra_args["positions"] = getattr(attention_metadata, "positions", None)
+
     local_window_size = getattr(self, "sliding_window_size", None)
 
     # Same fallback as SplashAttention.forward: Decoder normally computes
@@ -388,6 +409,13 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     # K/V stay at num_kv_heads: the kernel groups q head h onto kv head
     # h // (num_heads // num_kv_heads), the same mapping as GQA tiling,
     # without materializing num_heads copies of K/V.
+    attention_metadata = kwargs.pop("attention_metadata", None)
+    if attention_metadata is not None:
+      if kwargs.get("segment_ids") is None:
+        kwargs["segment_ids"] = getattr(attention_metadata, "segment_ids", None)
+      if kwargs.get("positions") is None:
+        kwargs["positions"] = getattr(attention_metadata, "positions", None)
+
     local_window_size = getattr(self, "sliding_window_size", None)
 
     query = query.contiguous()

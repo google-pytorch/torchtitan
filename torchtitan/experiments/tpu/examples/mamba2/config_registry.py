@@ -1,3 +1,4 @@
+from torchtitan.experiments.tpu.components.optim import default_adamw
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -18,7 +19,8 @@ from torchtitan.observability import metrics
 from torchtitan.components import optim as optimizer
 from torchtitan.components.optim import lr_scheduler
 from torchtitan.config import configs
-from torchtitan.distributed import activation_checkpoint
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import activation_remat
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.components.optim import Optim
@@ -141,7 +143,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("debugmodel"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=2,
               decay_ratio=0.8,
@@ -151,12 +153,11 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 512,
-          max_context_length=512,
           steps=10,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_remat=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -168,7 +169,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("130M"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=8e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=1000,
               decay_ratio=0.8,
@@ -178,12 +179,11 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=16 * 2048,
-          max_context_length=2048,
           steps=10000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_remat=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -195,7 +195,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("370M"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=6e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=6e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=1000,
               decay_ratio=0.8,
@@ -205,12 +205,11 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 2048,
-          max_context_length=2048,
           steps=10000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_remat=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -222,7 +221,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("780M"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=5e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=5e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=1000,
               decay_ratio=0.8,
@@ -232,12 +231,11 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=4 * 2048,
-          max_context_length=2048,
           steps=10000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_remat=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -249,7 +247,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("1.3B"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=4e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=4e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=1000,
               decay_ratio=0.8,
@@ -259,12 +257,11 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=2 * 2048,
-          max_context_length=2048,
           steps=10000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_remat=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -276,7 +273,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("2.7B"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=3e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=1000,
               decay_ratio=0.8,
@@ -286,12 +283,11 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=2 * 2048,
-          max_context_length=2048,
           steps=10000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.SelectiveAC.Config(),
+      activation_remat=activation_remat.DefaultActivationRematConfig(),
   )
 
 
@@ -303,7 +299,7 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       model=model_registry("2.7B"),
       dataloader=c4_test_dataloader(),
       optim=Optim.Config(
-          optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
+          optimizer=default_adamw(lr=3e-4, implementation="foreach"),
           lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
               warmup_steps=100,
               decay_ratio=0.8,
@@ -313,10 +309,9 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       ),
       training=configs.TrainingConfig(
           num_tokens_per_microbatch_per_dp_rank=8 * 262144,
-          max_context_length=262144,
           steps=1000,
       ),
-      parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
+      parallelism=ParallelismConfig(expert_parallel_degree=1),
       checkpointer=None,
-      activation_checkpoint=activation_checkpoint.FullAC.Config(),
+      activation_remat=activation_remat.FullActivationRematConfig(),
   )

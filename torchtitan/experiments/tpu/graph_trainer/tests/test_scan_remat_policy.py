@@ -25,7 +25,25 @@ from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     count_collectives,
     scan_body_remat_window,
 )
-from torchtitan.models.common.moe import _batch_wise_load_balance_loss
+def _batch_wise_load_balance_loss(
+    scores_BLE: torch.Tensor,
+    routing_map_BLE: torch.Tensor,
+    top_k: int,
+    aux_loss_coeff: float,
+    *,
+    dp_mesh=None,
+    cp_mesh=None,
+) -> torch.Tensor:
+    counts = routing_map_BLE.sum(dim=(0, 1)).float()
+    if dp_mesh is not None:
+        dist.all_reduce(counts, group=dp_mesh.get_group())
+    if cp_mesh is not None:
+        dist.all_reduce(counts, group=cp_mesh.get_group())
+    probs = scores_BLE / scores_BLE.sum(dim=-1, keepdim=True)
+    mean_probs = probs.mean(dim=(0, 1))
+    num_experts = scores_BLE.shape[-1]
+    freq = counts / (counts.sum() / top_k + 1e-6)
+    return aux_loss_coeff * num_experts * (freq * mean_probs).sum()
 
 SEED = 1234
 N_LAYERS = 3

@@ -10,12 +10,13 @@ from torchtitan.distributed import parallelism_context as _parallelism_context
 from torchtitan.distributed.parallelism_context import (
     DistributedTopology,
     MeshAxisName,
-    ParallelDims,
     ParallelismContext,
     init_device_mesh,
     unfold_dp_axes,
     unfold_dp_axis,
 )
+
+ParallelDims = ParallelismContext
 
 __all__ = [
     "DistributedTopology",
@@ -26,5 +27,3 @@ __all__ = [
     "unfold_dp_axes",
     "unfold_dp_axis",
 ]
-
-sys.modules[__name__] = _parallelism_context

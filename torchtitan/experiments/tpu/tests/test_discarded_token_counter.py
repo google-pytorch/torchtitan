@@ -1,3 +1,4 @@
+from torchtitan.experiments.tpu.components.grouped_experts import GroupedExperts, TpuRoutedExperts
 """Tests for the discarded MoE token-counter override."""
 
 from absl.testing import absltest
@@ -9,16 +10,19 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
     tpu_discarded_token_counter,
 )
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    GroupedExperts,
+    TpuRoutedExperts,
+)
 from torchtitan.models.common.activation import Softmax
-from torchtitan.models.common.config_utils import make_aux_loss_config, make_moe_config
+from torchtitan.models.common.config_utils import make_moe_config
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
-    GroupedExperts,
+    MicrobatchWiseLoadBalanceLoss,
     MoE,
-    RoutedExperts,
     TokenChoiceTopKRouter,
 )
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
+from torchtitan.models.common.moe.token_dispatcher import LocalTokenDispatcher
 
 
 _NUM_EXPERTS, _TOP_K, _DIM = 4, 2, 8
@@ -34,6 +38,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
   aux = load_balance_coeff is None
   config = make_moe_config(
       num_experts=_NUM_EXPERTS,
+      enable_sp=False,
       load_balance_coeff=load_balance_coeff,
       router=TokenChoiceTopKRouter.Config(
           num_experts=_NUM_EXPERTS,
@@ -43,7 +48,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
               in_features=_DIM, out_features=_NUM_EXPERTS, bias=False
           ),
       ),
-      routed_experts=RoutedExperts.Config(
+      routed_experts=TpuRoutedExperts.Config(
           inner_experts=GroupedExperts.Config(
               dim=_DIM,
               hidden_dim=_DIM,
@@ -59,11 +64,7 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
     # `aux_loss_coeff` only builds the microbatch-wise loss. The sequence-wise
     # variant this test exercises is a fork addition set as
     # `TokenChoiceTopKRouter.Config.aux_loss`.
-    config.router.aux_loss = make_aux_loss_config(
-        type="sequence_wise", coeff=1e-3, top_k=_TOP_K
-    )
-    config.router.aux_loss.global_batch_size = _BATCH
-    config.router.aux_loss.seq_len = _SEQ
+    config.router.aux_loss = MicrobatchWiseLoadBalanceLoss.Config(coeff=1e-3)
   return config
 
 
@@ -77,7 +78,10 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     for p in moe.parameters():
       nn.init.normal_(p, std=0.02)
 
-    moe(torch.randn(_TOKENS, _DIM))
+    moe(
+        torch.randn(_TOKENS, _DIM),
+        aux_loss_denominator=torch.tensor(_TOKENS, dtype=torch.float32),
+    )
 
     expected = _TOKENS * _TOP_K if coeff is not None else 0
     self.assertEqual(moe.router.tokens_per_expert_E.sum().item(), expected)
@@ -91,7 +95,13 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     overridden.load_state_dict(base.state_dict())
 
     x = torch.randn(_TOKENS, _DIM)
-    torch.testing.assert_close(overridden(x), base(x), rtol=0, atol=0)
+    denom = torch.tensor(_TOKENS, dtype=torch.float32)
+    torch.testing.assert_close(
+        overridden(x, aux_loss_denominator=denom),
+        base(x, aux_loss_denominator=denom),
+        rtol=0,
+        atol=0,
+    )
 
 
 if __name__ == "__main__":

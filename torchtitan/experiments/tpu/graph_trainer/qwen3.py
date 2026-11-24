@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch.nn as nn
 
 from torchtitan.config import TrainingConfig
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3 import (
     build_model_config as graph_trainer_model_registry,
 )
@@ -24,7 +24,7 @@ from torchtitan.experiments.tpu.profiling.mfu_flops import (
 from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.base.model import BaseModel
 
 
 graph_trainer_parallelize_qwen3 = GraphTrainerQwen3Model.parallelize
@@ -66,6 +66,12 @@ class MaxTextTpuGraphTrainerQwen3Model(TpuGraphTrainerQwen3Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TpuGraphTrainerQwen3Model.Config):
+        def build_flops_estimator(self, model: nn.Module, *, seq_len: int):
+            _, flops_per_token = get_maxtext_decoder_nparams_and_flops(
+                self, model, seq_len
+            )
+            return lambda _inputs: flops_per_token
+
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
@@ -117,11 +123,15 @@ def model_registry(
     *,
     seq_len: int | None = None,
     attn_backend: str = "flex",
+    parallelism=None,
 ) -> TpuGraphTrainerQwen3Model.Config:
+    from torchtitan.config.parallelism import ParallelismConfig  # pylint: disable=g-import-not-at-top
+
     base = graph_trainer_model_registry(
         flavor,
         seq_len=seq_len,
         attn_backend=attn_backend,
+        parallelism=parallelism or ParallelismConfig(),
     )
     return TpuGraphTrainerQwen3Model.Config(
         **{

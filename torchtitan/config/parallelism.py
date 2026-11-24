@@ -86,12 +86,33 @@ class ParallelismConfig:
     fsdp_defer_gradient_reduction: bool = False
     """Defer FSDP gradient reduction until the last accumulation step."""
 
+    fsdp_enable_cpu_offloading: bool = False
+    """
+    Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP
+    """
+
     fsdp_symm_mem_scope: FSDPSymmMemScope = None
     """
     Which FSDP modules use symmetric-memory communication. None disables it.
     "dense" skips any module with routed experts. An MoE transformer block is
     one FSDP module, so its attention parameters are skipped along with its
     experts.
+    """
+
+    fsdp_unshard_in_current_stream: bool = False
+    """
+    Issue FSDP pre-forward/pre-backward all-gathers on the current (compute)
+    stream instead of on separate all-gather streams, via
+    ``FSDPModule.set_unshard_in_current_stream``. All-gather
+    buffers are then allocated in the compute stream's memory pool, avoiding
+    inter-stream fragmentation. All-gathers still overlap with compute via
+    explicit forward/backward prefetching, but the pre-all-gather copy-in and
+    dtype cast no longer overlap with compute.
+
+    Supported for decoders whose FSDP units run in the order
+    ``tok_embeddings -> layers -> norm/lm_head``, which is the chain the
+    explicit prefetching follows. Raises for models with MTP layers or
+    multimodal encoders, and for Flux.
     """
 
     tensor_parallel_degree: int = 1
@@ -159,6 +180,15 @@ class ParallelismConfig:
     is disabled (`pipeline_parallel_degree = 1`, the default).
     """
 
+    pipeline_parallel_max_outstanding_sends: int | None = None
+    """
+    Maximum number of pending pipeline send actions per rank. Each action is
+    identified by its direction, stage, and microbatch and may own several P2P
+    operations. Must be a non-negative integer. This applies only to
+    multi-stage schedules because their global action lowering can move
+    explicit send waits. None adds no hard limit.
+    """
+
     pp_max_unsharded_active_stages: int | None = None
     """Maximum local pipeline stages whose parameters may remain unsharded.
 
@@ -174,7 +204,7 @@ class ParallelismConfig:
     reshard placement. ``"auto"`` uses ``min(pp_rank + 2,
     pp_max_unsharded_active_stages)``. ``"full"`` uses the complete residency
     window. A tuple supplies one positive value per pipeline rank for expert
-    tuning. See ``docs/composability.md`` for the detailed contract.
+    tuning. See ``torchtitan/distributed/PIPELINE_PARALLEL.md`` for the detailed contract.
     """
 
     context_parallel_degree: int = 1
@@ -199,7 +229,20 @@ class ParallelismConfig:
     pp and dp_replicate are outer dimensions unaffected by this constraint.
     """
 
+    save_parallelism_folder: str | None = None
+    """
+    Folder, relative to dump_folder, to save the device-mesh layout into while
+    the parallelism context is built: each rank writes its host, local rank
+    and view of every global mesh to ``rank_<r>.json``. None disables it.
+    """
+
     def __post_init__(self):
+        layers_per_stage = self.pipeline_parallel_layers_per_stage
+        if layers_per_stage is not None and layers_per_stage < 1:
+            raise ValueError(
+                "parallelism.pipeline_parallel_layers_per_stage must be positive "
+                f"when set; got {layers_per_stage}."
+            )
         if (
             self.pipeline_parallel_module_fqns_per_model_part is not None
             and self.pipeline_parallel_layers_per_stage is not None

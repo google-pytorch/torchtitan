@@ -8,7 +8,7 @@ import copy
 import importlib
 import logging
 import math
-import os as os
+import os
 from dataclasses import dataclass, field, fields, MISSING
 from fractions import Fraction
 from typing import Any
@@ -16,7 +16,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.nn import init
 from torch.nn.attention.flex_attention import and_masks
 from transformers import AutoConfig
@@ -24,24 +23,29 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
-from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.base.model import BaseModel, FlopsEstimator
+from torchtitan.models.base.module import Module, ModuleDict
 from torchtitan.models.common.attention import (
     create_attention_mask,
     get_causal_mask_mod,
     get_document_mask_mod,
 )
-from torchtitan.models.utils import quadratic_attention_flops_per_token
-from torchtitan.protocols.model import BaseModel
-from torchtitan.protocols.module import Module, ModuleDict
+from torchtitan.models.common.flops import quadratic_attention_flops_per_token
 
 from .parallelize import parallelize_hf_transformers
 from .pipeline import pipeline_hf_transformers
 
 
 logger = logging.getLogger(__name__)
+
+# HF's own _init_weights, captured before _patch_hf_llama_like replaces it, so the
+# patched version can delegate modules whose init it does not reimplement.
+_hf_init_weights = PreTrainedModel._init_weights
 
 
 class HFFlexKernel(Module):
@@ -163,13 +167,9 @@ _REMOTE_CONFIG_DENYLIST = frozenset({"deepseek_v2", "deepseek_v3"})
 def _get_moe_attr_name(layer: nn.Module) -> str | None:
     """Return the attribute name holding the MoE block on a decoder layer.
 
-    Most models use ``mlp``; Mixtral and GraniteMoe use ``block_sparse_moe``.
-    Returns ``None`` if no candidate is present.
+    Models use ``mlp``.  Returns ``None`` if not present.
     """
-    for name in ("mlp", "block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
-        if hasattr(layer, name):
-            return name
-    return None
+    return "mlp" if hasattr(layer, "mlp") else None
 
 
 # The backend routes attention through flex. The custom impl name is registered
@@ -178,7 +178,7 @@ def _get_moe_attr_name(layer: nn.Module) -> str | None:
 # routes attention through ``_flex_attention_torchtitan`` -- bypassing HF's
 # per-model ``_supports_flex_attn`` gate. A causal or document/packing BlockMask
 # is applied via the titan-built mask (is_causal alone cannot express
-# cross-sample masking); see ``get_attention_masks``.
+# cross-sample masking); see ``get_attention_metadata``.
 _ATTN_IMPLEMENTATION = "flex_torchtitan"
 
 
@@ -200,22 +200,7 @@ def _uses_dsa(config) -> bool:
 
 
 class HFTransformerModel(BaseModel):
-    def parallelize(
-        self,
-        *,
-        parallelism_context: ParallelismContext | None = None,
-        parallel_dims: ParallelismContext | None = None,
-        **kwargs,
-    ):
-        if parallelism_context is None:
-            assert parallel_dims is not None
-            parallelism_context = parallel_dims
-        return parallelize_hf_transformers(
-            self,
-            parallelism_context=parallelism_context,
-            **kwargs,
-        )
-
+    parallelize = parallelize_hf_transformers
     pipeline = pipeline_hf_transformers
 
     @classmethod
@@ -230,7 +215,7 @@ class HFTransformerModel(BaseModel):
         self,
         *,
         parallelism_context: ParallelismContext,
-        training: TrainingConfig,
+        precision: PrecisionConfig,
         parallelism: ParallelismConfig,
     ) -> None:
         from torchtitan.distributed.fsdp import (
@@ -245,10 +230,10 @@ class HFTransformerModel(BaseModel):
         apply_fsdp(
             self,
             dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+            reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
             pp_enabled=parallelism_context.pp_enabled,
-            cpu_offload=training.enable_cpu_offload,
+            cpu_offload=parallelism.fsdp_enable_cpu_offloading,
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             symm_mem_scope=parallelism.fsdp_symm_mem_scope,
             ep_degree=parallelism_context.ep,
@@ -283,6 +268,12 @@ class HFTransformerModel(BaseModel):
         label2id: dict | None = field(init=False, default=None)
         problem_type: str | None = field(init=False, default=None)
 
+        def __post_init__(self, **kwargs) -> None:
+            # Configurable.Config.__post_init__ is ahead of PretrainedConfig
+            # in the MRO and takes no extra arguments. HF passes leftover
+            # kwargs, including attn_implementation, to self.__post_init__.
+            PretrainedConfig.__post_init__(self, **kwargs)
+
         def __init__(
             self,
             model_config,
@@ -293,13 +284,18 @@ class HFTransformerModel(BaseModel):
             PretrainedConfig.__init__(
                 self, attn_implementation=_ATTN_IMPLEMENTATION, **kwargs
             )
-            # Set param_init and sharding_config before Module.Config.build()
-            # accesses them. PretrainedConfig.__getattribute__ doesn't
-            # recognize slots inherited from Module.Config.
+            # Set param_init, sharding_config and preserve_dtype_params before
+            # Module.Config.build() accesses them. PretrainedConfig.__getattribute__
+            # doesn't recognize slots inherited from Module.Config.
             self.param_init = (
                 None  # noqa: this sets Config.param_init, not Module._param_init
             )
             self.sharding_config = None
+            self.preserve_dtype_params = ()
+            # HF modules run eager; the loss and the swapped-in TorchTitan MoE (SwiGLU) can compile.
+            self.local_compile = LocalCompileConfig(
+                regions=["loss", "fused_binary_activation"]
+            )
 
             assert model_config is not None, "model_config is required"
 
@@ -393,6 +389,8 @@ class HFTransformerModel(BaseModel):
             for attr_name, value in explicit_overrides.items():
                 if attr_name not in self._tt_to_hf_attribute_map:
                     self._titan_injected_model_args[attr_name] = value
+            if not hasattr(self, "max_context_length"):
+                self.max_context_length = getattr(self, "max_seq_len", 2048)
 
         def _configure_hf_attention(self):
             """Configure HuggingFace attention to route through flex attention.
@@ -400,7 +398,7 @@ class HFTransformerModel(BaseModel):
             Routes attention through the flex HOP so a causal or document/packing
             BlockMask can be applied -- is_causal alone cannot express
             cross-sample (packed)
-            masking. The titan-built BlockMask (see ``get_attention_masks``)
+            masking. The titan-built BlockMask (see ``get_attention_metadata``)
             rides HF's normal ``attention_mask`` argument (HF returns an
             already-4D/BlockMask mask as-is), so no custom mask plumbing is
             needed. The custom impl name only exists to bypass HF's per-model
@@ -496,20 +494,6 @@ class HFTransformerModel(BaseModel):
                     if cls_name:
                         hf_model_config.architectures = [cls_name]
 
-            # Heterogeneous configs (transformers >= 5.19; e.g. Gemma-4's global
-            # layers use head_dim 512 and 2 KV heads) keep per-layer values
-            # out of the public attributes, and reading one from the global
-            # config raises. Read the global values here and carry the
-            # per-layer overrides onto this config below; copying only the
-            # global values would build every layer with one shape.
-            per_layer_overrides = None
-            if getattr(hf_model_config, "is_heterogeneous", False):
-                per_layer_overrides = {
-                    int(i): o
-                    for i, o in hf_model_config.to_dict()["per_layer_config"].items()
-                }
-                hf_model_config.allow_global_per_layer_attribute_access = True
-
             # Explicitly update attributes based on mappings
             for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
                 if hasattr(hf_model_config, hf_name):
@@ -535,21 +519,8 @@ class HFTransformerModel(BaseModel):
                 if key == "num_experts" and hasattr(self, "n_routed_experts"):
                     self.n_routed_experts = value
 
-            if per_layer_overrides is not None:
-                # Global reads (head_dim, n_kv_heads below and in FLOP
-                # counting) see the default layer; the model reads each
-                # layer's own config. A flavor may have cut the layer count.
-                self.allow_global_per_layer_attribute_access = True
-                # Cut layer_types with the overrides: HF validates every listed
-                # layer type against the per-layer config.
-                layer_types = getattr(self, "layer_types", None)
-                if isinstance(layer_types, list):
-                    self.layer_types = layer_types[: self.num_hidden_layers]
-                self.per_layer_config = {
-                    i: o for i, o in per_layer_overrides.items()
-                    if i < self.num_hidden_layers
-                }
-
+            self.max_context_length = max_context_length
+            # Aliases HF's max_position_embeddings.
             self.max_seq_len = max_context_length
             self.deterministic = deterministic
 
@@ -608,8 +579,8 @@ class HFTransformerModel(BaseModel):
 
             return self
 
-        def get_nparams_and_flops(
-            self, model: nn.Module, seq_len: int
+        def _parameter_counts(
+            self, model: nn.Module, *, include_embeddings: bool
         ) -> tuple[int, int]:
             assert isinstance(model, HFTransformerModel)
             named_parameters = list(model.named_parameters())
@@ -618,24 +589,25 @@ class HFTransformerModel(BaseModel):
                 id(param): Fraction(1) for _, param in named_parameters
             }
 
-            lm_head = getattr(model, "lm_head", None)
-            lm_head_parameter_ids = (
-                {id(param) for param in lm_head.parameters()}
-                if isinstance(lm_head, nn.Module)
-                else set()
-            )
-            for module in model.modules():
-                if isinstance(module, nn.Embedding):
-                    for param in module.parameters(recurse=False):
-                        if id(param) not in lm_head_parameter_ids:
-                            parameter_weights[id(param)] = Fraction(0)
+            if not include_embeddings:
+                lm_head = getattr(model, "lm_head", None)
+                lm_head_parameter_ids = (
+                    {id(param) for param in lm_head.parameters()}
+                    if isinstance(lm_head, nn.Module)
+                    else set()
+                )
+                for module in model.modules():
+                    if isinstance(module, nn.Embedding):
+                        for param in module.parameters(recurse=False):
+                            if id(param) not in lm_head_parameter_ids:
+                                parameter_weights[id(param)] = Fraction(0)
 
             for layer in model.layers.values():
-                moe_config = getattr(layer, "_native_moe_config", None)
-                if moe_config is None:
+                moe_params = getattr(layer, "_native_moe_params", None)
+                if moe_params is None:
                     continue
                 active_expert_ratio = Fraction(
-                    moe_config.router.top_k, moe_config.num_experts
+                    moe_params["top_k"], moe_params["num_experts"]
                 )
                 if getattr(layer, "_layer_level_moe", False):
                     moe_block = layer
@@ -656,7 +628,15 @@ class HFTransformerModel(BaseModel):
                 for _, param in named_parameters
             )
             assert nparams_for_matmul.denominator == 1
-            active_nparams = nparams_for_matmul.numerator
+            return nparams, nparams_for_matmul.numerator
+
+        def get_parameter_counts(self, model: nn.Module) -> tuple[int, int]:
+            return self._parameter_counts(model, include_embeddings=True)
+
+        def build_flops_estimator(
+            self, model: nn.Module, *, seq_len: int
+        ) -> FlopsEstimator:
+            _, active_nparams = self._parameter_counts(model, include_embeddings=False)
 
             if all(
                 hasattr(self, name)
@@ -692,10 +672,6 @@ class HFTransformerModel(BaseModel):
 
             attention_op_flops = 0
             unsupported_layer_types = set()
-            # Attention-free models (Mamba) have no attention heads and so no
-            # attention term; their matmuls are counted in 6 * active_nparams.
-            if not getattr(self, "n_heads", None):
-                layer_types = []
             for layer_type in layer_types:
                 if layer_type in ("attention", "full_attention"):
                     sliding_window_size = None
@@ -736,11 +712,7 @@ class HFTransformerModel(BaseModel):
                 )
 
             num_flops_per_token = 6 * active_nparams + attention_op_flops
-            logger.info(
-                f"Total parameter count: {nparams:,}, "
-                f"active parameters: {active_nparams:,}"
-            )
-            return nparams, num_flops_per_token
+            return lambda input_dict: num_flops_per_token * input_dict["input"].numel()
 
     def __init__(self, config: Config):
         super().__init__()
@@ -863,23 +835,25 @@ class HFTransformerModel(BaseModel):
                     "HF model's built-in experts kernel."
                 )
 
-        self.model = self._build_hf_model(model_cls, config)
+        self.model = model_cls(config=config)
         self.max_seq_len = config.max_seq_len
         self.cp_mesh = None
 
         # Convert ModuleList to ModuleDict to preserve original indices
         # This ensures state dict keys match checkpoint keys
-        if isinstance(self.layers, nn.ModuleList):
-            self.layers = SliceableModuleDict(
-                {str(i): layer for i, layer in enumerate(self.layers)}
+        if hasattr(self.model, "model") and isinstance(
+            self.model.model.layers, nn.ModuleList
+        ):
+            self.model.model.layers = SliceableModuleDict(
+                {str(i): layer for i, layer in enumerate(self.model.model.layers)}
             )
 
-        for layer in self.layers.values():
-            # moe_enabled means "swapped for a Titan MoE at ``layer.moe``",
-            # which only MoE configs do; a dense config runs HF's MoE block.
-            if not config.is_moe:
-                layer.moe_enabled = False
-                continue
+        layers_iter = (
+            self.model.model.layers.values()
+            if hasattr(self.model, "model")
+            else ()
+        )
+        for layer in layers_iter:
             # Detect MoE layers by checking for gate/router and experts sub-modules.
             # Gemma4 has router/experts as siblings of the dense MLP at the
             # layer level (not inside ``mlp``).
@@ -901,13 +875,9 @@ class HFTransformerModel(BaseModel):
                     layer._layer_level_moe = True
 
         if config.is_moe:
-            from .moe_replacement import prepare_native_moe_configs
+            from .moe_replacement import probe_native_moe_params
 
-            prepare_native_moe_configs(self, config)
-
-    def _build_hf_model(self, model_cls, config):
-        """Construct the wrapped HF model; a subclass may prepare or retry."""
-        return model_cls(config=config)
+            probe_native_moe_params(self, config)
 
     def set_cp_mesh(self, mesh):
         self.cp_mesh = mesh
@@ -951,12 +921,6 @@ class HFTransformerModel(BaseModel):
                     shared = getattr(self.mlp, shared_name, None)
                     if shared is not None:
                         shared.layer_idx = layer_idx
-            # Some architectures keep the MLP under another name (LFM2 and
-            # Falcon-H1: `feed_forward`; GraniteMoeHybrid: `shared_mlp`).
-            if mlp_cls is not None:
-                for module in self.modules():
-                    if isinstance(module, mlp_cls):
-                        module.layer_idx = layer_idx
 
         def _initialize_weights_patched(self, module, is_remote_code: bool = False):
             # NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
@@ -1010,14 +974,14 @@ class HFTransformerModel(BaseModel):
             layer_idx_classes = tuple(layer_idx_classes)
 
             if isinstance(module, layer_idx_classes):
-                layer_idx = getattr(module, "layer_idx", None)
-                depth_init = getattr(config, "depth_init", False)
-                if depth_init and layer_idx is None:
+                if not hasattr(module, "layer_idx"):
                     raise ValueError(
                         f"Module {module} does not have a layer_idx attribute"
                     )
 
-                if depth_init:
+                layer_idx = module.layer_idx
+
+                if hasattr(config, "depth_init") and config.depth_init:
                     init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
                 else:
                     init_std = 0.02 / (2 * config.num_hidden_layers) ** 0.5
@@ -1148,6 +1112,13 @@ class HFTransformerModel(BaseModel):
                 if hasattr(module, "bias") and module.bias is not None:
                     module.bias.data.zero_()
 
+            elif "RotaryEmbedding" in module.__class__.__name__:
+                # HF rotary modules compute their inv_freq buffers in __init__, which
+                # meta init + to_empty() leaves uninitialized. HF's _init_weights
+                # recomputes them for every rope_type, so delegate instead of
+                # reimplementing its rope dispatch.
+                _hf_init_weights(self, module)
+
         decoder_layer_cls.__init__ = _decoder_layer_init_patched
         PreTrainedModel._init_weights = _init_weights_patched
         PreTrainedModel._initialize_weights = _initialize_weights_patched
@@ -1276,33 +1247,32 @@ class HFTransformerModel(BaseModel):
         self,
         input_dict: dict[str, Any],
         *,
-        parallelism_context: ParallelismContext | None = None,
-        parallel_dims: ParallelismContext | None = None,
+        parallelism_context: ParallelismContext,
         parallelism: ParallelismConfig,
         max_num_documents: int | None = None,
-        max_context_length: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        global_routing_token_counts: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any]]:
         """Build the attention mask (when positions are present), CP-shard, return."""
-        del max_num_documents, max_context_length
-        if parallelism_context is None:
-            assert parallel_dims is not None
-            parallelism_context = parallel_dims
+        del max_num_documents, global_routing_token_counts
         # Function-local import avoids a circular import.
         from torchtitan.distributed import context_parallel
         from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-        from torchtitan.models.common.cp_attention import (
-            KVAllGatherCPFlexInnerAttention,
+        from torchtitan.models.common.attention.cp_attention import (
+            AllGatherKVFlexInnerAttention,
         )
         from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 
         input_shardings = decoder_input_sharding()
+        loss_kwargs = input_dict.pop("loss_kwargs", {})
+        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_dict.update(loss_kwargs)
         input_dict.pop("padding_mask", None)
-        if "attention_masks" not in input_dict:
+        if "attention_metadata" not in input_dict:
             positions = input_dict.get("positions")
             if positions is not None:
-                masks = self.get_attention_masks(positions=positions)
+                masks = self.get_attention_metadata(positions=positions)
                 if masks is not None:
-                    input_dict["attention_masks"] = masks
+                    input_dict["attention_metadata"] = masks
 
         if parallelism_context.cp_enabled:
             load_balancer_config = parallelism.context_parallel_load_balancer
@@ -1311,7 +1281,7 @@ class HFTransformerModel(BaseModel):
                     seq_len=context_parallel.get_cp_input_seq_len(
                         input_dict, input_shardings=input_shardings
                     ),
-                    attention_metadata=input_dict.get("attention_masks"),
+                    attention_metadata=input_dict.get("attention_metadata"),
                 )
                 if load_balancer_config is not None
                 else None
@@ -1321,11 +1291,11 @@ class HFTransformerModel(BaseModel):
                 if load_balancer is not None
                 else None
             )
-            if "attention_masks" in input_dict:
+            if "attention_metadata" in input_dict:
                 input_dict[
-                    "attention_masks"
-                ] = KVAllGatherCPFlexInnerAttention.prepare_cp_metadata(
-                    input_dict["attention_masks"],
+                    "attention_metadata"
+                ] = AllGatherKVFlexInnerAttention.prepare_cp_metadata(
+                    input_dict["attention_metadata"],
                     permutation=permutation,
                 )
             input_dict = context_parallel.shard_tensors(
@@ -1342,11 +1312,12 @@ class HFTransformerModel(BaseModel):
             input_shardings,
         )
         input_dict.update(annotated)
+        loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
         inputs = input_dict.pop("input")
         labels = input_dict.pop("labels")
-        return inputs, labels, input_dict
+        return inputs, labels, input_dict, loss_kwargs
 
-    def get_attention_masks(self, positions: torch.Tensor):
+    def get_attention_metadata(self, positions: torch.Tensor):
         """Build a flex BlockMask (causal or document-causal).
 
         ``forward`` (or the trainer under CP) calls this and passes the result
@@ -1410,7 +1381,7 @@ class HFTransformerModel(BaseModel):
 
     def forward(self, *args, **kwargs):
         positions = kwargs.pop("positions", None)
-        attention_masks = kwargs.pop("attention_masks", None)
+        attention_metadata = kwargs.pop("attention_metadata", None)
         model_args = (args[0].unsqueeze(0), *args[1:])
 
         if positions is not None:
@@ -1421,7 +1392,7 @@ class HFTransformerModel(BaseModel):
             # arange would use the wrong positions.
             #
             # The BlockMask is prebuilt in ``preprocess_inputs`` and passed
-            # in via ``attention_masks``.
+            # in via ``attention_metadata``.
             kwargs["position_ids"] = positions.unsqueeze(0)
         else:
             local_seq_len = args[0].shape[0]
@@ -1429,11 +1400,11 @@ class HFTransformerModel(BaseModel):
                 local_seq_len, device=args[0].device
             ).unsqueeze(0)
 
-        if attention_masks is not None:
+        if attention_metadata is not None:
             # HF returns an already-4D mask / BlockMask as-is (see
             # masking_utils._preprocess_mask_arguments), so the titan-built
             # BlockMask flows straight through to the flex attention function.
-            kwargs["attention_mask"] = attention_masks
+            kwargs["attention_mask"] = attention_metadata
 
         output = self.model.model(*model_args, **kwargs)
         hidden_states = output.last_hidden_state.squeeze(0)
@@ -1483,43 +1454,7 @@ class HFTransformerModel(BaseModel):
             else:
                 logger.info("Skipping nn.Identity module during weight initialization.")
 
-        # Some HF inits build a value as a plain tensor and copy it into the
-        # parameter (Mamba / Gated DeltaNet A_log in Qwen3-Next, Qwen3.5,
-        # Nemotron-H, Jamba, Zamba2). Under FSDP / TP the parameter is a
-        # DTensor, so give the value the parameter's placements first.
-        from transformers import initialization as hf_init
-
-        hf_copy = hf_init.copy_
-
-        def copy_into_dtensor(tensor, other):
-            if isinstance(tensor, DTensor) and not isinstance(other, DTensor):
-                other = distribute_tensor(
-                    other.to(tensor.to_local().device),
-                    tensor.device_mesh,
-                    tensor.placements,
-                )
-            return hf_copy(tensor, other)
-
-        hf_init.copy_ = copy_into_dtensor
-        try:
-            self.model.apply(selective_init)
-        finally:
-            hf_init.copy_ = hf_copy
-
-        # HF rotary embeddings compute their `inv_freq` buffer in __init__, not in
-        # `_init_weights`. With meta-device init + `to_empty()`, that buffer is
-        # left uninitialized (zeros), which silently disables RoPE (no positional
-        # information -> near-random outputs). Recompute it from each rotary
-        # module's `rope_init_fn` so positions work after materialization.
-        for module in self.model.modules():
-            rope_init_fn = getattr(module, "rope_init_fn", None)
-            if rope_init_fn is not None and hasattr(module, "inv_freq"):
-                device = module.inv_freq.device
-                inv_freq, attention_scaling = rope_init_fn(module.config, device)
-                module.inv_freq.copy_(
-                    inv_freq.to(device=device, dtype=module.inv_freq.dtype)
-                )
-                module.attention_scaling = attention_scaling
+        self.model.apply(selective_init)
 
         # TODO(3outeille): For pipeline parallel, only tie weights if both input and output embeddings are on the same device
         # Maybe better way of handling this?

@@ -691,6 +691,89 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
+      # qwen3_5 CP: CP full attention + head-parallel GatedDeltaNet. The debug
+      # models have 2 GatedDeltaNet key heads, so cp=2. Eager runs on CPU
+      # only: eager TPU CP with dp_shard > 1 can get non-finite gradients on
+      # the current torch_tpu build (see test_train_minimal_distributed); TPU
+      # runs the compiled Splash variants below.
+      dict(
+          testcase_name="qwen3_5_cp2_all_gather",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          skip_devices=[device_type.AcceleratorDeviceType.TPU],
+      ),
+      dict(
+          testcase_name="qwen3_5_cp2_ulysses",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          skip_devices=[device_type.AcceleratorDeviceType.TPU],
+      ),
+      dict(
+          testcase_name="qwen3_5_cp2_ulysses_allgather_reducescatter",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_ulysses_cp2_agrs",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          # The eager collectives under strict SPMD type checking.
+          args=["--debug.spmd_typechecking"],
+          skip_devices=[device_type.AcceleratorDeviceType.TPU],
+      ),
+      # FSDP2 over the flattened (dp_shard, cp) mesh instead of SimpleFSDP.
+      dict(
+          testcase_name="qwen3_5_fsdp_cp2_all_gather",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          args=["--parallelism.no-use_simple_fsdp"],
+          skip_devices=[device_type.AcceleratorDeviceType.TPU],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_cp2_all_gather_splash",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          enable_compile=True,
+          args=[
+              "--splash_attention_kernel.use_splash_attention_kernel",
+              # 128 tokens per CP rank, the shortest the Splash kernel takes.
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=512",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_5_moe_cp2_ulysses_splash",
+          module="torchtitan.experiments.tpu.qwen3_5",
+          config="qwen35_moe_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          enable_compile=True,
+          args=[
+              "--splash_attention_kernel.use_splash_attention_kernel",
+              # 128 tokens per CP rank, the shortest the Splash kernel takes.
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=512",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
   ])
   def test_train_distributed(
       self,

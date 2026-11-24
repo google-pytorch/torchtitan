@@ -241,6 +241,23 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
           training=self.training,
           splash_attention_kernel=self.splash_attention_kernel,
       )
+      # The Pallas fused loss tiles each rank's tokens by b_block_size, and a
+      # CP rank holds 1 / cp of the data-parallel rank's tokens.
+      cp = self.parallelism.context_parallel_degree
+      b_block_size = getattr(self.loss, "b_block_size", None)
+      tokens_per_rank = (
+          self.training.num_tokens_per_microbatch_per_dp_rank // cp
+      )
+      if (
+          b_block_size
+          and getattr(self.loss, "implementation", None) == "mosaic_tpu"
+          and tokens_per_rank % b_block_size
+      ):
+        raise ValueError(
+            f"With context_parallel_degree={cp}, each rank holds"
+            f" {tokens_per_rank} tokens, which the Pallas loss's b_block_size"
+            f" ({b_block_size}) must divide."
+        )
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed
     # that is crashing when running on TAP.

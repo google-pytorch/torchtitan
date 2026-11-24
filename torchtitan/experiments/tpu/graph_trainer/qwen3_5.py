@@ -50,16 +50,13 @@ def parallelize_qwen3_5(
 ) -> nn.Module:
   """Applies FQN annotation, SimpleFSDP, and GraphTrainer compile to Qwen3.5."""
   del ac_config
-  # Upstream's eager parallelize_qwen3_5 rejects CP too (the GatedDeltaNet
-  # needs the whole sequence); TP is untested on TPU, the TPU model_registry
-  # has no pipelining_fn, and EP requires mesh-split optimizer support.
-  if (
-      parallel_dims.tp_enabled
-      or parallel_dims.cp_enabled
-      or parallel_dims.pp_enabled
-  ):
+  # CP recipes run the GatedDeltaNet head-parallel (qwen3_5/cp_gated_delta.py;
+  # upstream's eager parallelize_qwen3_5 rejects CP because its GatedDeltaNet
+  # needs the whole sequence). TP is untested on TPU and the TPU model_registry
+  # has no pipelining_fn; EP runs with SimpleFSDP only.
+  if parallel_dims.tp_enabled or parallel_dims.pp_enabled:
     raise NotImplementedError(
-        "TPU GraphTrainer Qwen3.5 does not support TP, CP, or PP."
+        "TPU GraphTrainer Qwen3.5 does not support TP or PP."
     )
   if parallel_dims.ep_enabled and not parallelism.use_simple_fsdp:
     raise NotImplementedError(

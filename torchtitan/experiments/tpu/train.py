@@ -217,12 +217,18 @@ class TPUTrainer(torchtitan.trainer.Trainer):
     model_spec = getattr(job_config, "model_spec", None)
     if model_spec is not None:
       # The eager (non-scan) step runs the SwiGLU gate/up projections as two
-      # GEMMs over the stacked w13 halves; see TpuTwoProjFeedForward.
+      # GEMMs, over a [2F, D] w13 that FSDP shards on dim 0 unless tensor
+      # parallelism needs upstream's stacked [2, F, D]; see
+      # TpuPackedFeedForward and TpuTwoProjFeedForward.
       from torchtitan.experiments.tpu.components.ffn import TpuTwoProjFeedForwardConverter  # pylint: disable=g-import-not-at-top
 
+      parallelism = getattr(job_config, "parallelism", None)
+      tp_degree = (
+          parallelism.tensor_parallel_degree if parallelism is not None else 1
+      )
       job_config.model_spec = dataclasses.replace(
           model_spec,
-          model=TpuTwoProjFeedForwardConverter.Config()
+          model=TpuTwoProjFeedForwardConverter.Config(packed=tp_degree <= 1)
           .build()
           .convert(model_spec.model),
           post_optimizer_build_fn=with_split_optimizers_by_mesh(

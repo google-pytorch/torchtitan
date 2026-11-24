@@ -395,6 +395,26 @@ def apply_tpu_graph_trainer_model_transforms(
     raise ValueError("CPU-offload budget must be nonnegative")
   _validate_tpu_selective(config)
 
+  # Zero-3 recipes (parameters resharded after forward) use the packed
+  # two-projection FFN, as the regular trainer does; see TpuPackedFeedForward
+  # for the measurements. Zero-2 keeps upstream's FeedForward (qwen3_8b: two
+  # projections cost +3.3% step time and +4.3 GiB), as do scan layers
+  # (185d6b57) and tensor-parallel runs (the packed layout is TP-1 only).
+  if (
+      not compile_config.use_scan_layers
+      and config.model_spec is not None
+      and config.parallelism.fsdp_reshard_after_forward == "always"
+      and config.parallelism.tensor_parallel_degree <= 1
+  ):
+    from torchtitan.experiments.tpu.components.ffn import TpuTwoProjFeedForwardConverter  # pylint: disable=g-import-not-at-top
+
+    config.model_spec = dataclasses.replace(
+        config.model_spec,
+        model=TpuTwoProjFeedForwardConverter.Config(packed=True)
+        .build()
+        .convert(config.model_spec.model),
+    )
+
   if not compile_config.use_scan_layers:
     return
 

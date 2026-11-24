@@ -220,17 +220,19 @@ def parallelize_qwen3_5(
     ac_config = tpu_selective_ac_config(ac_config)
   effective_compile_config = compile_config
   if compile_config.enable and hasattr(model, "layers"):
-    # TPU: torch_tpu `spmd_safe` for compiled blocks. Per-block compile also
-    # wraps MoE blocks unless EP is on (as in gemma4): without it,
-    # SplitCompiler splits a block at every SimpleFSDP/CP collective. The
-    # whole-model modes keep MoE blocks unwrapped, including TpuGraphTrainer,
-    # which drops `tpu_compile_mode` and sets `compile.mode="aot_fx_trace"`.
+    # TPU: torch_tpu `spmd_safe` for compiled blocks. Per-block compile wraps
+    # every block, MoE included: without it, SplitCompiler splits a block at
+    # every SimpleFSDP/CP/EP collective, and with CP and EP together the split
+    # blocks give run-to-run different, sometimes non-finite, losses on TPU
+    # (8 of 8 repeated runs bit-identical with it). The whole-model modes keep
+    # MoE blocks unwrapped, including TpuGraphTrainer, which drops
+    # `tpu_compile_mode` and sets `compile.mode="aot_fx_trace"`.
     per_block = tpu_compile_mode not in ("fullgraph", "aot_fx_trace") and (
         getattr(compile_config, "mode", None) != "aot_fx_trace"
     )
     for layer in model.layers.values():
       has_moe = any(isinstance(m, MoE) for m in layer.modules())
-      if not has_moe or (per_block and not parallel_dims.ep_enabled):
+      if not has_moe or per_block:
         apply_spmd_safe(layer)
   if (
       tpu_compile_mode in ("fullgraph", "aot_fx_trace")

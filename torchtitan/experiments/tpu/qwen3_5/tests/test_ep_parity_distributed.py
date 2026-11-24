@@ -230,10 +230,9 @@ class EpParityDistributedTest(
   @parameterized.named_parameters(
       ("_ep2_ulysses", "qwen35_moe_debugmodel_ulysses_cp2", 2),
       ("_ep2_all_gather", "qwen35_moe_debugmodel_allgather_cp2", 2),
-      # EP = 4 > top_k = 2: `auto` takes ragged_all_to_all, and EP spans the
-      # whole dp_shard x cp group of 4 devices. CPU only for now: the EP = 4
-      # ragged_all_to_all cases above fail on the TPU CI image (also on main).
-      ("_ep4_ulysses_cpu", "qwen35_moe_debugmodel_ulysses_cp2", 4),
+      # EP = 4 > top_k = 2: `auto` takes ragged_all_to_all, and EP spans
+      # dp_shard x cp ranks rather than only the CP group.
+      ("_ep4_ulysses", "qwen35_moe_debugmodel_ulysses_cp2", 4),
   )
   def test_qwen3_5_moe_ep_cp2_matches_single_device(
       self, config: str, ep_degree: int
@@ -250,8 +249,6 @@ class EpParityDistributedTest(
     on_tpu = (
         self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU
     )
-    if on_tpu and ep_degree > 2:
-      self.skipTest("EP = 4 ragged_all_to_all fails on the TPU CI image.")
     if self.num_devices % 4:
       # EP comes out of dp_shard * cp, i.e. all devices here.
       self.skipTest("EP x CP=2 needs a multiple of 4 devices.")

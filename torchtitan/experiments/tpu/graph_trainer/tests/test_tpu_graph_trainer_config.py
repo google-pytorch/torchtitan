@@ -334,8 +334,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     config = JaxJobConfig.derive_from(source)
 
+    # Upstream ec953b36: a present generic CompileConfig means enabled.
     self.assertIs(type(config.compile), CompileConfig)
-    self.assertTrue(config.compile.enable)
+    self.assertFalse(hasattr(config.compile, "enable"))
     self.assertEqual(config.compile.components, ["model"])
     self.assertEqual(config.compile.backend, "tpu")
     self.assertFalse(
@@ -346,12 +347,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   @parameterized.named_parameters(
       (
           "generic",
-          CompileConfig(enable=True, components=["model"], backend="tpu"),
+          CompileConfig(components=["model"], backend="tpu"),
       ),
       (
           "graph",
           GraphTrainerCompileConfig(
-              enable=True,
               components=["model"],
               backend="tpu",
               memory_policy="full",
@@ -367,6 +367,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIsInstance(config.compile, TpuGraphTrainerCompileConfig)
+    self.assertTrue(config.compile.enable)
     self.assertEqual(config.compile.components, ["model"])
     self.assertEqual(config.compile.backend, "tpu")
     self.assertEqual(config.compile.pass_pipeline, "tpu")
@@ -408,6 +409,80 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.compile.optimizer_compile, "separate_graph")
     self.assertFalse(config.compile.compile_grad_norm)
     self.assertFalse(config.compile.materialize_forward_before_backward)
+
+  @parameterized.parameters(
+      TpuTrainerCompileConfig, TpuGraphTrainerCompileConfig
+  )
+  def test_disabled_compile_keeps_its_components_for_enabling(
+      self, compile_cls
+  ) -> None:
+    # Upstream reads `"model" in compile.components`, so a disabled config
+    # presents none; enabling it must bring back what was asked for.
+    disabled = compile_cls()
+    self.assertFalse(disabled.enable)
+    self.assertEqual(disabled.components, [])
+    self.assertEqual(
+        dataclasses.replace(disabled, enable=True).components,
+        ["model", "loss"],
+    )
+
+    custom = compile_cls(components=["model"])
+    self.assertEqual(custom.components, [])
+    enabled = dataclasses.replace(custom, enable=True)
+    self.assertEqual(enabled.components, ["model"])
+    self.assertEqual(
+        dataclasses.replace(enabled, enable=False).components, []
+    )
+    self.assertEqual(
+        dataclasses.replace(enabled, components=["loss"]).components,
+        ["loss"],
+    )
+
+  @parameterized.parameters(
+      TpuTrainerCompileConfig, TpuGraphTrainerCompileConfig
+  )
+  def test_enable_assigned_after_construction_is_rejected(
+      self, compile_cls
+  ) -> None:
+    # `components` follows `enable` only at construction; the TPU entry points
+    # refuse an enabled config that would compile nothing.
+    from torchtitan.experiments.tpu.tpu_job_config import validate_compile_components  # pylint: disable=g-import-not-at-top
+
+    compile_config = compile_cls()
+    validate_compile_components(compile_config)
+    validate_compile_components(None)
+    compile_config.enable = True
+    self.assertEqual(compile_config.components, [])
+    with self.assertRaisesRegex(ValueError, "compile.components is empty"):
+      validate_compile_components(compile_config)
+    validate_compile_components(dataclasses.replace(compile_cls(), enable=True))
+
+    enabled = compile_cls(enable=True)
+    enabled.enable = False
+    with self.assertRaisesRegex(ValueError, "compile.enable is unset"):
+      validate_compile_components(enabled)
+    validate_compile_components(dataclasses.replace(enabled, enable=False))
+
+  def test_cli_enable_compiles_a_recipe_that_leaves_compile_off(self) -> None:
+    # tyro builds the parsed config from the recipe's default instance, whose
+    # `components` is already empty. `--compile.enable` alone used to yield an
+    # enabled config with no components, i.e. nothing compiled (flux_dev).
+    args = [
+        "--module=torchtitan.experiments.tpu.llama3",
+        "--config=llama3_debugmodel",
+    ]
+    default = ConfigManager().parse_args(args)
+    self.assertFalse(default.compile.enable)
+    self.assertEqual(default.compile.components, [])
+
+    enabled = ConfigManager().parse_args(args + ["--compile.enable"])
+    self.assertTrue(enabled.compile.enable)
+    self.assertEqual(enabled.compile.components, ["model", "loss"])
+
+    model_only = ConfigManager().parse_args(
+        args + ["--compile.enable", "--compile.components", "model"]
+    )
+    self.assertEqual(model_only.compile.components, ["model"])
 
   def test_graph_optimizer_compile_mode_is_cli_addressable(self) -> None:
     config = ConfigManager().parse_args([
@@ -2100,14 +2175,14 @@ class TpuGraphTrainerEpDropStatsTest(parameterized.TestCase):
             get_optional_mesh=meshes.__getitem__,
             get_mesh=get_mesh,
         ),
-        step=1,
+        num_completed_steps=1,
     )
     with mock.patch.object(
         tpu_graph_trainer_module.dist_utils,
         "dist_sum_tensor",
         side_effect=lambda x, mesh=None, extra_pg=None: x,
     ) as sum_mock:
-      global_L2 = TpuGraphTrainer._maybe_log_ep_drop_stats(
+      global_L2 = tpu_graph_trainer_module.TpuGraphTrainingEngine._maybe_log_ep_drop_stats(
           typing.cast(typing.Any, trainer)
       )
     sum_mock.assert_called_once()

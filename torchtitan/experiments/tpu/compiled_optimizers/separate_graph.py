@@ -192,6 +192,9 @@ def _build_compiled_optimizer_groups(opt: torch.optim.Optimizer) -> list:
 def apply_compiled_optimizer(trainer: Any) -> None:
   """Wraps trainer.optimizers.step() to run AdamW in 1 compiled XLA graph.
 
+  ``trainer`` is any object exposing an ``optimizers`` container, normally the
+  ``TrainingEngine`` (which owns the optimizers since upstream ec953b36).
+
   1. Intercepts optimizer.step().
   2. Extracts weight, grad, and optimizer states into flat tensors.
   3. Traces functionalized AdamW math via minimal_fx_tracer into an FX graph.

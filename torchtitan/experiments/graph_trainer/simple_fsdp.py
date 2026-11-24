@@ -476,6 +476,18 @@ def data_parallel(
                 continue
 
         param_non_dp_mesh_types = {}
+        # Fork divergence from upstream pytorch/torchtitan: a stacked Linear
+        # stores weight as [N, F, D] and bias as [N, F] (FeedForward.w13 has
+        # N=2, pytorch/torchtitan#4808). Sharding dim 0 would hit the
+        # replicate-if-narrower-than-the-mesh rule below and keep the whole
+        # weight, its gradient and its optimizer state on every rank, so shard
+        # the matrix rows (dim 1), as core FSDP's
+        # `_linear_param_shard_placements` does. Remove when the upstream merge
+        # reaches pytorch/torchtitan#4867 (d0f3bbfd6), which does this here.
+        is_stacked_linear = (
+            isinstance(mod, nn.Linear) and getattr(mod, "num_linears", 1) > 1
+        )
+        param_shardings: dict[str, tuple[Placement, ...]] = {}
 
         for p_name, p in params_dict.items():
             if p is not None and p.numel() > 0:
@@ -487,6 +499,14 @@ def data_parallel(
                     raise NotImplementedError(
                         f"{p_name} is already a DTensor, so sharding it on dim "
                         f"{dim} would be dropped on the EP/TP path"
+                    )
+                if is_stacked_linear:
+                    dim = 1
+                    # `ReplicateComputation`'s EP/TP path re-wraps the parameter
+                    # with the sharding it is given, so hand it this axis.
+                    param_shardings[p_name] = tuple(
+                        Shard(dim) if isinstance(pl, Shard) else pl
+                        for pl in param_sharding
                     )
                 p, non_dp_mesh_types = _prepare_spmd_parameter_for_fsdp(
                     p,
@@ -535,7 +555,7 @@ def data_parallel(
             lambda param_name: ReplicateComputation(
                 param_fqn=(f"{module_fqn}.{param_name}" if module_fqn else param_name),
                 device_mesh=device_mesh,
-                param_sharding=param_sharding,
+                param_sharding=param_shardings.get(param_name, param_sharding),
                 mode=mode,
                 mp_policy=mp_policy,
                 non_dp_mesh_types=param_non_dp_mesh_types.get(param_name, {}),

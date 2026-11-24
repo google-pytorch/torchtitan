@@ -6,6 +6,60 @@ from typing import Any, Iterator
 import torch
 
 from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.data.types import TrainingMicrobatch
+
+
+@dataclass(kw_only=True, slots=True)
+class FluxEncodedMicrobatch(TrainingMicrobatch):
+    """One DP-local Flux microbatch whose encodings are already computed.
+
+    The precomputed and random dataloaders yield this instead of raw images
+    and prompts; ``FluxModel.preprocess_inputs`` consumes the encodings as is
+    when the trainer has no encoders. ``labels`` aliases ``img_encodings``.
+    """
+
+    labels: torch.Tensor
+    img_encodings: torch.Tensor
+    t5_encodings: torch.Tensor
+    clip_encodings: torch.Tensor
+    num_valid_tokens: int
+
+    @classmethod
+    def from_encodings(
+        cls,
+        *,
+        img_encodings: torch.Tensor,
+        t5_encodings: torch.Tensor,
+        clip_encodings: torch.Tensor,
+    ) -> "FluxEncodedMicrobatch":
+        return cls(
+            labels=img_encodings,
+            img_encodings=img_encodings,
+            t5_encodings=t5_encodings,
+            clip_encodings=clip_encodings,
+            # As FluxCollator: one "token" per latent element.
+            num_valid_tokens=img_encodings.numel(),
+        )
+
+    def as_input_dict(self) -> dict[str, Any]:
+        return {
+            "labels": self.labels,
+            "img_encodings": self.img_encodings,
+            "t5_encodings": self.t5_encodings,
+            "clip_encodings": self.clip_encodings,
+        }
+
+    def to_input_dict(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> dict[str, Any]:
+        # `labels` and `img_encodings` are one tensor: copy it to the device
+        # once and keep the alias.
+        inputs = super(FluxEncodedMicrobatch, self).to_input_dict(
+            device, non_blocking=non_blocking
+        )
+        if self.labels is self.img_encodings:
+            inputs["labels"] = inputs["img_encodings"]
+        return inputs
 
 
 class PrecomputedDataloader(BaseDataLoader):
@@ -64,8 +118,13 @@ class PrecomputedDataloader(BaseDataLoader):
                 if step >= self.max_steps:
                     break
                 data = torch.load(file_path, weights_only=False)
-                # FluxTrainer expects a single TrainerBatch dict keyed by "labels".
-                yield {**data, "labels": data["img_encodings"]}
+                # Upstream ec953b36: the training loop consumes
+                # TrainingMicrobatch objects.
+                yield FluxEncodedMicrobatch.from_encodings(
+                    img_encodings=data["img_encodings"],
+                    t5_encodings=data["t5_encodings"],
+                    clip_encodings=data["clip_encodings"],
+                )
                 step += 1
             if step >= self.max_steps:
                 raise RuntimeError(f"Reached max_steps={self.max_steps} while iterating through precomputed batches. Please ensure that the number of precomputed batches is at least max_steps.")

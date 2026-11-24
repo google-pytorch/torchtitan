@@ -45,6 +45,7 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
 )
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
+    FSDP_PARAM_FQNS_META,
     MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
@@ -57,6 +58,18 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_fsdp_all_gather_schedule,
     apply_tpu_remat_schedule,
 )
+
+
+if not hasattr(torch.ops.tpu, "_all_gather_dim"):
+    # CPU stand-in with TorchTPU's schema (as in test_graph_split.py).
+    def _all_gather_dim(
+        shard: torch.Tensor, dim: int, group_size: int, group_name: str
+    ) -> torch.Tensor:
+        return torch.cat([shard] * group_size, dim)
+
+    torch.library.custom_op("tpu::_all_gather_dim", mutates_args=())(
+        _all_gather_dim
+    ).register_fake(_all_gather_dim)
 
 
 def _set_tensor_meta(
@@ -282,6 +295,53 @@ class TestTpuFsdpRematSchedule(unittest.TestCase):
             )
         )
         self.assertIs(all_gather.args[0], activation)
+
+    def _dim_all_gather_graph(self, parameter_fqn: str):
+        graph = torch.fx.Graph()
+        weight = _set_tensor_meta(graph.placeholder("weight"))
+        activation = _set_tensor_meta(graph.placeholder("activation"))
+        loss = _set_tensor_meta(
+            graph.call_function(torch.ops.aten.sum.default, args=(activation,))
+        )
+        all_gather = _set_tensor_meta(
+            graph.call_function(
+                torch.ops.tpu._all_gather_dim.default,
+                args=(weight, 1, 2, "fsdp"),
+            ),
+            layer_id=0,
+            backward=True,
+            recomputed=True,
+        )
+        all_gather.meta["custom"][FSDP_PARAM_FQNS_META] = (parameter_fqn,)
+        graph.output((loss, all_gather))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        apply_tpu_remat_fsdp_all_gather_schedule(gm, (), num_static_inputs=1)
+        return gm, weight, loss, all_gather
+
+    def test_all_gather_barrier_protects_dim_all_gathers(self) -> None:
+        # SimpleFSDP gathers a parameter sharded off dim 0 (a stacked Linear's
+        # [N, F, D] weight) with TorchTPU's single-op dim-d all-gather. Its
+        # recompute needs the same barrier as a c10d all-gather, or the full
+        # parameter stays alive from forward to backward.
+        gm, weight, loss, all_gather = self._dim_all_gather_graph(
+            "layers.0.feed_forward.w13.weight"
+        )
+
+        barriers = _collect_fsdp_all_gather_barriers(gm)
+        self.assertEqual(set(barriers), {0})
+        barrier = barriers[0]
+        self.assertEqual(barrier.args, (weight, loss))
+        gathered_from = all_gather.args[0]
+        self.assertIs(gathered_from.target, operator.getitem)
+        self.assertEqual(gathered_from.args, (barrier, 0))
+
+    def test_all_gather_barrier_leaves_expert_dim_all_gathers(self) -> None:
+        gm, weight, _, all_gather = self._dim_all_gather_graph(
+            "layers.0.moe.routed_experts.inner_experts.w1_EDF"
+        )
+
+        self.assertFalse(_collect_fsdp_all_gather_barriers(gm))
+        self.assertIs(all_gather.args[0], weight)
 
     def test_rs_deadline_reuses_all_gather_barriers(self) -> None:
         traced = _trace_simple_fsdp_remat_graph()

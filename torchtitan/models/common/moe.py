@@ -21,7 +21,6 @@ from torchtitan.distributed.spmd_types import (
     maybe_set_sparse_mesh,
     spmd_local_context,
     spmd_mesh_size,
-    spmd_sparse_mesh,
 )
 from torchtitan.models.common.activation import (
     BinaryActivationFn,
@@ -396,7 +395,7 @@ def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
     # TODO: the meshes are wired by hand, assuming TP splits router tokens only
     # under EP. Upstream's global batch-wise loss (pytorch/torchtitan#4772)
     # infers this from spmd_types placements; switch when it lands.
-    dp_mesh = parallel_dims.get_optional_mesh("batch")
+    dp_mesh = parallel_dims.get_optional_mesh("dp")
     cp_mesh = parallel_dims.get_optional_mesh("cp")
     tp_mesh = (
         parallel_dims.get_optional_mesh("tp") if parallel_dims.ep_enabled else None
@@ -482,10 +481,9 @@ class GroupedExperts(Module):
         """Raw expert computation without dispatch/combine.
 
         Shape suffixes here describe logical grouped-mm inputs, not physical
-        sharding. Under EP, E may be a local shard of experts; under TP,
-        expert weights shard hidden dimensions instead; under SP, R may be a
-        local token shard. Keep logical capital suffixes here to avoid encoding
-        a specific parallel layout in these local tensor names.
+        sharding. Under EP, E may be a local shard of experts; under SP, R may
+        be a local token shard. Keep logical capital suffixes here to avoid
+        encoding a specific parallel layout in these local tensor names.
         """
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
         if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
@@ -1068,7 +1066,7 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
             # gate computes and emits dense_sequence_parallel_placement
             # whenever EP is on, and tokens_per_expert_E is TP-Partial for the
             # same reason).
-            axes = ("cp", "tp") if spmd_sparse_mesh() is not None else ("cp",)
+            axes = ("cp", "tp")
 
             # Eq. 18: per-expert routing frequency counts_i over the forward's
             # tokens, then f_i = E * counts_i / sum_j counts_j (so

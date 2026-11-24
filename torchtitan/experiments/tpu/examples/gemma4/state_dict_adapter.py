@@ -6,7 +6,9 @@ from typing import Any
 
 import torch
 
-from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
+from torch.distributed.tensor import DTensor, Replicate
+
+from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model, QKVLinearKeqV
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 # Non-text towers of the multimodal checkpoint, with any leading "model." removed.
@@ -47,6 +49,47 @@ def _single_file_safetensors_keys(hf_assets_path: str) -> set[str] | None:
         (header_len,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(header_len))
     return {k for k in header if k != "__metadata__"}
+
+
+def _replicated(tensor: torch.Tensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.redistribute(
+            tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
+        )
+    return tensor
+
+
+def _split_qk_linear(
+    state_dict: dict[str, Any], *, prefix: str, head_dim: int, heads_per_kv: int
+) -> None:
+    """Expose a K=V layer's packed ``wqkv`` as logical ``wq`` / ``wk``."""
+    r_dim = heads_per_kv + 1
+    for param in ("weight", "bias"):
+        key = f"{prefix}wqkv.{param}"
+        if key not in state_dict:
+            continue
+        tensor = _replicated(state_dict.pop(key))
+        n_kv = tensor.shape[0] // (r_dim * head_dim)
+        tail = tensor.shape[1:]
+        w = tensor.reshape(n_kv, r_dim, head_dim, *tail)
+        state_dict[f"{prefix}wq.{param}"] = w[:, :heads_per_kv].reshape(-1, *tail).contiguous()
+        state_dict[f"{prefix}wk.{param}"] = w[:, heads_per_kv].reshape(-1, *tail).contiguous()
+
+
+def _merge_qk_linear(
+    state_dict: dict[str, Any], *, prefix: str, head_dim: int, heads_per_kv: int
+) -> None:
+    """Pack logical ``wq`` / ``wk`` into a K=V layer's ``wqkv``."""
+    for param in ("weight", "bias"):
+        keys = [f"{prefix}{w}.{param}" for w in ("wq", "wk")]
+        if not all(k in state_dict for k in keys):
+            continue
+        wq, wk = (_replicated(state_dict.pop(k)) for k in keys)
+        n_kv = wk.shape[0] // head_dim
+        tail = wq.shape[1:]
+        q = wq.reshape(n_kv, heads_per_kv, head_dim, *tail)
+        k = wk.reshape(n_kv, 1, head_dim, *tail)
+        state_dict[f"{prefix}wqkv.{param}"] = torch.cat([q, k], dim=1).reshape(-1, *tail)
 
 
 class Gemma4StateDictAdapter(StateDictAdapter):
@@ -119,8 +162,29 @@ class Gemma4StateDictAdapter(StateDictAdapter):
             "lm_head.weight": "lm_head.weight",
         }
 
+    def _keqv_prefixes(self):
+        """``(prefix, head_dim, heads_per_kv)`` of every K=V projection."""
+        for fqn, config, _parent, _ in self.model_config.traverse(
+            QKVLinearKeqV.Config
+        ):
+            yield (
+                f"{fqn}." if fqn else "",
+                config.head_dim,
+                config.n_heads // config.n_kv_heads,
+            )
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert from a TorchTitan Gemma4 state dict to a HuggingFace state dict."""
+        state_dict = dict(state_dict)
+        # Native state dicts keep the physical fused parameters (upstream
+        # 1e4b1f68 / 63c4e9fe); expose the logical wq/wk(/wv) and w1/w3 keys
+        # here. K=V layers pack only Q and K, so split them before the base
+        # class handles the regular QKVLinear and w13 parameters.
+        for prefix, head_dim, heads_per_kv in self._keqv_prefixes():
+            _split_qk_linear(
+                state_dict, prefix=prefix, head_dim=head_dim, heads_per_kv=heads_per_kv
+            )
+        state_dict = self._native_fused_linears_to_hf(state_dict)
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
         hf_state_dict: dict[str, Any] = {}
         pending_w1: dict[str, torch.Tensor] = {}
@@ -228,4 +292,11 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                 if key in self.from_hf_map:
                     state_dict[self.from_hf_map[key]] = value
 
+        # Pack the logical keys back into the native fused parameters. The base
+        # class merges wq/wk/wv and w1/w3; K=V layers have no wv.
+        state_dict = self._native_fused_linears_from_hf(state_dict)
+        for prefix, head_dim, heads_per_kv in self._keqv_prefixes():
+            _merge_qk_linear(
+                state_dict, prefix=prefix, head_dim=head_dim, heads_per_kv=heads_per_kv
+            )
         return state_dict

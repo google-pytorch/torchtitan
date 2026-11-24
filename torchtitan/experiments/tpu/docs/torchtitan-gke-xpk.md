@@ -241,8 +241,7 @@ docker push $IMAGE_TAG
     - `compile.enable=true`: enable torch compile for better performance.
     - `quantize.linear.float8.enable_fsdp_float8_all_gather=true`: enable FP8 all-gather for FSDP.
     - `quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp=true`: precompute FP8 dynamic scale for FSDP.
-    - `checkpoint.enable=true`: enable model checkpointing.
-    - `checkpoint.folder="$GCS_MOUNT/checkpoints"`: set checkpoint directory in GCS bucket.
+    - `checkpointer.folder="$GCS_MOUNT/checkpoints"`: enables checkpointing and sets the checkpoint directory in GCS bucket.
     ```bash
     #!/bin/bash
     set -ex
@@ -300,8 +299,7 @@ docker push $IMAGE_TAG
       --compile.enable true \
       --quantize.linear.float8.enable_fsdp_float8_all_gather true \
       --quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp true \
-      --checkpoint.folder "$GCS_MOUNT/checkpoints" \
-      --checkpoint.enable
+      --checkpointer.folder "$GCS_MOUNT/checkpoints"
 
     ```
 

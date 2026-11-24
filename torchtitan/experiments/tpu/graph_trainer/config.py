@@ -8,7 +8,9 @@
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Annotated, TYPE_CHECKING, Any, Literal
+
+import tyro
 
 from torch import nn
 from torchtitan.experiments.graph_trainer.configs import (
@@ -29,7 +31,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
 )
 from torchtitan.experiments.tpu.components.layer_loop import builds_layer_loop
 
-from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    sync_compile_components,
+    TPUTrainerConfig,
+)
 
 if TYPE_CHECKING:
   from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
@@ -129,6 +134,10 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   ``"loss"`` unless a separately compiled loss is intentional.
   """
 
+  # Fork: the TPU compile config carries knobs that apply even when
+  # torch.compile is off; upstream removed ``CompileConfig.enable`` in
+  # ec953b36 and uses ``compile is None`` instead.
+  enable: bool = False
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"
@@ -175,6 +184,15 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+  # ``components`` to restore when ``enable`` is set; maintained by
+  # ``sync_compile_components``, not a user option.
+  enabled_components: Annotated[list[str] | None, tyro.conf.Suppress] = None
+
+  def __post_init__(self) -> None:
+    super(TpuGraphTrainerCompileConfig, self).__post_init__()
+    # Upstream consumers read "compile is not None and <component> in
+    # components"; keep the fork's explicit switch consistent with that.
+    sync_compile_components(self)
 
 
 def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:
@@ -371,25 +389,6 @@ def apply_tpu_graph_trainer_model_transforms(
   if compile_config.cpu_offload_budget_gb < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
   _validate_tpu_selective(config)
-
-  # Under scan layers, use TpuSingleProjPackedFeedForward (one w13 GEMM over
-  # contiguous [w1; w3] rows + output chunk) instead of splitting w13.weight
-  # into two F.linears, which regressed scan step time. Non-scan keeps the
-  # two-projection TpuPackedFeedForward.
-  # TODO(#195): remove TpuPackedFeedForward and this converter call.
-  if config.model_spec is not None:
-    from torchtitan.experiments.tpu.components.ffn import TpuPackedFeedForwardConverter  # pylint: disable=g-import-not-at-top
-
-    tp_degree = max(1, config.parallelism.tensor_parallel_degree)
-    config.model_spec = dataclasses.replace(
-        config.model_spec,
-        model=TpuPackedFeedForwardConverter.Config(
-            tp_degree=tp_degree,
-            single_projection=compile_config.use_scan_layers,
-        )
-        .build()
-        .convert(config.model_spec.model),
-    )
 
   if not compile_config.use_scan_layers:
     return

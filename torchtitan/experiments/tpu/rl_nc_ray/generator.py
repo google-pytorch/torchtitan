@@ -19,8 +19,8 @@ import types
 import ray
 import torchtitan.experiments.tpu.rl_nc_ray  # Ensure mock runs first
 
-from torchtitan.experiments.rl.actors.generator import VLLMGenerator
-from torchtitan.experiments.rl.models.vllm_registry import register_to_vllm
+from torchtitan.rl.generator import VLLMGenerator
+from torchtitan.rl.model.vllm_registry import register_to_vllm
 
 # Modular Weight Transfer Helpers
 from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import (
@@ -221,7 +221,7 @@ class RayVLLMGenerator:
             pickle.dump((model_spec, compile_config, config), f)
 
         # [TPU HACK] Monkey patch VLLMGenerator to support Ray weight transfer in engine loop
-        import torchtitan.experiments.rl.actors.generator as gen_mod
+        import torchtitan.rl.generator as gen_mod
         
         if not hasattr(gen_mod, "_OriginalModelStateDictPullRequest"):
             gen_mod._OriginalModelStateDictPullRequest = gen_mod.ModelStateDictPullRequest
@@ -334,7 +334,7 @@ class RayVLLMGenerator:
         
         pull_model_state_dict_future = asyncio.get_running_loop().create_future()
         
-        import torchtitan.experiments.rl.actors.generator as gen_mod
+        import torchtitan.rl.generator as gen_mod
         
         async with self.generator._engine_loop_condition:
             self.generator._model_state_dict_pull_request = gen_mod.ModelStateDictPullRequest(

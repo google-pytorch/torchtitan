@@ -180,7 +180,7 @@ def test_packed_qkv_supports_k_eq_v():
 
   fused_state = fused.state_dict()
   packed_state = packed.state_dict()
-  assert set(packed_state) == {"wq.weight", "wk.weight"}
+  assert set(packed_state) == {"wqkv.weight"}
   _assert_state_equal(packed_state, fused_state)
   packed.load_state_dict(fused_state)
   fused.load_state_dict(packed.state_dict())

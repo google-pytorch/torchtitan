@@ -1410,6 +1410,12 @@ class TpuRoutedExperts(RoutedExperts):
     num_token_chunks: int = 1
     max_inflight_chunks: int = 2
     accumulate_chunk_weight_grads_fp32: bool = True
+    # With token chunking, add each chunk's expert dWeight onto a running sum
+    # inside the TGMM kernels (MegaBlox `existing_out`) instead of storing one
+    # dWeight per chunk and summing them in autograd through an FP32 copy of
+    # the weights. Needs the BF16 Pallas grouped matmuls; other experts keep
+    # the autograd sums.
+    accumulate_chunk_weight_grads_in_kernel: bool = True
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -1431,6 +1437,9 @@ class TpuRoutedExperts(RoutedExperts):
     self.max_inflight_chunks = config.max_inflight_chunks
     self.accumulate_chunk_weight_grads_fp32 = (
         config.accumulate_chunk_weight_grads_fp32
+    )
+    self.accumulate_chunk_weight_grads_in_kernel = (
+        config.accumulate_chunk_weight_grads_in_kernel
     )
     self._warned_chunk_snap: set[tuple[int, int]] = set()
     self.scale_before_down_proj = config.scale_before_down_proj
@@ -1555,26 +1564,47 @@ class TpuRoutedExperts(RoutedExperts):
     needs_chunk_counts = not is_roe
 
     unsharded_weights = None
+    dweight_accumulators = None
     if hasattr(self.inner_experts, "unshard_weights"):
       # Unshard the SimpleFSDP expert parameters once, outside the chunk loop
       # (`TpuGroupedExperts.unshard_weights` explains how its all-gathers keep
-      # the experts' `module_fqn` for SimpleFSDP bucketing). Widening the
-      # unsharded weights to FP32 here causes ``TpuGroupedExperts.forward``'s
-      # per-chunk ``.bfloat16()`` casts to widen each chunk's dWeight to FP32
-      # before PyTorch autograd sums across chunks; ``insert_ep_chunk_barriers``
-      # keeps those widening casts out of forward barriers so XLA folds
-      # ``bf16(fp32(w_bf16))`` to ``w_bf16``.
+      # the experts' `module_fqn` for SimpleFSDP bucketing).
       with maybe_set_sparse_mesh():
         unsharded_weights = self.inner_experts.unshard_weights()
-        # TODO(b/587943723): TpuGraphTrainer ZeRO-3 with chunk barriers folds
-        # this cast away (see insert_ep_chunk_barriers), but the eager trainer
-        # without activation checkpointing saves one BF16 weight copy per
-        # chunk (each chunk's `.bfloat16()` re-cast), and GraphTrainer ZeRO-2
-        # saves this FP32 cast as the unshard output
-        # (graph_trainer/fsdp_patterns.py, `_find_last_user_in_wait_chain`).
-        # Fix with a storage-free FP32 grad accumulator that keeps the forward
-        # weights in BF16.
-        if self.accumulate_chunk_weight_grads_fp32:
+        supports_in_kernel = getattr(
+            self.inner_experts, "supports_chunk_dweight_accumulation", None
+        )
+        if (
+            self.accumulate_chunk_weight_grads_in_kernel
+            and supports_in_kernel is not None
+            and supports_in_kernel()
+        ):
+          # Each chunk's TGMMs add their dWeights onto one running sum per
+          # weight inside the kernel, in FP32 by default, and the weights get
+          # the total once (`TpuGroupedExperts.chunk_dweight_accumulators`).
+          # The chunks then need the weights only in BF16, cast once here.
+          dweight_accumulators = self.inner_experts.chunk_dweight_accumulators(
+              unsharded_weights,
+              accumulate_fp32=self.accumulate_chunk_weight_grads_fp32,
+          )
+          unsharded_weights = tuple(
+              w if w.dtype == torch.bfloat16 else w.bfloat16()
+              for w in unsharded_weights
+          )
+        elif self.accumulate_chunk_weight_grads_fp32:
+          # Widening the unsharded weights to FP32 here causes
+          # ``TpuGroupedExperts.forward``'s per-chunk ``.bfloat16()`` casts to
+          # widen each chunk's dWeight to FP32 before PyTorch autograd sums
+          # across chunks; ``insert_ep_chunk_barriers`` keeps those widening
+          # casts out of forward barriers so XLA folds ``bf16(fp32(w_bf16))``
+          # to ``w_bf16``.
+          # TODO(b/587943723): TpuGraphTrainer ZeRO-3 with chunk barriers
+          # folds this cast away (see insert_ep_chunk_barriers), but the eager
+          # trainer without activation checkpointing saves one BF16 weight
+          # copy per chunk (each chunk's `.bfloat16()` re-cast), and
+          # GraphTrainer ZeRO-2 saves this FP32 cast as the unshard output
+          # (graph_trainer/fsdp_patterns.py, `_find_last_user_in_wait_chain`).
+          # The in-kernel accumulation above avoids both.
           unsharded_weights = tuple(
               w.float() if w.dtype != torch.float32 else w
               for w in unsharded_weights
@@ -1623,6 +1653,10 @@ class TpuRoutedExperts(RoutedExperts):
             and isinstance(metadata_c, TpuEpDispatchMetadata)
         ):
           dropped_chunks.append(metadata_c.dropped_count)
+        expert_kwargs = dict(extra_expert_kwargs)
+        if dweight_accumulators is not None:
+          expert_kwargs["dweight_accumulators"] = dweight_accumulators
+          expert_kwargs["last_chunk"] = chunk_idx == len(x_chunks) - 1
         if self.scale_before_down_proj:
           if not isinstance(metadata_c, TpuEpDispatchMetadata):
             raise ValueError(
@@ -1639,7 +1673,7 @@ class TpuRoutedExperts(RoutedExperts):
                 routed_input_c,
                 num_tokens_per_expert_e,
                 row_scale_R=metadata_c.row_scale_R,
-                **extra_expert_kwargs,
+                **expert_kwargs,
             )
           metadata_c = replace(metadata_c, row_scale_applied=True)
         else:
@@ -1647,8 +1681,10 @@ class TpuRoutedExperts(RoutedExperts):
             routed_output_c = self.inner_experts(
                 routed_input_c,
                 num_tokens_per_expert_e,
-                **extra_expert_kwargs,
+                **expert_kwargs,
             )
+        if dweight_accumulators is not None:
+          routed_output_c, dweight_accumulators = routed_output_c
         out_chunks.append(
             self.token_dispatcher.combine(routed_output_c, metadata_c, x_c)
         )

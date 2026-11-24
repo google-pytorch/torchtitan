@@ -180,6 +180,9 @@ class TpuQwen35Model(Qwen35Model):
           accumulate_chunk_weight_grads_fp32=getattr(
               tpu_cfg, "ep_chunk_dw_fp32", None
           ),
+          accumulate_chunk_weight_grads_in_kernel=getattr(
+              tpu_cfg, "ep_chunk_dw_in_kernel", None
+          ),
           paired_grouped_mm=getattr(tpu_cfg, "ep_paired_grouped_mm", None),
       )
 

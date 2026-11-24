@@ -252,6 +252,90 @@ class _LinearExperts(torch.nn.Module):
         return (x_RD.bfloat16() @ weights[0].bfloat16()).to(x_RD.dtype)
 
 
+class _StubDWeightToken(torch.autograd.Function):
+    """``chunk_dweight_accumulator`` in plain PyTorch: a placeholder whose grad is the sum."""
+
+    @staticmethod
+    def forward(ctx, weight, accumulate_fp32):
+        ctx.weight_dtype = weight.dtype
+        dtype = torch.float32 if accumulate_fp32 else weight.dtype
+        return torch.zeros((), dtype=dtype).expand(weight.shape)
+
+    @staticmethod
+    def backward(ctx, grad_acc):
+        return grad_acc.to(ctx.weight_dtype), None
+
+
+class _StubAccumulatingMatmul(torch.autograd.Function):
+    """``x @ w`` whose dWeight is added onto the accumulator, like the TGMM kernels."""
+
+    @staticmethod
+    def forward(ctx, x, w, acc, last_chunk):
+        ctx.save_for_backward(x, w)
+        ctx.acc_dtype = acc.dtype
+        out = x @ w
+        if last_chunk:
+            return out
+        return out, torch.zeros((), dtype=acc.dtype).expand(acc.shape)
+
+    @staticmethod
+    def backward(ctx, grad_out, *grad_acc):
+        x, w = ctx.saved_tensors
+        dw = (x.float().T @ grad_out.float()).to(ctx.acc_dtype)
+        if grad_acc and grad_acc[0] is not None:
+            dw = dw + grad_acc[0]
+        return grad_out @ w.T, None, dw, None
+
+
+class _AccumulatingLinearExperts(_LinearExperts):
+    """``_LinearExperts`` that sums its chunk dWeights through accumulators."""
+
+    def __init__(self, dim: int, dtype: torch.dtype):
+        super().__init__(dim, dtype)
+        self.accumulate_fp32: list[bool] = []
+        self.last_chunk_flags: list[bool] = []
+        self.received_accs: list[tuple[int, ...]] = []
+        self.returned_accs: list[tuple[int, ...]] = []
+
+    def supports_chunk_dweight_accumulation(self):
+        return True
+
+    def chunk_dweight_accumulators(self, weights, *, accumulate_fp32):
+        self.accumulate_fp32.append(accumulate_fp32)
+        return tuple(_StubDWeightToken.apply(w, accumulate_fp32) for w in weights)
+
+    def forward(
+        self,
+        x_RD,
+        num_tokens_per_expert_E,
+        row_scale_R=None,
+        *,
+        pre_unsharded_weights=None,
+        dweight_accumulators=None,
+        last_chunk=False,
+    ):
+        if dweight_accumulators is None:
+            return super().forward(
+                x_RD,
+                num_tokens_per_expert_E,
+                row_scale_R,
+                pre_unsharded_weights=pre_unsharded_weights,
+            )
+        self.weight_dtypes.append(pre_unsharded_weights[0].dtype)
+        self.last_chunk_flags.append(last_chunk)
+        self.received_accs.append(tuple(map(id, dweight_accumulators)))
+        acc_w1, acc_w2, acc_w3 = dweight_accumulators
+        result = _StubAccumulatingMatmul.apply(
+            x_RD.bfloat16(), pre_unsharded_weights[0], acc_w1, last_chunk
+        )
+        if last_chunk:
+            return result.to(x_RD.dtype), None
+        out, next_w1 = result
+        next_accs = (next_w1, acc_w2, acc_w3)
+        self.returned_accs.append(tuple(map(id, next_accs)))
+        return out.to(x_RD.dtype), next_accs
+
+
 def _stub_chunked_routed(dim: int, num_chunks: int, accumulate_fp32: bool):
     """A chunked ``TpuRoutedExperts`` with identity dispatch/combine on one process."""
     routed = TpuRoutedExperts.Config(
@@ -354,6 +438,54 @@ class ChunkedRoutedExpertsTest(parameterized.TestCase):
             if "ep_chunk_idx" in n.meta.get("custom", {})
         }
         assert chunk_ids == set(range(num_chunks))
+
+    @parameterized.parameters(True, False)
+    def test_in_kernel_chunk_dweights_thread_through_the_chunks(
+        self, accumulate_fp32
+    ):
+        """Experts that sum chunk dWeights get the accumulators chunk to chunk.
+
+        The chunked forward unshards once, casts the FP32 weights to BF16 once
+        (no FP32 widening), starts the accumulators with the FP32 choice,
+        passes each chunk the accumulators the previous chunk returned, and
+        flags only the last chunk. The weight gets the sum of the chunks'
+        dWeights through the accumulators.
+        """
+        torch.manual_seed(0)
+        dim, tokens, num_chunks = 8, 12, 4
+        routed, chunk_rows = _stub_chunked_routed(dim, num_chunks, accumulate_fp32)
+        experts = _AccumulatingLinearExperts(dim, torch.float32)
+        routed.inner_experts = experts
+        x = torch.randn(tokens, dim)
+        out = routed(x, *_stub_inputs(tokens))
+
+        assert experts.unshard_calls == 1
+        assert chunk_rows == [3, 3, 3, 3]
+        assert experts.accumulate_fp32 == [accumulate_fp32]
+        assert experts.weight_dtypes == [torch.bfloat16] * num_chunks
+        assert experts.last_chunk_flags == [False] * (num_chunks - 1) + [True]
+        assert experts.received_accs[1:] == experts.returned_accs
+
+        out.sum().backward()
+        want = x.bfloat16().float().T @ torch.ones(tokens, dim)
+        assert experts.w.grad is not None
+        assert experts.w.grad.dtype == torch.float32
+        torch.testing.assert_close(experts.w.grad, want, rtol=1e-2, atol=1e-2)
+
+    def test_in_kernel_chunk_dweights_can_be_turned_off(self):
+        """``accumulate_chunk_weight_grads_in_kernel=False`` keeps the autograd sums."""
+        dim, tokens = 8, 12
+        routed, _ = _stub_chunked_routed(dim, 4, accumulate_fp32=True)
+        routed.accumulate_chunk_weight_grads_in_kernel = False
+        experts = _AccumulatingLinearExperts(dim, torch.bfloat16)
+        routed.inner_experts = experts
+        out = routed(torch.randn(tokens, dim), *_stub_inputs(tokens))
+        assert experts.accumulate_fp32 == []
+        assert experts.last_chunk_flags == []
+        # The autograd path widens the weights to FP32 for the FP32 sums.
+        assert experts.weight_dtypes == [torch.float32] * 4
+        out.sum().backward()
+        assert experts.w.grad.dtype == torch.bfloat16
 
     def test_unshard_weights_matches_forward_layout_and_module_fqn(self):
         from torchtitan.experiments.graph_trainer.common_utils import (

@@ -147,6 +147,18 @@ class EpParityDistributedTest(
               "--tpu_config.ep_scale_before_down_proj=True",
           ],
       ),
+      # The same, with the chunk dWeights summed in autograd instead of inside
+      # the TGMM kernels.
+      (
+          "_ep4_chunk4_w2_autograd_dw",
+          4,
+          [
+              _PALLAS_GMM_CONFIG,
+              "--tpu_config.ep_token_chunks=4",
+              "--tpu_config.ep_scale_before_down_proj=True",
+              "--tpu_config.ep_chunk_dw_in_kernel=False",
+          ],
+      ),
   )
   def test_qwen3_5_moe_ep_matches_single_device(
       self, ep_degree: int, extra_args: list[str]

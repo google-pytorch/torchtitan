@@ -23,6 +23,9 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox import ops as gmm_ops
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm as megablox_gmm
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
+    _dweight_token,
+)
 from torchtitan.experiments.tpu.kernels.pallas_naming import call_named
 
 
@@ -284,7 +287,18 @@ def _dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
     return _accumulate_dinput(dout3, rhs3, grad_lhs, group_sizes, tile_m=tile_m)
 
 
-def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
+def _paired_dweight(
+    lhs,
+    dout1,
+    dout3,
+    group_sizes,
+    *,
+    tile_m,
+    tile_k=0,
+    existing1=None,
+    existing3=None,
+    out_dtype=jnp.bfloat16,
+):
     """Traverse each expert's routed rows once to produce two weight grads.
 
     This follows upstream MegaBlox TGMM's structure: use its group metadata,
@@ -294,6 +308,12 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     accumulators, duplicating the dot and store within one traversal so both
     gradients share the lhs load and metadata work. Empty experts are visited
     so every output slab is written.
+
+    With ``existing1`` and ``existing3`` (both or neither), each FP32 group sum
+    is added onto the matching slab of the existing tensor before the single
+    store, in place (the existing tensors are aliased to the outputs), as
+    MegaBlox TGMM does with ``existing_out``. ``out_dtype`` must then equal
+    their dtype.
     """
     if tile_m <= 0:
         raise ValueError("tile_m must be positive")
@@ -307,6 +327,18 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     tile_k = tile_k or k
     if tile_k <= 0 or k % tile_k:
         raise ValueError("tile_k must divide K")
+    if (existing1 is None) != (existing3 is None):
+        raise ValueError("Pass both existing dWeights or neither")
+    has_existing = existing1 is not None
+    if has_existing:
+        for existing in (existing1, existing3):
+            if existing.shape != (groups, k, n) or existing.dtype != jnp.dtype(
+                out_dtype
+            ):
+                raise ValueError(
+                    f"Existing dWeight {existing.shape} {existing.dtype} must"
+                    f" be ({groups}, {k}, {n}) {jnp.dtype(out_dtype)}"
+                )
     group_metadata, num_active_tiles = _metadata(
         group_sizes,
         m=m,
@@ -316,18 +348,12 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     )
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    def kernel(
-        group_metadata,
-        group_offset,
-        lhs,
-        dout1,
-        dout3,
-        out1,
-        out3,
-        acc1,
-        acc3,
-    ):
+    def kernel(group_metadata, group_offset, lhs, dout1, dout3, *refs):
         del group_offset
+        if has_existing:
+            existing1_ref, existing3_ref, out1, out3, acc1, acc3 = refs
+        else:
+            out1, out3, acc1, acc3 = refs
         # Grid axis 1 walks the K slabs; each slab replays the full row
         # traversal below with its own accumulator, so nothing here depends
         # on the slab index except the block specs.
@@ -401,8 +427,13 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
 
         @pl.when(group_is_changing)
         def _store_accumulators():
-            out1[...] = acc1[...].astype(jnp.bfloat16)
-            out3[...] = acc3[...].astype(jnp.bfloat16)
+            sum1 = acc1[...]
+            sum3 = acc3[...]
+            if has_existing:
+                sum1 = sum1 + existing1_ref[...].astype(jnp.float32)
+                sum3 = sum3 + existing3_ref[...].astype(jnp.float32)
+            out1[...] = sum1.astype(out_dtype)
+            out3[...] = sum3.astype(out_dtype)
 
     def lhs_indices(n_i, k_i, grid_id, group_metadata, group_offset):
         del n_i, group_offset
@@ -419,15 +450,26 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     lhs_spec = pl.BlockSpec((tile_m, tile_k), lhs_indices)
     dout_spec = pl.BlockSpec((tile_m, n), dout_indices)
     out_spec = pl.BlockSpec((None, tile_k, n), out_indices)
+    in_specs = [lhs_spec, dout_spec, dout_spec]
+    operands = [lhs, dout1, dout3]
+    input_output_aliases = {}
+    name = "moe_tgmm_w13_wgrad"
+    if has_existing:
+        in_specs += [out_spec, out_spec]
+        operands += [existing1, existing3]
+        # Operands 7 and 8 count the three group-metadata arrays, group_offset,
+        # lhs, dout1 and dout3.
+        input_output_aliases = {7: 0, 8: 1}
+        name = "moe_tgmm_w13_wgrad_accum"
     return pl.pallas_call(
         kernel,
         out_shape=[
-            jax.ShapeDtypeStruct((groups, k, n), jnp.bfloat16),
-            jax.ShapeDtypeStruct((groups, k, n), jnp.bfloat16),
+            jax.ShapeDtypeStruct((groups, k, n), out_dtype),
+            jax.ShapeDtypeStruct((groups, k, n), out_dtype),
         ],
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=[lhs_spec, dout_spec, dout_spec],
+            in_specs=in_specs,
             out_specs=[out_spec, out_spec],
             grid=(1, k // tile_k, num_active_tiles),
             scratch_shapes=[
@@ -435,11 +477,12 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
                 pltpu.VMEM((tile_k, n), jnp.float32),
             ],
         ),
+        input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary")
         ),
-        name="moe_tgmm_w13_wgrad",
-    )(group_metadata, group_offset, lhs, dout1, dout3)
+        name=name,
+    )(group_metadata, group_offset, *operands)
 
 
 @pallas.jax_op("tt_experts::paired_grouped_mm")
@@ -534,4 +577,155 @@ def paired_segment_matmul_pallas_2d(
     )
 
 
-__all__ = ["paired_segment_matmul_pallas_2d"]
+@pallas.jax_op("tt_experts::paired_grouped_mm_bwd_accumulate")
+def _paired_grouped_mm_bwd_accumulate(
+    dout1: jax.Array,
+    dout3: jax.Array,
+    lhs: jax.Array,
+    rhs1: jax.Array,
+    rhs3: jax.Array,
+    group_sizes: jax.Array,
+    dweight_acc1: jax.Array | None,
+    dweight_acc3: jax.Array | None,
+    tile_m: int,
+    tgmm_tile_m: int,
+    tgmm_tile_k: int,
+    accumulate_fp32: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """dInput, and both dWeights added onto their accumulators in the kernel.
+
+    Without accumulators (the first chunk to run backward), the dWeights are
+    stored fresh in FP32 when ``accumulate_fp32``, else in BF16.
+    """
+    grad_lhs = _dinput(dout1, dout3, rhs1, rhs3, group_sizes, tile_m=tile_m)
+    if dweight_acc1 is None:
+        out_dtype = jnp.float32 if accumulate_fp32 else jnp.bfloat16
+    else:
+        out_dtype = dweight_acc1.dtype
+    acc1, acc3 = _paired_dweight(
+        lhs,
+        dout1,
+        dout3,
+        group_sizes,
+        tile_m=tgmm_tile_m,
+        tile_k=tgmm_tile_k,
+        existing1=dweight_acc1,
+        existing3=dweight_acc3,
+        out_dtype=out_dtype,
+    )
+    return grad_lhs, acc1, acc3
+
+
+def _accumulate_forward(ctx, lhs, rhs1, rhs3, group_sizes, acc1, static_args):
+    ctx.save_for_backward(lhs, rhs1, rhs3, group_sizes)
+    ctx.static_args = static_args
+    ctx.accumulate_fp32 = acc1.dtype == torch.float32
+    return _paired_grouped_mm_fwd(lhs, rhs1, rhs3, group_sizes, *static_args)
+
+
+def _accumulate_backward(ctx, grad_output1, grad_output3, grad_acc1, grad_acc3):
+    lhs, rhs1, rhs3, group_sizes = ctx.saved_tensors
+    grad_lhs, acc1, acc3 = _paired_grouped_mm_bwd_accumulate(
+        grad_output1,
+        grad_output3,
+        lhs,
+        rhs1,
+        rhs3,
+        group_sizes,
+        grad_acc1,
+        grad_acc3,
+        *ctx.static_args,
+        ctx.accumulate_fp32,
+    )
+    return (grad_lhs, None, None, None, acc1, acc3) + (None,) * len(
+        ctx.static_args
+    )
+
+
+class _PairedGroupedMMAccumulate(torch.autograd.Function):
+    """Paired grouped matmul whose dWeights join chunk accumulators, not last."""
+
+    @staticmethod
+    def forward(ctx, lhs, rhs1, rhs3, group_sizes, acc1, acc3, *static_args):
+        out1, out3 = _accumulate_forward(
+            ctx, lhs, rhs1, rhs3, group_sizes, acc1, static_args
+        )
+        return out1, out3, _dweight_token(acc1), _dweight_token(acc3)
+
+    @staticmethod
+    def backward(ctx, grad_output1, grad_output3, grad_acc1, grad_acc3):
+        return _accumulate_backward(
+            ctx, grad_output1, grad_output3, grad_acc1, grad_acc3
+        )
+
+
+class _PairedGroupedMMAccumulateLast(torch.autograd.Function):
+    """Paired grouped matmul for the last chunk: its backward starts the sums."""
+
+    @staticmethod
+    def forward(ctx, lhs, rhs1, rhs3, group_sizes, acc1, acc3, *static_args):
+        return _accumulate_forward(
+            ctx, lhs, rhs1, rhs3, group_sizes, acc1, static_args
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output1, grad_output3):
+        return _accumulate_backward(ctx, grad_output1, grad_output3, None, None)
+
+
+def paired_segment_matmul_pallas_2d_accumulate(
+    lhs: torch.Tensor,
+    rhs1: torch.Tensor,
+    rhs3: torch.Tensor,
+    group_sizes: torch.Tensor,
+    dweight_acc1: torch.Tensor,
+    dweight_acc3: torch.Tensor,
+    *,
+    last_chunk: bool,
+    tile_m: int = 1024,
+    tgmm_tile_m: int = 128,
+    tgmm_tile_k: int = 0,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor] | None,
+]:
+    """``paired_segment_matmul_pallas_2d`` with in-kernel chunk dWeight sums.
+
+    The accumulators work as in
+    ``expert_segment_matmul.segment_matmul_pallas_2d_accumulate``: they come
+    from ``chunk_dweight_accumulator(rhs1)`` and ``(rhs3)`` for the first chunk
+    and from the previous chunk after that, and ``rhs1``/``rhs3`` get no
+    gradient from this call. Returns both outputs and the next chunk's
+    ``(acc1, acc3)``, or ``None`` for them when ``last_chunk``.
+    """
+    if rhs1.shape != rhs3.shape:
+        raise ValueError("Paired grouped matmul weights must have equal shapes")
+    if dweight_acc1.shape != rhs1.shape or dweight_acc3.shape != rhs3.shape:
+        raise ValueError("dWeight accumulators must match the weight shapes")
+    if dweight_acc1.dtype != dweight_acc3.dtype:
+        raise ValueError("Both dWeight accumulators must have one dtype")
+    if group_sizes.dtype != torch.int32:
+        group_sizes = group_sizes.to(torch.int32)
+    args = (
+        lhs,
+        rhs1,
+        rhs3,
+        group_sizes,
+        dweight_acc1,
+        dweight_acc3,
+        tile_m,
+        tgmm_tile_m,
+        tgmm_tile_k,
+    )
+    if last_chunk:
+        out1, out3 = _PairedGroupedMMAccumulateLast.apply(*args)
+        return out1, out3, None
+    out1, out3, acc1, acc3 = _PairedGroupedMMAccumulate.apply(*args)
+    return out1, out3, (acc1, acc3)
+
+
+__all__ = [
+    "paired_segment_matmul_pallas_2d",
+    "paired_segment_matmul_pallas_2d_accumulate",
+]

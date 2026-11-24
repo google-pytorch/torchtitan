@@ -2368,6 +2368,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       self.assertEqual(experts.num_token_chunks, num_token_chunks)
       self.assertEqual(experts.max_inflight_chunks, 2)
       self.assertTrue(experts.accumulate_chunk_weight_grads_fp32)
+      self.assertTrue(experts.accumulate_chunk_weight_grads_in_kernel)
     for dispatcher in dispatchers:
       self.assertEqual(dispatcher.ep_transport, "auto")
       self.assertFalse(dispatcher.fuse_route_score_backward)
@@ -2435,13 +2436,14 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self._assert_ep_recipe(parsed, ep_degree=16, num_token_chunks=16)
 
     # The EP opt-outs: no topology-aware mesh, unpaired expert GMMs, and BF16
-    # cross-chunk dWeight sums.
+    # cross-chunk dWeight sums in autograd instead of in the TGMM kernels.
     parsed_off = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
         "--config=qwen35_moe_397b_split_tokamax_ep_benchmark",
         "--parallelism.no-enable_tpu_topo_mesh",
         "--tpu_config.ep_paired_grouped_mm=False",
         "--tpu_config.ep_chunk_dw_fp32=False",
+        "--tpu_config.ep_chunk_dw_in_kernel=False",
     ])
     self.assertFalse(parsed_off.parallelism.enable_tpu_topo_mesh)
     apply_tpu_graph_trainer_model_transforms(parsed_off)
@@ -2468,6 +2470,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertLen(grouped_off, num_moe_off)
     for experts in routed_off:
       self.assertFalse(experts.accumulate_chunk_weight_grads_fp32)
+      self.assertFalse(experts.accumulate_chunk_weight_grads_in_kernel)
     for experts in grouped_off:
       self.assertFalse(experts.use_pallas_paired_grouped_mm)
 

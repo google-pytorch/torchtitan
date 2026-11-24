@@ -7,6 +7,7 @@
 import contextlib
 import logging
 import os as os
+from typing import cast
 
 import torch
 
@@ -60,14 +61,12 @@ def main() -> None:
     )
 
     config_manager = ConfigManager()
-    config = config_manager.parse_args()
+    config = cast(Trainer.Config, config_manager.parse_args())
 
     # NOTE: internal meta tooling relies on source="training".
     sl.init_structured_logger(
         source="training",
-        # pyrefly: ignore [missing-attribute]
         output_dir=config.dump_folder,
-        # pyrefly: ignore [missing-attribute]
         enable=config.debug.enable_structured_logging,
     )
     sl.log_trace_instant("structured_logger_started")
@@ -83,18 +82,16 @@ def main() -> None:
                 config.parallelism,  # pyrefly: ignore [missing-attribute]
             )
 
-            trainer = config.build()  # pyrefly: ignore [missing-attribute]
+            trainer = config.build()
 
-            if (
-                config.checkpoint.create_seed_checkpoint  # pyrefly: ignore[missing-attribute]
-            ):
+            if config.create_seed_checkpoint:
                 assert (
                     int(os.environ["WORLD_SIZE"]) == 1
                 ), "Must create seed checkpoint using a single device, to disable sharding."
                 assert (
-                    config.checkpoint.enable  # pyrefly: ignore [missing-attribute]
-                ), "Must enable checkpointing when creating a seed checkpoint."
-                trainer.checkpointer.save(curr_step=0, last_step=True)
+                    config.checkpointer is not None
+                ), "Must configure checkpointer when creating a seed checkpoint."
+                trainer.engine.save_checkpoint(last_step=True)
                 logger.info("Created seed checkpoint")
             else:
                 trainer.train()

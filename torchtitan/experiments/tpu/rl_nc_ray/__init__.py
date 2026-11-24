@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # Monarch / Torchstore Mocking for Ray
 # =====================================================================
-# The PolicyTrainer and VLLMGenerator from torchtitan.experiments.rl.actors 
+# The RL Trainer and VLLMGenerator from torchtitan.rl (torchtitan.rl.distributed.actors)
 # inherit from monarch.actor.Actor and use torchstore. 
 # Since we are using Ray and do not want Monarch dependencies or its 
 # Actor metaclass/endpoints to interfere with Ray, we dynamically mock 

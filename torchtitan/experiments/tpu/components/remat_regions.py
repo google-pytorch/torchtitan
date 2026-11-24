@@ -14,13 +14,13 @@ these names.
 Model code marks values that op names alone cannot tell apart by computing
 them inside ``with annotate_region(<region name>):``.
 
-This module imports only torch at load time, so model code can use it without
-importing the graph trainer.
+This module imports only torch, so model code can use it without importing
+the graph trainer.
 """
 
 from contextlib import AbstractContextManager
 
-from torch.fx.traceback import annotate, annotate_fn
+from torch.fx.traceback import annotate
 
 # The FX node annotation key whose value names a region.
 REMAT_REGION = "remat_region"
@@ -39,6 +39,7 @@ MOE_EP_DISPATCH = "moe.ep_dispatch"
 FEED_FORWARD_W2 = "feed_forward.w2"
 # The MoE aux loss's all-reduced expert counts. The scan body always saves
 # them: redoing the all-reduce in backward is an exposed round trip per layer.
+# Set on `_all_reduce_expert_counts` in `models/common/moe.py`; keep in sync.
 MOE_EXPERT_COUNTS = "moe.expert_counts"
 
 
@@ -50,23 +51,3 @@ def annotate_region(name: str) -> AbstractContextManager[None]:
   """
   return annotate({REMAT_REGION: name})
 
-
-_MOE_EXPERT_COUNTS_ANNOTATED = False
-
-
-def annotate_moe_expert_counts() -> None:
-  """Mark the MoE aux loss's count all-reduce as region ``MOE_EXPERT_COUNTS``.
-
-  Wraps ``moe._all_reduce_expert_counts`` once, at setup, so the shared model
-  file stays untouched. The module global is replaced, not a reference to it:
-  ``moe.py``'s loss functions look the name up in their own module each call.
-  """
-  global _MOE_EXPERT_COUNTS_ANNOTATED
-  if _MOE_EXPERT_COUNTS_ANNOTATED:
-    return
-  from torchtitan.models.common import moe  # pylint: disable=g-import-not-at-top
-
-  moe._all_reduce_expert_counts = annotate_fn(  # pylint: disable=protected-access
-      {REMAT_REGION: MOE_EXPERT_COUNTS}
-  )(moe._all_reduce_expert_counts)  # pylint: disable=protected-access
-  _MOE_EXPERT_COUNTS_ANNOTATED = True

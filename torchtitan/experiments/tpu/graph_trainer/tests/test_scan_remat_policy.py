@@ -25,12 +25,10 @@ from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_with_remat_policy,
 )
 from torchtitan.experiments.tpu.components.remat_regions import (
-    annotate_moe_expert_counts,
     annotate_region,
     ATTENTION_INNER_ATTENTION,
     MOE_EXPERT_COUNTS,
 )
-from torchtitan.models.common import moe
 from torchtitan.models.common.moe import _batch_wise_load_balance_loss
 
 SEED = 1234
@@ -221,8 +219,6 @@ class TestScanRematPolicy(unittest.TestCase):
 
     def setUp(self):
         _init_single_rank_gloo(12392)
-        # `LayerStack.install` does this for a scanned model.
-        annotate_moe_expert_counts()
 
     def tearDown(self):
         if dist.is_initialized():
@@ -265,12 +261,6 @@ class TestScanRematPolicy(unittest.TestCase):
             "_c10d_functional.all_reduce.default", _ops(captured[0][1])
         )
         self._check_same_grads(got, want)
-
-    def test_the_counts_are_wrapped_once(self):
-        wrapped = moe._all_reduce_expert_counts
-        annotate_moe_expert_counts()
-        self.assertIs(moe._all_reduce_expert_counts, wrapped)
-        self.assertFalse(hasattr(wrapped.__wrapped__, "__wrapped__"))
 
     def test_a_body_without_regions_recomputes_everything(self):
         want, legacy = _run(_legacy, extra=None)

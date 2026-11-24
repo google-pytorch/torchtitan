@@ -13,7 +13,6 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
-from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
@@ -215,15 +214,9 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(),
-      validator=Validator.Config(
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
 
 
@@ -302,11 +295,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -333,11 +322,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       loss_kernel=LossKernelConfig(
           use_loss_kernel=False,
       ),
-      validator=Validator.Config(
-          enable=False,
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
 
 
@@ -371,11 +356,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
           enable_tpu_topo_mesh=True,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -403,11 +384,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       loss_kernel=LossKernelConfig(
           use_loss_kernel=True,
       ),
-      validator=Validator.Config(
-          enable=False,
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
 
 
@@ -589,11 +566,7 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
           # explicit while Zero-3 memory/overlap policy is tuned separately.
           fsdp_reshard_after_forward="never",
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       # GraphTrainer does not apply this eager AC config; its graph
       # rematerialization policy is selected on the final compile config below.
       activation_checkpoint=SelectiveAC.Config(),
@@ -623,11 +596,7 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
           sa_block_q_dq=1024,
           sa_block_kv_dq=1024,
       ),
-      validator=Validator.Config(
-          enable=False,
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
   _enable_pallas_cross_entropy(config)
   graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
@@ -780,7 +749,7 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
       sa_block_kv_dq=1024,
   )
   cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
-  cfg.validator = Validator.Config(enable=False)
+  cfg.validator = None
   graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       cfg, graph_trainer_model_registry
   )
@@ -872,9 +841,9 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
   )
   cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
   cfg.metrics.log_freq = 1
-  cfg.checkpoint = CheckpointManager.Config(enable=False)
+  cfg.checkpointer = None
   cfg.profiler = Profiler.Config(enable_profiling=False)
-  cfg.validator = Validator.Config(enable=False)
+  cfg.validator = None
   return cfg
 
 

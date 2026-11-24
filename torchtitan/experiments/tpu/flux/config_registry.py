@@ -46,14 +46,15 @@ def flux_testmodel() -> FluxTrainer.Config:
   # Point both datasets at the local cc12m_test shards explicitly, so the
   # config does not depend on the upstream default (repo-relative) paths.
   config.dataloader.dataset_path = f"{_TEST_ASSETS}cc12m_test"
-  validation = config.validator.dataloader.dataset
-  config.validator.dataloader.dataset = dataclasses.replace(
-      validation,
-      dataset=dataclasses.replace(
-          validation.dataset,
-          source=dataclasses.replace(
-              validation.dataset.source, path=f"{_TEST_ASSETS}cc12m_test"
-          ),
-      ),
-  )
+  if config.validator is not None:
+    validation = config.validator.dataloader.dataset
+    config.validator.dataloader.dataset = dataclasses.replace(
+        validation,
+        dataset=dataclasses.replace(
+            validation.dataset,
+            source=dataclasses.replace(
+                validation.dataset.source, path=f"{_TEST_ASSETS}cc12m_test"
+            ),
+        ),
+    )
   return config

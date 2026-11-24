@@ -77,8 +77,6 @@ def mamba3_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
           steps=1000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
-      checkpoint=checkpoint.CheckpointManager.Config(
-          interval=100, last_save_model_only=False
-      ),
+      checkpointer=None,
       activation_checkpoint=activation_checkpoint.FullAC.Config(),
   )

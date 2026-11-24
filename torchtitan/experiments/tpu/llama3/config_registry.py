@@ -9,7 +9,6 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
-from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
     ParallelismConfig,
@@ -136,17 +135,27 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(),
-      validator=Validator.Config(
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
+
+
+def llama3_debugmodel_checkpoint() -> TPUTrainerConfig:
+  """`llama3_debugmodel` with checkpointing on, for the checkpoint tests.
+
+  Upstream's `checkpointer` is `None` when off and `tyro.conf.AvoidSubcommands`
+  keeps a `None` default off the CLI, so a saving recipe has to carry the
+  config; `--checkpointer.interval/folder` then override it.
+  """
+  config = llama3_debugmodel()
+  # Full training state on the last step too: the resume runs reload the
+  # dataloader and optimizer from the final save.
+  config.checkpointer = CheckpointManager.Config(
+      interval=2, last_save_model_only=False
+  )
   return config
 
 
@@ -187,15 +196,9 @@ def llama3_1b() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
       ),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(),
-      validator=Validator.Config(
-          freq=5,
-          steps=10,
-      ),
+      validator=None,
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
   return config
@@ -226,18 +229,9 @@ def llama3_8b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
           enable_tpu_topo_mesh=True,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=True,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
-      validator=Validator.Config(
-          enable=False,
-          freq=500,
-          steps=1200,
-          dataloader=c4_test_dataloader(),
-      ),
+      validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
       ),
@@ -291,18 +285,9 @@ def llama3_70b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
           enable_tpu_topo_mesh=True,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=True,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
-      validator=Validator.Config(
-          enable=False,
-          freq=500,
-          steps=1200,
-          dataloader=c4_test_dataloader(),
-      ),
+      validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
       ),
@@ -356,18 +341,9 @@ def llama3_405b() -> TPUTrainerConfig:
           use_simple_fsdp=True,
           enable_tpu_topo_mesh=True,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=True,
-      ),
+      checkpointer=None,
       activation_checkpoint=FullAC.Config(),
-      validator=Validator.Config(
-          enable=False,
-          freq=500,
-          steps=1200,
-          dataloader=c4_test_dataloader(),
-      ),
+      validator=None,
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
       ),
@@ -448,15 +424,14 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           use_simple_fsdp=True,
           enable_tpu_topo_mesh=True,
       ),
-      checkpoint=CheckpointManager.Config(
+      checkpointer=CheckpointManager.Config(
           # `enable` is on only so the initial HF weight load happens;
           # `load_only` then suppresses every save, including the
           # unconditional last-step one.
-          enable=True,
           load_only=True,
           initial_load_in_hf=True,
-          initial_load_model_only=True,
-      ),
+          initial_load_model_only=True
+                 ),
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",

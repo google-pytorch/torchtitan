@@ -33,6 +33,7 @@ def use_expert_parallel(
     num_token_chunks: int | None = None,
     max_inflight_chunks: int | None = None,
     accumulate_chunk_weight_grads_fp32: bool | None = None,
+    accumulate_chunk_weight_grads_in_kernel: bool | None = None,
     paired_grouped_mm: bool | None = None,
 ) -> None:
   """Configures a MoE model config for expert parallelism on TPU.
@@ -77,6 +78,9 @@ def use_expert_parallel(
     accumulate_chunk_weight_grads_fp32: Optional override for summing the
       chunked expert weight gradients across token chunks in FP32 (the
       ``TpuRoutedExperts`` default) instead of the weight dtype.
+    accumulate_chunk_weight_grads_in_kernel: Optional override for summing
+      those gradients inside the Pallas TGMM kernels (the ``TpuRoutedExperts``
+      default) instead of in autograd.
     paired_grouped_mm: ``False`` switches paired Pallas grouped matmuls to the
       unpaired kernels under EP; ``None`` or ``True`` leaves the recipe's
       choice. The paired kernel skips rows past the routed count like the
@@ -110,6 +114,10 @@ def use_expert_parallel(
       if accumulate_chunk_weight_grads_fp32 is not None:
         ep_experts.accumulate_chunk_weight_grads_fp32 = (
             accumulate_chunk_weight_grads_fp32
+        )
+      if accumulate_chunk_weight_grads_in_kernel is not None:
+        ep_experts.accumulate_chunk_weight_grads_in_kernel = (
+            accumulate_chunk_weight_grads_in_kernel
         )
       # Routing weights before W2 pass `row_scale_R`, which only the Pallas
       # grouped matmuls accept (stock `GroupedExperts` has no such argument).

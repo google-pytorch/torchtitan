@@ -426,5 +426,130 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         torch.testing.assert_close(drhs3, drhs3_ref, rtol=0, atol=0)
 
 
+class PairedChunkDWeightAccumulationTest(
+    base_device_test.BaseAcceleratorDeviceTest
+):
+    """``paired_segment_matmul_pallas_2d_accumulate`` over three EP chunks."""
+
+    # (group sizes, row count) per chunk. The second chunk routes nothing to
+    # experts 0 and 2; rows past each chunk's routed count are NaN.
+    _CHUNKS = (([40, 0, 70, 18], 256), ([0, 64, 0, 60], 128), ([21, 9, 30, 4], 128))
+
+    def _run_chunks(self, *, accumulate, accumulate_fp32, tgmm_tile_k):
+        device = self.accelerator_device
+        generator = torch.Generator().manual_seed(0)
+        groups, k, n = 4, 256, 256
+
+        def integers(shape):
+            # Small integers keep every FP32 partial sum exact in any order;
+            # the sums still pass 256, where BF16 stops holding integers.
+            return torch.randint(-24, 25, shape, generator=generator).bfloat16()
+
+        def with_nan_tail(valid_rows, rows, width):
+            nan = torch.full((rows - valid_rows, width), float("nan"))
+            return torch.cat([integers((valid_rows, width)), nan]).bfloat16()
+
+        rhs1 = integers((groups, k, n)).to(device).requires_grad_()
+        rhs3 = integers((groups, k, n)).to(device).requires_grad_()
+        chunks = []
+        for sizes, rows in self._CHUNKS:
+            valid = sum(sizes)
+            chunks.append(
+                (
+                    with_nan_tail(valid, rows, k).to(device).requires_grad_(),
+                    with_nan_tail(valid, rows, n).to(device),
+                    with_nan_tail(valid, rows, n).to(device),
+                    torch.tensor(sizes, dtype=torch.int32).to(device),
+                )
+            )
+        kwargs = dict(tile_m=128, tgmm_tile_m=128, tgmm_tile_k=tgmm_tile_k)
+        outs = []
+        if accumulate:
+            accs = tuple(
+                expert_segment_matmul.chunk_dweight_accumulator(
+                    w, accumulate_fp32=accumulate_fp32
+                )
+                for w in (rhs1, rhs3)
+            )
+            for i, (lhs, _, _, sizes) in enumerate(chunks):
+                out1, out3, accs = (
+                    paired_segment_matmul.paired_segment_matmul_pallas_2d_accumulate(
+                        lhs,
+                        rhs1,
+                        rhs3,
+                        sizes,
+                        *accs,
+                        last_chunk=i == len(chunks) - 1,
+                        **kwargs,
+                    )
+                )
+                outs += [out1, out3]
+            self.assertIsNone(accs)
+        else:
+            for lhs, _, _, sizes in chunks:
+                outs += list(
+                    paired_segment_matmul.paired_segment_matmul_pallas_2d(
+                        lhs, rhs1, rhs3, sizes, **kwargs
+                    )
+                )
+        grads = torch.autograd.grad(
+            outs,
+            [lhs for lhs, *_ in chunks] + [rhs1, rhs3],
+            [g for _, g1, g3, _ in chunks for g in (g1, g3)],
+        )
+        valid_rows = [sum(sizes) for sizes, _ in self._CHUNKS]
+        outs = [
+            out[:valid_rows[i // 2]].cpu() for i, out in enumerate(outs)
+        ]
+        grad_lhs = [g[:v].cpu() for g, v in zip(grads[:-2], valid_rows)]
+        exact = []
+        for lhs, g1, g3, sizes in chunks:
+            sizes_list = sizes.cpu().tolist()
+            valid = sum(sizes_list)
+            rows = lhs[:valid].detach().cpu().float().split(sizes_list)
+            exact.append(
+                tuple(
+                    torch.stack(
+                        [
+                            r.T @ d.float()
+                            for r, d in zip(rows, g[:valid].cpu().split(sizes_list))
+                        ]
+                    )
+                    for g in (g1, g3)
+                )
+            )
+        return outs, grad_lhs, (grads[-2].cpu(), grads[-1].cpu()), exact
+
+    def test_accumulated_dweights_are_the_chunk_sums(self):
+        """Both weights get every chunk's dWeight, summed in FP32 in the kernel."""
+        for tgmm_tile_k in (0, 128):
+            outs, grad_lhs, dweights, exact = self._run_chunks(
+                accumulate=True, accumulate_fp32=True, tgmm_tile_k=tgmm_tile_k
+            )
+            for idx, dweight in enumerate(dweights):
+                want = torch.stack([e[idx] for e in exact]).sum(0)
+                self.assertEqual(dweight.dtype, torch.bfloat16)
+                torch.testing.assert_close(
+                    dweight, want.to(torch.bfloat16), rtol=0, atol=0
+                )
+            ref_outs, ref_grad_lhs, _, _ = self._run_chunks(
+                accumulate=False, accumulate_fp32=True, tgmm_tile_k=tgmm_tile_k
+            )
+            for got, want in zip(outs + grad_lhs, ref_outs + ref_grad_lhs):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_bf16_accumulation_rounds_after_every_chunk(self):
+        """Without FP32 the running sum is a BF16 tensor, rounded per chunk."""
+        _, _, dweights, exact = self._run_chunks(
+            accumulate=True, accumulate_fp32=False, tgmm_tile_k=0
+        )
+        for idx, dweight in enumerate(dweights):
+            running = None
+            for chunk in reversed(exact):  # backward runs the last chunk first
+                total = chunk[idx] if running is None else chunk[idx] + running.float()
+                running = total.to(torch.bfloat16)
+            torch.testing.assert_close(dweight, running, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     absltest.main()

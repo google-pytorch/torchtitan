@@ -26,7 +26,9 @@ and cluster setup.
   overlaps another chunk's expert matmuls and each chunk's worst-case expert
   buffer is `1/C` of the unchunked one. The expert weights are still
   all-gathered once per layer, and their per-chunk gradients are summed in
-  FP32 (`--tpu_config.ep_chunk_dw_fp32=False` sums them in BF16).
+  FP32 inside the dWeight kernels: each chunk's kernel adds onto a running sum
+  instead of storing its own (`--tpu_config.ep_chunk_dw_fp32=False` sums in
+  BF16; `--tpu_config.ep_chunk_dw_in_kernel=False` sums in autograd instead).
 - **Routing weights before the down projection**
   (`ep_scale_before_down_proj`), so combine is a plain sum.
 - **Paired W1 + W3 expert matmuls stay on.** The paired Pallas kernel skips the

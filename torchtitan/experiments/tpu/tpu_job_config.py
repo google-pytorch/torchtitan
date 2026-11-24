@@ -54,6 +54,9 @@ class TPUConfig:
   ep_max_inflight_chunks: int | None = None
   # False sums each layer's cross-chunk expert dWeights in BF16 instead of FP32.
   ep_chunk_dw_fp32: bool | None = None
+  # False sums those dWeights in autograd instead of inside the Pallas TGMM
+  # kernels.
+  ep_chunk_dw_in_kernel: bool | None = None
   # False switches paired W1+W3 Pallas grouped matmuls to unpaired under EP.
   ep_paired_grouped_mm: bool | None = None
 

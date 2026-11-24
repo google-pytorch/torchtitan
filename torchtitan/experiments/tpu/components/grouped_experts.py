@@ -8,10 +8,13 @@ import torch.nn.functional as F
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
+    chunk_dweight_accumulator,
     segment_matmul_pallas_2d,
+    segment_matmul_pallas_2d_accumulate,
 )
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
+    paired_segment_matmul_pallas_2d_accumulate,
 )
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
@@ -348,6 +351,32 @@ class TpuGroupedExperts(GroupedExperts):
             w2_EKN = w2_EKN.transpose(-2, -1)
         return w1_EKN, w2_EKN, w3_EKN
 
+    def supports_chunk_dweight_accumulation(self) -> bool:
+        """Whether ``forward`` can sum EP chunk dWeights inside its kernels.
+
+        Only the BF16 Pallas grouped matmuls can (their TGMMs take a running
+        accumulator); the FP8 and native ``torch._grouped_mm`` paths can't.
+        """
+        return self.use_pallas_grouped_mm and not self.use_fp8_grouped_mm
+
+    def chunk_dweight_accumulators(
+        self,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        accumulate_fp32: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Starts one in-kernel dWeight accumulator per ``unshard_weights`` output.
+
+        Pass them to the first chunk's ``forward(dweight_accumulators=...)``.
+        Each weight's gradient is then the sum of every chunk's dWeight, added
+        up inside the TGMM kernels in FP32 when ``accumulate_fp32`` (else in
+        the weight dtype) and rounded once to the weight dtype.
+        """
+        return tuple(
+            chunk_dweight_accumulator(w, accumulate_fp32=accumulate_fp32)
+            for w in weights
+        )
+
     def forward(
         self,
         x_RD: torch.Tensor,
@@ -357,14 +386,42 @@ class TpuGroupedExperts(GroupedExperts):
         pre_unsharded_weights: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None,
-    ) -> torch.Tensor:
+        dweight_accumulators: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+        last_chunk: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[
+            torch.Tensor,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        ]
+    ):
         """Run the experts on expert-sorted rows.
 
         ``row_scale_R``, if given, multiplies each row's hidden activation
         before the down projection (W2). ``pre_unsharded_weights``, if given,
         is the output of ``unshard_weights`` and is used instead of the
         parameters.
+
+        ``dweight_accumulators`` (EP token chunking only, with
+        ``pre_unsharded_weights``) are the (w1, w2, w3) accumulators from
+        ``chunk_dweight_accumulators`` or from the previous chunk. Each
+        grouped matmul then adds its dWeight onto its accumulator inside the
+        TGMM kernel, and the weights get their gradients through the
+        accumulators instead. With them, ``forward`` returns the output and the
+        next chunk's accumulators, or ``None`` for those when ``last_chunk``.
         """
+        if dweight_accumulators is not None:
+            if not self.supports_chunk_dweight_accumulation():
+                raise ValueError(
+                    "dweight_accumulators need the BF16 Pallas grouped matmuls"
+                )
+            if pre_unsharded_weights is None:
+                raise ValueError(
+                    "dweight_accumulators need the pre_unsharded_weights they"
+                    " were started from"
+                )
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
@@ -455,6 +512,18 @@ class TpuGroupedExperts(GroupedExperts):
             return self._fp8_experts_forward(
                 x_bf16, w1_EKN, w2_EKN, w3_EKN, fp8_tokens_per_expert_E
             )[:num_rows].type_as(x_RD)
+        if dweight_accumulators is not None:
+            return self._accumulating_pallas_forward(
+                x_bf16,
+                (w1_EKN, w2_EKN, w3_EKN),
+                num_tokens_per_expert_E,
+                row_scale_R,
+                dweight_accumulators,
+                last_chunk=last_chunk,
+                num_rows=num_rows,
+                pad_rows=pad_rows,
+                out_dtype=x_RD.dtype,
+            )
         if self.use_pallas_paired_grouped_mm:
             # Every expert kernel gets BF16 weights and returns BF16 dWeights.
             # FP32 FSDP reductions widen those gradients after the kernel; BF16
@@ -504,6 +573,94 @@ class TpuGroupedExperts(GroupedExperts):
             tgmm_tiling=w2_tgmm_tiling,
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
+
+    def _accumulating_pallas_forward(
+        self,
+        x_bf16: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        num_tokens_per_expert_E: torch.Tensor,
+        row_scale_R: torch.Tensor | None,
+        dweight_accumulators: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        last_chunk: bool,
+        num_rows: int,
+        pad_rows: int,
+        out_dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
+        """The BF16 Pallas experts with in-kernel chunk dWeight accumulation.
+
+        The same kernels and math as ``forward``'s Pallas path, through the
+        ``*_accumulate`` grouped matmuls: the forward values are unchanged,
+        and each dWeight goes into its accumulator instead of to its weight.
+        """
+        w1_EKN, w2_EKN, w3_EKN = weights
+        acc_w1, acc_w2, acc_w3 = dweight_accumulators
+        tile_m = self.pallas_grouped_mm_tile_m
+        tile_k = self.pallas_grouped_mm_tile_k
+        tile_n = self.pallas_grouped_mm_tile_n
+        tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
+        w2_tgmm_tiling = self.pallas_grouped_mm_w2_tgmm_tiling or tgmm_tiling
+        if self._use_transposed_w2_rhs:
+            w2_tgmm_tiling = (
+                self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
+            )
+
+        def grouped_mm(lhs, weight, acc, tgmm, transpose_rhs=False):
+            return segment_matmul_pallas_2d_accumulate(
+                lhs,
+                weight,
+                num_tokens_per_expert_E,
+                acc,
+                last_chunk=last_chunk,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                tgmm_tiling=tgmm,
+                transpose_rhs=transpose_rhs,
+            )
+
+        if self.use_pallas_paired_grouped_mm:
+            gate_RF, up_RF, next_w13 = paired_segment_matmul_pallas_2d_accumulate(
+                x_bf16,
+                w1_EKN.bfloat16(),
+                w3_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                acc_w1,
+                acc_w3,
+                last_chunk=last_chunk,
+                tile_m=tile_m,
+                tgmm_tile_m=tgmm_tiling[0],
+                tgmm_tile_k=tgmm_tiling[1],
+            )
+            next_w1, next_w3 = (None, None) if next_w13 is None else next_w13
+        else:
+            gate_RF, next_w1 = grouped_mm(
+                x_bf16, w1_EKN.bfloat16(), acc_w1, tgmm_tiling
+            )
+            up_RF, next_w3 = grouped_mm(
+                x_bf16, w3_EKN.bfloat16(), acc_w3, tgmm_tiling
+            )
+        hidden_RF = self._activation_fn(gate_RF) * up_RF
+        if row_scale_R is not None:
+            if pad_rows:
+                row_scale_R = F.pad(row_scale_R, (0, pad_rows))
+            hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
+                hidden_RF.dtype
+            )
+        out_RD, next_w2 = grouped_mm(
+            hidden_RF,
+            w2_EKN.bfloat16(),
+            acc_w2,
+            w2_tgmm_tiling,
+            transpose_rhs=self._use_transposed_w2_rhs,
+        )
+        out_RD = out_RD[:num_rows].to(out_dtype)
+        if last_chunk:
+            return out_RD, None
+        return out_RD, (next_w1, next_w2, next_w3)
 
     def _fp8_experts_forward(
         self,

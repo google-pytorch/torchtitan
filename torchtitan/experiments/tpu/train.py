@@ -70,22 +70,12 @@ class TPUTrainer(torchtitan.train.Trainer):
     # runs this hook before it builds the LR schedulers.
     model_spec = getattr(job_config, "model_spec", None)
     if model_spec is not None:
-      # TODO(#195): remove TpuPackedFeedForward and this converter call.
-      # Upstream pytorch/torchtitan#4808 stores w13 stacked as [2, F, D] with
-      # contiguous gate/up halves, which lands with PR #195; re-check dense
-      # step time there before deleting.
-      from torchtitan.experiments.tpu.components.ffn import TpuPackedFeedForwardConverter  # pylint: disable=g-import-not-at-top
+      # The eager (non-scan) step runs the SwiGLU gate/up projections as two
+      # GEMMs over the stacked w13 halves; see TpuTwoProjFeedForward.
+      from torchtitan.experiments.tpu.components.ffn import TpuTwoProjFeedForwardConverter  # pylint: disable=g-import-not-at-top
 
-      parallelism = getattr(job_config, "parallelism", None)
-      tp_degree = (
-          max(1, parallelism.tensor_parallel_degree)
-          if parallelism is not None
-          else 1
-      )
-      model = (
-          TpuPackedFeedForwardConverter.Config(tp_degree=tp_degree)
-          .build()
-          .convert(model_spec.model)
+      model = TpuTwoProjFeedForwardConverter.Config().build().convert(
+          model_spec.model
       )
       job_config.model_spec = dataclasses.replace(
           model_spec,

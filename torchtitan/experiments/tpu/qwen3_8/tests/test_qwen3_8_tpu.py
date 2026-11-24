@@ -391,6 +391,7 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
   @parameterized.parameters(
       "qwen38_debugmodel",
       "qwen38_moe_debugmodel",
+      "qwen38_moe_debugmodel_ep8",
   )
   def test_recipe_parses(self, config_name: str):
     cfg = ConfigManager().parse_args([

@@ -8,7 +8,8 @@ Covers:
    top-10 routing over more experts plus the shared expert, 1/4 partial
    rotary with ``mrope_section`` in the 2.4T's proportions. Forward logits,
    loss and every parameter gradient, with negative controls.
-2. ``scaled_down`` and the 2.4T-A95B flavor's shapes and parameter counts.
+2. ``scaled_down``, the 2.4T-A95B flavor's shapes and parameter counts, and
+   every recipe in the registry.
 """
 
 import copy
@@ -18,10 +19,12 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
+from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.qwen3_5 import use_tpu_modules
 import torchtitan.experiments.tpu.qwen3_8 as qwen3_8_tpu
+from torchtitan.experiments.tpu.qwen3_8 import config_registry
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
@@ -384,6 +387,27 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
     nparams, _ = config.get_nparams_and_flops(model, 4096)
     # 26.25B per layer (25.77B routed experts) x 92 + 4.07B embeddings/head.
     self.assertBetween(nparams, 2.40e12, 2.44e12)
+
+  @parameterized.parameters(
+      "qwen38_debugmodel",
+      "qwen38_moe_debugmodel",
+  )
+  def test_recipe_parses(self, config_name: str):
+    cfg = ConfigManager().parse_args([
+        "--module",
+        "torchtitan.experiments.tpu.qwen3_8",
+        "--config",
+        config_name,
+    ])
+    self.assertEqual(cfg.model_spec.name, "qwen3_8")
+    self.assertIsNone(cfg.model_spec.model.vision_encoder)
+    self.assertTrue(hasattr(config_registry, config_name))
+    moes = [m for _, m, _, _ in cfg.model_spec.model.traverse(MoE.Config)]
+    for moe in moes:
+      # Upstream's expert-bias balancer, not a router aux loss.
+      self.assertEqual(moe.load_balance_coeff, 1e-3)
+      self.assertIsNone(moe.router.aux_loss)
+
 
 if __name__ == "__main__":
   absltest.main()

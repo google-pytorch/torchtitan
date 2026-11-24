@@ -2,11 +2,16 @@
 
 Recipe helpers come from the Qwen3.5 TPU registry: Qwen3.8 is the same
 architecture (see the package docstring).
+
+Generation portability: the debug and proxy recipes set no libtpu flags and
+run on TPU v6e and TPU7x alike. Only ``qwen38_2_4t_a95b``, which targets TPU7x,
+adds TPU7x flags (``_TPU7X_FLAGS``).
 """
 
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -23,6 +28,11 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 _TPU_MOE_CONVERTERS = qwen35_recipes._TPU_MOE_CONVERTERS + [
     TpuRoutedExpertsConverter.Config()
 ]
+
+# TPU7x only. The largest scoped VMEM limit TPU7x accepts (as in
+# `qwen35_moe_35b`); the Splash backward at head_dim 256 needs more than the
+# 32 MiB default.
+_TPU7X_FLAGS = tpu_flags.merge_flags({"xla_tpu_scoped_vmem_limit_kib": 65472})
 
 
 def _use_ragged_ep_transport(cfg: TPUTrainerConfig) -> None:
@@ -119,4 +129,40 @@ def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
   cfg.optimizer = default_adamw(lr=3e-4, implementation="foreach")
   cfg.lr_scheduler = qwen35_recipes.qwen35_moe_35b().lr_scheduler
   cfg.checkpoint.enable = False
+  return cfg
+
+
+def qwen38_2_4t_a95b() -> TPUTrainerConfig:
+  """Qwen3.8-2.4T-A95B (92 hybrid layers, 512 experts) on TPU7x.
+
+  Starting point for the full model, not yet run: EP=64, FSDP over the rest,
+  TP=1, 4K context, FP32 parameters, gradients and AdamW state with bf16
+  compute, full activation checkpointing, the expert-bias balancer, and the
+  `qwen35_moe_35b` kernels (Pallas paired grouped matmuls, Splash with
+  1024 blocks for head_dim 256, Pallas fused linear cross-entropy). At 92
+  layers the regular trainer's single step graph is not expected to compile
+  in reasonable time; the graph-split or scan variant comes with Phase 4.
+  """
+  cfg = qwen35_recipes.qwen35_moe_35b()
+  seq_len = 4096
+  cfg.hf_assets_path = "./assets/hf/Qwen3.8-2.4T-A95B"
+  cfg.model_spec = model_registry(
+      "2.4T-A95B", seq_len=seq_len, converters=_TPU_MOE_CONVERTERS
+  )
+  # pylint: disable-next=protected-access
+  qwen35_recipes._use_tpu_moe_kernels(cfg, tile_m=512)
+  cfg.training.max_context_length = seq_len
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 4 * seq_len
+  cfg.parallelism = ParallelismConfig(
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=64,
+      fsdp_reshard_after_forward="always",
+      use_simple_fsdp=True,
+  )
+  # The compiled gradient norm handles one gradient list; EP splits dense and
+  # expert gradients across meshes (`TPUTrainerConfig.__post_init__`).
+  cfg.compile.compile_grad_norm = False
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, _TPU7X_FLAGS
+  )
   return cfg

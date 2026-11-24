@@ -42,11 +42,13 @@ def _use_ragged_ep_transport(cfg: TPUTrainerConfig) -> None:
   torch_tpu's `all_to_all` rejects asymmetric output buffers, which
   upstream's variable-size EP transport produces. The ragged transport's
   receive buffer would otherwise be sized for the worst case (`ep_size * T *
-  top_k` rows per rank: about 60 of the 91 GiB peak per rank of the TPU7x
-  proxy, and 64x the routed rows at EP=64). `ep_capacity_factor=2.0` with
+  top_k` rows per rank: 64x the routed rows at EP=64, 10.7 GB bf16 per buffer
+  at dim 8192 and T = 1024). `ep_capacity_factor=2.0` with
   `ep_capacity_overflow="grow"` sizes it at twice this rank's routed rows,
   doubling as needed so that no route is dropped (the default "drop" would
-  drop the routes past the cap).
+  drop the routes past the cap). The buffer then grows with routing
+  imbalance: on the TPU7x proxies from random initialization it reached 8x
+  the initial size at 8 layers.
   """
   assert cfg.model_spec is not None
   dispatchers = list(
@@ -105,9 +107,8 @@ def _real_shape_proxy(
   EP=64 does on the full model's 512. bf16 parameters and optimizer state
   (`training.dtype`), full activation checkpointing, plain SDPA and the
   reference GatedDeltaNet: rung 1, for shapes, memory and numerics, not
-  speed. One sequence of `seq_len` tokens per rank: the ragged EP transport's
-  receive buffer is sized for the worst case, `expert_parallel_degree * T *
-  top_k` rows of dim 8192, which bounds the tokens per rank. The
+  speed. One sequence of `seq_len` tokens per rank, on the bounded dropless
+  EP transport (`_use_ragged_ep_transport`). The
   `qwen35_moe_35b` LR schedule (200 warmup steps, clamped to
   `training.steps` in short runs); a 2-step warmup to 3e-4 spiked the loss.
   `max_seq_len` (default `seq_len`) sizes the model's RoPE table, the upper
@@ -144,8 +145,8 @@ def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
   """2.4T-A95B proxy for one TPU v6e-8 host: 4 layers, 64 experts, EP=8.
 
   4 layers are one period of the 3:1 GatedDeltaNet / attention pattern. 2K
-  tokens per rank: at 4K the ragged EP buffer (8 * 4096 * 10 x 8192 bf16 =
-  5.4 GB) ran out of HBM on v6e. See `_real_shape_proxy`.
+  tokens per rank peak at 30.8 of the 32 GiB per v6e chip. See
+  `_real_shape_proxy`.
   """
   return _real_shape_proxy(
       num_layers=4, num_experts=64, expert_parallel_degree=8, seq_len=2048
@@ -176,10 +177,9 @@ def qwen38_2_4t_a95b_proxy_tpu7x() -> TPUTrainerConfig:
 
   The full model's 512 experts at its EP degree (8 experts per rank) on 64
   chips / 128 ranks, with the TPU7x libtpu flags and the Pallas grouped
-  matmul experts (`_use_tpu7x_expert_tiles`). 1K tokens per rank: the
-  ragged EP receive buffer is 64 * T * 10 rows of dim 8192, 10.7 GB bf16 at
-  T = 1024 and 21.5 GB at 2048, and the dispatch, the combine and their
-  gradients each hold one. Raise `--training.max_context_length` and
+  matmul experts (`_use_tpu7x_expert_tiles`). 1K tokens per rank by default
+  (39 GiB peak per rank at 4 layers, 50 GiB at 8). Raise
+  `--training.max_context_length` and
   `--training.num_tokens_per_microbatch_per_dp_rank` together to sweep it, up
   to 8192 (the RoPE table's length).
   See `_real_shape_proxy` and

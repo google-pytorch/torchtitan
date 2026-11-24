@@ -1,11 +1,10 @@
 # Qwen3.8-2.4T-A95B proxies on TPU7x 4x4x4
 
-> **Status: not yet run.** These launch blocks are the harness for the first
-> TPU7x jobs on Qwen3.8-2.4T-A95B. Their configs parse
-> (`test_launch_configs_parse` in `qwen3_8/tests/test_qwen3_8_tpu.py`), and
-> the same code path ran on one TPU v6e-8 host (`qwen38_2_4t_a95b_proxy`, and
-> `qwen38_moe_debugmodel_ep8` with this recipe's libtpu flags). Record
-> results under "Benchmark Results" after the first run.
+> **Status:** Job A and the bf16 part of Job B ran (see "Benchmark Results"):
+> 4 and 8 layers at 1K and 2K tokens per rank. Not yet run: FP32 state, 4K
+> tokens, TP. These launch blocks follow the `gcluster` setup of the TPU
+> README; the runs used an equivalent JobSet on a GKE TPU7x cluster with
+> Kueue.
 
 The full model does not fit on one slice. These recipes run real-per-rank-shape
 proxies on 64 chips (128 ranks): full width (dim 8192, 64/4 heads of 256,
@@ -28,17 +27,27 @@ Docker image build.
 
 ## Before you launch
 
-* **Image.** Build the image from this torchtitan branch with a torch_tpu
-  wheel that includes the eager O2 compilation of ragged dots (torch_tpu
-  commit `9e40d7782`, "Compile ragged dot ops at O2 in eager mode"). Without
-  it, `torch._grouped_mm` returns wrong rows whenever a rank's first experts
-  get no tokens at dim 8192 (eager XLA:TPU at O1, libtpu >= 0.0.53). Put the
-  wheel in the build context; the Dockerfile installs `torch_tpu-*.whl`.
-* **Tokens per rank.** The EP transport is the dropless `ragged_all_to_all`,
-  whose receive buffer is sized for the worst case: 64 * T * 10 rows of dim
-  8192, so 10.7 GB bf16 at T = 1024 and 21.5 GB at 2048. The recipes default
-  to 1K tokens per rank; Job B tries 2K. 4K and up need the bounded-capacity
-  transport.
+* **libtpu.** At dim 8192, eager XLA:TPU (optimization level O1) miscompiles
+  `torch._grouped_mm` on libtpu 0.0.53.x: when a rank's first experts get no
+  tokens, the first non-empty expert's rows come back wrong. The 0.0.54
+  nightlies fix it (the pure-JAX reproducer passes with
+  `0.0.54.dev20261124`). Build the image with such a libtpu, or with a
+  torch_tpu that compiles ragged dots at O2 in eager mode, which is what the
+  runs below used.
+* **Tokens per rank.** The EP transport is the dropless `ragged_all_to_all`
+  with a bounded receive buffer (`ep_capacity_factor=2.0`,
+  `ep_capacity_overflow="grow"`): twice this rank's routed rows, doubled
+  whenever a step routes more, instead of the worst case of 64 * T * 10 rows
+  of dim 8192 (10.7 GB bf16 per buffer at T = 1024). The buffer, and with it
+  memory and step time, therefore depends on how evenly the router spreads
+  tokens (see "Benchmark Results"). The recipes default to 1K tokens per rank
+  and size RoPE for up to 8K, so Job B's token overrides work.
+* **Expert matmul.** The TPU7x proxies run the routed experts with the Pallas
+  grouped matmul in 512 x 2048 x 1024 tiles. XLA's `torch._grouped_mm` for
+  these shapes needs 64.9 MB of scoped VMEM at the 63.9 MB limit the recipes
+  set, and the Pallas defaults need 108-120 MB. XLA's path does compile with
+  `--extra-libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=32768`, and agrees
+  with the Pallas path on step 1 (loss 12.97524 vs 12.97523, same grad_norm).
 * **TP.** TP > 1 failed for every model on TPU v6e-8 (XLA `RET_CHECK` on the
   strided FSDP replica groups). These recipes use TP=1.
 * **Gate.** Before every dispatch: the image carries the commits you expect,
@@ -192,4 +201,76 @@ gcluster job cancel "$WORKLOAD_NAME" --cluster "$CLUSTER_NAME" \
 
 ## Benchmark Results
 
-Not yet run.
+All runs: TPU7x 4x4x4 (128 ranks), all 512 experts at EP=64 (8 per rank,
+expert state FSDP-sharded over the 2 ranks that hold the same experts), bf16
+state, correctness path (eager, plain SDPA, reference GatedDeltaNet, full
+activation checkpointing), libtpu 0.0.53.1 with torch_tpu compiling ragged
+dots at O2. Medians of steps 2-10 of 10. Run date 11/24/2026. These runs
+used a global-batch auxiliary load-balancing loss (coefficient 1e-3) from an
+earlier revision of the recipes; the recipes now use upstream's expert-bias
+balancer, which these numbers do not reflect yet.
+
+Recipes as they are (dropless, growing receive buffer):
+
+| Layers | Tokens per rank | Peak HBM per rank | Step time | MFU |
+|---:|---:|---:|---:|---:|
+| 4 | 1024 | 39.12 GiB (41%) | 3.94 s | 0.82% |
+| 8 | 1024 | 50.07 GiB (52%) | 10.51 s | 0.51% |
+| 4 | 2048 | 48.40 GiB (50%) | 6.39 s | 1.01% |
+| 8 | 2048 | 74.20 GiB (77%) | 19.56 s | 0.55% |
+
+From random initialization the proxies' loss is unstable (13.1 -> 7.0 -> 12.5
+over the first five steps at 8 layers), and routing with it: at 8 layers some
+rank received more than 8x its mean share of routed rows, so the receive
+buffers grew to 163840 rows (six of them, 15 GiB, live at the peak) and step
+time doubled. To measure memory and step time without that, the same points
+ran with a fixed receive buffer, `ep_capacity_overflow="drop"` at
+`ep_capacity_factor=2.0` on every `TpuAllToAllTokenDispatcher.Config`. That
+drops the routes past the cap, so it is a measurement setting, not a
+training recipe:
+
+| Layers | Tokens per rank | Peak HBM per rank | Step time | MFU |
+|---:|---:|---:|---:|---:|
+| 4 | 1024 | 39.10 GiB (41%) | 2.72 s | 1.19% |
+| 8 | 1024 | 43.78 GiB (46%) | 5.16 s | 1.04% |
+| 4 | 2048 | 42.48 GiB (44%) | 4.39 s | 1.48% |
+| 8 | 2048 | 47.22 GiB (49%) | 8.73 s | 1.24% |
+
+In every fixed-buffer run the peak is at the LM head and loss: 8 GiB of
+stack, 22.7 GiB of vocabulary-sized matrices (the embedding and LM head,
+248320 x 8192, gathered unsharded in bf16 and in FP32), and the logits (2.8
+GiB at 1K tokens, 5.7 GiB at 2K). In the profiled steps, collectives take most
+of the device time: at 4 layers and 1K tokens, reduce-scatter 47-48%,
+all-gather 14-15%, offloaded collectives 13%, ragged all-to-all 6-7%, and
+the kernels (custom calls) 11-12%.
+
+## Sizing the full model (estimate)
+
+From the fixed-buffer points, at EP=64 with bf16 state:
+
+| Tokens per rank | Per layer per rank | Fixed (stack, vocabulary, logits) |
+|---:|---:|---:|
+| 1024 | 1.17 GiB | 34.4 GiB |
+| 2048 | 1.19 GiB | 37.7 GiB |
+
+The per-layer term is the layer's sharded state: 26.26B parameters / 128
+ranks x 6 bytes (bf16 parameters and both AdamW moments; at the peak, which
+precedes the backward pass, the gradients are not yet allocated) = 1.15 GiB.
+Per-layer activations are negligible under full activation checkpointing, so
+the per-layer term shrinks with the rank count. The fixed term does not.
+
+For 92 layers at 1K tokens per rank (94.7 GiB usable per rank, 2 ranks per
+chip):
+
+| State | 64 chips | 128 chips | 256 chips | 512 chips |
+|---|---:|---:|---:|---:|
+| bf16 (6 B/param at the peak) | 140 GiB | 87 GiB | 61 GiB | 48 GiB |
+| FP32 (12 B/param at the peak) | 245 GiB | 140 GiB | 87 GiB | 61 GiB |
+
+So about 128 chips with bf16 state (tight) or 256 with FP32 state (tight), and
+twice that for headroom. Caveats: this is a two-point linear fit; it ignores
+the gradients late in the backward pass (2 or 4 more bytes per parameter,
+partly offset by the vocabulary buffers being freed by then); it uses the
+fixed buffer, so routing imbalance adds to it; and 4K tokens adds about 8
+GiB of logits. The largest term that does not shrink with chips is the 22.7
+GiB of unsharded vocabulary matrices, the first thing to cut.

@@ -50,4 +50,3 @@ def annotate_region(name: str) -> AbstractContextManager[None]:
   not change what runs.
   """
   return annotate({REMAT_REGION: name})
-

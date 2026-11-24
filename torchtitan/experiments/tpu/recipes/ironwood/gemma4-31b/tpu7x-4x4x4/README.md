@@ -41,7 +41,7 @@ exports them before PJRT initialization.
 | Flag | Why |
 |---|---|
 | `xla_tpu_dvfs_p_state=7` | TPU7x's throughput operating point. Trades device power for clock speed; does not change the graph (loss and grad_norm are unchanged at every step). |
-| `xla_tpu_scoped_vmem_limit_kib=65472` | Raises the scoped VMEM budget from the 32 MiB default to the 64 MiB a TPU7x core has, so the compiler keeps more intermediates in VMEM. Changes the compiler's tiling, so results differ at round-off level. Together with the P-state: +15.6% throughput at 2 sequences per rank. |
+| `xla_tpu_scoped_vmem_limit_kib=65536` | Raises the scoped VMEM budget from the 32 MiB default to the 64 MiB a TPU7x core has, so the compiler keeps more intermediates in VMEM. Changes the compiler's tiling, so results differ at round-off level. Together with the P-state: +15.6% throughput at 2 sequences per rank. |
 | `xla_tpu_enable_sparse_core_collective_aggregator=true` `xla_tpu_enable_latency_hiding_layer_scheduler=true` | Lets the latency-hiding layer scheduler overlap the FSDP collectives with compute. The scheduler requires the SparseCore collective aggregator, so keep the two enabled or disabled together. |
 | `xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false` `xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true` `xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true` | Splits multi-dimensional reduce-scatters into hierarchical stages across both SparseCores. Together with the scheduler pair: +1.4% throughput. |
 
@@ -49,7 +49,7 @@ exports them before PJRT initialization.
 
 ```bash
 LIBTPU_INIT_FLAGS="xla_tpu_dvfs_p_state=7 \
-xla_tpu_scoped_vmem_limit_kib=65472 \
+xla_tpu_scoped_vmem_limit_kib=65536 \
 xla_tpu_enable_sparse_core_collective_aggregator=true \
 xla_tpu_enable_latency_hiding_layer_scheduler=true \
 xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
@@ -101,3 +101,8 @@ Run Date: 11/24/2026 (mean of steps 10-30, three runs)
 Measured at torchtitan `d0f0316e` with torch_tpu 0.3.0 and libtpu 0.0.50. The
 same config with no libtpu flags and 2 sequences per rank reaches 1,969 TPS per
 rank and 32.6% MFU.
+
+The three runs above, and the batch-size table, used
+`xla_tpu_scoped_vmem_limit_kib=65472`. One run of this exact command with
+`65536` (64 MiB) measured 13.06s per step, 2,510 TPS per rank and 41.5% MFU,
+with loss and grad_norm identical to the `65472` runs at all 30 steps.

@@ -1,7 +1,8 @@
 from collections.abc import Callable
 import dataclasses
+import logging
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import spmd_types as spmd
 import torch
@@ -14,7 +15,7 @@ from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     FlexInnerAttention,
-    FusedQKVLinear,
+    QKVLinear,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
@@ -24,6 +25,7 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
+from torchtitan.models.common.activation import BinaryActivationFn
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import (
     _tokens_per_expert,
@@ -32,7 +34,8 @@ from torchtitan.models.common.moe import (
 )
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class Gemma4Embedding(Embedding):
@@ -93,7 +96,7 @@ class Gemma4RoPE(CosSinRoPE):
 
 
 class _FusedQKInit:
-    """Slice-wise initializer for ``FusedQKVLinearKeqV.wqkv``.
+    """Slice-wise initializer for ``QKVLinearKeqV.wqkv``.
 
     Mirrors ``torchtitan.models.common.config_utils._FusedQKVInit`` for two
     slices: Q and K are initialized as if they were separate ``wq`` / ``wk``
@@ -143,7 +146,7 @@ def fused_qk_param_init(
     n_kv_heads: int,
     head_dim: int,
 ) -> dict[str, Callable]:
-    """``_fused_qkv_param_init`` counterpart for ``FusedQKVLinearKeqV`` (Q, K)."""
+    """``fused_qkv_param_init`` counterpart for ``QKVLinearKeqV`` (Q, K)."""
     return {
         param: _FusedQKInit(base_init, n_heads, n_kv_heads, head_dim)
         for param in ("weight", "bias")
@@ -151,10 +154,10 @@ def fused_qk_param_init(
     }
 
 
-class FusedQKVLinearKeqV(FusedQKVLinear):
+class QKVLinearKeqV(QKVLinear):
     """Single fused Q/K projection, reusing K as V (global K=V layers).
 
-    Like :class:`FusedQKVLinear`, but ``wqkv`` holds only Q and K rows:
+    Like :class:`QKVLinear`, but ``wqkv`` holds only Q and K rows:
     ``out_features = (n_heads + n_kv_heads) * head_dim``, split along
     R = heads_per_kv + 1 (Q heads per KV group + K). ``forward`` returns
     ``(xq, xk, xk)``. Checkpoints expose only ``wq.*`` / ``wk.*`` (no ``wv``),
@@ -162,7 +165,7 @@ class FusedQKVLinearKeqV(FusedQKVLinear):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FusedQKVLinear.Config):
+    class Config(QKVLinear.Config):
         k_eq_v: ClassVar[bool] = True
 
     def __init__(self, config: Config) -> None:
@@ -444,15 +447,31 @@ class Gemma4Attention(GQAttention):
         return self.wo(out_TD)
 
 
+class GeGLU(BinaryActivationFn):
+    """GeGLU activation: GELU (tanh approximation) on the gate, times up."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BinaryActivationFn.Config):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        pass
+
+    def __call__(
+        self, gate: torch.Tensor, up: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        del kwargs
+        return F.gelu(gate, approximate="tanh") * up
+
+
 class Gemma4FeedForward(FeedForward):
-    """GeGLU feed-forward network (GELU with tanh approximation)."""
+    """GeGLU feed-forward network over upstream's fused ``w13`` projection."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(FeedForward.Config):
-        pass
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
+        activation_fn: BinaryActivationFn.Config = dataclasses.field(
+            default_factory=GeGLU.Config
+        )
 
 
 class Gemma4Router(TokenChoiceTopKRouter):
@@ -508,24 +527,27 @@ class Gemma4MoE(MoE):
             else None
         )
 
-    def forward(self, x_TD: torch.Tensor, **router_kwargs) -> torch.Tensor:
-        # Router receives unnormalized residual x_TD (applies its own scale-free RMSNorm).
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        *,
+        padding_mask_T: torch.Tensor | None = None,
+        **router_kwargs,
+    ) -> torch.Tensor:
+        # Router receives unnormalized residual x_TD (applies its own scale-free
+        # RMSNorm). It also accumulates ``tokens_per_expert_E`` (upstream d34a13fd).
         (
             topk_scores_TK,
             topk_expert_ids_TK,
             routing_map_TE,
-        ) = self.router(x_TD, self.expert_bias_E, **router_kwargs)
+        ) = self.router(
+            x_TD, self.expert_bias_E, padding_mask_T=padding_mask_T, **router_kwargs
+        )
         num_local_tokens_per_expert_E = (
             routing_map_TE.sum(dim=0)
             if routing_map_TE is not None
-            else _tokens_per_expert(
-                topk_expert_ids_TK, self.tokens_per_expert_E.numel()
-            )
+            else _tokens_per_expert(topk_expert_ids_TK, self.router.num_experts)
         )
-
-        if self.training:
-            with torch.no_grad():
-                self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
 
         # Routed experts receive pre_feedforward_layernorm_2(x_TD).
         x_experts_TD = (
@@ -603,6 +625,8 @@ class Gemma4TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h_attn = self.attention(
             self.attention_norm(x),
@@ -618,7 +642,9 @@ class Gemma4TransformerBlock(TransformerBlock):
             assert self.post_feedforward_layernorm_1 is not None
             assert self.post_feedforward_layernorm_2 is not None
             h_mlp = self.post_feedforward_layernorm_1(h_mlp)
-            h_moe = self.post_feedforward_layernorm_2(self.moe(h))
+            h_moe = self.post_feedforward_layernorm_2(
+                self.moe(h, padding_mask_T=padding_mask)
+            )
             h_ffn = h_mlp + h_moe
         else:
             h_ffn = h_mlp
@@ -791,7 +817,7 @@ class Gemma4Model(Decoder):
                 n_kv_heads = attention.n_kv_heads or n_heads
                 head_dim = attention.head_dim or dim // n_heads
 
-                if isinstance(attention.qkv_linear, FusedQKVLinearKeqV.Config) or getattr(
+                if isinstance(attention.qkv_linear, QKVLinearKeqV.Config) or getattr(
                     attention.qkv_linear, "k_eq_v", False
                 ):
                     # Global K=V layers have only Q, K, and O projections (no V projection).
@@ -811,7 +837,8 @@ class Gemma4Model(Decoder):
                 if feed_forward is not None:
                     if not isinstance(feed_forward, FeedForward.Config):
                         raise ValueError("Expected FeedForward.Config")
-                    forward_weight_flops += 6 * dim * feed_forward.w1.out_features
+                    # w13 holds the gate and up projections.
+                    forward_weight_flops += 3 * dim * feed_forward.w13.out_features
 
                 moe = layer.moe
                 if moe is not None:
@@ -874,7 +901,7 @@ class Gemma4Model(Decoder):
 
 
 __all__ = [
-    "FusedQKVLinearKeqV",
+    "QKVLinearKeqV",
     "Gemma4Attention",
     "Gemma4Embedding",
     "Gemma4FeedForward",

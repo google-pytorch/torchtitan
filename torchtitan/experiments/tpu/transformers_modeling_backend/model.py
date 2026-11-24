@@ -32,6 +32,7 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 import contextlib
 import copy
 import json
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -44,7 +45,6 @@ from torchtitan.experiments.transformers_modeling_backend.model import (
     HFTransformerModel,
     SliceableModuleDict,
 )
-from torchtitan.tools.logging import logger
 
 from . import _meta_init, _structure
 # Registers ``attn_implementation="splash_tpu"`` with HF's AttentionInterface.
@@ -53,6 +53,8 @@ from . import _meta_init, _structure
 # module and nothing else from the lane, and an unregistered name would be
 # quietly built as sdpa.
 from . import attention as _attention  # noqa: F401  pylint: disable=unused-import
+
+logger = logging.getLogger(__name__)
 
 
 class _Attrs:

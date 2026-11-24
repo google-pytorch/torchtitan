@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import logging
 import os as os
 import time
 from collections.abc import Iterator
@@ -30,8 +31,10 @@ from torchtitan.models.common.aux_loss import AuxLoss, collect_aux_loss_metrics
 from torchtitan.observability.sdc_replayer import ScalarStateAccessor, SDCReplayer
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
+
+
+logger = logging.getLogger(__name__)
 
 
 class FaultTolerantTrainer(Trainer):
@@ -194,7 +197,7 @@ class FaultTolerantTrainer(Trainer):
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
-            from torchtitan.components.metrics import ensure_pp_loss_visible
+            from torchtitan.observability.metrics import ensure_pp_loss_visible
 
             if not model_spec.pipelining_fn:
                 raise RuntimeError(
@@ -562,6 +565,10 @@ class FaultTolerantTrainer(Trainer):
                     ft_pg,
                 ),
             )
+            # ft_pg is None in semi-sync training.
+            if ft_pg is not None:
+                # Avoid artificial jumps in logged loss when replicas leave or rejoin.
+                global_avg_loss /= ft_pg.size()
         else:
             global_avg_loss = global_max_loss = accumulated_loss.item()
             global_ntokens_seen = self.ntokens_seen

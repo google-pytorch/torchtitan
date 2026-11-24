@@ -28,6 +28,7 @@ only make sense together are the named bundles below, composed with
 """
 
 import importlib.metadata
+import logging
 import os
 import re
 from typing import Iterable, Mapping, MutableMapping
@@ -35,8 +36,8 @@ from typing import Iterable, Mapping, MutableMapping
 import tyro
 
 from torchtitan.config.manager import custom_registry
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 FlagValue = bool | int | float | str
 

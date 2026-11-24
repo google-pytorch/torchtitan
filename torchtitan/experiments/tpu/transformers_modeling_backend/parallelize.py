@@ -20,6 +20,7 @@ same swap for the torchtitan-native llama3.
 """
 
 import dataclasses
+import logging
 
 import torch
 from torch import nn
@@ -35,10 +36,10 @@ from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
 from torchtitan.experiments.transformers_modeling_backend.parallelize import (
     parallelize_hf_transformers,
 )
-from torchtitan.tools.logging import logger
 
 from .model import substitute_tpu_experts
 
+logger = logging.getLogger(__name__)
 
 
 def _defer_parametrization_during_init(model: nn.Module) -> None:

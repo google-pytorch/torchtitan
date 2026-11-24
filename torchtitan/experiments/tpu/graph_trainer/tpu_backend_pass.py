@@ -43,7 +43,8 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
 # ``tag_with_memory_policy_pass`` looks them up by name.
 import torchtitan.experiments.tpu.graph_trainer.tpu_host_offload  # noqa: F401
 import torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy  # noqa: F401
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult

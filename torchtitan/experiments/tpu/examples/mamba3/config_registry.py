@@ -5,7 +5,7 @@
 
 from torchtitan.components import checkpointer as checkpoint
 from torchtitan.components import loss
-from torchtitan.components import metrics
+from torchtitan.observability import metrics
 from torchtitan.components import optimizer
 from torchtitan.components.optimizer import lr_scheduler
 from torchtitan.config import configs

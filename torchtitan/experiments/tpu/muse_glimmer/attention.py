@@ -49,6 +49,7 @@ from torchtitan.experiments.tpu.distributed.cp_attention import (
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.attention import ScaledDotProductInnerAttention
 from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.models.common.cp_attention import CPInnerAttention
 from torchtitan.models.muse_glimmer.model import Attention
 
 
@@ -237,7 +238,10 @@ class UlyssesCPSlidingWindowScaledDotProductInnerAttention(
   """
 
   @dataclass(kw_only=True, slots=True)
-  class Config(SlidingWindowScaledDotProductInnerAttention.Config):
+  class Config(
+      CPInnerAttention.Config,
+      SlidingWindowScaledDotProductInnerAttention.Config,
+  ):
     pass
 
   def local_forward(self, q_THK, k_THK, v_THV, **kwargs) -> torch.Tensor:
@@ -252,7 +256,10 @@ class KVAllGatherCPSlidingWindowScaledDotProductInnerAttention(
   """Load-balanced KV all-gather CP over the sliding-window SDPA."""
 
   @dataclass(kw_only=True, slots=True)
-  class Config(SlidingWindowScaledDotProductInnerAttention.Config):
+  class Config(
+      CPInnerAttention.Config,
+      SlidingWindowScaledDotProductInnerAttention.Config,
+  ):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_reference_attention: bool = False
     """Run ``local_forward`` on TPU without a kernel (tests, tiny models)."""

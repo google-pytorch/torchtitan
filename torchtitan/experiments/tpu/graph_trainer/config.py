@@ -372,6 +372,25 @@ def apply_tpu_graph_trainer_model_transforms(
     raise ValueError("CPU-offload budget must be nonnegative")
   _validate_tpu_selective(config)
 
+  # Under scan layers, use TpuSingleProjPackedFeedForward (one w13 GEMM over
+  # contiguous [w1; w3] rows + output chunk) instead of splitting w13.weight
+  # into two F.linears, which regressed scan step time. Non-scan keeps the
+  # two-projection TpuPackedFeedForward.
+  # TODO(#195): remove TpuPackedFeedForward and this converter call.
+  if config.model_spec is not None:
+    from torchtitan.experiments.tpu.components.ffn import TpuPackedFeedForwardConverter  # pylint: disable=g-import-not-at-top
+
+    tp_degree = max(1, config.parallelism.tensor_parallel_degree)
+    config.model_spec = dataclasses.replace(
+        config.model_spec,
+        model=TpuPackedFeedForwardConverter.Config(
+            tp_degree=tp_degree,
+            single_projection=compile_config.use_scan_layers,
+        )
+        .build()
+        .convert(config.model_spec.model),
+    )
+
   if not compile_config.use_scan_layers:
     return
 

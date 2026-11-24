@@ -52,7 +52,7 @@ from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwe
 from torchtitan.experiments.tpu.qwen3_5.model import TpuQwen35Attention, TpuQwen35Model, TpuQwen35TransformerBlock
 import torchtitan.models.qwen3_5 as upstream_qwen3_5
 from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [

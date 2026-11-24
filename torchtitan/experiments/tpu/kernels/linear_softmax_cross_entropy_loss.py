@@ -24,12 +24,14 @@ applies the transform to each logits tile in-kernel (see that module's doc).
 
 import hashlib
 import inspect
+import logging
 
 import jax
 import tokamax
 import torch
 from torch_tpu._internal.pallas import pallas
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _has_logit_transform(soft_cap, output_multiplier) -> bool:

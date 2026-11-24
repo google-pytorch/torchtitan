@@ -11,13 +11,13 @@ torchax/ experiments. The matcher supports two path styles:
 integer path segments with ``*``, then a regex pattern fallback.
 """
 
+import logging
 import re
 
 import jax
 from flax import nnx
-import torchtitan.tools.logging
 
-logger = torchtitan.tools.logging.logger
+logger = logging.getLogger(__name__)
 
 P = jax.sharding.PartitionSpec
 

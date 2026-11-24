@@ -27,7 +27,7 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.rl.controller import Controller
 from torchtitan.experiments.tpu.rl_nc_ray.trainer import RayTPUPolicyTrainer
 from torchtitan.experiments.tpu.rl_nc_ray.generator import RayVLLMGenerator
-from torchtitan.tools.logging import init_logger
+from torchtitan.observability.logging import init_logger
 
 from torchtitan.experiments.tpu.rl_nc_ray.tpu_env_utils import (
     discover_tpu_cluster_layout,

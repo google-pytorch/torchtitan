@@ -27,6 +27,7 @@ bounds on each).
 """
 
 from dataclasses import dataclass, replace
+import logging
 import math
 from typing import Literal, get_args
 import weakref
@@ -57,8 +58,9 @@ from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
-from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.tools.logging import logger
+from torchtitan.config.transform import ModelConfigConverter
+
+logger = logging.getLogger(__name__)
 
 EpTransport = Literal[
     "all_to_all", "ragged_all_to_all", "ring_of_experts", "auto"

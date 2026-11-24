@@ -19,7 +19,7 @@ import dataclasses
 import torchtitan.models.muse_glimmer as upstream_muse_glimmer
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
 from torchtitan.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.config.transform import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .attention import SlidingWindowScaledDotProductInnerAttention

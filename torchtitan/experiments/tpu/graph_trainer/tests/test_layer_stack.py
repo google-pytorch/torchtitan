@@ -322,11 +322,10 @@ class TestLayerStack(unittest.TestCase):
             _build(stacked=True)
 
     def test_the_body_recomputes_its_gather_in_backward(self):
-        """The in-body gather is worth nothing unless backward redoes it.
+        """Backward must redo each layer's weight all-gather.
 
-        Left alone, the partitioner saves the gathered per-layer weight across
-        the cut: the gather runs inside the loop, but its result is carried
-        out of it. ``run``'s remat policy recomputes the gather to stop that.
+        If it saved the gathered weight instead, every layer's full weight
+        would stay in memory and scan would save nothing.
         """
         captured = []
         partition = partitioners.min_cut_rematerialization_partition

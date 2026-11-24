@@ -1,6 +1,7 @@
 """Unit and numerical tests for Gemma 4 in torchtitan.experiments.tpu.examples.gemma4."""
 
 import copy
+import dataclasses
 from functools import partial
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -47,6 +48,8 @@ from torchtitan.experiments.tpu.examples.gemma4.model import (
     SlidingWindowScaledDotProductAttention,
 )
 from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
+    _merge_qk_linear,
+    _split_qk_linear,
     Gemma4StateDictAdapter,
 )
 from torchtitan.experiments.tpu.components.grouped_experts import (
@@ -274,7 +277,9 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     )
 
     cfg = gemma4_moe_testmodel()
-    cfg.compile.enable = True
+    # Not `cfg.compile.enable = True`: `components` follows `enable` only when
+    # the compile config is constructed.
+    cfg.compile = dataclasses.replace(cfg.compile, enable=True)
     cfg.parallelism.use_simple_fsdp = False
 
     for ep_enabled, expected_calls in ((False, 2), (True, 0)):
@@ -520,10 +525,23 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
           ),
       ).build()
 
-  def test_state_dict_exposes_only_wq_wk_and_roundtrips(self):
+  def _logical(self, module: QKVLinearKeqV) -> dict[str, torch.Tensor]:
+    """The adapter's logical wq/wk view of the module's native state dict."""
+    sd = dict(module.state_dict())
+    _split_qk_linear(
+        sd, prefix="", head_dim=module.head_dim, heads_per_kv=module.heads_per_kv
+    )
+    return sd
+
+  def test_state_dict_is_native_and_adapter_splits_to_wq_wk(self):
     for with_bias in (False, True):
       module = self._build(with_bias=with_bias)
-      sd = module.state_dict()
+      native = module.state_dict()
+      # Native state dicts keep the packed parameter (upstream 1e4b1f68).
+      expected = {"wqkv.weight"} | ({"wqkv.bias"} if with_bias else set())
+      self.assertEqual(set(native), expected)
+
+      sd = self._logical(module)
       expected = {"wq.weight", "wk.weight"}
       if with_bias:
         expected |= {"wq.bias", "wk.bias"}
@@ -546,8 +564,17 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
           sd["wk.weight"], w[:, module.heads_per_kv].reshape(-1, self._DIM)
       )
 
+      # Merging the logical keys restores the native parameter exactly.
+      merged = dict(sd)
+      _merge_qk_linear(
+          merged,
+          prefix="",
+          head_dim=module.head_dim,
+          heads_per_kv=module.heads_per_kv,
+      )
+      self.assertEqual(set(merged), set(native))
       restored = self._build(with_bias=with_bias)
-      restored.load_state_dict(sd)
+      restored.load_state_dict(merged)
       for (name, p_ref), (_, p_new) in zip(
           module.named_parameters(), restored.named_parameters()
       ):
@@ -556,7 +583,7 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
   def test_forward_matches_separate_q_k_projections(self):
     torch.manual_seed(0)
     module = self._build(with_bias=True)
-    sd = module.state_dict()
+    sd = self._logical(module)
     num_tokens = 6
     x = torch.randn(num_tokens, self._DIM)
 
@@ -594,7 +621,7 @@ class TestFusedQKVLinearKeqV(absltest.TestCase):
     module = self._build()
     with torch.no_grad():
       module.wqkv.weight.copy_(fused)
-    sd = module.state_dict()
+    sd = self._logical(module)
     torch.testing.assert_close(sd["wq.weight"], wq)
     torch.testing.assert_close(sd["wk.weight"], wk)
 
@@ -1061,15 +1088,9 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
         for name, param in hf_model.named_parameters()
         if param.grad is not None
     }
+    # from_hf packs HF's separate q/k/v and gate/up grads into the native
+    # wqkv / w13 layouts, exactly as it does for weights.
     hf_grads_in_tt_keys = adapter.from_hf(raw_hf_grads)
-    # HF has separate q/k/v grads; fold them into the fused wqkv layout with
-    # the same merge the load hook applies to weights (wq/wk only on K=V).
-    # Likewise gate/up grads into the fused w13 layout.
-    for name, module in tt_model.named_modules():
-      if isinstance(module, QKVLinear):
-        module._merge_qkv_on_load(module, hf_grads_in_tt_keys, f"{name}.")
-      elif isinstance(module, FeedForward):
-        module._merge_w13_on_load(module, hf_grads_in_tt_keys, f"{name}.")
     # When weights are tied, both models accumulate the embedding + lm_head
     # gradient into the single shared parameter (tok_embeddings.weight in TT).
     if tt_config.enable_weight_tying:

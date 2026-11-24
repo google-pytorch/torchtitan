@@ -68,6 +68,7 @@ from torchtitan.experiments.tpu.distributed.cp_attention import (
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet, TpuInnerGatedDeltaNet
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 from torchtitan.protocols.module import Module
 
@@ -177,9 +178,13 @@ def _is_plain_linear(module: torch.nn.Module) -> bool:
   Head-sliced projections read ``weight``/``bias`` directly, which would skip
   a subclass's own ``forward`` (e.g. a Float8 linear).
   """
-  return (
-      isinstance(module, torch.nn.Linear)
-      and type(module).forward is torch.nn.Linear.forward
+  if not isinstance(module, torch.nn.Linear):
+    return False
+  forward = type(module).forward
+  # Upstream's ``Linear.forward`` only flattens/unflattens stacked weights
+  # (``num_linears > 1``); a single projection is a plain ``F.linear``.
+  return forward is torch.nn.Linear.forward or (
+      forward is Linear.forward and getattr(module, "num_linears", 1) == 1
   )
 
 

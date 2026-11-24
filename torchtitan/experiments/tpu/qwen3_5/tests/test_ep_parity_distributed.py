@@ -122,8 +122,8 @@ class EpParityDistributedTest(
       ("_ep4_roe", 4, ["--tpu_config.ep_transport=ring_of_experts"]),
       ("_ep8_roe", 8, ["--tpu_config.ep_transport=ring_of_experts"]),
       # Explicit ragged_all_to_all at EP=2, where `auto` picks Ring-of-Experts.
-      # Without tpu_flags.TENSORCORE_RAGGED_ALL_TO_ALL, this two-device
-      # subgroup hangs on TPU7x with libtpu older than 0.0.51.
+      # This two-device subgroup hung on TPU7x with libtpu older than 0.0.51,
+      # whose SparseCore ragged-all-to-all didn't support subslice programs.
       ("_ep2_ragged", 2, ["--tpu_config.ep_transport=ragged_all_to_all"]),
       # Routing weights applied before W2 (`scale_before_down_proj`) under both
       # Ring-of-Experts (EP=2 via auto) and ragged_all_to_all (EP=4 via auto).

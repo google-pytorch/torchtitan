@@ -13,6 +13,7 @@ rank-local.
 """
 
 import dataclasses
+import types
 import unittest
 from unittest import mock
 
@@ -29,10 +30,14 @@ from torchtitan.components.optimizer import (
     ParamGroupConfig,
     default_adamw,
 )
-from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.experiments.graph_trainer.trainer import (
+    GraphTrainer,
+    GraphTrainingEngine,
+)
 from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
+    TpuGraphTrainingEngine,
 )
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     graph_trainer_qwen3_debugmodel,
@@ -310,7 +315,8 @@ class TpuTrainersSplitOptimizersTest(_FakeTwoRankTestCase):
   """Both TPU trainers split inside the hook the base trainer runs first.
 
   The base ``__init__`` is replaced by the optimizer section of upstream
-  ``Trainer.__init__``: build optimizers, run the model spec's
+  ``TrainingEngine._initialize_optimizer``, which ``Trainer.__init__`` reaches
+  through the engine: build optimizers, run the model spec's
   ``post_optimizer_build_fn``, then build the LR schedulers.
   """
 
@@ -344,13 +350,17 @@ class TpuTrainersSplitOptimizersTest(_FakeTwoRankTestCase):
 
         def base_init(trainer, config, model=model, optimizers=optimizers):
           trainer.config = config
-          trainer.model_parts = [model]
-          trainer.optimizers = optimizers
-          # TpuGraphTrainer's in-graph optimizer check reads this.
+          # TpuGraphTrainer's in-graph optimizer check reads these.
+          trainer.engine = types.SimpleNamespace(
+              _optimizer_in_graph=(
+                  getattr(config.compile, "optimizer_compile", None)
+                  == "in_graph"
+              )
+          )
           trainer.gradient_accumulation_steps = 1
           hook = config.model_spec.post_optimizer_build_fn
           if hook is not None:
-            hook(optimizers, trainer.model_parts, mock.sentinel.parallel_dims)
+            hook(optimizers, [model], mock.sentinel.parallel_dims)
           groups_at_lr_scheduler_build.append(
               len(optimizers.optimizers[0].param_groups)
           )
@@ -379,7 +389,16 @@ class TpuTrainersSplitOptimizersTest(_FakeTwoRankTestCase):
         for group in optimizer.param_groups:
           self.assertIn("initial_lr", group)
         if trainer_cls is TpuGraphTrainer:
-          # The in-graph optimizer path marks every split group capturable.
+          # The engine's in-graph optimizer path marks every split group
+          # capturable after the base engine built (and split) the optimizers.
+          engine = object.__new__(TpuGraphTrainingEngine)
+          engine.optimizers = optimizers
+          engine._optimizer_in_graph = True
+          engine._optimizer_separate_graph = False
+          with mock.patch.object(
+              GraphTrainingEngine, "_initialize_optimizer", return_value=None
+          ):
+            engine._initialize_optimizer(config.model_spec)
           self.assertTrue(
               all(group["capturable"] for group in optimizer.param_groups)
           )

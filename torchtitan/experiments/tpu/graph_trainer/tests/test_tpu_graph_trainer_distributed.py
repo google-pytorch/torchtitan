@@ -100,7 +100,7 @@ class _RecordLosses:
 class _RecordEpDropStats:
   """Runs the trainer, saving rank 0's losses and logged EP drop counts.
 
-  Wraps ``TpuGraphTrainer._maybe_log_ep_drop_stats``, which returns the
+  Wraps ``TpuGraphTrainingEngine._maybe_log_ep_drop_stats``, which returns the
   batch-mesh sum it logged, so the record is what the run reported. A
   module-level class for the same pickling reason as ``_RecordLosses``.
   """
@@ -111,12 +111,12 @@ class _RecordEpDropStats:
     self.__qualname__ = "_RecordEpDropStats"
 
   def __call__(self, config):
-    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainingEngine  # pylint: disable=g-import-not-at-top
 
     losses = []
     drop_stats = []
     original_log = metrics.MetricsProcessor.log
-    original_drop_stats = TpuGraphTrainer._maybe_log_ep_drop_stats
+    original_drop_stats = TpuGraphTrainingEngine._maybe_log_ep_drop_stats
 
     def log(processor, step, global_avg_loss, global_max_loss, *args, **kwargs):
       losses.append([step, global_avg_loss])
@@ -124,15 +124,15 @@ class _RecordEpDropStats:
           processor, step, global_avg_loss, global_max_loss, *args, **kwargs
       )
 
-    def log_drop_stats(trainer):
-      stats = original_drop_stats(trainer)
+    def log_drop_stats(engine):
+      stats = original_drop_stats(engine)
       if stats is not None:
-        drop_stats.append([trainer.step, stats.tolist()])
+        drop_stats.append([engine.num_completed_steps, stats.tolist()])
       return stats
 
     with mock.patch.object(metrics.MetricsProcessor, "log", log):
       with mock.patch.object(
-          TpuGraphTrainer, "_maybe_log_ep_drop_stats", log_drop_stats
+          TpuGraphTrainingEngine, "_maybe_log_ep_drop_stats", log_drop_stats
       ):
         torchtitan.experiments.tpu.train.start_trainer(config)
 

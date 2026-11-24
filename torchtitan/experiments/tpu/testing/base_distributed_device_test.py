@@ -666,6 +666,9 @@ def _run_cpu_verification(
   cpu_config.parallelism.data_parallel_replicate_degree = 1
   cpu_config.parallelism.context_parallel_degree = 1
   cpu_config.compile.enable = False
+  # Upstream reads ``"model" in compile.components`` (see
+  # ``TpuTrainerCompileConfig.__post_init__``).
+  cpu_config.compile.components = []
   if (
       isinstance(cpu_config, tpu_job_config_module.BaseTPUTrainerConfig)
       and cpu_config.model_spec is not None
@@ -948,6 +951,16 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
 
     config = config_manager.parse_args(config_args)
     config.dump_folder = tempfile.gettempdir()
+    if enable_compile:
+      # `--compile.enable` once parsed to an enabled config with no components
+      # for recipes that leave compile off, so these tests ran eager.
+      compile_config = config.compile
+      self.assertIsNotNone(compile_config)
+      self.assertTrue(getattr(compile_config, "enable", True))
+      self.assertTrue(
+          compile_config.components,
+          "enable_compile=True resolved to a config that compiles nothing",
+      )
 
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
       # Workers are spawned and re-detect their device, so hide the accelerator

@@ -142,7 +142,7 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
         dp_rank=0,
         tokenizer=HuggingFaceTokenizer(tokenizer_path=self._TOKENIZER_PATH),
         max_context_length=128,
-        num_tokens_per_batch=128,
+        num_tokens_per_microbatch=128,
     )
 
   def test_chat_json_trains_on_the_response_only(self) -> None:
@@ -162,7 +162,7 @@ class TPUGrainDataLoaderChatTest(absltest.TestCase):
             response_field="answer",
             shuffle=False,
         )
-        labels = next(iter(loader))["labels"].flatten().tolist()
+        labels = next(iter(loader)).labels.flatten().tolist()
         # The first document's prompt is masked, so its answer is the first
         # supervised span.
         self.assertEqual(labels[0], IGNORE_INDEX)
@@ -197,13 +197,22 @@ class FluxRandomDataloaderTest(absltest.TestCase):
         dp_rank=0,
         tokenizer=None,
         max_context_length=320,
-        num_tokens_per_batch=640,
+        num_tokens_per_microbatch=640,
     )
     self.assertIsInstance(loader, RandomDataloader)
     self.assertEqual(loader.state_dict(), {})
     loader.load_state_dict({})
-    batch = next(iter(loader))
+    # Upstream ec953b36: Trainer.train_step reads `num_valid_tokens` and the
+    # engine calls `to_input_dict`, so the loader must yield a
+    # TrainingMicrobatch, not a dict.
+    from torchtitan.components.data.types import TrainingMicrobatch
+
+    microbatch = next(iter(loader))
+    self.assertIsInstance(microbatch, TrainingMicrobatch)
+    self.assertEqual(microbatch.num_valid_tokens, 2 * 16 * 32 * 32)
+    batch = microbatch.to_input_dict("cpu")
     self.assertEqual(batch["labels"].shape, (2, 16, 32, 32))
+    self.assertEqual(batch["img_encodings"].shape, (2, 16, 32, 32))
     self.assertEqual(batch["t5_encodings"].shape, (2, 64, 128))
     self.assertEqual(batch["clip_encodings"].shape, (2, 32))
 
@@ -235,12 +244,15 @@ class FluxRandomDataloaderTest(absltest.TestCase):
           dp_rank=0,
           tokenizer=trainer_self.tokenizer,
           max_context_length=cfg.training.max_context_length,
-          num_tokens_per_batch=(
+          num_tokens_per_microbatch=(
               cfg.training.num_tokens_per_microbatch_per_dp_rank
           ),
       )
-      trainer_self.parallel_dims = mock.MagicMock(dp_shard_enabled=False)
-      trainer_self.device = "cpu"
+      # Upstream ec953b36: the device/mesh state lives on the engine.
+      trainer_self.engine = mock.MagicMock(
+          parallel_dims=mock.MagicMock(dp_shard_enabled=False),
+          device="cpu",
+      )
 
     with (
         mock.patch.object(Trainer, "__init__", _fake_super_init),

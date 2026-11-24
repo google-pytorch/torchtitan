@@ -85,8 +85,10 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   wrapper, hf = trainer.model, trainer.model.model
   assert isinstance(wrapper, TPUHFTransformerModel), type(wrapper)
 
-  batch = dict(next(iter(trainer.dataloader)))
-  valid = batch.pop("num_valid_tokens", None)
+  # Upstream ec953b36: dataloaders yield TrainingMicrobatch objects.
+  microbatch = next(iter(trainer.dataloader))
+  batch = dict(microbatch.as_input_dict())
+  valid = microbatch.num_valid_tokens
   batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
   tokens, labels, extra = wrapper.preprocess_inputs(
       batch, parallel_dims=trainer.parallel_dims, parallelism=config.parallelism

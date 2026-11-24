@@ -5,6 +5,7 @@ from typing import Any, Iterator
 import torch
 
 from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.models.flux.precomputed_loader import FluxEncodedMicrobatch
 from torchtitan.models.flux.utils import IMAGE_LATENT_SIZE_RATIO, LATENT_CHANNELS
 
 logger = logging.getLogger(__name__)
@@ -88,17 +89,14 @@ class RandomDataloader(BaseDataLoader):
 
             data, img_enc = self.batches[step % num_batches]
 
-            # Yield a dictionary copy so inplace `.to(device)` calls in
-            # trainer.py don't overwrite the cached CPU tensors in self.batches,
-            # which grows memory usage and can cause TPU OOM.
-            # FluxTrainer expects a single TrainerBatch dict keyed by "labels".
-            data_copy = {
-                "labels": img_enc,
-                "img_encodings": data["img_encodings"],
-                "t5_encodings": data["t5_encodings"],
-                "clip_encodings": data["clip_encodings"],
-            }
-            yield data_copy
+            # Upstream ec953b36: the training loop consumes TrainingMicrobatch
+            # objects. `to_input_dict` builds a new dict of device copies, so
+            # the cached CPU tensors in self.batches are never overwritten.
+            yield FluxEncodedMicrobatch.from_encodings(
+                img_encodings=img_enc,
+                t5_encodings=data["t5_encodings"],
+                clip_encodings=data["clip_encodings"],
+            )
             step += 1
 
     def state_dict(self) -> dict[str, Any]:

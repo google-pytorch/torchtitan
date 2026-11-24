@@ -9,17 +9,27 @@ from unittest import mock
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax
 import jax.numpy as jnp
+import numpy
 import torch
 from torchtitan.components import loss
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss
 
 
-class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
+class LinearSoftmaxCrossEntropyLossUnitTest(parameterized.TestCase):
 
-  def test_backward_normalizes_singleton_cotangent(self):
-    dout = jnp.ones((1,), dtype=jnp.float32)
+  @parameterized.named_parameters(
+      # Reduced losses: the custom op's one-element cotangent is passed to
+      # Tokamax as a scalar.
+      ("sum", "sum", [1.0], ()),
+      ("mean", "mean", [1.0], ()),
+      # One loss per row: the (B,) cotangent is passed through unchanged.
+      ("none", "none", [0.5, -2.0], (2,)),
+  )
+  def test_backward_cotangent_shape(self, reduction, dout_values, dout_shape):
+    dout = jnp.asarray(dout_values, dtype=jnp.float32)
     lse = jnp.zeros((2,), dtype=jnp.float32)
     x = jnp.zeros((2, 4), dtype=jnp.bfloat16)
     labels = jnp.zeros((2,), dtype=jnp.int32)
@@ -36,19 +46,52 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
     ) as backward:
       # pylint: disable=protected-access
       linear_softmax_cross_entropy_loss._my_bwd(
-          dout,
-          lse,
-          x,
-          labels,
-          weights,
-          "sum",
-          "mosaic_tpu",
-          1,
-          1,
-          1,
+          dout, lse, x, labels, weights, reduction, "mosaic_tpu", 1, 1, 1
       )
 
-    self.assertEqual(backward.call_args.args[0].shape, ())
+    passed = backward.call_args.args[0]
+    self.assertEqual(passed.shape, dout_shape)
+    self.assertEqual(numpy.asarray(passed).reshape(-1).tolist(), dout_values)
+
+  def test_reduction_none_xla_backward_matches_autograd(self):
+    # The XLA reference path runs on CPU: check the per-row backward's values.
+    torch.manual_seed(0)
+    rows, hidden, vocab = 6, 8, 16
+    x = torch.randn(rows, hidden)
+    weights = torch.randn(hidden, vocab) / 4
+    labels = torch.randint(0, vocab, (rows,))
+    dout = torch.randn(rows)
+
+    xr = x.clone().requires_grad_(True)
+    wr = weights.clone().requires_grad_(True)
+    logits = xr @ wr
+    loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+    (loss * dout).sum().backward()
+    lse = torch.logsumexp(logits.detach(), dim=-1)
+
+    to_jax = lambda t: jnp.asarray(t.numpy())
+    # On a TPU host JAX runs on the TPU, whose default matmul precision is
+    # bf16; compare against the FP32 autograd reference in FP32.
+    with jax.default_matmul_precision("float32"):
+      # pylint: disable=protected-access
+      grad_x, grad_w = linear_softmax_cross_entropy_loss._my_bwd(
+          to_jax(dout),
+          to_jax(lse),
+          to_jax(x),
+          to_jax(labels.to(torch.int32)),
+          to_jax(weights),
+          "none",
+          "xla",
+          rows,
+          hidden,
+          vocab,
+      )
+    torch.testing.assert_close(
+        torch.from_numpy(numpy.asarray(grad_x)), xr.grad, rtol=1e-4, atol=1e-5
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(numpy.asarray(grad_w)), wr.grad, rtol=1e-4, atol=1e-5
+    )
 
   def test_forward_fake_loss_shape_follows_reduction(self):
     # A make_fx / GraphTrainer trace uses the fake: reduction="none" must give
@@ -300,6 +343,13 @@ class LinearSoftmaxCrossEntropyLossTest(
       (torch.bfloat16, "sum", "xla", 1.6e-2, 1e-5, 2.0, 1.0),
       (torch.bfloat16, "mean", "mosaic_tpu", 1.6e-2, 1e-5, 5e-2, 1e-2),
       (torch.bfloat16, "mean", "xla", 1.6e-2, 1e-5, 5e-2, 1e-2),
+      # reduction="none": one loss per row, backward with a random per-row
+      # cotangent. bf16 grad tolerances as in the bf16 cases above: the
+      # reference computes the logits in bf16 too.
+      (torch.float32, "none", "mosaic_tpu", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.float32, "none", "xla", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.bfloat16, "none", "mosaic_tpu", 1.6e-2, 1e-2, 5e-2, 0.5),
+      (torch.bfloat16, "none", "xla", 1.6e-2, 1e-2, 5e-2, 0.5),
   )
   def test_gradient_new(
       self,
@@ -322,6 +372,16 @@ class LinearSoftmaxCrossEntropyLossTest(
     x_tpu = x.detach().clone().to(device).requires_grad_(True)
     weights_tpu = weights.detach().clone().to(device).requires_grad_(True)
     labels_tpu = labels.to(device)
+    # reduction="none" returns one loss per row; back-propagate a random
+    # per-row cotangent through it.
+    dout_tpu = (
+        torch.randn(b, dtype=torch.float32).to(device)
+        if reduction == "none"
+        else None
+    )
+
+    def backward(out):
+      (out if dout_tpu is None else (out * dout_tpu).sum()).backward()
 
     # Reference Math on TPU
     logits = x_tpu @ weights_tpu
@@ -330,7 +390,7 @@ class LinearSoftmaxCrossEntropyLossTest(
         labels_tpu,
         reduction=reduction,
     )
-    expected_out.backward()
+    backward(expected_out)
     expected_grad_x = x_tpu.grad.clone()
     expected_grad_weights = weights_tpu.grad.clone()
 
@@ -353,7 +413,9 @@ class LinearSoftmaxCrossEntropyLossTest(
       )
 
     actual_out = run_custom(x_tpu, labels_tpu, weights_tpu)
-    actual_out.backward()
+    if reduction == "none":
+      self.assertEqual(tuple(actual_out.shape), (b,))
+    backward(actual_out)
     actual_grad_x = x_tpu.grad
     actual_grad_weights = weights_tpu.grad
 
@@ -363,7 +425,10 @@ class LinearSoftmaxCrossEntropyLossTest(
     self.assertEqual(actual_grad_weights.dtype, weights_tpu.dtype)
 
     torch.testing.assert_close(
-        actual_out.cpu(), expected_out.cpu(), rtol=loss_rtol, atol=loss_atol
+        actual_out.detach().cpu(),
+        expected_out.detach().cpu(),
+        rtol=loss_rtol,
+        atol=loss_atol,
     )
 
     # Try creating a new tensor and copying
@@ -389,6 +454,86 @@ class LinearSoftmaxCrossEntropyLossTest(
         reduction,
         dtype,
     )
+
+  @parameterized.named_parameters(
+      # name, dtype, soft_cap, output_multiplier, loss_rtol, grad_rtol,
+      # grad_atol, rel_fro. fp32 operands go through the MXU at the TPU's
+      # default (bf16-pass) precision, so each row's loss is off by up to
+      # ~0.6% from the FP32 reference (a summed loss averages this out, hence
+      # the 1e-4 of test_linear_softmax_ce_softcap.py), and a few dW elements
+      # by up to ~0.08 (6 of 131072 at cap 20, multiplier 1); rel_fro bounds
+      # the gradients as a whole, as in that test. bf16 operands are exact
+      # products in FP32, so the bf16 case stays tight.
+      ("fp32_cap20_m1", torch.float32, 20.0, 1.0, 1e-2, 1e-2, 0.1, 1e-2),
+      ("fp32_cap20_m0196", torch.float32, 20.0, 0.196116, 1e-2, 1e-2, 0.1, 1e-2),
+      ("bf16_cap20_m1", torch.bfloat16, 20.0, 1.0, 2e-3, 5e-2, 5e-2, 2e-2),
+  )
+  def test_gradient_reduction_none_soft_cap(
+      self,
+      dtype,
+      soft_cap,
+      output_multiplier,
+      loss_rtol,
+      grad_rtol,
+      grad_atol,
+      rel_fro,
+  ):
+    """Per-row loss and backward through the soft-capped kernel."""
+    device = self.accelerator_device
+    b, h, v = 1024, 128, 1024
+    gen = torch.Generator().manual_seed(1234)
+    # Scale so the logits reach the tanh's nonlinear range.
+    x = (torch.randn(b, h, generator=gen) * 4.0).to(dtype)
+    weights = (torch.randn(h, v, generator=gen) * 0.25).to(dtype)
+    labels = torch.randint(0, v, (b,), generator=gen)
+    dout = torch.randn(b, generator=gen)
+
+    # FP32 reference on the same rounded operands, on CPU.
+    x_ref = x.clone().requires_grad_(True)
+    w_ref = weights.clone().requires_grad_(True)
+    logits = x_ref.float() @ w_ref.float()
+    logits = soft_cap * torch.tanh(logits * output_multiplier / soft_cap)
+    expected = torch.nn.functional.cross_entropy(
+        logits, labels, reduction="none"
+    )
+    (expected * dout).sum().backward()
+
+    x_tpu = x.to(device).requires_grad_(True)
+    w_tpu = weights.to(device).requires_grad_(True)
+    actual = (
+        linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
+            x_tpu,
+            labels.to(device),
+            w_tpu,
+            reduction="none",
+            implementation="mosaic_tpu",
+            b_block_size=128,
+            h_block_size=128,
+            v_block_size=128,
+            soft_cap=soft_cap,
+            output_multiplier=output_multiplier,
+        )
+    )
+    self.assertEqual(tuple(actual.shape), (b,))
+    (actual * dout.to(device)).sum().backward()
+
+    torch.testing.assert_close(
+        actual.detach().cpu().float(),
+        expected.detach(),
+        rtol=loss_rtol,
+        atol=1e-3,
+    )
+    for actual_grad, expected_grad in (
+        (x_tpu.grad, x_ref.grad),
+        (w_tpu.grad, w_ref.grad),
+    ):
+      actual_grad = actual_grad.cpu().float()
+      expected_grad = expected_grad.float()
+      torch.testing.assert_close(
+          actual_grad, expected_grad, rtol=grad_rtol, atol=grad_atol
+      )
+      error = (actual_grad - expected_grad).norm() / expected_grad.norm()
+      self.assertLess(error.item(), rel_fro)
 
   def test_single_hidden_block_non_pow2_vocab_tile_640(self):
     """Tests single-H-block Mosaic LCE with non-power-of-2 v_block_size=640."""

@@ -251,7 +251,10 @@ def _my_bwd(
   # Tokamax's backward API consumes its cotangent as a scalar. Whole-graph XLA
   # can fold that distinction away; an executable boundary preserves the
   # one-element shape, so normalize it explicitly before entering Tokamax.
-  dout = jax.numpy.reshape(dout, ())
+  # reduction="none" has one loss per row, so its cotangent is a (B,) vector,
+  # which Tokamax's backward (and the soft-cap copy) take as is.
+  if reduction != "none":
+    dout = jax.numpy.reshape(dout, ())
   if _has_logit_transform(soft_cap, output_multiplier):
     from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel  # pylint: disable=g-import-not-at-top
 
@@ -506,8 +509,9 @@ def linear_softmax_cross_entropy_loss(
       labels: The ground truth labels index in the dimension of (B,).
       weights: The linear projection weight matrix in the dimension of (H, V)
         where V is the dimension of the output logits aka vocabulary size.
-      reduction: The reduction method for the cross entropy loss. Can be set to
-        "sum" or "mean" explicitly.
+      reduction: The reduction method for the cross entropy loss: "sum",
+        "mean", or "none" for one loss per row (shape (B,)), whose backward
+        takes a per-row cotangent.
       implementation: By default "None" will be used to pick the best available
         backend. Can be set to "xla" or "mosaic_tpu" explicitly.
       b_block_size: Block size for batch dimension.

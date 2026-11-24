@@ -773,6 +773,64 @@ def _split_tokamax_benchmark_for_cp(cp: int) -> TpuGraphTrainer.Config:
   return cfg
 
 
+def _397b_64k_cp(
+    strategy: Literal["ulysses", "all_gather"], cp: int
+) -> TpuGraphTrainer.Config:
+  """``qwen35_moe_397b_split_tokamax_ep_benchmark`` tuned for 64K context.
+
+  One 65,536-token sequence per CP group (65,536 / ``cp`` tokens per rank,
+  bf16 parameters and optimizer state as in the 8K recipe). Measured on
+  tpu7x-4x4x8 (128 chips, 256 ranks) with Ulysses CP 2, adding one change at
+  a time to the 8K recipe's settings (MFU, mean of steps 6-12):
+
+  - EP 8, 2,048-token expert chunks, worst-case expert buffers: 14.8%.
+  - ``ep_capacity_factor`` 1.5: 18.8%. Dropless EP sizes each chunk's expert
+    buffer for the worst case (``ep_degree * T * top_k`` rows, about 8x the
+    routed rows), and copying those buffers dominated the MoE layers. Routes
+    beyond the capacity are dropped and logged (``[ep_capacity]``): from
+    random initialization, 0.1% at step 1 and 7.4% at step 40.
+  - Two layers per forward and backward executable and BF16 cross-chunk expert
+    dW, 4,096-token chunks: 20.5%.
+  - EP 4: 21.5%.
+  - 16,384-token chunks (two per MoE layer at 32K tokens per rank): 25.3%.
+  - Splash blocks of 2,048 query and key/value rows (1,024 per compute step):
+    26.2%. 4,096-row blocks do not compile (VMEM), and the fused Splash
+    backward runs out of HBM at 64K.
+
+  Without the capacity cap (``--tpu_config.ep_capacity_factor None``), 16K-
+  token chunks run out of HBM; with ``--tpu_config.ep_token_chunks=8`` the
+  dropless run measures 20.3%. KV all-gather CP 2 measures 24.4% before the
+  Splash block change.
+  """
+  cfg = qwen35_moe_397b_split_tokamax_ep_benchmark()
+  cfg.training.max_context_length = 65536
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 65536
+  splash = cfg.splash_attention_kernel
+  splash.sa_use_document_aware_block_skipping = False
+  splash.sa_use_fused_bwd_kernel = False
+  for name in ("q", "kv", "q_dkv", "kv_dkv", "q_dq", "kv_dq"):
+    setattr(splash, f"sa_block_{name}", 2048)
+  splash.sa_block_kv_compute = 1024
+  splash.sa_block_kv_dkv_compute = 1024
+  cfg.parallelism.expert_parallel_degree = 4
+  cfg.tpu_config.ep_token_chunks = max(1, 65536 // cp // 16384)
+  cfg.tpu_config.ep_capacity_factor = 1.5
+  cfg.tpu_config.ep_chunk_dw_fp32 = False
+  cfg.compile.graph_split.forward_layers_per_executable = 2
+  cfg.compile.graph_split.backward_layers_per_executable = 2
+  return _qwen35_cp(cfg, strategy=strategy, cp_degree=cp)
+
+
+def qwen35_moe_397b_64k_ulysses_cp2() -> TpuGraphTrainer.Config:
+  """397B-A17B, 64K context, Ulysses CP 2, EP 4 (see `_397b_64k_cp`)."""
+  return _397b_64k_cp("ulysses", 2)
+
+
+def qwen35_moe_397b_64k_allgather_cp2() -> TpuGraphTrainer.Config:
+  """397B-A17B, 64K context, KV all-gather CP 2, EP 4 (see `_397b_64k_cp`)."""
+  return _397b_64k_cp("all_gather", 2)
+
+
 def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
     TpuGraphTrainer.Config
 ):

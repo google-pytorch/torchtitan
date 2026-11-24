@@ -956,6 +956,8 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       ("qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2", "headtail"),
       ("qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2", None),
       ("qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2_agrs", None),
+      ("qwen35_moe_397b_64k_ulysses_cp2", None),
+      ("qwen35_moe_397b_64k_allgather_cp2", "headtail"),
   )
   def test_recipes_convert_every_layer(self, recipe, load_balancer):
     cfg = getattr(config_registry, recipe)()
@@ -979,6 +981,27 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     )
     for _, attn, _, _ in attentions:
       self.assertTrue(issubclass(attn.inner_attention._owner, mixin))
+
+  @parameterized.parameters(
+      "qwen35_moe_397b_64k_ulysses_cp2", "qwen35_moe_397b_64k_allgather_cp2"
+  )
+  def test_397b_64k_recipes(self, recipe):
+    cfg = getattr(config_registry, recipe)()
+    self.assertEqual(cfg.training.max_context_length, 65536)
+    self.assertEqual(cfg.training.num_tokens_per_microbatch_per_dp_rank, 65536)
+    self.assertEqual(cfg.parallelism.expert_parallel_degree, 4)
+    self.assertEqual(cfg.tpu_config.ep_token_chunks, 2)
+    self.assertEqual(cfg.tpu_config.ep_capacity_factor, 1.5)
+    self.assertFalse(cfg.tpu_config.ep_chunk_dw_fp32)
+    self.assertFalse(cfg.splash_attention_kernel.sa_use_fused_bwd_kernel)
+    self.assertEqual(cfg.splash_attention_kernel.sa_block_q, 2048)
+    self.assertEqual(cfg.splash_attention_kernel.sa_block_kv_compute, 1024)
+    graph_split = cfg.compile.graph_split
+    self.assertEqual(graph_split.forward_layers_per_executable, 2)
+    self.assertEqual(graph_split.backward_layers_per_executable, 2)
+    cp_gated_delta.validate_gated_delta_context_parallel(
+        cfg.model_spec.model, cfg.parallelism
+    )
 
   def _cp_config(self, *, gated_delta_lb="unset", cp=2, strategy="ulysses"):
     cfg = config_registry.qwen35_debugmodel()

@@ -784,6 +784,34 @@ class GraphSplitTest(absltest.TestCase):
         )
     )
 
+  def test_ep_count_gather_is_not_an_expert_weight_or_fsdp_gather(self):
+    """The ragged EP transport's expert-count all-gather is routing metadata.
+
+    ``dispatch`` is called directly, not through the dispatcher's ``forward``,
+    so its nodes carry the routed experts' FQN, under ``.moe.``. The integer
+    dtype is what keeps the gather out of both passes, also when a backward
+    recompute gathers saved counts.
+    """
+    graph = torch.fx.Graph()
+    counts = graph.placeholder("saved_counts")
+    counts.meta["val"] = torch.zeros((8,), dtype=torch.int32)
+    gather = graph.call_function(
+        torch.ops.tpu._all_gather_dim.default, args=(counts, 0, 2, "ep_pg")
+    )
+    gather.meta["val"] = torch.zeros((16,), dtype=torch.int32)
+    gather.meta["custom"] = {
+        "module_fqn": "layers.0.moe.routed_experts",
+        "EP": "dispatch",
+    }
+    graph.output((gather,))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    self.assertFalse(under_splash_lib._is_gathered_expert_weight(gather))
+    roles = collectives_lib.classify_fsdp_roles(
+        collectives_lib.collect_collective_chains(gm)
+    )
+    self.assertIsNone(roles[gather])
+
   def test_expert_all_gathers_under_splash(self):
     barriers = []
 
@@ -810,6 +838,48 @@ class GraphSplitTest(absltest.TestCase):
     # A model without MoE layers or Splash has nothing to join.
     with self.assertRaisesRegex(ValueError, "no layer with both"):
       self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
+
+  def test_ep_collectives_are_not_classified_as_expert_weights_or_fsdp_ag(self):
+    graph = torch.fx.Graph()
+    ids_ph = graph.placeholder("saved_ids")
+    ids_ph.meta["val"] = torch.zeros((4, 2), dtype=torch.int32)
+    param_ph = graph.placeholder("expert_w")
+    param_ph.meta["val"] = torch.zeros((4, 8), dtype=torch.bfloat16)
+
+    ids_ag = graph.call_function(
+        torch.ops.tpu._all_gather_dim.default, args=(ids_ph, 0, "ep_pg")
+    )
+    ids_ag.meta["val"] = torch.zeros((8, 2), dtype=torch.int32)
+    ids_ag.meta["custom"] = {
+        "module_fqn": "layers.0.moe.routed_experts.token_dispatcher"
+    }
+
+    tok_ag = graph.call_function(
+        torch.ops.tpu._all_gather_dim.default, args=(param_ph, 0, "ep_pg")
+    )
+    tok_ag.meta["val"] = torch.zeros((8, 8), dtype=torch.bfloat16)
+    tok_ag.meta["custom"] = {
+        "module_fqn": "layers.0.moe.routed_experts.token_dispatcher"
+    }
+
+    weight_ag = graph.call_function(
+        torch.ops.tpu._all_gather_dim.default, args=(param_ph, 0, "fsdp_pg")
+    )
+    weight_ag.meta["val"] = torch.zeros((8, 8), dtype=torch.bfloat16)
+    weight_ag.meta["custom"] = {
+        "module_fqn": "layers.0.moe.routed_experts.inner_experts"
+    }
+    graph.output((ids_ag, tok_ag, weight_ag))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    self.assertFalse(under_splash_lib._is_gathered_expert_weight(ids_ag))
+    self.assertFalse(under_splash_lib._is_gathered_expert_weight(tok_ag))
+    self.assertTrue(under_splash_lib._is_gathered_expert_weight(weight_ag))
+
+    chains = collectives_lib.collect_collective_chains(gm)
+    roles = collectives_lib.classify_fsdp_roles(chains)
+    self.assertIsNone(roles[ids_ag])
+    self.assertEqual(roles[weight_ag], "ag")
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

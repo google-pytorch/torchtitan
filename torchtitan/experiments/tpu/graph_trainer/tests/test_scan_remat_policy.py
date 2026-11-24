@@ -248,7 +248,7 @@ class TestScanRematPolicy(unittest.TestCase):
         self.assertIn("aten.tanh.default", ops)
 
     def test_the_real_aux_loss_over_two_groups(self):
-        """`_batch_wise_load_balance_loss` itself, with its in-place all-reduces."""
+        """The real MoE aux loss (`_batch_wise_load_balance_loss`), whose count all-reduces run in place, over two groups."""
         extra = _real_aux_term(dist.new_group([0]), dist.new_group([0]))
         want, legacy = _run(_legacy, extra=extra)
         got, captured = _run(_saving(), extra=extra)
@@ -283,7 +283,7 @@ class TestScanRematPolicy(unittest.TestCase):
         self._check_same_grads(got, want)
 
     def test_a_selected_region_is_saved(self):
-        """At torch's default budget (1.0): no pin is needed for the tags."""
+        """A region in `save_regions` is saved, at PyTorch's default memory budget."""
         self.assertEqual(functorch_config.activation_memory_budget, 1.0)
         want, _ = _run(_legacy, extra=_attention_term)
         _, unselected = _run(_saving(), extra=_attention_term)
@@ -296,7 +296,7 @@ class TestScanRematPolicy(unittest.TestCase):
         self._check_same_grads(got, want)
 
     def test_the_policy_holds_under_non_strict_tracing(self):
-        """The graph trainer's tracer: checkpoint must still tag the body."""
+        """Under the graph trainer's non-strict tracing, the policy's tags still reach the scan body."""
         extra = _both(_aux_term, _attention_term)
         want, legacy = _run(_legacy, extra=extra)
         got, captured = _run_non_strict(

@@ -702,6 +702,19 @@ def split_forward_graph_by_layer(
   return chunked
 
 
+def _collective_group_name(node: torch.fx.Node) -> str | None:
+  """The ``group_name`` argument of a functional collective node, if any."""
+  if "group_name" in node.kwargs:
+    return node.kwargs["group_name"]
+  schema = getattr(node.target, "_schema", None)
+  if schema is None:
+    return None
+  for i, arg in enumerate(schema.arguments):
+    if arg.name == "group_name" and i < len(node.args):
+      return node.args[i]
+  return None
+
+
 def _collect_backward_collective_owners(
     collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
     n_layers: int,
@@ -712,27 +725,60 @@ def _collect_backward_collective_owners(
   A parameter gather is owned by the layer of its first consumer, a gradient
   reduction by the layer that produced its input (``classify_fsdp_roles``).
   Collectives with neither role stay with their inputs. An all-gather or
-  reduce-scatter of a ``pipelined_kinds`` kind that has neither role raises,
-  since pipelining it as FSDP traffic would be wrong.
+  reduce-scatter of a ``pipelined_kinds`` kind that has neither role raises if
+  it runs on the process group of a gradient reduction, since pipelining it as
+  FSDP traffic would be wrong; on another group (e.g. the context-parallel K/V
+  gathers and their gradient reduce-scatters) it is not FSDP traffic and stays
+  with its inputs. Only gradient reductions name the FSDP groups: a gather of
+  activations saved from forward is also fed only by graph inputs. Such a
+  gather on another group (e.g. a recomputed context-parallel K/V gather) is
+  owned as ``"act"``: it stays with the layer that reads it, is never
+  pipelined, and does not count as that layer's parameter gather. Without any
+  recognized gradient reduction, every such collective raises.
   """
   owners: dict[torch.fx.Node, tuple[str, int]] = {}
-  for launch, role in classify_fsdp_roles(collective_chains).items():
+  roles = classify_fsdp_roles(collective_chains)
+  fsdp_groups = {
+      _collective_group_name(launch)
+      for launch, role in roles.items()
+      if role == "rs"
+  }
+  for launch, role in roles.items():
     if role is None:
-      if (is_gather(launch) and "ag" in pipelined_kinds) or (
-          is_reduce_scatter(launch) and "rs" in pipelined_kinds
-      ):
+      # Without a recognized gradient reduction there is no FSDP group to
+      # tell CP traffic apart by, so keep the strict check.
+      on_fsdp_group = (
+          not fsdp_groups or _collective_group_name(launch) in fsdp_groups
+      )
+      if (
+          (is_gather(launch) and "ag" in pipelined_kinds)
+          or (is_reduce_scatter(launch) and "rs" in pipelined_kinds)
+      ) and on_fsdp_group:
         raise ValueError(
             f"Backward collective {launch.name!r} is neither a parameter "
-            "gather nor a gradient reduction, so fsdp_pipeline cannot move it"
+            "gather nor a gradient reduction, so fsdp_pipeline cannot move it "
+            f"(group {_collective_group_name(launch)!r}; gradient reductions "
+            f"run on {sorted(map(str, fsdp_groups))})"
         )
       continue
+    kind = role
+    if (
+        role == "ag"
+        and fsdp_groups
+        and _collective_group_name(launch) not in fsdp_groups
+    ):
+      # A gather of saved activations, not parameters: keep it with its
+      # consumer layer. Leaving it unowned would place it with its graph
+      # inputs, i.e. at the start of backward, holding every layer's gathered
+      # activations at once.
+      kind = "act"
     inputs, users = chain_boundary(collective_chains[launch])
     nodes = users if role == "ag" else inputs | {launch}
     layer_ids = {
         i for i in (_get_layer_id(n) for n in nodes) if 0 <= i < n_layers
     }
     if layer_ids:
-      owners[launch] = (role, max(layer_ids))
+      owners[launch] = (kind, max(layer_ids))
   return owners
 
 
@@ -867,7 +913,8 @@ def split_backward_graph_by_layer(
         partition,
         f"FSDP {kind} layer {layer_id}",
     )
-    raw_collective_partitions[kind][layer_id] = partition
+    if kind in raw_collective_partitions:
+      raw_collective_partitions[kind][layer_id] = partition
 
   for layer_id, nodes in layer_nodes.items():
     _assign_partition(

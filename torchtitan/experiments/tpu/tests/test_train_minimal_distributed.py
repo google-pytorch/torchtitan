@@ -6,6 +6,30 @@ import torch.multiprocessing as mp
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.testing import base_distributed_device_test
 
+# Shared by the compiled qwen3_5 CP parity cases: SimpleFSDP and Tokamax
+# Splash. The debug model's RoPE table holds 256 positions; each of the two CP
+# ranks gets 128 of them, the shortest the Splash kernel takes.
+_QWEN35_CP_SPLASH_ARGS = [
+    "--parallelism.use_simple_fsdp",
+    "--training.max_context_length=256",
+    "--training.num_tokens_per_microbatch_per_dp_rank=512",
+    "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+    "--splash_attention_kernel.sa_block_q=128",
+    "--splash_attention_kernel.sa_block_kv=128",
+    "--splash_attention_kernel.sa_block_kv_compute=128",
+    "--splash_attention_kernel.sa_block_q_dkv=128",
+    "--splash_attention_kernel.sa_block_kv_dkv=128",
+    "--splash_attention_kernel.sa_block_kv_dkv_compute=128",
+]
+_QWEN35_CP_TOLERANCES = dict(
+    loss_atol=5e-3,
+    loss_rtol=5e-3,
+    grad_atol=1e-2,
+    grad_rtol=5e-3,
+    param_atol=1e-2,
+    param_rtol=5e-3,
+)
+
 
 class TrainMinimalDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
@@ -393,6 +417,49 @@ class TrainMinimalDistributedTest(
           grad_rtol=5e-3,
           param_atol=1e-2,
           param_rtol=5e-3,
+      ),
+      # qwen3_5 CP: CP full attention + head-parallel GatedDeltaNet against the
+      # single-device CPU reference (packed documents restart the GatedDeltaNet
+      # and are masked in attention). The debug model has 2 GatedDeltaNet key
+      # heads, so cp=2 with dp_shard over the other devices. Compiled only:
+      # eager TPU runs with dp_shard > 1 intermittently get wrong or non-finite
+      # gradients on the current torch_tpu build (cf. the Qwen3 Ulysses note
+      # above; here both strategies run subgroup all-to-alls). Per-layer
+      # torch.compile (skipped on CPU) with the Tokamax Splash kernel in the CP
+      # attention and the traced (functional-collective) GatedDeltaNet
+      # collectives.
+      dict(
+          testcase_name="qwen3_5_simplefsdp_cp2_all_gather_compile",
+          module="qwen3_5",
+          config="qwen35_debugmodel_allgather_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          enable_compile=True,
+          args=_QWEN35_CP_SPLASH_ARGS,
+          **_QWEN35_CP_TOLERANCES,
+      ),
+      dict(
+          testcase_name="qwen3_5_simplefsdp_cp2_ulysses_compile",
+          module="qwen3_5",
+          config="qwen35_debugmodel_ulysses_cp2",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          enable_compile=True,
+          args=_QWEN35_CP_SPLASH_ARGS,
+          **_QWEN35_CP_TOLERANCES,
+      ),
+      dict(
+          testcase_name="qwen3_5_simplefsdp_cp2_ulysses_agrs_compile",
+          module="qwen3_5",
+          config="qwen35_debugmodel_ulysses_cp2_agrs",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          context_parallel_degree=2,
+          enable_compile=True,
+          args=_QWEN35_CP_SPLASH_ARGS,
+          **_QWEN35_CP_TOLERANCES,
       ),
   ])
   def test_train_minimal_distributed_parity(

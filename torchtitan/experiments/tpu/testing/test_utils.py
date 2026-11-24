@@ -222,6 +222,56 @@ def check_equivalence(
     raise AssertionError(error_message)
 
 
+def _call_module_function(
+    module_name: str,
+    function_name: str,
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> None:
+  """Spawned-process entry point of ``run_in_subprocess``."""
+  import importlib  # pylint: disable=g-import-not-at-top
+
+  getattr(importlib.import_module(module_name), function_name)(*args, **kwargs)
+
+
+def _run_in_spawned_process(
+    module_name: str,
+    function_name: str,
+    args: list[Any],
+    kwargs: dict[str, Any],
+    env: dict[str, str] | None,
+) -> None:
+  """Runs ``module_name.function_name`` in a spawned process with ``env``.
+
+  A spawned child inherits ``os.environ`` as it is when the child starts, so
+  ``env`` is applied only around ``start()``.
+
+  Raises:
+      subprocess.CalledProcessError: If the child exits with a nonzero code.
+  """
+  import torch.multiprocessing as mp  # pylint: disable=g-import-not-at-top
+
+  ctx = mp.get_context("spawn")
+  process = ctx.Process(
+      target=_call_module_function,
+      args=(module_name, function_name, args, kwargs),
+  )
+  saved_env = dict(os.environ)
+  try:
+    if env is not None:
+      os.environ.clear()
+      os.environ.update(env)
+    process.start()
+  finally:
+    os.environ.clear()
+    os.environ.update(saved_env)
+  process.join()
+  if process.exitcode != 0:
+    raise subprocess.CalledProcessError(
+        process.exitcode, f"{module_name}.{function_name}"
+    )
+
+
 def run_in_subprocess(
     module_name: str,
     function_name: str,
@@ -254,15 +304,18 @@ def run_in_subprocess(
   kwargs = kwargs or {}
 
   if sys.executable is None:
-    logging.warning(
-        "sys.executable is None (likely embedded Python). Falling back to"
-        " in-process execution which may leak state."
+    # Embedded Python (e.g. Google3 tests) has no interpreter to launch with
+    # `-c`; spawn a multiprocessing child instead. Running the function in this
+    # process would leak state into later tests: a CPU-only `env` cannot hide an
+    # accelerator this process already detected, so the function would attach
+    # this process to the device and the next test's workers could not open it.
+    logging.info(
+        "Running %s.%s in a spawned subprocess (no sys.executable)...",
+        module_name,
+        function_name,
     )
-    import importlib
-
-    module = importlib.import_module(module_name)
-    func = getattr(module, function_name)
-    return func(*args, **kwargs)
+    _run_in_spawned_process(module_name, function_name, args, kwargs, env)
+    return
 
   logging.info(
       "Running %s.%s in an isolated subprocess...", module_name, function_name

@@ -487,13 +487,37 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
             )
-        hidden_RF = self._activation_fn(gate_RF) * up_RF
-        if row_scale_R is not None:
+        if (
+            self.activation == "silu"
+            and row_scale_R is not None
+            and gate_RF.device.type == "tpu"
+        ):
+            # Lazy import so CPU-only environments never import JAX/Pallas.
+            from torchtitan.experiments.tpu.kernels.expert_swiglu import (  # pylint: disable=g-import-not-at-top
+                expert_swiglu,
+            )
+
             if pad_rows:
                 row_scale_R = F.pad(row_scale_R, (0, pad_rows))
-            hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
-                hidden_RF.dtype
+            # Only the leading sum(num_tokens_per_expert_E) rows hold routed
+            # tokens (a static-size EP receive buffer is mostly tail), so the
+            # kernel computes those and zeroes the rest of the last row_align
+            # tile instead of running SwiGLU and the row scale over every row.
+            hidden_RF = expert_swiglu(
+                gate_RF,
+                up_RF,
+                num_tokens_per_expert_E,
+                row_scale_R=row_scale_R,
+                row_align=row_align,
             )
+        else:
+            hidden_RF = self._activation_fn(gate_RF) * up_RF
+            if row_scale_R is not None:
+                if pad_rows:
+                    row_scale_R = F.pad(row_scale_R, (0, pad_rows))
+                hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
+                    hidden_RF.dtype
+                )
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),

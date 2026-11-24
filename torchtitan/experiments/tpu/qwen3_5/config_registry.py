@@ -7,10 +7,8 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
-from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
     CommConfig,
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -323,13 +321,10 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
       ),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(preserve_rng_state=False),
-      compile=CompileConfig(enable=False, backend="tpu"),
-      validator=Validator.Config(enable=False),
+      compile=TpuTrainerCompileConfig(enable=False, backend="tpu"),
+      validator=None,
       tpu_config=TPUConfig(enable_amp=False),
   )
 
@@ -486,7 +481,7 @@ def qwen35_moe_35b(flavor: str = "35B-A3B") -> TPUTrainerConfig:
       compile=TpuTrainerCompileConfig(
           enable=False, backend="tpu", compile_grad_norm=True
       ),
-      validator=Validator.Config(enable=False),
+      validator=None,
       # Full attention in Qwen3.5 35B-A3B has head_dim=256 (2x Qwen3's 128):
       # Splash's backward overflows the default 32 MiB of scoped VMEM with
       # 2048 blocks, so use 1024.

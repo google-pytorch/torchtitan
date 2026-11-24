@@ -5,7 +5,6 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
-from torchtitan.components.validate import Validator
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -109,10 +108,7 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(use_simple_fsdp=True),
-      checkpoint=CheckpointManager.Config(
-          interval=10,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(),
   )
 
@@ -183,11 +179,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
           enable_tpu_topo_mesh=True,
           data_parallel_shard_degree=-1,
       ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=False,
-      ),
+      checkpointer=None,
       activation_checkpoint=SelectiveAC.Config(),
       # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
       # the other TPU recipes.
@@ -217,7 +209,7 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
           sa_block_kv_dq=1024,
       ),
       loss_kernel=LossKernelConfig(use_loss_kernel=False),
-      validator=Validator.Config(enable=False),
+      validator=None,
   )
   # Merged into the default, which keeps the diagnostic coordinator off.
   config.libtpu_init_flags = tpu_flags.merge_flags(

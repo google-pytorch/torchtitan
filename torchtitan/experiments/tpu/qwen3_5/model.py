@@ -135,4 +135,8 @@ class TpuQwen35Model(Qwen35Model):
           ep_capacity_factor=getattr(tpu_cfg, "ep_capacity_factor", None),
           num_token_chunks=getattr(tpu_cfg, "ep_token_chunks", None),
           max_inflight_chunks=getattr(tpu_cfg, "ep_max_inflight_chunks", None),
+          accumulate_chunk_weight_grads_fp32=getattr(
+              tpu_cfg, "ep_chunk_dw_fp32", None
+          ),
+          paired_grouped_mm=getattr(tpu_cfg, "ep_paired_grouped_mm", None),
       )

@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 import logging
 import os
-from typing import Any, cast
+from typing import Any, cast, NamedTuple
 
 import torch
 from torch import nn
@@ -268,12 +268,15 @@ class TpuGraphTrainer(GraphTrainer):
             return False
         return configure_ep_drop_stats(self.model_parts, enabled=True)
 
-    def _pop_ep_drop_stat_outputs(self, outputs: Sequence[Any]) -> Sequence[Any]:
-        """Removes and keeps the output ``_with_ep_drop_stat_outputs`` appended."""
+    def _pop_ep_drop_stat_outputs(self, outputs: Any) -> Any:
+        """Unwraps ``_with_ep_drop_stat_outputs``'s ``(outputs, stats)`` pair.
+
+        Keeps the stats for logging and returns the step's own outputs.
+        """
         if not self._ep_drop_stats_enabled:
             return outputs
-        self._ep_drop_stats_L2 = outputs[-1]
-        return outputs[:-1]
+        outputs, self._ep_drop_stats_L2 = outputs
+        return outputs
 
     def _maybe_log_ep_drop_stats(self) -> torch.Tensor | None:
         """Logs global and worst-layer EP dropped-route rates when capacity-bounded.
@@ -573,19 +576,16 @@ class TpuGraphTrainer(GraphTrainer):
                 extra_kwargs,
             )
         outputs = self._pop_ep_drop_stat_outputs(outputs)
-        loss = outputs[0]
-        grads = outputs[1 : 1 + len(params)]
+        self.last_loss_metrics = outputs.loss_metrics
         if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[1 + len(params) :])
-            )
+            set_moe_routing_metric_tensors([model], list(outputs.routing_metrics))
 
         # Sum, not assign, so gradient accumulation keeps every microbatch.
         # Each microbatch loss is divided by the whole step's token count, so
         # the sum is the full-batch mean.
-        accumulate_param_grads_(*_unique_param_grads(params, grads))
+        accumulate_param_grads_(*_unique_param_grads(params, outputs.grads))
 
-        return loss
+        return outputs.loss
 
     def _clip_grad_norm(self) -> torch.Tensor:
         if self._compiled_grad_norm is None:
@@ -685,31 +685,25 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
         outputs = self._pop_ep_drop_stat_outputs(outputs)
-        loss = outputs[0]
-        n = len(self._optstate_param_fqns)
-        new_params = outputs[1 : 1 + n]
-        new_exp_avgs = outputs[1 + n : 1 + 2 * n]
-        new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
-        new_step = outputs[1 + 3 * n]
+        self.last_loss_metrics = outputs.loss_metrics
         if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[2 + 3 * n :])
-            )
+            set_moe_routing_metric_tensors([model], list(outputs.routing_metrics))
 
         from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
 
         update_model_and_optstate_buffers(
             model,
             self._optstate_param_fqns,
-            new_params,
-            new_exp_avgs,
-            new_exp_avg_sqs,
+            outputs.params,
+            outputs.exp_avgs,
+            outputs.exp_avg_sqs,
         )
+        new_step = outputs.step
         model._optstate_step.copy_(
             new_step.detach() if isinstance(new_step, torch.Tensor) else new_step
         )
 
-        return loss
+        return outputs.loss
 
 
 def _data_id(t: torch.Tensor) -> int:
@@ -758,10 +752,12 @@ def _check_in_graph_optimizer_grad_accum(
 
 
 def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:
-    """Returns ``step_fn`` with the MoE layers' EP drop stats as a last output.
+    """Returns ``step_fn`` with the MoE layers' EP drop stats as an extra output.
 
-    ``TpuGraphTrainer._pop_ep_drop_stat_outputs`` removes it after the step
-    runs, so the positions of the step's other outputs don't change.
+    The step's own outputs (a ``FwdBwdOutputs`` / ``FwdBwdAdamWOutputs``) stay
+    nested as the first element of a ``(outputs, stats)`` pair, so the traced
+    output spec rebuilds them with their field names, and
+    ``TpuGraphTrainer._pop_ep_drop_stat_outputs`` unwraps the pair.
     """
     from torchtitan.experiments.tpu.components.token_dispatcher import (  # pylint: disable=g-import-not-at-top
         collect_ep_drop_stat_tensors,
@@ -770,13 +766,30 @@ def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:
     def step_with_ep_drop_stats(inputs, labels, global_valid_tokens, extra_kwargs):
         outputs = step_fn(inputs, labels, global_valid_tokens, extra_kwargs)
         (stats_L2,) = collect_ep_drop_stat_tensors([model])
-        return [*outputs, stats_L2]
+        return outputs, stats_L2
 
     return step_with_ep_drop_stats
 
 
 _GRAD_CLIP_EPS = 1e-6
 _GRAD_CLIP_MAX_SCALE = 1.0
+
+
+class FwdBwdAdamWOutputs(NamedTuple):
+    """Outputs of the traced forward, backward and AdamW step (``_make_fwd_bwd_adamw_fn``).
+
+    Flattened in field order in the traced graph and rebuilt by ``run_traced``.
+    """
+
+    loss: torch.Tensor
+    # Updated parameters and optimizer state, in ``param_fqns`` order.
+    params: Sequence[torch.Tensor]
+    exp_avgs: Sequence[torch.Tensor]
+    exp_avg_sqs: Sequence[torch.Tensor]
+    step: torch.Tensor
+    routing_metrics: Sequence[torch.Tensor]
+    # The loss function's metrics (``{}`` for the built-in losses).
+    loss_metrics: Any
 
 
 def _make_fwd_bwd_adamw_fn(
@@ -811,7 +824,7 @@ def _make_fwd_bwd_adamw_fn(
             if collect_moe_routing_metrics
             else []
         )
-        loss = compute_annotated_loss(
+        loss, loss_metrics = compute_annotated_loss(
             loss_fn,
             pred,
             labels,
@@ -860,14 +873,15 @@ def _make_fwd_bwd_adamw_fn(
             foreach=False,
             capturable=capturable,
         )
-        return [
+        return FwdBwdAdamWOutputs(
             loss,
-            *new_params,
-            *new_eas,
-            *new_eass,
+            list(new_params),
+            list(new_eas),
+            list(new_eass),
             new_steps[0],
-            *routing_metrics,
-        ]
+            routing_metrics,
+            loss_metrics,
+        )
 
     return fwd_bwd_adamw
 

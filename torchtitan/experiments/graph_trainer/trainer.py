@@ -5,9 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, cast, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -86,12 +86,38 @@ def _maybe_apply_numa_binding(device_index: int, device_type: str) -> None:
     logger.info("NUMA binding applied for GPU %d", device_index)
 
 
-def make_fwd_bwd_step(model, loss_fn, *, accumulate_gradients: bool = False, collect_moe_routing_metrics: bool = False):
+class FwdBwdOutputs(NamedTuple):
+    """Outputs of the traced forward-backward step (``make_fwd_bwd_step``).
+
+    The traced graph returns these flattened in field order, and ``run_traced``
+    / ``GraphRunner`` rebuild the tuple, so call sites read fields by name.
+    """
+
+    loss: torch.Tensor
+    # Parameter gradients, in ``named_parameters`` order; empty when the step
+    # accumulates them into gradient buffers itself.
+    grads: Sequence[torch.Tensor]
+    routing_metrics: Sequence[torch.Tensor]
+    # Whatever the loss function returned next to the loss (``{}`` for the
+    # built-in losses, which then add no graph outputs).
+    loss_metrics: Any
+
+
+def make_fwd_bwd_step(
+    model,
+    loss_fn,
+    *,
+    accumulate_gradients: bool = False,
+    collect_moe_routing_metrics: bool = False,
+):
     """Return a plain function that traces the entire fwd+loss+bwd step.
 
     ``model`` and ``loss_fn`` are captured in the closure so neither shows up
     as a graph input. Pass ``model`` through ``minimal_fx_tracer(fn, module=model)``
     to thread its parameters/buffers as static graph inputs.
+
+    The step returns ``FwdBwdOutputs``; its ``loss_metrics`` are the loss
+    function's metrics (see ``compute_annotated_loss``).
     """
 
     def compute_step(inputs, labels, global_valid_tokens, extra_kwargs):
@@ -105,7 +131,7 @@ def make_fwd_bwd_step(model, loss_fn, *, accumulate_gradients: bool = False, col
         # annotate_module_fqns won't tag it. Annotate it here so that
         # downstream passes (bucketing, SAC, kernel annotations) can
         # attribute loss nodes in the traced graph.
-        loss = compute_annotated_loss(
+        loss, loss_metrics = compute_annotated_loss(
             loss_fn,
             pred,
             labels,
@@ -117,27 +143,27 @@ def make_fwd_bwd_step(model, loss_fn, *, accumulate_gradients: bool = False, col
             if parameter.requires_grad
         ]
         grads = compute_parameter_gradients(loss, named_params)
-        return loss, named_params, grads, routing_metrics
+        return loss, named_params, grads, routing_metrics, loss_metrics
 
     if not accumulate_gradients:
 
         def fwd_bwd_step(inputs, labels, global_valid_tokens, extra_kwargs):
-            loss, _named_params, grads, routing_metrics = compute_step(
-                inputs, labels, global_valid_tokens, extra_kwargs
+            loss, _named_params, grads, routing_metrics, loss_metrics = (
+                compute_step(inputs, labels, global_valid_tokens, extra_kwargs)
             )
-            return [loss, *grads, *routing_metrics]
+            return FwdBwdOutputs(loss, list(grads), routing_metrics, loss_metrics)
 
         return fwd_bwd_step
 
     def fwd_bwd_step(
         gradient_buffers, inputs, labels, global_valid_tokens, extra_kwargs
     ):
-        loss, named_params, grads, routing_metrics = compute_step(
+        loss, named_params, grads, routing_metrics, loss_metrics = compute_step(
             inputs, labels, global_valid_tokens, extra_kwargs
         )
         for (fqn, _parameter), grad in zip(named_params, grads, strict=True):
             gradient_buffers[fqn].add_(grad)
-        return [loss, *routing_metrics]
+        return FwdBwdOutputs(loss, [], routing_metrics, loss_metrics)
 
     return fwd_bwd_step
 
@@ -161,6 +187,10 @@ class GraphTrainer(Trainer):
         self._graph_runner: GraphRunner | None = None
         self._trainable_params: tuple[torch.Tensor, ...] | None = None
         self._graph_gradient_state: GraphGradientState | None = None
+        # The loss function's metrics from the latest forward_backward_step
+        # (``FwdBwdOutputs.loss_metrics``); with gradient accumulation, the
+        # last microbatch's.
+        self.last_loss_metrics: Any = None
         self._validate_inplace_graph_gradient_accumulation_config()
         if self.config.compile.enable_inplace_graph_gradient_accumulation:
             self._ensure_graph_gradient_state(self.model_parts[0])
@@ -348,29 +378,24 @@ class GraphTrainer(Trainer):
                 global_valid_tokens,
                 extra_kwargs,
             )
+        if not isinstance(outputs, FwdBwdOutputs):
+            raise RuntimeError(
+                "The traced step did not return FwdBwdOutputs (got "
+                f"{type(outputs).__name__}); re-generate precompiled artifacts "
+                "saved before this output format."
+            )
+        self.last_loss_metrics = outputs.loss_metrics
+        if self._collect_moe_routing_metrics:
+            set_moe_routing_metric_tensors([model], list(outputs.routing_metrics))
         if gradient_state is None:
-            loss = outputs[0]
-            grads = outputs[1 : 1 + len(params)]
-            if self._collect_moe_routing_metrics:
-                set_moe_routing_metric_tensors([model], list(outputs[1 + len(params) :]))
             accumulate_param_grads_(
                 params,
-                grads,
+                outputs.grads,
                 clone_grads_to_initialize_param_grad=isinstance(
                     self._traced_step.gm.forward, CUDAGraphWrapper
                 ),
             )
-            return loss
-
-        loss = outputs[0]
-        if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors([model], list(outputs[1:]))
-        elif len(outputs) != 1:
-            raise RuntimeError(
-                "GraphTrainer directly traced gradient accumulation expected a "
-                f"loss-only output, got {len(outputs)} outputs"
-            )
-        return loss
+        return outputs.loss
 
     def _ensure_graph_gradient_state(
         self,

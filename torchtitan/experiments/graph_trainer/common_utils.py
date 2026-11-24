@@ -17,7 +17,12 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 from torch.fx.traceback import annotate, annotate_fn
-from torch.utils._pytree import register_constant, register_pytree_node, tree_map
+from torch.utils._pytree import (
+    register_constant,
+    register_pytree_node,
+    tree_leaves,
+    tree_map,
+)
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -33,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 BOXED_CODEGEN_META = "graph_trainer_boxed_codegen"
-LossResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, dict[str, Any]]
+LossResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, Any]
 AnnotatedLossFn: TypeAlias = Callable[..., LossResult]
 
 
@@ -246,19 +251,37 @@ def compute_annotated_loss(
     pred: torch.Tensor,
     labels: torch.Tensor,
     loss_kwargs: dict[str, Any] | None = None,
-) -> torch.Tensor:
-    """Compute the loss tensor with the same FX metadata convention as GraphTrainer."""
+) -> tuple[torch.Tensor, Any]:
+    """Compute ``(loss, metrics)`` with the same FX metadata convention as GraphTrainer.
+
+    ``loss_fn`` follows the loss protocol: it returns ``(loss, metrics)``, or a
+    bare loss tensor, which is treated as ``(loss, {})``. ``metrics`` may be any
+    pytree of tensors (e.g. per-token log-probs for an RL actor update); the
+    traced step returns it as graph outputs, so built-in losses, whose metrics
+    are ``{}``, add no outputs.
+    """
     annotated_loss_fn = annotate_fn({_MODULE_FQN: "loss"})(loss_fn)
     result = annotated_loss_fn(pred, labels, **(loss_kwargs or {}))
-    if isinstance(result, tuple):
-        if len(result) != 2:
-            raise ValueError(
-                "GraphTrainer loss functions must return a loss tensor or "
-                "(loss tensor, metrics)."
-            )
-        loss, _metrics = result
-        return loss
-    return result
+    if not isinstance(result, tuple):
+        return result, {}
+    if len(result) != 2:
+        raise ValueError(
+            "GraphTrainer loss functions must return a loss tensor or "
+            "(loss tensor, metrics)."
+        )
+    loss, metrics = result
+    non_tensors = [
+        type(leaf).__name__
+        for leaf in tree_leaves(metrics)
+        if not isinstance(leaf, torch.Tensor)
+    ]
+    if non_tensors:
+        # A Python scalar would be baked into the traced graph as a constant.
+        raise ValueError(
+            "GraphTrainer loss metrics must be tensors, got leaves of type "
+            f"{sorted(set(non_tensors))}."
+        )
+    return loss, metrics
 
 
 def accumulate_param_grads_(

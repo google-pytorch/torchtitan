@@ -58,6 +58,10 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
 )
+from torchtitan.experiments.graph_trainer.trainer import (
+    FwdBwdOutputs,
+    make_fwd_bwd_step,
+)
 
 
 def _boxed_run(gm: fx.GraphModule, args: list[object]):
@@ -192,17 +196,17 @@ class GraphPipelineRuntimeTraceTest(unittest.TestCase):
 
         _build_test_stage_graphs(stage, (x,), {}, target, {})
 
-    def test_compute_annotated_loss_uses_loss_kwargs_and_unwraps_metrics(self) -> None:
+    def test_compute_annotated_loss_uses_loss_kwargs_and_returns_metrics(self) -> None:
         def loss_fn(pred, target, *, global_valid_tokens):
             return ((pred - target) ** 2).sum() / global_valid_tokens, {
-                "ignored": pred.sum()
+                "log_prob": pred.mean(dim=-1)
             }
 
         pred = torch.randn(2, 4)
         target = torch.randn(2, 4)
         global_valid_tokens = torch.tensor(2.0)
 
-        loss = compute_annotated_loss(
+        loss, metrics = compute_annotated_loss(
             loss_fn,
             pred,
             target,
@@ -210,6 +214,72 @@ class GraphPipelineRuntimeTraceTest(unittest.TestCase):
         )
 
         self.assertEqual(loss, ((pred - target) ** 2).sum() / global_valid_tokens)
+        torch.testing.assert_close(metrics["log_prob"], pred.mean(dim=-1))
+
+    def test_compute_annotated_loss_bare_tensor_has_empty_metrics(self) -> None:
+        def loss_fn(pred, target, *, global_valid_tokens):
+            return ((pred - target) ** 2).sum() / global_valid_tokens
+
+        loss, metrics = compute_annotated_loss(
+            loss_fn,
+            torch.ones(2),
+            torch.zeros(2),
+            {"global_valid_tokens": torch.tensor(2.0)},
+        )
+        torch.testing.assert_close(loss, torch.tensor(1.0))
+        self.assertEqual(metrics, {})
+
+    def test_compute_annotated_loss_rejects_non_tensor_metrics(self) -> None:
+        def loss_fn(pred, target, *, global_valid_tokens):
+            return pred.sum(), {"num_tokens": 3.0}
+
+        with self.assertRaisesRegex(ValueError, "must be tensors"):
+            compute_annotated_loss(
+                loss_fn,
+                torch.randn(2),
+                torch.randn(2),
+                {"global_valid_tokens": torch.tensor(1.0)},
+            )
+
+    def _traced_fwd_bwd(self, loss_fn):
+        model = nn.Linear(4, 2)
+        x = torch.randn(3, 4)
+        target = torch.randn(3, 2)
+        global_tokens = torch.tensor(3.0)
+        step_fn = make_fwd_bwd_step(model, loss_fn)
+        traced = minimal_fx_tracer(step_fn, module=model)(
+            x, target, global_tokens, {}
+        )
+        outputs = run_traced(traced, module=model)(x, target, global_tokens, {})
+        num_flat_outputs = len(traced.gm.graph.find_nodes(op="output")[0].args[0])
+        return model, x, outputs, num_flat_outputs
+
+    def test_make_fwd_bwd_step_builtin_loss_adds_no_outputs(self) -> None:
+        def loss_fn(pred, labels, *, global_valid_tokens):
+            return ((pred - labels) ** 2).sum() / global_valid_tokens, {}
+
+        model, _, outputs, num_flat_outputs = self._traced_fwd_bwd(loss_fn)
+        num_params = len(list(model.parameters()))
+        self.assertIsInstance(outputs, FwdBwdOutputs)
+        # Same flat graph as before metrics were returned: loss + grads.
+        self.assertEqual(num_flat_outputs, 1 + num_params)
+        self.assertEqual(len(outputs.grads), num_params)
+        self.assertEqual(outputs.loss_metrics, {})
+
+    def test_make_fwd_bwd_step_returns_loss_metrics(self) -> None:
+        def loss_fn(pred, labels, *, global_valid_tokens):
+            loss = ((pred - labels) ** 2).sum() / global_valid_tokens
+            return loss, {"log_prob": pred.detach().mean(dim=-1)}
+
+        model, x, outputs, num_flat_outputs = self._traced_fwd_bwd(loss_fn)
+        num_params = len(list(model.parameters()))
+        self.assertIsInstance(outputs, FwdBwdOutputs)
+        self.assertEqual(num_flat_outputs, 1 + num_params + 1)
+        self.assertEqual(set(outputs.loss_metrics), {"log_prob"})
+        torch.testing.assert_close(
+            outputs.loss_metrics["log_prob"], model(x).mean(dim=-1)
+        )
+        self.assertTrue(all(g is not None for g in outputs.grads))
 
     def test_prepare_fwd_user_args_allows_absent_args_and_kwargs(self) -> None:
         stage = types.SimpleNamespace(is_first=True, is_last=False)

@@ -4,6 +4,10 @@ Recipe helpers come from the Qwen3.5 TPU registry: Qwen3.8 is the same
 architecture (see the package docstring).
 """
 
+from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.config.configs import ParallelismConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuRoutedExpertsConverter,
@@ -70,4 +74,49 @@ def qwen38_moe_debugmodel_ep8() -> TPUTrainerConfig:
   cfg = qwen38_moe_debugmodel()
   cfg.parallelism.expert_parallel_degree = 8
   _use_ragged_ep_transport(cfg)
+  return cfg
+
+
+def qwen38_2_4t_a95b_proxy() -> TPUTrainerConfig:
+  """Real-per-rank-shape proxy of Qwen3.8-2.4T-A95B for one TPU v6e-8 host.
+
+  The full width (dim 8192, 64 query / 4 KV heads of 256, GatedDeltaNet 16
+  key / 128 value heads, expert hidden size 2048, vocab 248320), the first 4
+  layers (3 GatedDeltaNet + 1 full attention, one period of the layer
+  pattern) and 64 routed experts, so EP=8 holds 8 experts per rank as EP=64
+  does on the full model's 512. bf16 parameters and optimizer state
+  (`training.dtype`), full activation checkpointing, plain SDPA and the
+  reference GatedDeltaNet: rung 1, for shapes and numerics, not speed.
+
+  2K tokens per rank: the ragged EP transport's worst-case receive buffer is
+  `ep * T * top_k` rows (8 * 4096 * 10 x 8192 bf16 = 5.4 GB at 4K, which ran
+  out of HBM on v6e). The `qwen35_moe_35b` LR schedule (200 warmup steps,
+  clamped to `training.steps` in short runs): the debug recipe's 2-step
+  warmup to 3e-4 spiked the loss (10.2 -> 14.0 at step 5, grad_norm 69).
+  """
+  cfg = qwen38_moe_debugmodel()
+  seq_len = 2048
+  cfg.hf_assets_path = "./tests/assets/tokenizer"
+  cfg.model_spec = model_registry(
+      "2.4T-A95B",
+      seq_len=seq_len,
+      converters=_TPU_MOE_CONVERTERS,
+      num_layers=4,
+      num_experts=64,
+  )
+  cfg.dataloader = c4_test_dataloader()
+  cfg.training.max_context_length = seq_len
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = seq_len
+  cfg.training.dtype = "bfloat16"
+  cfg.parallelism = ParallelismConfig(
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=8,
+      fsdp_reshard_after_forward="always",
+      use_simple_fsdp=True,
+  )
+  _use_ragged_ep_transport(cfg)
+  cfg.activation_checkpoint = FullAC.Config(preserve_rng_state=False)
+  cfg.optimizer = default_adamw(lr=3e-4, implementation="foreach")
+  cfg.lr_scheduler = qwen35_recipes.qwen35_moe_35b().lr_scheduler
+  cfg.checkpoint.enable = False
   return cfg

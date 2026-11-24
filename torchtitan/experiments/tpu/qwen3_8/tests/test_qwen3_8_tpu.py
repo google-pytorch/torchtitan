@@ -394,6 +394,7 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       "qwen38_debugmodel",
       "qwen38_moe_debugmodel",
       "qwen38_moe_debugmodel_ep8",
+      "qwen38_2_4t_a95b_proxy",
   )
   def test_recipe_parses(self, config_name: str):
     cfg = ConfigManager().parse_args([

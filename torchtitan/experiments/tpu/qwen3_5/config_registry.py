@@ -255,9 +255,9 @@ def _use_expert_parallel(
     experts live on the `(efsdp, ep)` mesh. `DEFER_AND_FUSE` fuses the eager
     norm across parameters.
   - One layer per forward and backward executable, with
-    `backward_partition_mode="by_layer"`: `fsdp_pipeline` treats every
-    backward all-gather and reduce-scatter as an FSDP collective, and the EP
-    token exchange isn't one.
+    `backward_partition_mode="by_layer"`. `fsdp_pipeline` also works with
+    EP (it moves only collectives on the FSDP groups; the EP token exchange
+    stays with its layer) and is used by the 64K recipes (`_397b_64k_cp`).
   - The topology-aware device mesh stays on (inherited from the base
     recipe): `ParallelDims.build_mesh` registers each mesh axis's logical
     layout with `spmd_types`, so the `efsdp` and `ep` axes pass its
@@ -796,6 +796,10 @@ def _397b_64k_cp(
   - Splash blocks of 2,048 query and key/value rows (1,024 per compute step):
     26.2%. 4,096-row blocks do not compile (VMEM), and the fused Splash
     backward runs out of HBM at 64K.
+  - ``backward_partition_mode="fsdp_pipeline"`` (each backward executable's
+    expert/FSDP gathers issued one executable early and its gradient
+    reduce-scatters one late): 26.5%. With ``--debug.seed`` fixed, losses
+    match ``by_layer`` at steps 1-2 and within 1e-4 relative afterwards.
 
   Without the capacity cap (``--tpu_config.ep_capacity_factor None``), 16K-
   token chunks run out of HBM; with ``--tpu_config.ep_token_chunks=8`` the
@@ -818,6 +822,7 @@ def _397b_64k_cp(
   cfg.tpu_config.ep_chunk_dw_fp32 = False
   cfg.compile.graph_split.forward_layers_per_executable = 2
   cfg.compile.graph_split.backward_layers_per_executable = 2
+  cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
   return _qwen35_cp(cfg, strategy=strategy, cp_degree=cp)
 
 

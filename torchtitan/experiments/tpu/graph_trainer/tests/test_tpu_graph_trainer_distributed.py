@@ -496,6 +496,34 @@ class TpuGraphTrainerDistributedTest(
         abs(step1_loss["ep1"]) * 1e-3,
     )
 
+  def test_qwen3_5_moe_graph_trainer_ep2_fsdp_pipeline_matches_by_layer(self):
+    """EP=2 with fsdp_pipeline backward matches by_layer over three steps.
+
+    fsdp_pipeline only moves each backward executable's FSDP all-gathers one
+    executable earlier and its gradient reduce-scatters one later, so the
+    losses after two optimizer updates match by_layer's.
+    """
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    for mode in ("by_layer", "fsdp_pipeline"):
+      path = os.path.join(tempdir, f"{mode}.json")
+      self._train_qwen3_5_moe(
+          _RecordLosses(path),
+          ["--training.steps=3", "--debug.seed=0"]
+          + _QWEN35_MOE_EP2
+          + [f"--compile.graph_split.backward_partition_mode={mode}"],
+      )
+      with open(path) as f:
+        losses[mode] = {int(k): v for k, v in json.load(f)}
+    logging.info("qwen3_5 MoE GraphTrainer EP=2 losses by mode: %s", losses)
+    for step in (1, 2, 3):
+      self.assertTrue(math.isfinite(losses["fsdp_pipeline"][step]))
+      self.assertLess(
+          abs(losses["fsdp_pipeline"][step] - losses["by_layer"][step]),
+          abs(losses["by_layer"][step]) * 1e-3,
+          msg=f"step {step}",
+      )
+
   @parameterized.named_parameters(
       # Ragged all-to-all caps at int(1024 * 0.5) = 512 rows, half the balanced
       # load, so at least half the routes drop.

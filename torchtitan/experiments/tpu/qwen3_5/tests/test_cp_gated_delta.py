@@ -999,6 +999,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     graph_split = cfg.compile.graph_split
     self.assertEqual(graph_split.forward_layers_per_executable, 2)
     self.assertEqual(graph_split.backward_layers_per_executable, 2)
+    self.assertEqual(graph_split.backward_partition_mode, "fsdp_pipeline")
     cp_gated_delta.validate_gated_delta_context_parallel(
         cfg.model_spec.model, cfg.parallelism
     )

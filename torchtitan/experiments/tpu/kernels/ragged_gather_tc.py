@@ -60,6 +60,11 @@ _RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL = 8
 _RAGGED_GATHER_REDUCE_TC_ALIGN = 128
 _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
+# Row block of `_ragged_scale_and_dscore_tc` (the Ring-of-Experts combine
+# backward). It runs the Pallas kernel only when the expert buffer's row count
+# is a positive multiple of this block, and an XLA fallback otherwise, so the
+# EP dispatcher rounds capped buffers up to it.
+SCALE_DSCORE_BLOCK_ROWS = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -820,7 +825,7 @@ def _ragged_scale_and_dscore_tc(
   ``dScore`` row sums accumulate across feature chunks.
   """
   cap, d_dim = g_gathered_RD.shape
-  block = 1024
+  block = SCALE_DSCORE_BLOCK_ROWS
   itemsize = jnp.dtype(g_gathered_RD.dtype).itemsize
   vmem_limit = pallas_vmem.vmem_limit_bytes()
   d_chunk = (
@@ -1502,6 +1507,7 @@ def roe_gather_row_scales(
 
 
 __all__ = [
+    "SCALE_DSCORE_BLOCK_ROWS",
     "roe_compute_routing",
     "roe_gather_row_scales",
     "roe_sort_gather",

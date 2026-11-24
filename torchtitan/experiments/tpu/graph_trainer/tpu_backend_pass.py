@@ -598,7 +598,11 @@ def construct_tpu_transform_passes(
     from torchtitan.experiments.tpu.graph_trainer.passes.insert_combine_barriers import (
         apply_combine_barrier_pass,
     )
+    from torchtitan.experiments.tpu.graph_trainer.passes.insert_ep_chunk_barriers import (
+        apply_ep_chunk_barrier_pass,
+    )
     passes.append(apply_combine_barrier_pass)
+    passes.append(apply_ep_chunk_barrier_pass)
 
     if fsdp_barrier_policy != "none":
         model_config = config.model_spec.model

@@ -1745,11 +1745,11 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           dump_folder="",
       )
 
-  def _moe_debug_trainer_config(self, *args):
-    """Parses ``qwen35_moe_debugmodel`` with extra CLI ``args``."""
+  def _moe_debug_trainer_config(self, *args, config="qwen35_moe_debugmodel"):
+    """Parses ``config`` (``qwen35_moe_debugmodel``) with extra CLI ``args``."""
     return ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3_5",
-        "--config=qwen35_moe_debugmodel",
+        f"--config={config}",
         *args,
     ])
 
@@ -1774,8 +1774,8 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         tpu_cfg.model_spec.model.build(), tpu_model.TpuQwen35Model
     )
 
-  def test_ep2_update_from_config_uses_ragged_transport(self):
-    """At EP=2 the routed experts use the shared ragged all-to-all path."""
+  def test_ep2_update_from_config_uses_auto_transport_and_cli_overrides(self):
+    """At EP=2 the routed experts default to `ep_transport='auto'` and honor CLI overrides."""
     cfg = self._moe_debug_trainer_config("--parallelism.expert_parallel_degree=2")
     model_config = cfg.model_spec.model
     model_config.update_from_config(
@@ -1790,12 +1790,299 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertTrue(dispatchers)
     for experts in routed:
       self.assertIsInstance(experts, TpuRoutedExperts.Config)
+      self.assertFalse(experts.scale_before_down_proj)
     for dispatcher in dispatchers:
       self.assertIsInstance(dispatcher, TpuAllToAllTokenDispatcher.Config)
-      self.assertEqual(dispatcher.ep_transport, "ragged_all_to_all")
+      self.assertEqual(dispatcher.ep_transport, "auto")
+      self.assertIsNone(dispatcher.ep_capacity_factor)
     for experts in grouped:
       self.assertFalse(experts.use_pallas_paired_grouped_mm)
+      self.assertFalse(experts.use_pallas_grouped_mm)
     self.assertIsInstance(model_config.build(), tpu_model.TpuQwen35Model)
+
+    # Routing weights before W2 need the Pallas grouped matmuls, and the EP
+    # config update says so instead of switching kernels.
+    native_cfg = self._moe_debug_trainer_config(
+        "--parallelism.expert_parallel_degree=2",
+        "--tpu_config.ep_scale_before_down_proj=True",
+    )
+    with self.assertRaisesRegex(ValueError, "use_pallas_grouped_mm"):
+      native_cfg.model_spec.model.update_from_config(
+          config=native_cfg, global_batch_size=1, local_global_batch_size=1
+      )
+
+    roe_cfg = self._moe_debug_trainer_config(
+        "--parallelism.expert_parallel_degree=2",
+        "--tpu_config.ep_transport=ring_of_experts",
+        "--tpu_config.ep_scale_before_down_proj=True",
+        "--tpu_config.ep_capacity_factor=1.5",
+        "--tpu_config.ep_token_chunks=4",
+        "--tpu_config.ep_max_inflight_chunks=3",
+        config="qwen35_moe_debugmodel_pallas_gmm",
+    )
+    roe_cfg.model_spec.model.update_from_config(
+        config=roe_cfg, global_batch_size=1, local_global_batch_size=1
+    )
+    for _, experts, _, _ in roe_cfg.model_spec.model.traverse(
+        TpuRoutedExperts.Config
+    ):
+      self.assertTrue(experts.scale_before_down_proj)
+      self.assertEqual(experts.num_token_chunks, 4)
+      self.assertEqual(experts.max_inflight_chunks, 3)
+    for _, experts, _, _ in roe_cfg.model_spec.model.traverse(
+        TpuGroupedExperts.Config
+    ):
+      self.assertTrue(experts.use_pallas_grouped_mm)
+      self.assertFalse(experts.use_pallas_paired_grouped_mm)
+      self.assertEqual(experts.pallas_grouped_mm_tile_m, 256)
+    for _, dispatcher, _, _ in roe_cfg.model_spec.model.traverse(
+        TpuAllToAllTokenDispatcher.Config
+    ):
+      self.assertEqual(dispatcher.ep_transport, "ring_of_experts")
+      self.assertEqual(dispatcher.ep_capacity_factor, 1.5)
+      self.assertFalse(dispatcher.fuse_route_score_backward)
+
+  def test_ring_of_experts_tpu_fx_trace_and_regions(self):
+    """Ring-of-Experts traces without host syncs on TPU and tags remat regions."""
+    if not self._is_tpu():
+      self.skipTest("Traces Pallas TensorCore Ring-of-Experts custom ops on TPU.")
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import (  # pylint: disable=g-import-not-at-top
+        minimal_fx_tracer,
+    )
+    from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (  # pylint: disable=g-import-not-at-top
+        select_ep_dispatch,
+        select_route_permutations,
+    )
+
+    dev = self.accelerator_device
+    num_experts, ep_size, top_k, tokens_per_rank, dim = 8, 2, 2, 1024, 128
+    mock_pg = SimpleNamespace(group_name="ep_roe_pg", size=lambda: ep_size)
+    holder = torch.nn.Module()
+    holder.register_buffer(
+        "_ep_local_rank",
+        torch.zeros((1,), dtype=torch.long, device=dev),
+        persistent=False,
+    )
+
+    for scale_before_w2, cap_factor, expected_cap in (
+        (False, None, ep_size * tokens_per_rank * top_k),
+        (True, None, ep_size * tokens_per_rank * top_k),
+        # int(2048 * 1.25) = 2560 rounds up to 3072, a multiple of the
+        # Pallas combine backward's 1024-row block (< worst case 4096).
+        (True, 1.25, 3072),
+    ):
+      disp = TpuAllToAllTokenDispatcher.Config(
+          num_experts=num_experts,
+          top_k=top_k,
+          fuse_route_score_backward=not scale_before_w2,
+          ep_transport="ring_of_experts",
+          ep_capacity_factor=cap_factor,
+      ).build()
+      if scale_before_w2:
+        disp.enable_row_scale_dispatch()
+      disp.wire_meshes(
+          ep_mesh=SimpleNamespace(  # pyrefly: ignore[bad-argument-type]
+              size=lambda: ep_size,
+              get_local_rank=lambda: 0,
+              get_group=lambda: mock_pg,
+              device_type="tpu",
+          )
+      )
+      disp.bind_ep_rank_holder(holder)
+
+      x_in = torch.randn(
+          tokens_per_rank, dim, device=dev, dtype=torch.bfloat16, requires_grad=True
+      )
+      scores_in = (
+          0.1 + torch.rand(tokens_per_rank, top_k, device=dev, dtype=torch.float32)
+      ).requires_grad_(True)
+      ids_in = torch.randint(0, num_experts, (tokens_per_rank, top_k), device=dev)
+      counts_in = torch.zeros(num_experts, dtype=torch.int32, device=dev)
+
+      def step(x, scores, ids, counts):
+        h, gs, meta = disp.dispatch(x, scores, ids, counts)
+        assert h.shape == (expected_cap, dim)
+        assert meta.dropped_count is not None
+        if scale_before_w2:
+          h = (h.float() * meta.row_scale_R.unsqueeze(-1)).to(h.dtype)
+          meta = dataclasses.replace(meta, row_scale_applied=True)
+        out = disp.combine(h * 2.0, meta, x)
+        dx, dscores = torch.autograd.grad(out.float().sum(), (x, scores))
+        return gs, meta.dropped_count, out, dx, dscores
+
+      # Trace as TpuGraphTrainer does: module buffers, here the EP rank, are
+      # graph inputs. Under EP > 1, dispatch refuses a rank baked in as a constant.
+      gm = minimal_fx_tracer(step, module=holder)(
+          x_in, scores_in, ids_in, counts_in
+      ).gm
+      self.assertIsNone(disp.last_dropped_count)
+      op_names = [
+          str(n.target) for n in gm.graph.nodes if n.op == "call_function"
+      ]
+      self.assertFalse(any("local_scalar_dense" in name for name in op_names))
+      self.assertTrue(any("_all_gather_dim" in name for name in op_names))
+      self.assertTrue(any("_reduce_scatter_dim" in name for name in op_names))
+      ep_disp_saved = select_ep_dispatch(gm)
+      self.assertGreaterEqual(len(ep_disp_saved), 2)
+      route_saved = select_route_permutations(gm)
+      self.assertGreaterEqual(len(route_saved), 1)
+      self.assertFalse(
+          any("roe_routing_metadata" in str(n.target) for n in route_saved)
+      )
+
+  def test_ring_of_experts_pallas_tc_capacity_overflow_matches_reference(self):
+    """Pallas TC Ring-of-Experts with ep_capacity_factor matches the PyTorch reference under overflow."""
+    if not self._is_tpu():
+      self.skipTest("Runs Pallas TensorCore Ring-of-Experts custom ops on TPU.")
+    from torchtitan.experiments.tpu.components import (  # pylint: disable=g-import-not-at-top
+        token_dispatcher as td_mod,
+    )
+    from torchtitan.experiments.tpu.testing.roe_reference import (  # pylint: disable=g-import-not-at-top
+        ReferenceRoETokenDispatcher,
+    )
+
+    dev = self.accelerator_device
+    num_experts, ep_size, top_k, tokens_per_rank, dim = 4, 2, 2, 1024, 128
+    # Balanced rows = 2048; factor 1.0 -> cap = 2048 (< worst case 4096). It
+    # is already a multiple of the kernel's 1024-row block, so the production
+    # dispatcher (which rounds) and the reference (which does not) agree.
+    cap_factor = 1.0
+    expected_cap = 2048
+
+    torch.manual_seed(2026)
+    global_x = torch.randn(
+        ep_size * tokens_per_rank, dim, device=dev, dtype=torch.bfloat16
+    )
+    global_scores = 0.1 + torch.rand(
+        ep_size * tokens_per_rank, top_k, device=dev, dtype=torch.float32
+    )
+    # Skew routing so rank 0 (experts 0, 1) receives > 2048 routes.
+    global_ids = torch.zeros(
+        (ep_size * tokens_per_rank, top_k), dtype=torch.int32, device=dev
+    )
+    global_ids[:640, 0] = 0
+    global_ids[640:1760, 0] = 1
+    global_ids[1760:, 0] = 2
+    global_ids[:1120, 1] = 1
+    global_ids[1120:1680, 1] = 2
+    global_ids[1680:, 1] = 3
+    # Rank 0: expert 0 has 640 routes, expert 1 has 1120 + 1120 = 2240; 2048
+    # kept (640 + 1408), 832 dropped. Rank 1: 848 + 368 = 1216, none dropped.
+    grad_upstream = torch.randn(
+        tokens_per_rank, dim, device=dev, dtype=torch.bfloat16
+    )
+
+    mock_pg = SimpleNamespace(group_name="ep_roe_cap_pg", size=lambda: ep_size)
+    fake_mesh = SimpleNamespace(
+        size=lambda: ep_size,
+        get_local_rank=lambda: 0,
+        get_group=lambda: mock_pg,
+        device_type="tpu",
+    )
+
+    for rank in (0, 1):
+      holder = torch.nn.Module()
+      holder.register_buffer(
+          "_ep_local_rank",
+          torch.tensor([rank], dtype=torch.long, device=dev),
+          persistent=False,
+      )
+      s_self = slice(rank * tokens_per_rank, (rank + 1) * tokens_per_rank)
+      s_peer = slice(
+          (1 - rank) * tokens_per_rank, (2 - rank) * tokens_per_rank
+      )
+
+      for scale_before_w2 in (False, True):
+        outs = {}
+        for name, config_cls in (
+            ("pallas", TpuAllToAllTokenDispatcher.Config),
+            ("reference", ReferenceRoETokenDispatcher.Config),
+        ):
+          x_local = global_x[s_self].clone().requires_grad_(True)
+          x_peer = global_x[s_peer].clone().requires_grad_(True)
+          sc_local = global_scores[s_self].clone().requires_grad_(True)
+          sc_peer = global_scores[s_peer].clone().requires_grad_(True)
+
+          def _fake_ag_apply(t, _mesh, _pg):
+            peer = x_peer if t.shape[1] == dim else sc_peer
+            return (
+                torch.cat([t, peer], dim=0)
+                if rank == 0
+                else torch.cat([peer, t], dim=0)
+            )
+
+          def _fake_rs_apply(g, _mesh, _pg):
+            return g[s_self]
+
+          disp = config_cls(
+              num_experts=num_experts,
+              top_k=top_k,
+              ep_transport="ring_of_experts",
+              ep_capacity_factor=cap_factor,
+              fuse_route_score_backward=not scale_before_w2,
+          ).build()
+          if scale_before_w2:
+            disp.enable_row_scale_dispatch()
+          disp.wire_meshes(ep_mesh=fake_mesh)  # pyrefly: ignore[bad-argument-type]
+          disp.bind_ep_rank_holder(holder)
+
+          with (
+              mock.patch.object(
+                  td_mod, "_ep_all_gather_impl", lambda _op, _m, _pg: global_ids
+              ),
+              mock.patch.object(td_mod._EpAllGather, "apply", _fake_ag_apply),
+              mock.patch.object(
+                  td_mod._EpReduceScatter, "apply", _fake_rs_apply
+              ),
+          ):
+            routed_in, counts_e, meta = disp.dispatch(
+                x_local,
+                sc_local,
+                global_ids[s_self],
+                torch.zeros(num_experts, dtype=torch.int32, device=dev),
+            )
+            self.assertEqual(routed_in.shape, (expected_cap, dim))
+            if name == "pallas":
+              self.assertIsInstance(meta, td_mod.TpuRoEDispatchMetadata)
+            else:
+              self.assertNotIsInstance(meta, td_mod.TpuRoEDispatchMetadata)
+            if scale_before_w2:
+              routed_mid = (
+                  routed_in.float() * meta.row_scale_R.unsqueeze(-1)
+              ).to(routed_in.dtype)
+              meta = dataclasses.replace(meta, row_scale_applied=True)
+            else:
+              routed_mid = routed_in
+            combined = disp.combine(routed_mid * 1.75, meta, x_local)
+            combined.backward(grad_upstream)
+
+          outs[name] = (
+              counts_e.cpu(),
+              int(meta.valid_count.item()),
+              int(meta.dropped_count.item()),
+              combined.detach().float().cpu(),
+              x_local.grad.detach().float().cpu(),
+              x_peer.grad.detach().float().cpu(),
+              sc_local.grad.detach().float().cpu(),
+              sc_peer.grad.detach().float().cpu(),
+          )
+
+        tc_res = outs["pallas"]
+        py_res = outs["reference"]
+        self.assertTrue(torch.equal(tc_res[0], py_res[0]))
+        self.assertEqual(tc_res[1], py_res[1])
+        self.assertEqual(tc_res[2], py_res[2])
+        if rank == 0:
+          self.assertEqual(tc_res[0].tolist(), [640, 1408])
+          self.assertEqual(tc_res[1], 2048)
+          self.assertEqual(tc_res[2], 832)
+        else:
+          self.assertEqual(tc_res[0].tolist(), [848, 368])
+          self.assertEqual(tc_res[1], 1216)
+          self.assertEqual(tc_res[2], 0)
+        for tc_t, py_t in zip(tc_res[3:], py_res[3:], strict=True):
+          torch.testing.assert_close(tc_t, py_t, rtol=2e-2, atol=2e-2)
+
 
   def test_35b_recipes(self):
     """Tests the 35B-A3B recipes, their TPU kernels and MFU accounting."""

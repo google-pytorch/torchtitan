@@ -584,10 +584,6 @@ class TrainDistributedTest(
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
           skip_devices=[
-              # TODO(b/587033846): multi-axis meshes fail on spmd_types under
-              # enable_tpu_topo_mesh; enable with the fix. CPU/CUDA: the flag
-              # is a no-op there.
-              device_type.AcceleratorDeviceType.TPU,
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],

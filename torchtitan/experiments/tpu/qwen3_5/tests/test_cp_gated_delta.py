@@ -993,9 +993,12 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     self.assertEqual(cfg.tpu_config.ep_token_chunks, 2)
     self.assertEqual(cfg.tpu_config.ep_capacity_factor, 1.5)
     self.assertFalse(cfg.tpu_config.ep_chunk_dw_fp32)
-    self.assertFalse(cfg.splash_attention_kernel.sa_use_fused_bwd_kernel)
-    self.assertEqual(cfg.splash_attention_kernel.sa_block_q, 2048)
-    self.assertEqual(cfg.splash_attention_kernel.sa_block_kv_compute, 1024)
+    splash = cfg.splash_attention_kernel
+    self.assertTrue(splash.use_tokamax_splash_attention_kernel)
+    self.assertEqual(splash.sa_num_stacked_q_heads, 16)
+    self.assertTrue(splash.sa_use_fused_bwd_kernel)
+    self.assertEqual(splash.sa_block_q, 128)
+    self.assertEqual(splash.sa_block_kv_compute, 1024)
     graph_split = cfg.compile.graph_split
     self.assertEqual(graph_split.forward_layers_per_executable, 2)
     self.assertEqual(graph_split.backward_layers_per_executable, 2)

@@ -794,12 +794,17 @@ def _397b_64k_cp(
   - EP 4: 21.5%.
   - 16,384-token chunks (two per MoE layer at 32K tokens per rank): 25.3%.
   - Splash blocks of 2,048 query and key/value rows (1,024 per compute step):
-    26.2%. 4,096-row blocks do not compile (VMEM), and the fused Splash
-    backward runs out of HBM at 64K.
+    26.2%. 4,096-row blocks do not compile (VMEM), and the stock fused
+    Splash backward runs out of HBM at 64K.
   - ``backward_partition_mode="fsdp_pipeline"`` (each backward executable's
     expert/FSDP gathers issued one executable early and its gradient
     reduce-scatters one late): 26.5%. With ``--debug.seed`` fixed, losses
     match ``by_layer`` at steps 1-2 and within 1e-4 relative afterwards.
+  - Tokamax Splash with 16 stacked query heads (``sa_num_stacked_q_heads``),
+    fused backward, 128-row Q blocks and 1,024-row KV blocks: 28.0%. The stock
+    Splash kernel runs these MQA heads one at a time at ~40% of peak. Q 256
+    or KV 2,048 blocks measure the same (27.9-28.1%). KV all-gather CP 2:
+    27.4%.
 
   Without the capacity cap (``--tpu_config.ep_capacity_factor None``), 16K-
   token chunks run out of HBM; with ``--tpu_config.ep_token_chunks=8`` the
@@ -809,13 +814,18 @@ def _397b_64k_cp(
   cfg = qwen35_moe_397b_split_tokamax_ep_benchmark()
   cfg.training.max_context_length = 65536
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 65536
+  # Tokamax Splash with the 16 query heads that share each KV head (per rank
+  # under CP 2) stacked into one tile: a 128-row Q block becomes a 2,048-row
+  # MXU tile. Tokamax supports only the fused backward, which fits at 64K.
   splash = cfg.splash_attention_kernel
   splash.sa_use_document_aware_block_skipping = False
-  splash.sa_use_fused_bwd_kernel = False
-  for name in ("q", "kv", "q_dkv", "kv_dkv", "q_dq", "kv_dq"):
-    setattr(splash, f"sa_block_{name}", 2048)
-  splash.sa_block_kv_compute = 1024
-  splash.sa_block_kv_dkv_compute = 1024
+  splash.use_tokamax_splash_attention_kernel = True
+  splash.use_batch_loop_fwd = True
+  splash.sa_num_stacked_q_heads = 16
+  splash.sa_use_fused_bwd_kernel = True
+  splash.sa_block_q = 128
+  for name in ("kv", "kv_compute", "q_dkv", "kv_dkv", "kv_dkv_compute"):
+    setattr(splash, f"sa_block_{name}", 1024)
   cfg.parallelism.expert_parallel_degree = 4
   cfg.tpu_config.ep_token_chunks = max(1, 65536 // cp // 16384)
   cfg.tpu_config.ep_capacity_factor = 1.5

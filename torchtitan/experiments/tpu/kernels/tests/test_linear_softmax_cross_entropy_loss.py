@@ -93,6 +93,27 @@ class LinearSoftmaxCrossEntropyLossUnitTest(parameterized.TestCase):
         torch.from_numpy(numpy.asarray(grad_w)), wr.grad, rtol=1e-4, atol=1e-5
     )
 
+  def test_forward_fake_loss_shape_follows_reduction(self):
+    # A make_fx / GraphTrainer trace uses the fake: reduction="none" must give
+    # one loss per row, not the (1,) of "sum" / "mean".
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    rows, hidden, vocab = 6, 4, 8
+    for reduction, loss_shape in (("none", (rows,)), ("sum", (1,))):
+      # pylint: disable=protected-access
+      fwd_name, _ = linear_softmax_cross_entropy_loss._get_loss_op_names(
+          reduction, "xla", 1024, 512, 2048
+      )
+      fwd_op = getattr(torch.ops.pallas, fwd_name)
+      with FakeTensorMode():
+        loss_out, lse = fwd_op(
+            torch.empty(rows, hidden, dtype=torch.bfloat16),
+            torch.empty(rows, dtype=torch.int64),
+            torch.empty(hidden, vocab, dtype=torch.bfloat16),
+        )
+      self.assertEqual(tuple(loss_out.shape), loss_shape, reduction)
+      self.assertEqual(tuple(lse.shape), (rows,), reduction)
+
   def test_backward_uses_single_buffer_when_double_buffering_exceeds_vmem(self):
     dout = jnp.ones((1,), dtype=jnp.float32)
     lse = jnp.zeros((1024,), dtype=jnp.float32)

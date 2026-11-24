@@ -10,9 +10,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import spmd_types as spmd
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
 
-import torch
+import spmd_types as spmd
 import torch.distributed as dist
 
 from torchtitan.distributed.parallel_dims import MeshAxisName

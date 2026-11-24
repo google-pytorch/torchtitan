@@ -28,6 +28,7 @@ from typing import Any, cast
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer.optimizer import (
@@ -181,6 +182,9 @@ class TpuGraphTrainer(GraphTrainer):
             config.compile.optimizer_compile == "in_graph"
         )
         if self._optimizer_in_graph:
+            _check_in_graph_optimizer_grad_accum(
+                self.gradient_accumulation_steps
+            )
             for opt in self.optimizers.optimizers:
                 for group in opt.param_groups:
                     group["capturable"] = True
@@ -492,6 +496,7 @@ class TpuGraphTrainer(GraphTrainer):
     ) -> torch.Tensor:
         """Override of GraphTrainer._make_fx_forward_backward_step applying TPU pipeline graph passes."""
         from torchtitan.experiments.graph_trainer.common_utils import (
+            accumulate_param_grads_,
             maybe_register_blockmask_pytree_node,
         )
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -575,9 +580,10 @@ class TpuGraphTrainer(GraphTrainer):
                 [model], list(outputs[1 + len(params) :])
             )
 
-        for param, grad in zip(params, grads, strict=True):
-            if param.requires_grad and grad is not None:
-                param.grad = grad
+        # Sum, not assign, so gradient accumulation keeps every microbatch.
+        # Each microbatch loss is divided by the whole step's token count, so
+        # the sum is the full-batch mean.
+        accumulate_param_grads_(*_unique_param_grads(params, grads))
 
         return loss
 
@@ -704,6 +710,51 @@ class TpuGraphTrainer(GraphTrainer):
         )
 
         return loss
+
+
+def _data_id(t: torch.Tensor) -> int:
+    # run_traced wraps each DTensor output on its own, so two DTensor grads
+    # can share one local tensor behind different wrappers.
+    return id(t._local_tensor if isinstance(t, DTensor) else t)
+
+
+def _unique_param_grads(
+    params: Sequence[torch.Tensor], grads: Sequence[torch.Tensor | None]
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Pairs each trainable param once with a grad tensor it does not share.
+
+    A tied weight is listed once per name, each time with its full gradient,
+    so it is kept only once. The graph can also return one tensor as two
+    params' grads; the second gets a copy, or the next microbatch's in-place
+    add would land in both.
+    """
+    seen_params: set[int] = set()
+    seen_grads: set[int] = set()
+    unique_params, unique_grads = [], []
+    for param, grad in zip(params, grads, strict=True):
+        if not param.requires_grad or grad is None or id(param) in seen_params:
+            continue
+        seen_params.add(id(param))
+        if _data_id(grad) in seen_grads:
+            grad = grad.clone()
+        seen_grads.add(_data_id(grad))
+        unique_params.append(param)
+        unique_grads.append(grad)
+    return unique_params, unique_grads
+
+
+def _check_in_graph_optimizer_grad_accum(
+    gradient_accumulation_steps: int,
+) -> None:
+    # The in-graph step runs AdamW inside every fwd/bwd call, so GA=k would
+    # take k optimizer steps per training step instead of one.
+    if gradient_accumulation_steps > 1:
+        raise ValueError(
+            "compile.optimizer_compile='in_graph' does not support gradient "
+            f"accumulation (got {gradient_accumulation_steps} steps). Use "
+            "'separate_graph', or set training.num_tokens_per_train_step so "
+            "that gradient accumulation is 1."
+        )
 
 
 def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:

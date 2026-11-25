@@ -33,6 +33,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
 from torchtitan.experiments.tpu.components.layer_loop import builds_layer_loop
 
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
   from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
@@ -416,6 +417,20 @@ def apply_tpu_graph_trainer_model_transforms(
     )
   if compile_config.cpu_offload_budget_gb < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
+  default_budget = next(
+      f.default
+      for f in dataclasses.fields(compile_config)
+      if f.name == "cpu_offload_budget_gb"
+  )
+  if (
+      compile_config.use_scan_layers
+      and memory_policy in ("full_and_scan_offload", "tpu_selective_and_offload")
+      and compile_config.cpu_offload_budget_gb != default_budget
+  ):
+    logger.warning(
+        "compile.cpu_offload_budget_gb is ignored with --compile.use-scan-layers:"
+        " every save named in compile.scan_offload goes to host."
+    )
   _validate_tpu_selective(config)
   _validate_scan_offload(config)
 

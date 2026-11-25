@@ -275,7 +275,10 @@ class TpuQwen35Model(Qwen35Model):
           max_context_length=max_context_length,
       )
     batch: dict[str, Any] = dict(input_dict)
-    padding_mask = batch.pop("padding_mask", None)
+    # Kept in the batch, as upstream does: `decoder_input_sharding()` has an
+    # entry for it, so it is CP-sharded with the tokens and reaches `forward`,
+    # where the MoE router excludes padding from its counts.
+    padding_mask = batch.get("padding_mask")
     if batch.pop("mrope_positions", None) is not None:
       # TPU: CP shards text tokens only; vision tokens would need scattering
       # into the sequence before sharding.

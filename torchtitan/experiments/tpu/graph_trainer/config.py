@@ -22,6 +22,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     configure_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
+    check_scan_expert_parallel,
     check_scan_parallelism,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
@@ -391,12 +392,7 @@ def apply_tpu_graph_trainer_model_transforms(
     return
 
   check_scan_parallelism(config.parallelism)
-  if config.parallelism.expert_parallel_degree > 1:
-    raise ValueError(
-        "--compile.use-scan-layers cannot be combined with "
-        "--parallelism.expert-parallel-degree > 1 "
-        "(https://github.com/google-pytorch/torchtitan/issues/25)."
-    )
+  check_scan_expert_parallel(config)
   assert config.model_spec is not None
   orig_parallelize_fn = config.model_spec.parallelize_fn
   assert orig_parallelize_fn is not None
@@ -407,6 +403,8 @@ def apply_tpu_graph_trainer_model_transforms(
     configure_simple_fsdp_shard_dims(model, kwargs.get("parallel_dims"))
     model = orig_parallelize_fn(model, **kwargs)
     for holder in model.modules():
+      if hasattr(holder, "place_expert_stacks"):
+        holder.place_expert_stacks(kwargs["parallel_dims"])
       if hasattr(holder, "build_split_meshes"):
         holder.build_split_meshes()
     return model

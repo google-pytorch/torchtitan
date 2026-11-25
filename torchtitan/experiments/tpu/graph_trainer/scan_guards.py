@@ -13,6 +13,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import StackedLayers
 
 
 __all__ = [
+    "check_scan_expert_parallel",
     "check_scan_parallelism",
     "check_scan_was_applied",
 ]
@@ -45,6 +46,64 @@ def check_scan_parallelism(parallelism: ParallelismConfig) -> None:
             f"but this run sets {', '.join(conflicts)}. Drop the flag, or set "
             "those degrees to 1."
         )
+
+
+def check_scan_expert_parallel(config) -> None:
+    """EP under scan: refuse what a scan body cannot trace or schedule.
+
+    The in-body EP transports need static shapes, so the expert buffer is a
+    fixed capacity: dropless worst case by default, or
+    ``--tpu_config.ep_capacity_factor``. Three settings break that or are lost
+    inside the body, and each would otherwise fail late or run silently worse:
+
+    * ``ep_transport="all_to_all"``: upstream's transport reads split sizes on
+      the host.
+    * ``ep_capacity_overflow="grow"`` (tt#240): reads the expert counts on the
+      host to size the buffer.
+    * more EP token chunks than ``ep_max_inflight_chunks``:
+      ``insert_ep_chunk_barriers`` bounds live chunks from node meta, which the
+      scan body's re-trace drops, so every chunk's buffer could be live.
+    """
+    from torchtitan.experiments.tpu.components.token_dispatcher import (  # pylint: disable=g-import-not-at-top
+        TpuAllToAllTokenDispatcher,
+        TpuRoutedExperts,
+    )
+
+    if config.parallelism.expert_parallel_degree <= 1:
+        return
+    tpu = getattr(config, "tpu_config", None)
+    model = config.model_spec.model
+    dispatchers = [c for _, c, _, _ in model.traverse(TpuAllToAllTokenDispatcher.Config)]
+    experts = [c for _, c, _, _ in model.traverse(TpuRoutedExperts.Config)]
+    transport = getattr(tpu, "ep_transport", None)
+    if transport == "all_to_all" or (
+        transport is None and any(d.ep_transport == "all_to_all" for d in dispatchers)
+    ):
+        raise ValueError(
+            "--compile.use-scan-layers with EP needs a static-shape transport; "
+            "ep_transport='all_to_all' reads split sizes on the host. Use "
+            "--tpu_config.ep_transport=auto (or ring_of_experts / ragged_all_to_all)."
+        )
+    if getattr(tpu, "ep_capacity_overflow", None) == "grow" or any(
+        getattr(d, "ep_capacity_overflow", "drop") == "grow" for d in dispatchers
+    ):
+        raise ValueError(
+            "--compile.use-scan-layers cannot run ep_capacity_overflow='grow': it "
+            "sizes the expert buffer from counts read on the host. Use a fixed "
+            "capacity: the dropless default, or --tpu_config.ep_capacity_factor."
+        )
+    chunks = getattr(tpu, "ep_token_chunks", None)
+    inflight = getattr(tpu, "ep_max_inflight_chunks", None)
+    for e in experts or [None]:
+        c = chunks if chunks is not None else getattr(e, "num_token_chunks", 1)
+        w = inflight if inflight is not None else getattr(e, "max_inflight_chunks", 2)
+        if c > w:
+            raise ValueError(
+                f"--compile.use-scan-layers with {c} EP token chunks and at most "
+                f"{w} in flight: the chunk barriers do not reach inside the scan "
+                "body, so all chunks could be live. Set --tpu_config.ep_token_chunks "
+                f"<= {w}."
+            )
 
 
 def check_scan_was_applied(model: nn.Module, *, use_scan_layers: bool) -> None:

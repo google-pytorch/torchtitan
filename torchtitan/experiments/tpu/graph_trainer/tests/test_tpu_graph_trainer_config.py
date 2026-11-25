@@ -278,19 +278,22 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     """
     config = qwen3_moe_30b()
     config.compile.use_scan_layers = True
-    # The recipe runs expert parallel, which is refused on its own; turn it off
-    # so this reaches the MoE check.
+    # The recipe runs expert parallel; turn it off so this checks the MoE
+    # model alone.
     config.parallelism.expert_parallel_degree = 1
 
     with torch.device("meta"):
       self._qwen3_graph_config(config).model_spec.model.build()
 
-  def test_scanning_refuses_expert_parallelism(self) -> None:
+  def test_scanning_refuses_ep_settings_a_scan_body_cannot_run(self) -> None:
+    # EP itself is allowed (`test_scan_expert_parallel.py`); more token chunks
+    # than in flight are not, since the chunk barriers miss the scan body.
     config = qwen3_8b()
     config.compile.use_scan_layers = True
     config.parallelism.expert_parallel_degree = 2
+    config.tpu_config.ep_token_chunks = 4
 
-    with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
+    with self.assertRaisesRegex(ValueError, "EP token chunks"):
       self._qwen3_graph_config(config)
 
   def test_regular_recipe_has_no_graph_compile_controls(self) -> None:

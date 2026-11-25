@@ -97,13 +97,23 @@ _MIN_TPU_GENERATION = 6
 _KERNEL_DTYPES = (torch.bfloat16, torch.float32)
 
 
-@functools.lru_cache(maxsize=1)
+_kda_imported: bool = False
+_kda_op: Any = None
+_kda_import_error: Exception | None = None
+
+
 def _import_kda() -> tuple[Any, Exception | None]:
   """Imports Tokamax's KDA op on first use: ``(kimi_delta_attention, error)``.
 
   Imported lazily, so config validation, override resolution and the XLA
-  fallback work without Tokamax.
+  fallback work without Tokamax. Cached in module globals rather than
+  ``functools.lru_cache`` so ``torch.compile`` guards the cached lookup via a
+  regular ``GlobalSource`` instead of tracing into the lazy import (or failing
+  with ``CLOSURE_MATCH`` under activation checkpointing).
   """
+  global _kda_imported, _kda_op, _kda_import_error
+  if _kda_imported:
+    return _kda_op, _kda_import_error
   try:
     # pylint: disable=g-import-not-at-top
     from tokamax import ops as tokamax_ops
@@ -112,11 +122,25 @@ def _import_kda() -> tuple[Any, Exception | None]:
     from tokamax._src.ops.kda import pallas_mosaic_tpu  # pylint: disable=unused-import
     # pylint: enable=g-import-not-at-top
 
-    return tokamax_ops.kimi_delta_attention, None
+    _kda_op = tokamax_ops.kimi_delta_attention
+    _kda_import_error = None
   except (ImportError, AttributeError, SyntaxError) as e:
     # Tokamax releases before 0.0.17 have no KDA op, and some do not import
     # under typeguard >= 3 (SyntaxError, openxla/tokamax#240).
-    return None, e
+    _kda_op = None
+    _kda_import_error = e
+  _kda_imported = True
+  return _kda_op, _kda_import_error
+
+
+def _clear_kda_import_cache() -> None:
+  global _kda_imported, _kda_op, _kda_import_error
+  _kda_imported = False
+  _kda_op = None
+  _kda_import_error = None
+
+
+_import_kda.cache_clear = _clear_kda_import_cache  # type: ignore[attr-defined]
 
 
 def has_tokamax_kda() -> bool:

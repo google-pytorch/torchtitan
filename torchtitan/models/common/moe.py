@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Literal
 
 import spmd_types as spmd
@@ -726,8 +727,26 @@ class TokenChoiceTopKRouter(Module):
 
             # The expert bias is only used for routing. The gating value is
             # still derived from the original scores.
-            topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
+            if (
+                scores_TE.device.type == "tpu"
+                and os.environ.get("TT_MOE_VPU_GATHER_BWD", "0") == "1"
+            ):
+                tc = spmd.is_type_checking()
+                if tc:
+                    scores_type = (
+                        spmd.get_local_type(scores_TE),
+                        spmd.get_partition_spec(scores_TE),
+                    )
+                with spmd.no_typecheck():
+                    topk_scores_TK = _DistinctRowGather.apply(
+                        scores_TE, topk_expert_ids_TK
+                    )
+                if tc and not spmd.has_local_type(topk_scores_TK):
+                    spmd.assert_type(topk_scores_TK, *scores_type)
+            else:
+                topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
 
+        token_mask_T: torch.Tensor | None = router_kwargs.pop("token_mask", None)
         if self.route_norm:
             denominator = topk_scores_TK.sum(dim=-1, keepdim=True) + 1e-20
             topk_scores_TK = topk_scores_TK / denominator
@@ -746,6 +765,19 @@ class TokenChoiceTopKRouter(Module):
             if self.build_routing_map
             else None
         )
+        if token_mask_T is not None:
+            mask_T1 = token_mask_T.reshape(-1, 1).bool()
+            if routing_map_TE is not None:
+                routing_map_TE = routing_map_TE & mask_T1
+            topk_scores_TK = torch.where(mask_T1, topk_scores_TK, 0.0)
+            # Values > num_experts are excluded by _tokens_per_expert's histc
+            # (min=0, max=num_experts) and sort after all real experts (0..E-1)
+            # in local_reorder, so MegaBlox skips padded tail tiles completely.
+            topk_expert_ids_TK = torch.where(
+                mask_T1,
+                topk_expert_ids_TK,
+                topk_expert_ids_TK.new_full((), self.num_experts + 1),
+            )
 
         # Auxiliary load-balance loss (DeepSeek-V3 Sec 2.1.2 Eqs 17-20).
         # The gradient is injected into topk_scores_TK on backward; the loss
@@ -899,6 +931,47 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
             return self.inject(loss, carrier=carrier)
 
 
+class _DistinctRowGather(torch.autograd.Function):
+    """Row-wise gather ``scores_TE.gather(-1, idx_TK)`` with a scatter-free VPU VJP."""
+
+    @staticmethod
+    def forward(ctx, scores_TE: torch.Tensor, idx_TK: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(idx_TK)
+        ctx.num_experts = scores_TE.shape[-1]
+        return scores_TE.gather(dim=-1, index=idx_TK)
+
+    @staticmethod
+    @spmd.no_typecheck()
+    def backward(ctx, grad_TK: torch.Tensor):
+        (idx_TK,) = ctx.saved_tensors
+        num_experts = ctx.num_experts
+        idx_i32 = idx_TK.to(torch.int32)
+        cols_1E = torch.arange(
+            num_experts, device=grad_TK.device, dtype=torch.int32
+        ).unsqueeze(0)
+        k_dim = idx_i32.shape[1]
+        out_TE = torch.where(idx_i32[:, 0:1] == cols_1E, grad_TK[:, 0:1], 0.0)
+        for k in range(1, k_dim):
+            out_TE = out_TE + torch.where(
+                idx_i32[:, k : k + 1] == cols_1E, grad_TK[:, k : k + 1], 0.0
+            )
+        return out_TE.to(grad_TK.dtype), None
+
+
+class _MaskPaddedTokens(torch.autograd.Function):
+    """Zero padded token rows in forward and backward so skipped MoE tail tiles cannot leak NaN."""
+
+    @staticmethod
+    def forward(ctx, x_TD: torch.Tensor, mask_T1: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(mask_T1)
+        return torch.where(mask_T1, x_TD, 0.0)
+
+    @staticmethod
+    def backward(ctx, grad_TD: torch.Tensor):
+        (mask_T1,) = ctx.saved_tensors
+        return torch.where(mask_T1, grad_TD, 0.0), None
+
+
 class MoE(Module):
     """Mixture of Experts layer.
 
@@ -980,13 +1053,18 @@ class MoE(Module):
         sequence-shards tokens across TP, the caller must provide a TP-divisible
         token count.
         """
+        token_mask = router_kwargs.get("token_mask")
+        mask_T1 = token_mask.reshape(-1, 1).bool() if token_mask is not None else None
+        x_in_TD = (
+            _MaskPaddedTokens.apply(x_TD, mask_T1) if mask_T1 is not None else x_TD
+        )
         # topk scores and expert IDs have shape (T, K); the routing map (T, E)
         # marks the experts each token is routed to (built inside the router).
         (
             topk_scores_TK,
             topk_expert_ids_TK,
             routing_map_TE,
-        ) = self.router(x_TD, self.expert_bias_E, **router_kwargs)
+        ) = self.router(x_in_TD, self.expert_bias_E, **router_kwargs)
         num_local_tokens_per_expert_E = (
             routing_map_TE.sum(dim=0)
             if routing_map_TE is not None
@@ -1005,17 +1083,21 @@ class MoE(Module):
                 self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
 
         out_TD = self.routed_experts(
-            x_TD,
+            x_in_TD,
             topk_scores_TK,
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
         )
+        if mask_T1 is not None:
+            out_TD = _MaskPaddedTokens.apply(out_TD, mask_T1)
 
         shared_out_TD = (
-            self.shared_experts(x_TD) if self.shared_experts is not None else None
+            self.shared_experts(x_in_TD) if self.shared_experts is not None else None
         )
 
         if shared_out_TD is not None:
+            if mask_T1 is not None:
+                shared_out_TD = _MaskPaddedTokens.apply(shared_out_TD, mask_T1)
             out_TD = out_TD + shared_out_TD
         return out_TD
 

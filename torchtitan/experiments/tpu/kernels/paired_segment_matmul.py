@@ -14,6 +14,8 @@ is 105 MB) it tiles K with ``tgmm_tile_k``; the K slabs are independent, each
 re-reads the dOutput rows once.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -264,12 +266,93 @@ def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
     )(group_metadata, group_offset, dout, rhs, existing)
 
 
+def _paired_dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
+    """Return ``bf16(bf16(dout1 @ rhs1^T) + bf16(dout3 @ rhs3^T))`` in one kernel."""
+    m, n = dout1.shape
+    groups, k, _ = rhs1.shape
+    group_metadata, num_active_tiles = _metadata(
+        group_sizes,
+        m=m,
+        tile_m=tile_m,
+        groups=groups,
+        visit_empty_groups=False,
+    )
+    group_offset = jnp.array([0], dtype=jnp.int32)
+
+    def kernel(group_metadata, group_offset, dout1, dout3, rhs1, rhs3, out):
+        del group_offset
+        _, _, m_tile_ids = group_metadata
+        grid_id = pl.program_id(1)
+        prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+        first_visit = jnp.logical_or(
+            grid_id == 0, m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
+        )
+
+        @pl.when(first_visit)
+        def _zero_out():
+            out[...] = jnp.zeros_like(out)
+
+        g1 = lax.dot_general(
+            dout1[...],
+            rhs1[...],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        g3 = lax.dot_general(
+            dout3[...],
+            rhs3[...],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        acc = g1.astype(out.dtype).astype(jnp.float32) + g3.astype(out.dtype).astype(
+            jnp.float32
+        )
+        mask = _get_store_mask(
+            grid_id=grid_id,
+            group_metadata=group_metadata,
+            tm=tile_m,
+            tn=k,
+        )
+        current = out[...].astype(jnp.float32)
+        out[...] = lax.select(mask[...], current + acc, current).astype(out.dtype)
+
+    def row_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+        del n_i, k_i, group_offset
+        return group_metadata[2][grid_id], 0
+
+    def rhs_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+        del n_i, k_i, group_offset
+        return group_metadata[1][grid_id], 0, 0
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, k), dout1.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                pl.BlockSpec((tile_m, n), row_indices),
+                pl.BlockSpec((tile_m, n), row_indices),
+                pl.BlockSpec((None, k, n), rhs_indices),
+                pl.BlockSpec((None, k, n), rhs_indices),
+            ],
+            out_specs=pl.BlockSpec((tile_m, k), row_indices),
+            grid=(1, num_active_tiles, 1),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary", "arbitrary")
+        ),
+        name="moe_gmm_w13_dgrad",
+    )(group_metadata, group_offset, dout1, dout3, rhs1, rhs3)
+
+
 def _dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
     """dInput = dout1 @ W1^T + dout3 @ W3^T, the second term added in place.
 
     Both terms are rounded to BF16 before the add, exactly as when two MegaBlox
     GMMs produced them and XLA added the outputs, so the result is bit-identical.
     """
+    if os.environ.get("TT_PAIRED_DINPUT", "0") == "1":
+        return _paired_dinput(dout1, dout3, rhs1, rhs3, group_sizes, tile_m=tile_m)
     k, n = rhs1.shape[1:]
     grad_lhs = call_named(
         megablox_gmm,

@@ -2600,6 +2600,58 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
           g_comp.cpu(), g_eager.cpu(), rtol=3e-2, atol=3e-2
       )
 
+  def test_distinct_row_gather_and_moe_token_mask(self):
+    from torchtitan.models.common.moe import (
+        GroupedExperts,
+        MoE,
+        RoutedExperts,
+        TokenChoiceTopKRouter,
+        _DistinctRowGather,
+    )
+    from torchtitan.models.common.linear import RouterGateLinear
+    from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
+
+    torch.manual_seed(42)
+    scores1 = torch.randn(16, 8, dtype=torch.float32, requires_grad=True)
+    scores2 = scores1.detach().clone().requires_grad_(True)
+    idx = torch.topk(scores1.detach(), k=3, dim=-1).indices
+    grad_out = torch.randn(16, 3, dtype=torch.float32)
+
+    y1 = _DistinctRowGather.apply(scores1, idx)
+    y2 = scores2.gather(dim=-1, index=idx)
+    torch.testing.assert_close(y1, y2)
+    y1.backward(grad_out)
+    y2.backward(grad_out)
+    torch.testing.assert_close(scores1.grad, scores2.grad)
+
+    moe_cfg = MoE.Config(
+        num_experts=4,
+        load_balance_coeff=1e-3,
+        router=TokenChoiceTopKRouter.Config(
+            num_experts=4,
+            top_k=2,
+            gate=RouterGateLinear.Config(in_features=16, out_features=4),
+        ),
+        routed_experts=RoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(
+                dim=16, hidden_dim=32, num_experts=4
+            ),
+            token_dispatcher=LocalTokenDispatcher.Config(
+                num_experts=4, top_k=2
+            ),
+        ),
+    )
+    moe = moe_cfg.build().train()
+    moe.tokens_per_expert_E.zero_()
+    x = torch.randn(6, 16, requires_grad=True)
+    mask = torch.tensor([True, True, True, True, False, False])
+    out = moe(x, token_mask=mask)
+    self.assertEqual(float(out[4:].abs().max().item()), 0.0)
+    # 4 valid tokens * top_k=2 = 8 total routed assignments (padded 2 tokens skipped).
+    self.assertEqual(float(moe.tokens_per_expert_E.sum().item()), 8.0)
+    out.sum().backward()
+    self.assertEqual(float(x.grad[4:].abs().max().item()), 0.0)
+
 
 if __name__ == "__main__":
   absltest.main()

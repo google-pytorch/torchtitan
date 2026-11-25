@@ -620,7 +620,13 @@ class TpuGraphTrainer(GraphTrainer):
         # Sum, not assign, so gradient accumulation keeps every microbatch.
         # Each microbatch loss is divided by the whole step's token count, so
         # the sum is the full-batch mean.
-        accumulate_param_grads_(*_unique_param_grads(params, outputs.grads))
+        uniq_params, uniq_grads = _unique_param_grads(params, outputs.grads)
+        if os.environ.get("TT_FOREACH_GRAD_ACCUM", "0") == "1":
+            _accumulate_param_grads_foreach_(
+                uniq_params, uniq_grads, accumulate_param_grads_
+            )
+        else:
+            accumulate_param_grads_(uniq_params, uniq_grads)
 
         return outputs.loss
 
@@ -921,6 +927,62 @@ def _make_fwd_bwd_adamw_fn(
         )
 
     return fwd_bwd_adamw
+
+
+def _accumulate_param_grads_foreach_(
+    params: Sequence[torch.Tensor],
+    grads: Sequence[torch.Tensor | None],
+    fallback_fn: Callable[..., None],
+) -> None:
+    """Fast C++ ``torch._foreach_add_`` gradient accumulation across local shards."""
+    from collections import defaultdict
+
+    fallback_params: list[torch.Tensor] = []
+    fallback_grads: list[torch.Tensor | None] = []
+    grouped_dst: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = (
+        defaultdict(list)
+    )
+    grouped_src: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = (
+        defaultdict(list)
+    )
+    for param, grad in zip(params, grads, strict=True):
+        if grad is None:
+            continue
+        p_grad = param.grad
+        if p_grad is None:
+            fallback_params.append(param)
+            fallback_grads.append(grad)
+            continue
+        if isinstance(p_grad, DTensor) and isinstance(grad, DTensor):
+            if (
+                p_grad.device_mesh == grad.device_mesh
+                and p_grad.placements == grad.placements
+            ):
+                dst_t = p_grad._local_tensor
+                src_t = grad._local_tensor
+                if dst_t.shape == src_t.shape and dst_t.stride() == src_t.stride():
+                    key = (dst_t.device, dst_t.dtype)
+                    grouped_dst[key].append(dst_t)
+                    grouped_src[key].append(src_t)
+                    continue
+            fallback_params.append(param)
+            fallback_grads.append(grad)
+        elif not isinstance(p_grad, DTensor) and not isinstance(grad, DTensor):
+            if p_grad.shape == grad.shape and p_grad.stride() == grad.stride():
+                key = (p_grad.device, p_grad.dtype)
+                grouped_dst[key].append(p_grad)
+                grouped_src[key].append(grad)
+                continue
+            fallback_params.append(param)
+            fallback_grads.append(grad)
+        else:
+            fallback_params.append(param)
+            fallback_grads.append(grad)
+
+    for key, dst_list in grouped_dst.items():
+        torch._foreach_add_(dst_list, grouped_src[key])
+    if fallback_params:
+        fallback_fn(fallback_params, fallback_grads)
 
 
 def _dump_weight_stats(model_parts) -> None:

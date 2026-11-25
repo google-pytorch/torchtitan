@@ -116,6 +116,7 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
       *,
       full_positions: torch.Tensor | None = None,
       full_segment_ids: torch.Tensor | None = None,
+      token_mask: torch.Tensor | None = None,
   ) -> torch.Tensor:
     layer_mask = (
         attention_masks[self.attn_mask_key]
@@ -139,7 +140,8 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
 
     h_TD = self.ffn_norm(x_TD)
     if self.moe_enabled:
-      x_TD = x_TD + self.moe(h_TD)
+      moe_kwargs = {"token_mask": token_mask} if token_mask is not None else {}
+      x_TD = x_TD + self.moe(h_TD, **moe_kwargs)
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
@@ -191,28 +193,15 @@ class TpuQwen35Model(Qwen35Model):
       positions: torch.Tensor | None = None,
       cp_full_positions: torch.Tensor | None = None,
       cp_full_segment_ids: torch.Tensor | None = None,
+      token_mask: torch.Tensor | None = None,
       **kwargs,
   ):
-    """``Qwen35Model.forward`` plus the CP document-boundary inputs.
-
-    Args:
-      tokens: Token ids (or embeddings when ``tok_embeddings`` is ``None``).
-      attention_masks: As upstream.
-      positions: As upstream; under CP, this rank's shard.
-      cp_full_positions: Under context parallelism, the positions of every token
-        of the unsharded sequence, in sequence order (the CP-sharded
-        ``positions`` before ``cp_shard``). The CP attention and GatedDeltaNet
-        layers derive the whole sequence's document boundaries from them instead
-        of all-gathering ``positions`` in every layer. Used by GatedDeltaNet.
-      cp_full_segment_ids: Under context parallelism, the whole sequence's
-        segment_ids in the CP attention's layout (computed once by
-        ``cp_shard``). Used by the full-attention layers.
-      **kwargs: Upstream's multimodal arguments.
-
-    Returns:
-      As upstream.
-    """
-    if cp_full_positions is None and cp_full_segment_ids is None:
+    """``Qwen35Model.forward`` plus the CP document-boundary and MoE padding-mask inputs."""
+    if (
+        cp_full_positions is None
+        and cp_full_segment_ids is None
+        and token_mask is None
+    ):
       return super().forward(
           tokens,
           attention_masks=attention_masks,
@@ -224,10 +213,10 @@ class TpuQwen35Model(Qwen35Model):
     )
     if unsupported:
       raise NotImplementedError(
-          "cp_full_positions / cp_full_segment_ids support text-only batches;"
-          f" got {unsupported}."
+          "cp_full_positions / cp_full_segment_ids / token_mask support"
+          f" text-only batches; got {unsupported}."
       )
-    # Text-only `Qwen35Model.forward` that also passes the CP inputs.
+    # Text-only `Qwen35Model.forward` that also passes CP and MoE token_mask inputs.
     with spmd_local_context("dp"):
       x = (
           self.tok_embeddings(tokens)
@@ -247,6 +236,7 @@ class TpuQwen35Model(Qwen35Model):
           positions,
           full_positions=cp_full_positions,
           full_segment_ids=cp_full_segment_ids,
+          token_mask=token_mask,
       )
     x = self.norm(x) if self.norm is not None else x
     if self._skip_lm_head:

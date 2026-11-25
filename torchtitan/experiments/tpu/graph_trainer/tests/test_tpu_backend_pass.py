@@ -377,5 +377,52 @@ class PartitionDonationTest(absltest.TestCase):
 
     self.assertIs(gm._tpu_executable, executable)
 
+  def test_demote_unused_gdn_residuals_rewrites_only_dead_residuals(self):
+    if not hasattr(torch.ops, "tt_qwen35") or not hasattr(
+        torch.ops.tt_qwen35, "maxtext_gdn_seg_fwd_res"
+    ):
+      torch.library.define(
+          "tt_qwen35::maxtext_gdn_seg_fwd_res",
+          "(Tensor x) -> (Tensor, Tensor)",
+      )
+      torch.library.define(
+          "tt_qwen35::maxtext_gdn_seg_fwd_only",
+          "(Tensor x) -> Tensor",
+      )
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(2, 4)
+
+    dead_res = graph.call_function(
+        torch.ops.tt_qwen35.maxtext_gdn_seg_fwd_res.default, args=(x,)
+    )
+    dead_out = graph.call_function(operator.getitem, args=(dead_res, 0))
+    dead_out.meta["val"] = torch.empty(2, 4)
+    dead_unused = graph.call_function(operator.getitem, args=(dead_res, 1))
+    dead_unused.meta["val"] = torch.empty(2, 4)
+
+    live_res = graph.call_function(
+        torch.ops.tt_qwen35.maxtext_gdn_seg_fwd_res.default, args=(dead_out,)
+    )
+    live_out = graph.call_function(operator.getitem, args=(live_res, 0))
+    live_saved = graph.call_function(operator.getitem, args=(live_res, 1))
+    graph.output((live_out, live_saved))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    tpu_backend_pass._demote_unused_gdn_residuals_pass(gm)
+    call_names = [
+        n.target.name()
+        for n in gm.graph.nodes
+        if n.op == "call_function" and isinstance(n.target, torch._ops.OpOverload)
+    ]
+    self.assertEqual(
+        call_names,
+        [
+            "tt_qwen35::maxtext_gdn_seg_fwd_only",
+            "tt_qwen35::maxtext_gdn_seg_fwd_res",
+        ],
+    )
+
 if __name__ == "__main__":
   absltest.main()

@@ -23,9 +23,12 @@ axis as one stream. This module provides the TPU replacements:
    pretraining runs over each ``[B, S]`` row as one stream.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+import os
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from torchtitan.config.configurable import Configurable
@@ -217,10 +220,10 @@ def causal_conv_silu(
   Returns:
     ``[B, S, C]`` output.
   """
-  if segment_ids_BS is None and causal_conv1d is not None:
-    reason = causal_conv1d.unsupported_reason(x_BSC, weight_C1W)
+  if causal_conv1d is not None:
+    reason = causal_conv1d.unsupported_reason(x_BSC, weight_C1W, segment_ids_BS)
     if reason is None:
-      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W)
+      return causal_conv1d.causal_conv_silu(x_BSC, weight_C1W, segment_ids_BS)
     if (
         x_BSC.device.type == "tpu"
         and not torch.compiler.is_compiling()
@@ -529,6 +532,44 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
     """
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
     num_tokens = query_TC.shape[0]
+    if (
+        query_TC.device.type == "tpu"
+        and os.environ.get("TT_USE_MAXTEXT_GDN", "0") == "1"
+    ):
+      from torchtitan.experiments.tpu.qwen3_5 import maxtext_gated_delta
+
+      query_BSC, key_BSC, value_BSC, a_BSH, b_BSH = (
+          unflatten_shim.unflatten_tensor(x, expected_flat_ndim=2)
+          for x in (query_TC, key_TC, value_TC, a_TH, b_TH)
+      )
+      if query_BSC.ndim == 2:
+        query_BSC, key_BSC, value_BSC, a_BSH, b_BSH = (
+            x.unsqueeze(0)
+            for x in (query_BSC, key_BSC, value_BSC, a_BSH, b_BSH)
+        )
+      if query_BSC.shape[1] % 64 == 0:
+        raw_seg_BS = None
+        if positions is not None:
+          raw_seg_BS = segment_ids_from_positions(
+              positions.reshape(-1)
+          ).reshape(query_BSC.shape[:2])
+        out_BSHV = maxtext_gated_delta.maxtext_conv_gated_delta(
+            query_BSC,
+            key_BSC,
+            value_BSC,
+            a_BSH,
+            b_BSH,
+            conv_q_weight_C1W,
+            conv_k_weight_C1W,
+            conv_v_weight_C1W,
+            A_log_H,
+            dt_bias_H,
+            raw_seg_BS,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+        )
+        return out_BSHV.reshape(num_tokens, *out_BSHV.shape[2:])
+
     g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
     beta_TH = torch.sigmoid(b_TH)
     # TT-UNFLATTEN-SHIM: unflatten [T, ...] to [B, S, ...] once for conv + recurrence.
@@ -675,9 +716,57 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     def reset_at_documents(self, value: bool) -> None:
       self.document_resets = replace(self.document_resets, enabled=value)
 
+    fuse_input_projections: bool = False
+
   def __init__(self, config: Config):
     super().__init__(config)
     self.reset_at_documents = config.document_resets.enabled
+    self.fuse_input_projections = config.fuse_input_projections
+
+  def _projections(self) -> tuple[nn.Linear, ...]:
+    return (
+        self.in_proj_q,
+        self.in_proj_k,
+        self.in_proj_v,
+        self.in_proj_z,
+        self.in_proj_a,
+        self.in_proj_b,
+    )
+
+  def input_projections(
+      self,
+      x_TD: torch.Tensor,
+      select: Callable[[torch.Tensor], torch.Tensor] | None = None,
+  ) -> tuple[torch.Tensor, ...]:
+    """Returns the ``(query, key, value, gate, a, b)`` input projections of ``x_TD``."""
+    projections = self._projections()
+    if select is None and not self.fuse_input_projections:
+      return tuple(proj(x_TD) for proj in projections)
+    for proj in projections:
+      if not torch.compiler.is_compiling() and (
+          not isinstance(proj, nn.Linear)
+          or type(proj).forward is not nn.Linear.forward
+      ):
+        raise ValueError(
+            "Fused or head-sliced GatedDeltaNet input projections read the"
+            " projection weights directly, so they need plain nn.Linear"
+            f" projections; got {type(proj).__qualname__}."
+        )
+    select = select if select is not None else (lambda w: w)
+    weights = [select(proj.weight) for proj in projections]
+    biases = [
+        select(proj.bias) if proj.bias is not None else None
+        for proj in projections
+    ]
+    if not self.fuse_input_projections:
+      return tuple(F.linear(x_TD, w, b) for w, b in zip(weights, biases))
+    if any(b is not None for b in biases):
+      raise ValueError(
+          "fuse_input_projections requires bias-free GatedDeltaNet input"
+          " projections."
+      )
+    fused = F.linear(x_TD, torch.cat(weights, dim=0))
+    return tuple(torch.split(fused, [w.shape[0] for w in weights], dim=-1))
 
   def forward(
       self,
@@ -687,19 +776,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
       *,
       full_positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
-    """GatedDeltaNet forward (upstream, plus positions).
-
-    Args:
-      x_TD: The layer input.
-      attention_masks: Varlen metadata, used for ``cu_seqlens`` only.
-      positions: Per-token positions; packed documents start at 0.
-      full_positions: Under context parallelism, every token's position in
-        sequence order (``TpuQwen35Model.forward``'s ``cp_full_positions``), so
-        the CP inner module does not all-gather ``positions``.
-
-    Returns:
-      The layer output.
-    """
+    """GatedDeltaNet forward (upstream, plus positions)."""
     num_tokens = x_TD.shape[0]
     if attention_masks is not None:
       cu_seqlens = attention_masks.cu_seq_q
@@ -712,12 +789,9 @@ class TpuGatedDeltaNet(GatedDeltaNet):
           device=x_TD.device,
       )
 
-    query_TC = self.in_proj_q(x_TD)
-    key_TC = self.in_proj_k(x_TD)
-    value_TC = self.in_proj_v(x_TD)
-    gate_TC = self.in_proj_z(x_TD)
-    a_TH = self.in_proj_a(x_TD)
-    b_TH = self.in_proj_b(x_TD)
+    query_TC, key_TC, value_TC, gate_TC, a_TH, b_TH = self.input_projections(
+        x_TD
+    )
     position_kwargs = {}
     if self.reset_at_documents:
       position_kwargs["positions"] = positions

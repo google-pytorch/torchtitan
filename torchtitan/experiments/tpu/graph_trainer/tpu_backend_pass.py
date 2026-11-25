@@ -520,6 +520,64 @@ def tpu_backend_compile_partitioned_pass(
     return gm
 
 
+def _demote_unused_gdn_residuals_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: Any = None,
+) -> torch.fx.GraphModule:
+    """Rewrites forward MaxText GDN nodes whose VJP residuals are dead to primal-only."""
+    del example_inputs
+    fwd_only_op = getattr(
+        getattr(torch.ops, "tt_qwen35", None), "maxtext_gdn_seg_fwd_only", None
+    )
+    if fwd_only_op is None:
+        return gm
+    changed = False
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function":
+            continue
+        target = node.target
+        if not (
+            isinstance(target, torch._ops.OpOverload)
+            and target.name() == "tt_qwen35::maxtext_gdn_seg_fwd_res"
+        ):
+            continue
+        out_user = None
+        dead_users: list[torch.fx.Node] = []
+        residuals_live = False
+        for u in list(node.users):
+            if (
+                u.op == "call_function"
+                and u.target is operator.getitem
+                and len(u.args) == 2
+                and isinstance(u.args[1], int)
+            ):
+                if u.args[1] == 0:
+                    out_user = u
+                elif len(u.users) == 0:
+                    dead_users.append(u)
+                else:
+                    residuals_live = True
+            else:
+                residuals_live = True
+        if residuals_live or out_user is None:
+            continue
+        with gm.graph.inserting_before(node):
+            primal = gm.graph.call_function(
+                fwd_only_op.default, args=node.args, kwargs=node.kwargs
+            )
+            primal.meta = dict(node.meta)
+            primal.meta["val"] = out_user.meta.get("val")
+        out_user.replace_all_uses_with(primal)
+        gm.graph.erase_node(out_user)
+        for u in dead_users:
+            gm.graph.erase_node(u)
+        gm.graph.erase_node(node)
+        changed = True
+    if changed:
+        gm.recompile()
+    return gm
+
+
 def construct_tpu_transform_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
@@ -571,6 +629,7 @@ def construct_tpu_transform_passes(
             )
         )
         passes.append(selective_activation_remat_pass)
+        passes.append(_demote_unused_gdn_residuals_pass)
         if config.compile.enable_remat_barriers:
             passes.append(
                 functools.partial(

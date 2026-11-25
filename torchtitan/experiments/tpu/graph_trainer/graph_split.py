@@ -760,6 +760,15 @@ def _collect_backward_collective_owners(
             f"(group {_collective_group_name(launch)!r}; gradient reductions "
             f"run on {sorted(map(str, fsdp_groups))})"
         )
+      if is_gather(launch) and not on_fsdp_group:
+        inputs, users = chain_boundary(collective_chains[launch])
+        layer_ids = {
+            i
+            for i in (_get_layer_id(n) for n in (inputs | users | {launch}))
+            if 0 <= i < n_layers
+        }
+        if layer_ids:
+          owners[launch] = ("act", max(layer_ids))
       continue
     kind = role
     if (

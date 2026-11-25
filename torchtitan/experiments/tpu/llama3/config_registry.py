@@ -486,14 +486,24 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
   return config
 
 
+def _save_attention(config: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
+  """Save the attention kernel's output for backward instead of recomputing it.
+
+  Faster at 8B and 70B; 405B runs out of HBM with it.
+  """
+  config.compile.memory_policy = "tpu_selective_and_offload"
+  config.compile.save_regions = ("attention.inner_attention",)
+  return config
+
+
 def llama3_8b_scan() -> TpuGraphTrainer.Config:
   """Llama3 8B on the scan lane."""
-  return _on_scan_lane(llama3_8b())
+  return _save_attention(_on_scan_lane(llama3_8b()))
 
 
 def llama3_70b_scan() -> TpuGraphTrainer.Config:
   """Llama3 70B on the scan lane."""
-  return _on_scan_lane(llama3_70b())
+  return _save_attention(_on_scan_lane(llama3_70b()))
 
 
 def llama3_405b_scan() -> TpuGraphTrainer.Config:

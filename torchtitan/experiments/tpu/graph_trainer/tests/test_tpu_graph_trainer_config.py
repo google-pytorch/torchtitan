@@ -1403,6 +1403,25 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertFalse(config.loss_kernel.use_loss_kernel)
 
   @parameterized.parameters(
+      (llama3_8b_scan, True),
+      (llama3_70b_scan, True),
+      (llama3_405b_scan, False),
+  )
+  def test_scan_recipe_saves_attention_below_405b(self, recipe, saves) -> None:
+    """405B runs out of HBM when it saves attention."""
+    compile_config = recipe().compile
+    if saves:
+      self.assertEqual(
+          compile_config.memory_policy, "tpu_selective_and_offload"
+      )
+      self.assertEqual(
+          compile_config.save_regions, ("attention.inner_attention",)
+      )
+    else:
+      self.assertEqual(compile_config.memory_policy, "full_and_scan_offload")
+      self.assertEqual(compile_config.save_regions, ())
+
+  @parameterized.parameters(
       llama3_8b_scan,
       llama3_70b_scan,
       llama3_405b_scan,
@@ -1418,8 +1437,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertIsInstance(config, TpuGraphTrainer.Config)
     self.assertTrue(config.compile.use_scan_layers)
     self.assertEqual(config.compile.mode, "aot_fx_trace")
-    self.assertEqual(
-        config.compile.memory_policy, "full_and_scan_offload"
+    self.assertIn(
+        config.compile.memory_policy,
+        ("full_and_scan_offload", "tpu_selective_and_offload"),
     )
     self.assertEqual(config.optimizer.implementation, "fused_opt_states_bf16")
     self.assertEqual(

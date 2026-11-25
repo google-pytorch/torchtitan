@@ -10,6 +10,7 @@ from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.experiments.tpu.kernels import pallas_vmem
 from torchtitan.experiments.tpu.testing import base_device_test
 import torchtitan.experiments.tpu.qwen3_5 as qwen3_5_tpu
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
@@ -206,28 +207,6 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
           max_num_segments=0
       ).build()
 
-    # `_tpu_generation` parses `"tpu7x"`, `"TPU v6e"`, `"TPU v5 lite"`, `"tpu-4"`.
-    try:
-      for dev_name, expected_gen in (
-          ("TPU7x", 7),
-          ("TPU v6e", 6),
-          ("TPU v5 lite", 5),
-          ("tpu-4", 4),
-          ("unknown", None),
-      ):
-        tokamax_gated_delta._tpu_generation.cache_clear()  # pylint: disable=protected-access
-        fake_tpu = mock.Mock()
-        fake_tpu.get_device_properties.return_value = mock.Mock(name=dev_name)
-        fake_tpu.get_device_properties.return_value.name = dev_name
-        with mock.patch.object(torch, "tpu", fake_tpu, create=True):
-          self.assertEqual(
-              tokamax_gated_delta._tpu_generation(),  # pylint: disable=protected-access
-              expected_gen,
-              msg=dev_name,
-          )
-    finally:
-      tokamax_gated_delta._tpu_generation.cache_clear()  # pylint: disable=protected-access
-
   def test_unsupported_inputs_fall_back_to_xla(self):
     """Tests that unsupported inputs run XLA with the same min_log_decay clamp."""
     kernel = tokamax_gated_delta.TokamaxGatedDeltaKernel.Config().build()
@@ -328,9 +307,13 @@ class TokamaxGatedDeltaTest(base_device_test.BaseAcceleratorDeviceTest):
         # Include decays below `min_log_decay` (-5.0) to verify fallback clamping.
         g = -10.0 * torch.rand(*shape, device=dev)
         beta = torch.sigmoid(torch.randn(*shape, device=dev)).to(q_dtype)
-        # The kernel reads the TPU generation once, at construction.
         gen_ctx = (
-            mock.patch.object(kernel, "_tpu_gen", mock_gen)
+            mock.patch.object(
+                pallas_vmem,
+                "tpu_generation",
+                autospec=True,
+                return_value=mock_gen,
+            )
             if mock_gen is not None
             else contextlib.nullcontext()
         )

@@ -11,10 +11,8 @@ import re
 import torch
 
 
-@torch._dynamo.assume_constant_result
 @functools.lru_cache(maxsize=1)
-def tpu_generation() -> int | None:
-  """Returns the TPU generation (e.g., 5, 6, 7), or ``None`` if unavailable."""
+def _parse_tpu_generation() -> int | None:
   get_props = getattr(
       getattr(torch, "tpu", None), "get_device_properties", None
   )
@@ -26,6 +24,20 @@ def tpu_generation() -> int | None:
     return None
   match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
   return int(match.group(1)) if match else None
+
+
+@torch._dynamo.assume_constant_result
+def tpu_generation() -> int | None:
+  """Returns the TPU generation (e.g., 5, 6, 7), or ``None`` if unavailable.
+
+  The result is cached, and torch.compile treats it as a constant. The cache
+  lives in a separate function because Dynamo traces through an
+  ``lru_cache`` wrapper and ignores ``assume_constant_result`` on it.
+  """
+  return _parse_tpu_generation()
+
+
+tpu_generation.cache_clear = _parse_tpu_generation.cache_clear
 
 
 def vmem_limit_bytes() -> int:

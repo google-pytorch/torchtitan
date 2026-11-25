@@ -1,5 +1,7 @@
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
+from typing import Literal, TypeVar
+
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -12,11 +14,16 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.config.transform import ContextParallelTransform, apply_transforms
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.components.datasets import (
     TPUGrainDataLoader,
     c4_test_dataloader,
+)
+from torchtitan.experiments.tpu.distributed.cp_attention import (
+    tpu_cp_inner_attention,
+    tpu_cp_load_balancer,
 )
 from torchtitan.experiments.tpu.graph_trainer.config import (
     GraphSplitterConfig,
@@ -26,12 +33,14 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
+from torchtitan.experiments.tpu.components import expert_parallel
 from torchtitan.experiments.tpu.components.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3_5 import model_registry
+from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import GatedDeltaNetCPStrategy, GatedDeltaNetContextParallelTransform, ReduceDtype
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaNet
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -43,6 +52,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     TpuTrainerCompileConfig,
 )
+from torchtitan.models.common.attention import BaseAttention
 
 _TPU_MOE_CONVERTERS = [
     TpuTokenDispatcherConverter.Config(),
@@ -222,6 +232,74 @@ def _use_graph_split(
   return cfg
 
 
+def _use_expert_parallel(
+    cfg: TpuGraphTrainer.Config,
+    *,
+    ep_degree: int,
+    num_token_chunks: int | None = None,
+) -> None:
+  """Turns on expert parallelism (EP) in a split Qwen3.5 MoE recipe.
+
+  `TpuQwen35Model.Config.update_from_config` passes
+  `parallelism.expert_parallel_degree` and the `tpu_config.ep_*` fields set
+  here to `use_expert_parallel`: `ep_transport="auto"` (Ring-of-Experts while
+  `ep_degree <= top_k`, the ragged all-to-all above that), routing weights
+  applied before the down projection, and `num_token_chunks` sequence chunks
+  per MoE layer with at most two in flight. Chunking divides each chunk's
+  dropless `[ep_degree * T / C * top_k, D]` expert buffer by C and lets one
+  chunk's token exchange overlap another chunk's expert matmuls.
+
+  It also changes the rest of the recipe:
+
+  - The gradient norm is eager: the compiled one needs a single mesh, and the
+    experts live on the `(efsdp, ep)` mesh. `DEFER_AND_FUSE` fuses the eager
+    norm across parameters.
+  - One layer per forward and backward executable, with
+    `backward_partition_mode="by_layer"`: `fsdp_pipeline` treats every
+    backward all-gather and reduce-scatter as an FSDP collective, and the EP
+    token exchange isn't one.
+  - The topology-aware device mesh stays on (inherited from the base
+    recipe): `ParallelDims.build_mesh` registers each mesh axis's logical
+    layout with `spmd_types`, so the `efsdp` and `ep` axes pass its
+    orthogonality check when the mesh reorders the devices.
+    `--parallelism.no-enable_tpu_topo_mesh` turns it off.
+  - SparseCore offload for the EP and expert-FSDP collectives, with gathers
+    and copies kept on the TensorCore (the `tpu_flags` bundles below).
+
+  `--parallelism.expert_parallel_degree` on the command line changes the EP
+  degree but not the chunk count: pass `--tpu_config.ep_token_chunks` with it.
+
+  Args:
+    cfg: The recipe to update in place.
+    ep_degree: The expert-parallel degree. It must divide the number of routed
+      experts and the number of FSDP ranks.
+    num_token_chunks: Sequence chunks per MoE layer, or `None` for
+      `default_num_token_chunks(ep_degree)` (`ep_degree` clamped to 4..16).
+  """
+  cfg.parallelism.expert_parallel_degree = ep_degree
+  cfg.compile.compile_grad_norm = False
+  if not cfg.tpu_config.eager_mode:
+    cfg.tpu_config.eager_mode = "DEFER_AND_FUSE"
+  cfg.tpu_config.ep_transport = "auto"
+  cfg.tpu_config.ep_scale_before_down_proj = True
+  cfg.tpu_config.ep_token_chunks = (
+      expert_parallel.default_num_token_chunks(ep_degree)
+      if num_token_chunks is None
+      else num_token_chunks
+  )
+  graph_split = cfg.compile.graph_split
+  graph_split.forward_layers_per_executable = 1
+  graph_split.backward_layers_per_executable = 1
+  graph_split.backward_partition_mode = "by_layer"
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      tpu_flags.SPARSECORE_COLLECTIVE_OFFLOAD,
+      tpu_flags.SPARSECORE_REDUCE_SCATTER_V2,
+      tpu_flags.LAYER_SCHEDULER_FOR_DEPENDENT_COLLECTIVES,
+      tpu_flags.EP_GATHER_COPY_ON_TENSORCORE,
+  )
+
+
 def qwen35_debugmodel() -> TPUTrainerConfig:
   """Debug config for hybrid Qwen3.5 (dense) on TPU."""
   return TPUTrainerConfig(
@@ -276,6 +354,25 @@ def qwen35_moe_debugmodel_fused_ce() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen35_moe_debugmodel_pallas_gmm() -> TPUTrainerConfig:
+  """`qwen35_moe_debugmodel` with unpaired Pallas grouped matmuls.
+
+  Canonical weight layout and 256-row tiles, and nothing else from
+  `_use_tpu_moe_kernels`. EP tests that apply routing weights before W2
+  (`--tpu_config.ep_scale_before_down_proj`) use it, since only the Pallas
+  grouped matmuls take per-row scales.
+  """
+  cfg = qwen35_moe_debugmodel()
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+  return cfg
+
+
 def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
   """Debug config for 4-layer hybrid Qwen3.5 MoE with the TPU MoE kernels.
 
@@ -285,6 +382,24 @@ def qwen35_moe_debugmodel_tpu_moe_kernels() -> TPUTrainerConfig:
   """
   cfg = qwen35_moe_debugmodel()
   _use_tpu_moe_kernels(cfg)
+  return cfg
+
+
+def qwen35_moe_debugmodel_pallas_experts() -> TPUTrainerConfig:
+  """Debug Qwen3.5 MoE with paired Pallas grouped matmuls on standard weights.
+
+  `qwen35_moe_debugmodel_pallas_gmm` with Pallas paired W1+W3 (and unpaired
+  W2) grouped matmuls, with the expert weights in the standard `(E, out, in)`
+  layout, so a CPU reference that runs `torch._grouped_mm` on the same
+  parameters can check loss, gradients and parameters
+  (`test_ep_parity_distributed`).
+  """
+  cfg = qwen35_moe_debugmodel_pallas_gmm()
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.use_pallas_paired_grouped_mm = True
   return cfg
 
 
@@ -304,7 +419,21 @@ def graph_trainer_qwen35_moe_debugmodel() -> TpuGraphTrainer.Config:
   )
 
 
-def qwen35_moe_35b() -> TPUTrainerConfig:
+def graph_trainer_qwen35_moe_debugmodel_tpu_moe_kernels() -> (
+    TpuGraphTrainer.Config
+):
+  """`graph_trainer_qwen35_moe_debugmodel` with the 35B/397B TPU MoE kernels.
+
+  Paired Pallas grouped matmuls on kernel-native expert weights and the fused
+  route-score backward (`_use_tpu_moe_kernels`), as the split benchmark
+  recipes run them, for GraphTrainer EP-vs-EP=1 tests.
+  """
+  cfg = graph_trainer_qwen35_moe_debugmodel()
+  _use_tpu_moe_kernels(cfg)
+  return cfg
+
+
+def qwen35_moe_35b(flavor: str = "35B-A3B") -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 
   As in the Qwen3 TPU recipes, FP32 parameters, gradients and AdamW state
@@ -316,14 +445,18 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
   paired grouped matmuls for the experts, Splash attention, Pallas fused
   linear cross-entropy, and torch_tpu's DEFER_AND_FUSE eager mode with a
   compiled gradient norm. 32K tokens per rank (16 sequences of 2048).
+
+  Args:
+    flavor: Model flavor. The 397B-A17B recipe reuses this one with
+      `"397B-A17B"` and then overrides the batch, dtypes and parallelism.
   """
   cfg = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
-      hf_assets_path="./assets/hf/Qwen3.5-35B-A3B",
+      hf_assets_path=f"./assets/hf/Qwen3.5-{flavor}",
       # Logging syncs the host on the loss; every 5 steps lets the host
       # dispatch the next step while the current one runs.
       metrics=MetricsProcessor.Config(log_freq=5),
-      model_spec=model_registry("35B-A3B", converters=_TPU_MOE_CONVERTERS),
+      model_spec=model_registry(flavor, converters=_TPU_MOE_CONVERTERS),
       optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       # A 2-step warmup to the peak LR diverged the randomly initialized
       # 40-layer model (loss 12.77 -> 6.45 -> 8.48 -> NaN at step 4 on
@@ -384,7 +517,9 @@ def qwen35_moe_35b() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
+def qwen35_moe_35b_split_tokamax_benchmark(
+    flavor: str = "35B-A3B",
+) -> TpuGraphTrainer.Config:
   """Qwen3.5-35B-A3B benchmark: ZeRO-3, graph split, Tokamax GatedDeltaNet.
 
   Runs on any TPU7x slice from tpu7x-2x2x2 (2 hosts, 8 chips, 16 ranks) up to
@@ -396,8 +531,13 @@ def qwen35_moe_35b_split_tokamax_benchmark() -> TpuGraphTrainer.Config:
   (without packed-document resets), Pallas paired grouped matmuls for the
   experts, Splash attention, and the Pallas fused linear cross-entropy. 32K
   tokens per rank (16 sequences of 2048).
+
+  Args:
+    flavor: Model flavor. The 397B-A17B EP recipe reuses this one with
+      `"397B-A17B"` (60 layers, 512 experts) and then overrides the batch,
+      dtypes and parallelism.
   """
-  base_cfg = qwen35_moe_35b()
+  base_cfg = qwen35_moe_35b(flavor)
   base_cfg.dataloader = c4_test_dataloader()
   base_cfg.hf_assets_path = "./tests/assets/tokenizer"
   base_cfg.parallelism = ParallelismConfig(
@@ -480,3 +620,216 @@ def qwen35_moe_35b_scan_tokamax_benchmark() -> TpuGraphTrainer.Config:
       ".tpu_discarded_token_counter"
   )
   return cfg
+
+
+def qwen35_moe_35b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
+  """`qwen35_moe_35b_split_tokamax_benchmark` with expert parallelism (EP = 4).
+
+  `_use_expert_parallel` at EP = 4: Ring-of-Experts (EP <= top_k = 8) in 4
+  token chunks per MoE layer. Runs on tpu7x-2x2x2 (16 ranks) and larger
+  slices. Pass `--parallelism.expert_parallel_degree` together with
+  `--tpu_config.ep_token_chunks` for another EP degree.
+  """
+  cfg = qwen35_moe_35b_split_tokamax_benchmark()
+  _use_expert_parallel(cfg, ep_degree=4)
+  return cfg
+
+
+def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
+  """Qwen3.5-397B-A17B 8K-context benchmark with expert parallelism (EP = 8).
+
+  `qwen35_moe_35b_split_tokamax_benchmark` for the 60-layer, 512-expert,
+  top-10 397B-A17B model on tpu7x-2x4x4 (32 chips, 64 ranks) and larger
+  slices, with `_use_expert_parallel` at EP = 8 (Ring-of-Experts):
+
+  - BF16 parameters, gradients and AdamW state (8 bytes per parameter, about
+    46 GiB per rank on 64 ranks, where FP32 would need about 92 GiB) and a
+    BF16 gradient reduce-scatter.
+  - 24,576 tokens per rank (3 sequences of 8192), in 12 token chunks of 2,048
+    per MoE layer.
+  - The default fused cross-entropy tiles (the 35B recipe's assume one
+    H = 2048 hidden block) and K-tiled expert dWeight matmuls that fit VMEM at
+    D = 4096, F = 1024.
+
+  `--parallelism.expert_parallel_degree=16 --tpu_config.ep_token_chunks=16`
+  switches to the ragged all-to-all (EP > top_k), and
+  `--parallelism.expert_parallel_degree=1` runs the same split and
+  rematerialization without EP.
+  """
+  cfg = qwen35_moe_35b_split_tokamax_benchmark("397B-A17B")
+  cfg.training.dtype = "bfloat16"
+  cfg.training.mixed_precision_param = "bfloat16"
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.training.max_context_length = 8192
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 3 * 8192
+  _enable_pallas_cross_entropy(cfg)
+  for _, experts, _, _ in cfg.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    # Untiled, the paired W1 + W3 dWeight needs two FP32 (K, N) accumulators
+    # plus double-buffered BF16 slabs, 86 MiB of VMEM at D = 4096, F = 1024:
+    # tile K at 1024. W2's K (F = 1024) needs no tiling; tile D at 2048 when W2
+    # is transposed.
+    tile_m = experts.pallas_grouped_mm_tile_m
+    experts.pallas_grouped_mm_tgmm_tiling = (tile_m, 1024, 0)
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (tile_m, 0, 0)
+    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (tile_m, 0, 2048)
+  _use_expert_parallel(cfg, ep_degree=8, num_token_chunks=12)
+  return cfg
+
+
+# A TPUTrainerConfig or a subclass (e.g. TpuGraphTrainer.Config).
+_TPUConfigT = TypeVar("_TPUConfigT", bound=TPUTrainerConfig)
+
+
+def _qwen35_cp(
+    config: _TPUConfigT,
+    *,
+    strategy: Literal["ulysses", "all_gather"],
+    cp_degree: int,
+    gated_delta_cp_strategy: GatedDeltaNetCPStrategy = "all_to_all",
+    gated_delta_cp_reduce_dtype: ReduceDtype = "float32",
+) -> _TPUConfigT:
+  """Enables TPU context parallelism for hybrid Qwen3.5.
+
+  As ``qwen3/config_registry.py::_qwen3_cp``, sets the CP degree and the load
+  balancer of ``strategy`` and applies core ``ContextParallelTransform`` with
+  the TPU CP inner attention to the full-attention layers. Also applies
+  ``GatedDeltaNetContextParallelTransform``, which runs the GatedDeltaNet
+  layers head-parallel over the same token layout (``cp_gated_delta``):
+  ``n_key_heads`` and ``n_value_heads`` must be divisible by ``cp_degree``.
+
+  Args:
+    config: The recipe to enable CP on.
+    strategy: The full-attention CP strategy, ``"all_gather"`` (load-balanced KV
+      all-gather) or ``"ulysses"``.
+    cp_degree: The context-parallel degree.
+    gated_delta_cp_strategy: ``GatedDeltaNetContextParallelTransform``'s
+      ``cp_strategy``.
+    gated_delta_cp_reduce_dtype: Its ``cp_reduce_dtype``.
+
+  Returns:
+    A validated copy of ``config`` with CP enabled.
+  """
+  assert config.model_spec is not None
+  load_balancer = tpu_cp_load_balancer(strategy)
+  config.parallelism.context_parallel_degree = cp_degree
+  config.parallelism.context_parallel_load_balancer = load_balancer
+  inner_attention = config.model_spec.model.first_full_attention_backend
+  assert inner_attention is not None
+  return apply_transforms(
+      config,
+      [
+          ContextParallelTransform(
+              inner_attention=tpu_cp_inner_attention(
+                  inner_attention._owner, strategy
+              )
+          ),
+          GatedDeltaNetContextParallelTransform(
+              load_balancer=load_balancer,
+              cp_strategy=gated_delta_cp_strategy,
+              cp_reduce_dtype=gated_delta_cp_reduce_dtype,
+          ),
+      ],
+  )
+
+
+def _allow_reference_attention(cfg: TPUTrainerConfig) -> None:
+  """Lets KV all-gather CP run its plain-PyTorch attention (no Splash)."""
+  assert cfg.model_spec is not None
+  for _, attn, _, _ in cfg.model_spec.model.traverse(BaseAttention.Config):
+    attn.inner_attention.allow_reference_attention = True
+
+
+def qwen35_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 debug model with KV all-gather CP degree 2 (head-parallel GDN).
+
+  The debug model runs without the Splash kernel, so KV all-gather CP opts in
+  to its plain-PyTorch reference attention, which is fine at this size.
+  """
+  cfg = _qwen35_cp(qwen35_debugmodel(), strategy="all_gather", cp_degree=2)
+  _allow_reference_attention(cfg)
+  return cfg
+
+
+def qwen35_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 debug model with Ulysses CP degree 2 (head-parallel GDN)."""
+  return _qwen35_cp(qwen35_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def qwen35_debugmodel_ulysses_cp2_agrs() -> TPUTrainerConfig:
+  """``qwen35_debugmodel_ulysses_cp2``, ``allgather_reducescatter`` GDN CP."""
+  return _qwen35_cp(
+      qwen35_debugmodel(),
+      strategy="ulysses",
+      cp_degree=2,
+      gated_delta_cp_strategy="allgather_reducescatter",
+  )
+
+
+def qwen35_moe_debugmodel_allgather_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 MoE debug model with KV all-gather CP degree 2."""
+  cfg = _qwen35_cp(qwen35_moe_debugmodel(), strategy="all_gather", cp_degree=2)
+  _allow_reference_attention(cfg)
+  return cfg
+
+
+def qwen35_moe_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
+  """Qwen3.5 MoE debug model with Ulysses CP degree 2."""
+  return _qwen35_cp(qwen35_moe_debugmodel(), strategy="ulysses", cp_degree=2)
+
+
+def _split_tokamax_benchmark_for_cp(cp: int) -> TpuGraphTrainer.Config:
+  """``qwen35_moe_35b_split_tokamax_benchmark`` sized for context parallelism.
+
+  32K-token sequences and 64K tokens per device (a CP group shares one
+  data-parallel rank's tokens, so the per-rank budget is scaled by ``cp``),
+  where CP pays off; Splash's document-aware block skipping is off, as KV
+  all-gather CP cannot use it and at long context it costs more than it saves.
+  Longer contexts set ``--training.max_context_length`` (and, from 64K,
+  ``--splash_attention_kernel.no-sa_use_fused_bwd_kernel``).
+  """
+  cfg = qwen35_moe_35b_split_tokamax_benchmark()
+  cfg.training.max_context_length = 32768
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 65536 * cp
+  cfg.splash_attention_kernel.sa_use_document_aware_block_skipping = False
+  return cfg
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
+    TpuGraphTrainer.Config
+):
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with KV all-gather CP 2."""
+  return _qwen35_cp(
+      _split_tokamax_benchmark_for_cp(2),
+      strategy="all_gather",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2() -> (
+    TpuGraphTrainer.Config
+):
+  """``qwen35_moe_35b_split_tokamax_benchmark`` with Ulysses CP degree 2."""
+  return _qwen35_cp(
+      _split_tokamax_benchmark_for_cp(2),
+      strategy="ulysses",
+      cp_degree=2,
+  )
+
+
+def qwen35_moe_35b_split_tokamax_benchmark_ulysses_cp2_agrs() -> (
+    TpuGraphTrainer.Config
+):
+  """Ulysses CP 2 with the ``allgather_reducescatter`` GatedDeltaNet strategy.
+
+  Reduces in bfloat16. Faster than ``all_to_all`` at long context on CP2, for
+  more HBM (see ``CPTpuGatedDeltaNet``).
+  """
+  return _qwen35_cp(
+      _split_tokamax_benchmark_for_cp(2),
+      strategy="ulysses",
+      cp_degree=2,
+      gated_delta_cp_strategy="allgather_reducescatter",
+      gated_delta_cp_reduce_dtype="bfloat16",
+  )

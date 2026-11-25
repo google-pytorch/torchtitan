@@ -9,6 +9,7 @@
 import dataclasses
 import typing
 from types import SimpleNamespace
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -30,6 +31,9 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_pass_pipeline,
+)
+from torchtitan.experiments.tpu.graph_trainer import (
+    tpu_graph_trainer as tpu_graph_trainer_module,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
@@ -89,6 +93,7 @@ from torchtitan.experiments.tpu.overrides.real_rope import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
+from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
 from torchtitan.experiments.tpu.qwen3.config_registry import (
@@ -108,6 +113,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_235b_fsdp_activation_offload_maxtext,
     qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_fp8,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
     reg_trainer_qwen3_8b,
@@ -1122,6 +1128,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         94,
     )
 
+  def test_235b_scan_fp8_keeps_route_scores_after_the_experts(self) -> None:
+    # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2,
+    # so the recipe multiplies them after the experts instead.
+    config = qwen3_moe_235b_scan_fp8()
+
+    assert config.model_spec is not None
+    model = config.model_spec.model
+    experts = list(model.traverse(TpuGroupedExperts.Config))
+    self.assertLen(experts, 94)
+    self.assertTrue(all(e.use_fp8_grouped_mm for _, e, _, _ in experts))
+    # The recipe targets v7x, so it turns on in-kernel W1/W3 quantization.
+    self.assertTrue(all(e.fp8_w13_fused_lhs_quant for _, e, _, _ in experts))
+    routed = list(model.traverse(TpuRoutedExperts.Config))
+    self.assertLen(routed, 94)
+    self.assertFalse(any(r.scale_before_down_proj for _, r, _, _ in routed))
+    dispatchers = list(model.traverse(TpuAllToAllTokenDispatcher.Config))
+    self.assertLen(dispatchers, 94)
+    self.assertTrue(
+        all(d.fuse_route_score_backward for _, d, _, _ in dispatchers)
+    )
+
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()
 
@@ -1792,8 +1819,8 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   def test_scan_is_refused_at_model_build(self) -> None:
     """Gemma 4's sliding and global layers cannot share a stack.
 
-    Layer 0 is sliding (``QKVLinear``) while layer 5 is global ``K=V``
-    (``QKVLinearKeqV`` with a larger ``head_dim``), so ``check_layers_are_stackable``
+    Layer 0 is sliding while layer 5 is global ``K=V`` (with a larger
+    ``head_dim`` and ``k_eq_v=True``), so ``check_layers_are_stackable``
     refuses the model when ``build()`` constructs the scan stack.
     """
     graph_config = graph_trainer_gemma4_debugmodel()
@@ -1808,6 +1835,35 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         ),
     ):
       graph_config.model_spec.model.build()
+
+  @parameterized.parameters(
+      (graph_trainer_gemma4_debugmodel, 6, 1),
+      (graph_trainer_gemma4_moe_debug, 6, 1),
+      (gemma4_31b, 60, 10),
+      (gemma4_31b_graph_trainer, 60, 10),
+      (gemma4_31b_graph_split, 60, 10),
+      (gemma4_31b_graph_split_offload, 60, 10),
+      (gemma4_26b_a4b, 30, 5),
+      (gemma4_26b_a4b_graph_trainer, 30, 5),
+      (gemma4_26b_a4b_graph_split, 30, 5),
+      (gemma4_26b_a4b_graph_split_offload, 30, 5),
+  )
+  def test_graph_trainer_recipes_use_packed_qkv(
+      self, recipe, expected_packed_layers: int, expected_keqv_layers: int
+  ) -> None:
+    """Production and GraphTrainer Gemma 4 recipes convert all layers (sliding and global K=V) to TpuPackedQKVLinear."""
+    config = recipe()
+    assert config.model_spec is not None
+    packed_cfgs = [
+        cfg
+        for _, cfg, _, _ in config.model_spec.model.traverse(
+            TpuPackedQKVLinear.Config
+        )
+    ]
+    self.assertLen(packed_cfgs, expected_packed_layers)
+    self.assertEqual(
+        sum(1 for cfg in packed_cfgs if cfg.k_eq_v), expected_keqv_layers
+    )
 
   @parameterized.parameters(
       gemma4_debugmodel,
@@ -2024,6 +2080,59 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
         "--compile.graph_split.backward_partition_mode=by_layer",
     ])
     apply_tpu_graph_trainer_model_transforms(ep_by_layer_cfg)
+
+
+class TpuGraphTrainerEpDropStatsTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ("_single_rank", False, False, False),
+      ("_dp_cp", True, False, False),
+      ("_ep_dp_cp", True, True, False),
+      ("_ep_tp", True, True, True),
+      ("_ep_tp_only", False, True, True),
+      # tp without EP holds the same tokens; drop stats never get here, but
+      # the reduction must not add tp.
+      ("_tp_without_ep", True, False, True),
+  )
+  def test_drop_stats_sum_over_token_holding_ranks(
+      self, has_loss_mesh, ep_enabled, has_tp_mesh
+  ):
+    loss_mesh = object() if has_loss_mesh else None
+    tp_group = object()
+    tp_mesh = (
+        SimpleNamespace(get_group=lambda: tp_group) if has_tp_mesh else None
+    )
+    meshes = {"loss": loss_mesh, "tp": tp_mesh}
+
+    def get_mesh(name):
+      raise AssertionError(f"drop stats must not require the {name!r} mesh")
+
+    trainer = SimpleNamespace(
+        _ep_drop_stats_enabled=True,
+        _ep_drop_stats_L2=torch.tensor([[1, 8], [0, 8]], dtype=torch.int32),
+        parallel_dims=SimpleNamespace(
+            ep_enabled=ep_enabled,
+            get_optional_mesh=meshes.__getitem__,
+            get_mesh=get_mesh,
+        ),
+        step=1,
+    )
+    with mock.patch.object(
+        tpu_graph_trainer_module.dist_utils,
+        "dist_sum_tensor",
+        side_effect=lambda x, mesh=None, extra_pg=None: x,
+    ) as sum_mock:
+      global_L2 = TpuGraphTrainer._maybe_log_ep_drop_stats(
+          typing.cast(typing.Any, trainer)
+      )
+    sum_mock.assert_called_once()
+    args, kwargs = sum_mock.call_args
+    self.assertIs(args[1], loss_mesh)
+    self.assertIs(
+        kwargs["extra_pg"], tp_group if ep_enabled and has_tp_mesh else None
+    )
+    self.assertEqual(global_L2.dtype, torch.int64)
+    self.assertEqual(global_L2.tolist(), [[1, 8], [0, 8]])
 
 
 if __name__ == "__main__":

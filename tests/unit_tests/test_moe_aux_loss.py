@@ -469,11 +469,11 @@ def test_graph_trainer_returns_routing_metrics_as_graph_outputs():
         inputs, labels, 8.0, {}
     )
 
-    assert len(traced_outputs) == 4
-    assert traced_outputs[-2].shape == (1, 3)
-    assert traced_outputs[-1].shape == (1,)
-    for eager, traced in zip(eager_outputs, traced_outputs, strict=True):
-        torch.testing.assert_close(eager, traced)
+    assert len(traced_step.gm.graph.find_nodes(op="output")[0].args[0]) == 4
+    assert len(traced_outputs.routing_metrics) == 2
+    assert traced_outputs.routing_metrics[0].shape == (1, 3)
+    assert traced_outputs.routing_metrics[1].shape == (1,)
+    torch.testing.assert_close(eager_outputs, traced_outputs)
 
 
 _E, _K, _D = 4, 2, 8

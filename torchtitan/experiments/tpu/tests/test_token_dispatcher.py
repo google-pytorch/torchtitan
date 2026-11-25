@@ -12,6 +12,8 @@ from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuRaggedDispatchMetadata,
     TpuRoutedExperts,
     TpuTokenDispatcherConverter,
+    _clone_repeated_tensors,
+    _is_tracing,
     scale_route_weights,
     stable_grouped_reduce,
 )
@@ -411,6 +413,26 @@ def test_scale_before_down_proj_allows_ep1_parallelize():
   parent_parallelize.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "ep_transport", ["ring_of_experts", "ragged_all_to_all", "auto"]
+)
+def test_scale_before_down_proj_allows_tpu_ep_transports_at_parallelize(
+    ep_transport,
+):
+  routed = TpuRoutedExperts.Config(
+      inner_experts=GroupedExperts.Config(dim=4, hidden_dim=6, num_experts=4),
+      token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+          num_experts=4, top_k=2, ep_transport=ep_transport
+      ),
+      scale_before_down_proj=True,
+  ).build()
+  with mock.patch(
+      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+  ) as parent_parallelize:
+    routed.parallelize(_parallel_dims_with_ep(has_ep=True))
+  parent_parallelize.assert_called_once()
+
+
 def test_scale_before_down_proj_rejects_all_to_all_metadata():
   # AllToAllDispatchMetadata subclasses LocalDispatchMetadata. Before the
   # explicit check, EP metadata passed the EP=1 guard and the forward reduced
@@ -439,9 +461,11 @@ def test_scale_before_down_proj_rejects_all_to_all_metadata():
       routed(x, scores, expert_ids, counts)
 
 
-@pytest.mark.parametrize("ep_transport", ["all_to_all", "ragged_all_to_all"])
+@pytest.mark.parametrize(
+    "ep_transport", ["all_to_all", "ragged_all_to_all", "ring_of_experts", "auto"]
+)
 def test_ep1_combine_keeps_the_fixed_k_reduction(ep_transport):
-  """Without an EP mesh, either transport uses the local fixed-K reduction."""
+  """Without an EP mesh, any transport uses the local fixed-K reduction."""
   generator = torch.Generator().manual_seed(11)
   num_experts, top_k, dim, tokens = 4, 2, 8, 6
   dispatcher = TpuAllToAllTokenDispatcher.Config(
@@ -471,3 +495,44 @@ def test_ep1_combine_keeps_the_fixed_k_reduction(ep_transport):
 def test_ragged_dispatch_metadata_is_not_local_metadata():
   # EP-1's guard in TpuRoutedExperts relies on this to refuse EP metadata.
   assert not issubclass(TpuRaggedDispatchMetadata, LocalDispatchMetadata)
+
+
+def test_clone_repeated_tensors_clones_only_repeats():
+    a, b, c = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+    out = _clone_repeated_tensors(a, [b, a, c, b, b])
+    assert out[0] is b and out[2] is c
+    for i in (1, 3, 4):
+        assert out[i] is not a and out[i] is not b
+    assert all(x is not y for i, x in enumerate(out) for y in out[:i])
+    for got, want in zip(out, [b, a, c, b, b]):
+        torch.testing.assert_close(got, want)
+
+
+class _SumInputs(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, *sizes):
+        return x + sum(s.sum() for s in sizes)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return (grad,) + (None,) * 3
+
+
+def test_clone_repeated_tensors_compiles_fullgraph():
+    """The `_RaggedAllToAll.apply` pattern: repeated size tensors, compiled."""
+
+    def fn(x, sizes):
+        offsets = sizes.cumsum(0)  # An intermediate, as the dispatcher's are.
+        assert _is_tracing(x)
+        args = _clone_repeated_tensors(x, [sizes, offsets, sizes])
+        return _SumInputs.apply(x, *args)
+
+    x = torch.randn(4, requires_grad=True)
+    sizes = torch.tensor([1, 2, 3])
+    compiled = torch.compile(fn, fullgraph=True, backend="aot_eager")
+    out = compiled(x, sizes)
+    out.sum().backward()
+    torch.testing.assert_close(out.detach(), x.detach() + 22)
+    torch.testing.assert_close(x.grad, torch.ones(4))
+    assert not _is_tracing(x)
+

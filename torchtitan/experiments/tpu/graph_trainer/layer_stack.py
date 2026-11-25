@@ -56,6 +56,7 @@ from torch.func import functional_call
 
 from torchtitan.config import derive
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    gather_like,
     gather_slice,
     plan_stacked_gathers,
     ScanFSDPSpec,
@@ -662,6 +663,80 @@ class LayerStack:
 
     # -- running the layers ------------------------------------------------
 
+    def _plan_prequantized_gathers(
+        self, template: nn.Module, layer_shapes, position: int = 0
+    ):
+        """``(position, buffer prefix, stack keys, spec, quantize)`` per group.
+
+        A submodule of the template opts in with ``scan_prequantize_groups()``
+        (buffer prefix -> weight names) and ``scan_prequantize(shard,
+        all_gather)``. A group is used only when every weight in it is sharded
+        whole along the gathered axis 0 (its first per-layer axis) by one
+        group and was not flattened; otherwise the module quantizes the
+        gathered weight itself.
+        """
+        key_of = dict(self.keys[position])
+        plan = []
+        for path, mod in template.named_modules():
+            groups_fn = getattr(mod, "scan_prequantize_groups", None)
+            if groups_fn is None:
+                continue
+            for key, weights in groups_fn().items():
+                names = [f"{path}.{w}" if path else w for w in weights]
+                keys = [key_of.get(n) for n in names]
+                specs = [self.fsdp_plan.get(k) for k in keys]
+                ok = all(
+                    k is not None
+                    and k not in layer_shapes
+                    and s is not None
+                    and s.sharded
+                    and s.gather_dim == 0
+                    and s.group_name == specs[0].group_name
+                    for k, s in zip(keys, specs)
+                )
+                if not ok:
+                    logger.warning(
+                        "Not pre-quantizing %s.%s in the scan: its weights "
+                        "aren't all sharded on their first axis",
+                        path,
+                        key,
+                    )
+                    continue
+                prefix = f"{path}.{key}" if path else key
+                plan.append(
+                    (position, prefix, keys, specs[0], mod.scan_prequantize)
+                )
+        if plan:
+            logger.info(
+                "Scan body quantizes and gathers FP8: %s",
+                [p[0] for p in plan],
+            )
+        return plan
+
+    def _prequantized_scan_body(self, body, keys, prequant):
+        """``run``'s scan body, plus each layer's pre-quantized FP8 weights.
+
+        Like the plain body in ``run`` -- make every row whole with
+        ``gather_slice``, run the layers, return a scalar y -- but each group in
+        ``prequant`` is also quantized from this rank's shard, gathered in FP8,
+        and passed to its position's layer as ``<prefix>_q`` /
+        ``<prefix>_scale``. The BF16 gathers stay for their gradient routing.
+        """
+
+        def scan_body(carry, slices):
+            params = {k: gather_slice(slices[k], self.fsdp_plan.get(k)) for k in keys}
+            extra = {}
+            for pos, prefix, group_keys, spec, quantize in prequant:
+                shard = torch.cat([slices[k].detach() for k in group_keys], dim=-1)
+                q, scale = quantize(shard, functools.partial(gather_like, spec=spec))
+                extra.setdefault(pos, {})[f"{prefix}_q"] = q
+                extra.setdefault(pos, {})[f"{prefix}_scale"] = scale
+            out = body(carry, params, extra)
+            # A scalar y, for the reason given in the plain body in ``run``.
+            return out, out.new_zeros(())
+
+        return scan_body
+
     def run(self, h: torch.Tensor, *args, use_scan: bool):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
@@ -705,7 +780,7 @@ class LayerStack:
                 f"flattened stacks with no layer name: {sorted(unmatched)}"
             )
 
-        def body(carry, params):
+        def body(carry, params, extra=None):
             # One cycle: each position's template runs with its row of its own
             # stacks. That is what makes the scan body a single traced graph
             # instead of n_layers of them. The templates have no parameters of
@@ -717,6 +792,8 @@ class LayerStack:
                     else params[k]
                     for name, k in self.keys[pos]
                 }
+                # The FP8 weights `_prequantized_scan_body` adds, if any.
+                layer_params.update((extra or {}).get(pos, {}))
                 carry = functional_call(template, layer_params, (carry, *args))
             return carry
 
@@ -771,6 +848,19 @@ class LayerStack:
                 # thing away. `scan` does not accept a body with no y, so return
                 # a scalar and drop it.
                 return out, out.new_zeros(())
+
+            # Opt-in FP8 path: modules that define `scan_prequantize_groups`
+            # get their weights quantized per shard and gathered in FP8. With
+            # no such module, `prequant` is empty and the body above runs as is.
+            prequant = [
+                group
+                for pos, template in enumerate(templates)
+                for group in self._plan_prequantized_gathers(
+                    template, layer_shapes, pos
+                )
+            ]
+            if prequant:
+                scan_body = self._prequantized_scan_body(body, keys, prequant)
 
             # Budget 0.0 forces the gathered weight to be recomputed in the
             # backward. Left alone, the partitioner saves it -- a collective

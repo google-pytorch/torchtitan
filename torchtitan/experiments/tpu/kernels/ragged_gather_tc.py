@@ -13,8 +13,9 @@
 # limitations under the License.
 #
 # Modifications: Bridged to PyTorch/TorchTPU via @pallas.jax_op and added
-# weighted gather-reduce, collision-free row-scale gather/scatter, and
-# _ragged_scale_and_dscore_tc backward kernels.
+# weighted gather-reduce, collision-free row-scale gather/scatter,
+# _ragged_scale_and_dscore_tc backward kernels, a 2D-output gather, and a
+# valid-prefix 2D -> 3D repack.
 
 """TensorCore DMA-driven ragged gather / gather-reduce kernels for MoE Ring-of-Experts.
 
@@ -29,10 +30,15 @@ submissions) and bridged to PyTorch/TorchTPU via ``@pallas.jax_op``:
   ``i < count`` into a static ``[cap, d0, d1]`` buffer using a dynamic Pallas
   grid ``(cdiv(count, block_size),)`` so HBM reads and writes scale strictly
   with ``count`` (~``1x`` local tokens) rather than worst-case ``cap``
-  (``ep_size * N``).
+  (``ep_size * N``). With ``out_2d=True`` it repacks each gathered block in
+  VMEM and stores it straight into a 2D ``[cap, D]`` buffer, so the expert
+  matmuls read the buffer without a full ``[cap, d0, d1] -> [cap, D]`` HBM
+  layout copy.
 - ``ragged_gather_reduce_tc`` compacts valid slots per output token, optionally
   multiplies each gathered row in VMEM by its FP32 routing weight, and sums in
   FP32 in deterministic buffer order without touching rows ``>= count``.
+  Its 2D ``[cap, D]`` input is repacked to 3D only over the valid prefix
+  (``_repack_2d_to_3d_valid_tc``), again scaling with ``count``.
 - ``_ragged_scale_and_dscore_tc`` runs a dynamic-grid ``(cdiv(count, 1024),
 d_chunks)``
   backward pass that simultaneously scales ``grad_routed_output`` by routing
@@ -60,6 +66,14 @@ _RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL = 8
 _RAGGED_GATHER_REDUCE_TC_ALIGN = 128
 _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
+# Row block of `_ragged_scale_and_dscore_tc` (the Ring-of-Experts combine
+# backward). It runs the Pallas kernel only when the expert buffer's row count
+# is a positive multiple of this block, and an XLA fallback otherwise, so the
+# EP dispatcher rounds capped buffers up to it.
+SCALE_DSCORE_BLOCK_ROWS = 1024
+# Sublanes per native `(8, 128)` VMEM tile for 32-bit dtypes. Narrower dtypes
+# pack `4 // itemsize` rows per sublane (see `_packed_row_tile`).
+_SUBLANES_32BIT = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,24 +90,55 @@ class RaggedGatherReduceMetadata:
 def _token_vmem_bytes(hidden_dim: int, itemsize: int) -> int:
   dim0 = hidden_dim // 128
   dim1 = 128
-  sublanes = 8 * max(1, 4 // itemsize)
+  sublanes = _packed_row_tile(itemsize)
   return (
       pl.cdiv(dim0, sublanes) * sublanes * pl.cdiv(dim1, 128) * 128 * itemsize
   )
+
+
+def _packed_row_tile(itemsize: int) -> int:
+  """Rows per native ``(sublanes, 128)`` tile: 8 (32-bit), 16 (16-bit), 32 (8-bit).
+
+  Dynamic row offsets into 2D ``[rows, D]`` VMEM/HBM buffers must be multiples
+  of this tile: Mosaic tiles bf16 2D VMEM buffers as ``(16, 128)`` on TPU7x and
+  rejects bf16 row slices that are only provably 8-row aligned (``E2003``).
+  """
+  return _SUBLANES_32BIT * max(1, 4 // itemsize)
 
 
 def safe_gather_block_size(
     hidden_dim: int,
     itemsize: int,
     requested_block_size: int = 1024,
+    *,
+    out_2d: bool = False,
 ) -> int:
-  """Clamps ``gather_block_size`` so 2 VMEM buffers fit within generation VMEM."""
+  """Clamps ``gather_block_size`` so VMEM buffers fit within generation VMEM."""
   vmem_budget = int(0.875 * pallas_vmem.vmem_limit_bytes())
   token_bytes = _token_vmem_bytes(hidden_dim, itemsize)
-  max_fit = vmem_budget // (_RAGGED_GATHER_TC_NUM_BUFFERS * token_bytes)
+  num_bufs = (
+      2 * _RAGGED_GATHER_TC_NUM_BUFFERS
+      if out_2d
+      else _RAGGED_GATHER_TC_NUM_BUFFERS
+  )
+  max_fit = vmem_budget // (num_bufs * token_bytes)
+  row_tile = _packed_row_tile(itemsize)
   if max_fit >= 128:
     max_fit = (max_fit // 128) * 128
+  elif out_2d and max_fit >= row_tile:
+    max_fit = (max_fit // row_tile) * row_tile
   return max(1, min(requested_block_size, max_fit))
+
+
+def roe_gather_out_2d(cap: int, itemsize: int, zero_pad_tail: bool) -> bool:
+  """Whether the Ring-of-Experts gathers store straight into a 2D ``[cap, D]`` buffer.
+
+  The 2D store needs ``cap`` to be a positive multiple of the dtype's packed
+  row tile. ``zero_pad_tail`` keeps the 3D gather, which is followed by a
+  zero fill of the rows past ``count``.
+  """
+  row_tile = _packed_row_tile(itemsize)
+  return not zero_pad_tail and cap >= row_tile and cap % row_tile == 0
 
 
 def safe_reduce_block_size(
@@ -179,16 +224,38 @@ def ragged_gather_tc(
     num_tokens: jax.Array | int,
     max_out_tokens: int,
     block_size: int = 1024,
+    *,
+    out_2d: bool = False,
 ) -> jax.Array:
-  """Gathers ``out[i] = x[indices[start + i]]`` for ``i < num_tokens`` on TC."""
+  """Gathers ``out[i] = x[indices[start + i]]`` for ``i < num_tokens`` on TC.
+
+  When ``out_2d=True`` (and ``max_out_tokens`` and ``block_size`` are multiples
+  of the dtype's packed row tile, 16 rows for bf16), each gathered 3D VMEM
+  block ``(block_size, dim0, dim1)`` is repacked in VMEM, one row tile at a
+  time, to ``(block_size, dim0 * dim1)`` (with tail rows inside the partial
+  final block zeroed) and DMA-stored directly to 2D ``[max_out_tokens, D]``
+  HBM, avoiding a full ``[max_out_tokens, dim0, dim1] -> [max_out_tokens, D]``
+  HBM layout copy.
+  """
   if max_out_tokens <= 0:
     raise ValueError(f"max_out_tokens must be positive, got {max_out_tokens}.")
   num_indices = indices.shape[0]
   _, dim0, dim1 = x.shape
+  d_dim = dim0 * dim1
+  block_size = min(block_size, max_out_tokens)
+  row_tile = _packed_row_tile(jnp.dtype(x.dtype).itemsize)
+  use_2d_store = (
+      out_2d
+      and max_out_tokens >= row_tile
+      and max_out_tokens % row_tile == 0
+      and block_size >= row_tile
+      and block_size % row_tile == 0
+  )
   if num_indices == 0 or (isinstance(num_tokens, int) and num_tokens == 0):
+    if out_2d:
+      return jnp.empty((max_out_tokens, d_dim), dtype=x.dtype)
     return jnp.empty((max_out_tokens, dim0, dim1), dtype=x.dtype)
 
-  block_size = min(block_size, max_out_tokens)
   num_buffers = _RAGGED_GATHER_TC_NUM_BUFFERS
   num_full_blocks = max_out_tokens // block_size
   rem = max_out_tokens % block_size
@@ -201,17 +268,34 @@ def ragged_gather_tc(
     indices = jnp.pad(indices, (0, idx_pad))
   max_win_start = indices.shape[0] - idx_window
 
-  def _ragged_gather_kernel(
-      scalars_smem_ref,
-      idx_hbm_ref,
-      x_hbm_ref,
-      o_hbm_ref,
-      vmem_ref,
-      idx_smem_ref,
-      idx_sem,
-      data_recv_sem,
-      data_send_sem,
-  ):
+  def _ragged_gather_kernel(*kernel_args):
+    if use_2d_store:
+      (
+          scalars_smem_ref,
+          idx_hbm_ref,
+          x_hbm_ref,
+          o_hbm_ref,
+          vmem_ref,
+          out_vmem_ref,
+          idx_smem_ref,
+          idx_sem,
+          data_recv_sem,
+          data_send_sem,
+      ) = kernel_args
+    else:
+      (
+          scalars_smem_ref,
+          idx_hbm_ref,
+          x_hbm_ref,
+          o_hbm_ref,
+          vmem_ref,
+          idx_smem_ref,
+          idx_sem,
+          data_recv_sem,
+          data_send_sem,
+      ) = kernel_args
+      out_vmem_ref = None
+
     block_idx = pl.program_id(0)
     buf_idx = block_idx % num_buffers
     start_idx = scalars_smem_ref[0]
@@ -253,7 +337,7 @@ def ragged_gather_tc(
 
         elif chunk_action == "recv_wait":
           pltpu.make_async_copy(
-              o_hbm_ref.at[pl.ds(0, size), :, :],
+              vmem_ref.at[b_idx, pl.ds(0, size), :, :],
               vmem_ref.at[b_idx, pl.ds(0, size), :, :],
               data_recv_sem.at[b_idx],
           ).wait()
@@ -298,9 +382,82 @@ def ragged_gather_tc(
           _over_valid_rows("data_start")
         elif action == "copy_out_start":
           _over_valid_rows("recv_wait")
-          _over_valid_rows("send_start")
+          if use_2d_store:
+            assert out_vmem_ref is not None
+
+            @pl.when(step_valid > 0)
+            def _repack_and_send_2d():
+              @pl.when(step_valid == length)
+              def _full():
+                @pl.loop(0, length // row_tile)
+                def _(s):
+                  r = pl.multiple_of(s * row_tile, row_tile)
+                  slab = vmem_ref[b_idx, pl.ds(r, row_tile), :, :]
+                  out_vmem_ref[b_idx, pl.ds(r, row_tile), :] = slab.reshape(
+                      row_tile, d_dim
+                  )
+
+              @pl.when(step_valid < length)
+              def _partial():
+                n_full = step_valid // row_tile
+
+                @pl.loop(0, n_full)
+                def _(s):
+                  r = pl.multiple_of(s * row_tile, row_tile)
+                  slab = vmem_ref[b_idx, pl.ds(r, row_tile), :, :]
+                  out_vmem_ref[b_idx, pl.ds(r, row_tile), :] = slab.reshape(
+                      row_tile, d_dim
+                  )
+
+                rem_r = step_valid - n_full * row_tile
+
+                @pl.when(rem_r > 0)
+                def _():
+                  r = pl.multiple_of(n_full * row_tile, row_tile)
+                  slab_2d = vmem_ref[b_idx, pl.ds(r, row_tile), :, :].reshape(
+                      row_tile, d_dim
+                  )
+                  mask = (
+                      jax.lax.broadcasted_iota(jnp.int32, (row_tile, d_dim), 0)
+                      < rem_r
+                  )
+                  out_vmem_ref[b_idx, pl.ds(r, row_tile), :] = jax.lax.select(
+                      mask, slab_2d, jnp.zeros((row_tile, d_dim), x.dtype)
+                  )
+
+                @pl.loop(pl.cdiv(step_valid, row_tile), length // row_tile)
+                def _(s):
+                  r = pl.multiple_of(s * row_tile, row_tile)
+                  out_vmem_ref[b_idx, pl.ds(r, row_tile), :] = jnp.zeros(
+                      (row_tile, d_dim), x.dtype
+                  )
+
+              pltpu.make_async_copy(
+                  out_vmem_ref.at[b_idx, pl.ds(0, length), :],
+                  o_hbm_ref.at[
+                      pl.ds(pl.multiple_of(base, row_tile), length), :
+                  ],
+                  data_send_sem.at[b_idx],
+              ).start()
+
+          else:
+            _over_valid_rows("send_start")
         elif action == "copy_out_wait":
-          _over_valid_rows("send_wait")
+          if use_2d_store:
+            assert out_vmem_ref is not None
+
+            @pl.when(step_valid > 0)
+            def _wait_send_2d():
+              pltpu.make_async_copy(
+                  out_vmem_ref.at[b_idx, pl.ds(0, length), :],
+                  o_hbm_ref.at[
+                      pl.ds(pl.multiple_of(base, row_tile), length), :
+                  ],
+                  data_send_sem.at[b_idx],
+              ).wait()
+
+          else:
+            _over_valid_rows("send_wait")
 
       if rem == 0:
         _do_len(block_size)
@@ -341,7 +498,6 @@ def ragged_gather_tc(
 
       _run_step(block_idx, buf_idx, "copy_out_wait")
 
-  out_shape = jax.ShapeDtypeStruct((max_out_tokens, dim0, dim1), x.dtype)
   scalars = jnp.stack([
       jnp.asarray(start, dtype=jnp.int32),
       jnp.asarray(num_tokens, dtype=jnp.int32),
@@ -349,7 +505,29 @@ def ragged_gather_tc(
   num_steps = pl.cdiv(
       num_tokens if isinstance(num_tokens, int) else scalars[1], block_size
   )
-  return pl.pallas_call(
+  if use_2d_store:
+    out_shape = jax.ShapeDtypeStruct((max_out_tokens, d_dim), x.dtype)
+    scratch_shapes = [
+        pltpu.VMEM((num_buffers, block_size, dim0, dim1), x.dtype),
+        pltpu.VMEM((num_buffers, block_size, d_dim), x.dtype),
+        pltpu.SMEM((idx_window,), indices.dtype),
+        pltpu.SemaphoreType.DMA(()),
+        pltpu.SemaphoreType.DMA((num_buffers,)),
+        pltpu.SemaphoreType.DMA((num_buffers,)),
+    ]
+    kernel_name = "ragged_gather_tc_2d"
+  else:
+    out_shape = jax.ShapeDtypeStruct((max_out_tokens, dim0, dim1), x.dtype)
+    scratch_shapes = [
+        pltpu.VMEM((num_buffers, block_size, dim0, dim1), x.dtype),
+        pltpu.SMEM((idx_window,), indices.dtype),
+        pltpu.SemaphoreType.DMA(()),
+        pltpu.SemaphoreType.DMA((num_buffers,)),
+        pltpu.SemaphoreType.DMA((num_buffers,)),
+    ]
+    kernel_name = "ragged_gather_tc"
+
+  res = pl.pallas_call(
       _ragged_gather_kernel,
       out_shape=out_shape,
       grid=(num_steps,),
@@ -359,19 +537,16 @@ def ragged_gather_tc(
           pl.BlockSpec(memory_space=pltpu.HBM),
       ],
       out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-      scratch_shapes=[
-          pltpu.VMEM((num_buffers, block_size, dim0, dim1), x.dtype),
-          pltpu.SMEM((idx_window,), indices.dtype),
-          pltpu.SemaphoreType.DMA(()),
-          pltpu.SemaphoreType.DMA((num_buffers,)),
-          pltpu.SemaphoreType.DMA((num_buffers,)),
-      ],
+      scratch_shapes=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=(pltpu.ARBITRARY,),
           vmem_limit_bytes=pallas_vmem.vmem_limit_bytes(),
       ),
-      name="ragged_gather_tc",
+      name=kernel_name,
   )(scalars, indices, x)
+  if out_2d and not use_2d_store:
+    return res.reshape(max_out_tokens, d_dim)
+  return res
 
 
 def ragged_gather_reduce_tc_metadata(
@@ -820,7 +995,7 @@ def _ragged_scale_and_dscore_tc(
   ``dScore`` row sums accumulate across feature chunks.
   """
   cap, d_dim = g_gathered_RD.shape
-  block = 1024
+  block = SCALE_DSCORE_BLOCK_ROWS
   itemsize = jnp.dtype(g_gathered_RD.dtype).itemsize
   vmem_limit = pallas_vmem.vmem_limit_bytes()
   d_chunk = (
@@ -906,6 +1081,66 @@ def _ragged_scale_and_dscore_tc(
   return grad_routed_RD, dw_2d.reshape(cap)
 
 
+def _repack_2d_to_3d_valid_tc(
+    x_2d: jax.Array,
+    count: jax.Array,
+) -> jax.Array:
+  """Repacks ``[0, cdiv(count, block) * block)`` of ``[cap, D]`` to ``[cap, D // 128, 128]``.
+
+  Avoids a full-buffer ``[cap, D] -> [cap, D // 128, 128]`` HBM layout copy over
+  unused padding rows past ``count``.
+  """
+  cap, d_dim = x_2d.shape
+  dim0, dim1 = d_dim // 128, 128
+  itemsize = jnp.dtype(x_2d.dtype).itemsize
+  row_tile = _packed_row_tile(itemsize)
+  vmem_limit = pallas_vmem.vmem_limit_bytes()
+  repack_block = None
+  if d_dim >= 128 and d_dim % 128 == 0:
+    for candidate in (512, 256, 128):
+      if (
+          cap >= candidate
+          and cap % candidate == 0
+          and candidate % row_tile == 0
+          and candidate * d_dim * itemsize * 4 <= int(0.75 * vmem_limit)
+      ):
+        repack_block = candidate
+        break
+  if repack_block is None:
+    return x_2d.reshape(cap, dim0, dim1)
+
+  count_1 = jnp.reshape(
+      jnp.clip(jnp.asarray(count, jnp.int32), 0, cap),
+      (1,),
+  )
+
+  def _repack_kernel(c_ref, in_2d_ref, out_3d_ref):
+    del c_ref
+    for r in range(0, repack_block, row_tile):
+      slab = in_2d_ref[pl.ds(r, row_tile), :]
+      out_3d_ref[pl.ds(r, row_tile), :, :] = slab.reshape(row_tile, dim0, dim1)
+
+  return pl.pallas_call(
+      _repack_kernel,
+      out_shape=jax.ShapeDtypeStruct((cap, dim0, dim1), x_2d.dtype),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=1,
+          grid=(pl.cdiv(count_1[0], repack_block),),
+          in_specs=[
+              pl.BlockSpec((repack_block, d_dim), lambda i, c_ref: (i, 0))
+          ],
+          out_specs=pl.BlockSpec(
+              (repack_block, dim0, dim1), lambda i, c_ref: (i, 0, 0)
+          ),
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel",),
+          vmem_limit_bytes=vmem_limit,
+      ),
+      name="repack_2d_to_3d_valid_tc",
+  )(count_1, x_2d)
+
+
 # --- PyTorch <-> JAX Custom Operators (@pallas.jax_op) ---
 
 
@@ -988,6 +1223,26 @@ def _roe_gather_fwd(
 ) -> jax.Array:
   g_tokens, d_dim = x_all_GD.shape
   x3d = x_all_GD.reshape(g_tokens, d_dim // 128, 128)
+  itemsize = jnp.dtype(x_all_GD.dtype).itemsize
+  if roe_gather_out_2d(cap, itemsize, zero_pad_tail):
+    eff_block = min(
+        gather_block_size,
+        safe_gather_block_size(
+            hidden_dim=d_dim,
+            itemsize=itemsize,
+            requested_block_size=gather_block_size,
+            out_2d=True,
+        ),
+    )
+    return ragged_gather_tc(
+        x3d,
+        token_ids_sorted_M,
+        start=start_count_2[0],
+        num_tokens=start_count_2[1],
+        max_out_tokens=cap,
+        block_size=eff_block,
+        out_2d=True,
+    )
   out3d = ragged_gather_tc(
       x3d,
       token_ids_sorted_M,
@@ -1006,6 +1261,7 @@ def _roe_gather_fwd(
 @pallas.jax_op("tt_moe::roe_gather_bwd")
 def _roe_gather_bwd(
     grad_routed_RD: jax.Array,
+    start_count_2: jax.Array,
     src_rows: jax.Array,
     tokens: jax.Array,
     blocks: jax.Array,
@@ -1014,7 +1270,7 @@ def _roe_gather_bwd(
     top_k: int,
     reduce_block_size: int,
 ) -> jax.Array:
-  cap, d_dim = grad_routed_RD.shape
+  _, d_dim = grad_routed_RD.shape
   meta = RaggedGatherReduceMetadata(
       src_rows=src_rows,
       tokens=tokens,
@@ -1022,7 +1278,7 @@ def _roe_gather_bwd(
       block_size=reduce_block_size,
       num_indices=num_indices,
   )
-  grad3d = grad_routed_RD.reshape(cap, d_dim // 128, 128)
+  grad3d = _repack_2d_to_3d_valid_tc(grad_routed_RD, start_count_2[1])
   out3d = ragged_gather_reduce_tc(
       grad3d,
       meta,
@@ -1071,7 +1327,7 @@ def _roe_unsort_fwd(
       num_indices=token_ids_sorted_M.shape[0],
   )
   out3d = ragged_gather_reduce_tc(
-      routed_output_RD.reshape(cap, d_dim // 128, 128),
+      _repack_2d_to_3d_valid_tc(routed_output_RD, count),
       meta,
       num_out_tokens=num_out_tokens,
       top_k=top_k,
@@ -1097,15 +1353,37 @@ def _roe_unsort_bwd(
   start = start_count_2[0]
   count = start_count_2[1]
 
-  g_gathered_3d = ragged_gather_tc(
-      grad_partial_GD.reshape(g_tokens, d_dim // 128, 128),
-      token_ids_sorted_M,
-      start=start,
-      num_tokens=count,
-      max_out_tokens=cap,
-      block_size=gather_block_size,
-  )
-  g_gathered_RD = g_gathered_3d.reshape(cap, d_dim)
+  grad_partial_3d = grad_partial_GD.reshape(g_tokens, d_dim // 128, 128)
+  itemsize = jnp.dtype(grad_partial_GD.dtype).itemsize
+  if roe_gather_out_2d(cap, itemsize, zero_pad_tail):
+    eff_block = min(
+        gather_block_size,
+        safe_gather_block_size(
+            hidden_dim=d_dim,
+            itemsize=itemsize,
+            requested_block_size=gather_block_size,
+            out_2d=True,
+        ),
+    )
+    g_gathered_RD = ragged_gather_tc(
+        grad_partial_3d,
+        token_ids_sorted_M,
+        start=start,
+        num_tokens=count,
+        max_out_tokens=cap,
+        block_size=eff_block,
+        out_2d=True,
+    )
+  else:
+    g_gathered_3d = ragged_gather_tc(
+        grad_partial_3d,
+        token_ids_sorted_M,
+        start=start,
+        num_tokens=count,
+        max_out_tokens=cap,
+        block_size=gather_block_size,
+    )
+    g_gathered_RD = g_gathered_3d.reshape(cap, d_dim)
 
   iota_cap = jnp.arange(cap, dtype=jnp.int32)
   valid_cap = iota_cap < count
@@ -1316,7 +1594,7 @@ class _RoESortGather(torch.autograd.Function):
       reduce_block_size: int,
       zero_pad_tail: bool,
   ) -> torch.Tensor:
-    ctx.save_for_backward(src_rows, tokens, blocks)
+    ctx.save_for_backward(start_count_2, src_rows, tokens, blocks)
     ctx.num_indices = token_ids_sorted_M.shape[0]
     ctx.num_out_tokens = x_all_GD.shape[0]
     ctx.top_k = top_k
@@ -1332,9 +1610,10 @@ class _RoESortGather(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_routed_RD: torch.Tensor):
-    src_rows, tokens, blocks = ctx.saved_tensors
+    start_count_2, src_rows, tokens, blocks = ctx.saved_tensors
     grad_x_all_GD = _roe_gather_bwd(
         grad_routed_RD.contiguous(),
+        start_count_2,
         src_rows,
         tokens,
         blocks,
@@ -1437,6 +1716,7 @@ class _RoEUnsortReduce(torch.autograd.Function):
     ctx.gather_block_size = gather_block_size
     return _roe_gather_bwd(
         routed_output_RD.contiguous(),
+        start_count_2,
         src_rows,
         tokens,
         blocks,
@@ -1502,7 +1782,9 @@ def roe_gather_row_scales(
 
 
 __all__ = [
+    "SCALE_DSCORE_BLOCK_ROWS",
     "roe_compute_routing",
+    "roe_gather_out_2d",
     "roe_gather_row_scales",
     "roe_sort_gather",
     "roe_unsort_combine",

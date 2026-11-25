@@ -7,9 +7,11 @@ EP=1 local path run on the whole batch.
 
 from unittest import mock
 
-import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
+from absl.testing import absltest
+from absl.testing import parameterized
 from torch.distributed.device_mesh import init_device_mesh
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -121,25 +123,25 @@ def _test_ep_ragged_all_to_all(device, rank, world_size, ep_size, mode):
     )
 
 
-@pytest.mark.parametrize(
-    "ep_size, mode",
-    [(2, "random"), (2, "skewed"), (2, "empty"), (4, "random"), (4, "skewed")],
-)
-def test_ragged_ep_matches_ep1(ep_size, mode):
-    distributed.run_distributed(
-        ep_size,
-        device_type.AcceleratorDeviceType.CPU,
-        _test_ep_ragged_all_to_all,
-        ep_size,
-        mode,
+class RaggedEpDispatcherDistributedTest(parameterized.TestCase):
+
+    @parameterized.parameters(
+        (2, "random"), (2, "skewed"), (2, "empty"), (4, "random"), (4, "skewed")
     )
+    def test_ragged_ep_matches_ep1(self, ep_size, mode):
+        distributed.run_distributed(
+            ep_size,
+            device_type.AcceleratorDeviceType.CPU,
+            _test_ep_ragged_all_to_all,
+            ep_size,
+            mode,
+        )
 
-
-def test_config_rejects_unknown_transport():
-    with pytest.raises(ValueError, match="ep_transport must be"):
-        TpuAllToAllTokenDispatcher.Config(
-            num_experts=8, top_k=2, ep_transport="invalid"
-        ).build()
+    def test_config_rejects_unknown_transport(self):
+        with self.assertRaisesRegex(ValueError, "ep_transport must be"):
+            TpuAllToAllTokenDispatcher.Config(
+                num_experts=8, top_k=2, ep_transport="invalid"
+            ).build()
 
 
 def _ragged_dispatcher_with_fake_mesh():
@@ -161,23 +163,24 @@ def _inputs():
     )
 
 
-def test_tracing_off_tpu_raises_instead_of_returning_zeros():
-    dispatcher = _ragged_dispatcher_with_fake_mesh()
-    dispatcher._gather_expert_counts = mock.Mock(return_value=torch.zeros(2, 2))
-    holder = _RankHolder(0)
-    dispatcher.bind_ep_rank_holder(holder)
+class RaggedDispatcherRankOwnerTest(parameterized.TestCase):
 
-    def dispatch(x, scores, ids, counts):
-        return dispatcher.dispatch(x, scores, ids, counts)
+    def test_tracing_off_tpu_raises_instead_of_returning_zeros(self):
+        dispatcher = _ragged_dispatcher_with_fake_mesh()
+        dispatcher._gather_expert_counts = mock.Mock(return_value=torch.zeros(2, 2))
+        holder = _RankHolder(0)
+        dispatcher.bind_ep_rank_holder(holder)
 
-    with pytest.raises(NotImplementedError):
-        make_fx(dispatch)(*_inputs())
+        def dispatch(x, scores, ids, counts):
+            return dispatcher.dispatch(x, scores, ids, counts)
 
+        with self.assertRaises(NotImplementedError):
+            make_fx(dispatch)(*_inputs())
 
-def test_dispatch_without_a_rank_owner_raises():
-    dispatcher = _ragged_dispatcher_with_fake_mesh()
-    with pytest.raises(RuntimeError, match="bound to a"):
-        dispatcher.dispatch(*_inputs())
+    def test_dispatch_without_a_rank_owner_raises(self):
+        dispatcher = _ragged_dispatcher_with_fake_mesh()
+        with self.assertRaisesRegex(RuntimeError, "bound to a"):
+            dispatcher.dispatch(*_inputs())
 
 
 def _traceable_dispatcher():
@@ -199,84 +202,83 @@ def _traceable_dispatcher():
     return dispatcher
 
 
-@pytest.mark.parametrize(
-    "rank_buffer, tracing_mode",
-    [
-        (None, "real"),
-        (torch.zeros(1, dtype=torch.long, device="meta"), "real"),
-        (torch.zeros(1, dtype=torch.long), "fake"),
-    ],
-    ids=["missing", "other_device", "not_a_graph_input"],
-)
-def test_tracing_without_a_usable_rank_buffer_raises(rank_buffer, tracing_mode):
-    # Falling back to a constant would bake this rank's index into the graph.
-    dispatcher = _traceable_dispatcher()
-    owner = torch.nn.Module()
-    if rank_buffer is not None:
-        owner.register_buffer("_ep_local_rank", rank_buffer, persistent=False)
-    dispatcher.bind_ep_rank_holder(owner)
+class RaggedDispatcherTracingTest(parameterized.TestCase):
 
-    def dispatch(x, scores, ids, counts):
-        return dispatcher.dispatch(x, scores, ids, counts)
-
-    with pytest.raises(RuntimeError, match="_ep_local_rank"):
-        make_fx(dispatch, tracing_mode=tracing_mode)(*_inputs())
-
-
-def test_graph_trainer_trace_reads_the_rank_from_the_owner_buffer():
-    # TpuGraphTrainer's tracer makes module buffers graph inputs, so one traced
-    # program computes each rank's offsets from that rank's own buffer.
-    dispatcher = _traceable_dispatcher()
-    owner = _RankHolder(0)
-    dispatcher.bind_ep_rank_holder(owner)
-
-    def send_sizes(x, scores, ids, counts):
-        return dispatcher.dispatch(x, scores, ids, counts)[2].disp_send_sizes
-
-    traced = minimal_fx_tracer(send_sizes, module=owner)(*_inputs())
-    run = run_traced(traced, module=owner)
-    torch.testing.assert_close(
-        run(*_inputs()), torch.tensor([2, 0], dtype=torch.int32)
+    @parameterized.named_parameters(
+        ("missing", None, "real"),
+        ("other_device", torch.zeros(1, dtype=torch.long, device="meta"), "real"),
+        ("not_a_graph_input", torch.zeros(1, dtype=torch.long), "fake"),
     )
-    owner._ep_local_rank.fill_(1)
-    torch.testing.assert_close(
-        run(*_inputs()), torch.tensor([0, 2], dtype=torch.int32)
-    )
+    def test_tracing_without_a_usable_rank_buffer_raises(
+        self, rank_buffer, tracing_mode
+    ):
+        # Falling back to a constant would bake this rank's index into the graph.
+        dispatcher = _traceable_dispatcher()
+        owner = torch.nn.Module()
+        if rank_buffer is not None:
+            owner.register_buffer("_ep_local_rank", rank_buffer, persistent=False)
+        dispatcher.bind_ep_rank_holder(owner)
 
+        def dispatch(x, scores, ids, counts):
+            return dispatcher.dispatch(x, scores, ids, counts)
 
-def test_eager_dispatch_without_a_rank_buffer_uses_the_mesh_rank():
-    # Eagerly the index is data, not part of a graph, so the mesh's rank works.
-    dispatcher = _ragged_dispatcher_with_fake_mesh()
-    dispatcher.ep_mesh.get_local_rank.return_value = 1
-    owner = torch.nn.Module()
-    dispatcher.bind_ep_rank_holder(owner)
-    torch.testing.assert_close(
-        dispatcher._get_ep_local_rank_tensor(torch.randn(2, 4)),
-        torch.tensor([1]),
-    )
+        with self.assertRaisesRegex(RuntimeError, "_ep_local_rank"):
+            make_fx(dispatch, tracing_mode=tracing_mode)(*_inputs())
 
+    def test_graph_trainer_trace_reads_the_rank_from_the_owner_buffer(self):
+        # TpuGraphTrainer's tracer makes module buffers graph inputs, so one traced
+        # program computes each rank's offsets from that rank's own buffer.
+        dispatcher = _traceable_dispatcher()
+        owner = _RankHolder(0)
+        dispatcher.bind_ep_rank_holder(owner)
 
-@pytest.mark.parametrize(
-    "has_ep, ep_transport, registers",
-    [
+        def send_sizes(x, scores, ids, counts):
+            return dispatcher.dispatch(x, scores, ids, counts)[2].disp_send_sizes
+
+        traced = minimal_fx_tracer(send_sizes, module=owner)(*_inputs())
+        run = run_traced(traced, module=owner)
+        torch.testing.assert_close(
+            run(*_inputs()), torch.tensor([2, 0], dtype=torch.int32)
+        )
+        owner._ep_local_rank.fill_(1)
+        torch.testing.assert_close(
+            run(*_inputs()), torch.tensor([0, 2], dtype=torch.int32)
+        )
+
+    def test_eager_dispatch_without_a_rank_buffer_uses_the_mesh_rank(self):
+        # Eagerly the index is data, not part of a graph, so the mesh's rank works.
+        dispatcher = _ragged_dispatcher_with_fake_mesh()
+        dispatcher.ep_mesh.get_local_rank.return_value = 1
+        owner = torch.nn.Module()
+        dispatcher.bind_ep_rank_holder(owner)
+        torch.testing.assert_close(
+            dispatcher._get_ep_local_rank_tensor(torch.randn(2, 4)),
+            torch.tensor([1]),
+        )
+
+    @parameterized.parameters(
         (True, "ragged_all_to_all", True),
         (True, "all_to_all", False),
         (False, "ragged_all_to_all", False),
-    ],
-)
-def test_parallelize_registers_the_rank_buffer_only_for_ragged_ep(
-    has_ep, ep_transport, registers
-):
-    routed = TpuRoutedExperts.Config(
-        inner_experts=GroupedExperts.Config(dim=4, hidden_dim=4, num_experts=2),
-        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
-            num_experts=2, top_k=1, ep_transport=ep_transport
-        ),
-    ).build()
-    mesh = mock.Mock()
-    mesh.device_type = "cpu"
-    mesh.get_local_rank.return_value = 0
-    parallel_dims = mock.Mock()
-    parallel_dims.get_optional_mesh.return_value = mesh if has_ep else None
-    routed.parallelize(parallel_dims)
-    assert ("_ep_local_rank" in dict(routed.named_buffers())) == registers
+    )
+    def test_parallelize_registers_the_rank_buffer_only_for_ragged_ep(
+        self, has_ep, ep_transport, registers
+    ):
+        routed = TpuRoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(dim=4, hidden_dim=4, num_experts=2),
+            token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+                num_experts=2, top_k=1, ep_transport=ep_transport
+            ),
+        ).build()
+        mesh = mock.Mock()
+        mesh.device_type = "cpu"
+        mesh.get_local_rank.return_value = 0
+        parallel_dims = mock.Mock()
+        parallel_dims.get_optional_mesh.return_value = mesh if has_ep else None
+        routed.parallelize(parallel_dims)
+        assert ("_ep_local_rank" in dict(routed.named_buffers())) == registers
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
+    absltest.main()

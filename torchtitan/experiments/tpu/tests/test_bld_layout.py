@@ -15,8 +15,13 @@ from torchtitan.experiments.tpu.overrides.bf16_rope import tpu_activation_dtype_
 from torchtitan.experiments.tpu.overrides.real_rope import tpu_real_arithmetic_complex_rope
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+from torchtitan.experiments.tpu.examples.gemma4.model import (
+    FusedQKVLinearKeqV,
+    fused_qk_param_init,
+)
 from torchtitan.models.common import ComplexRoPE
 from torchtitan.models.common import CosSinRoPE
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3 import _build_llama3_layers
 from torchtitan.models.qwen3 import _build_qwen3_layers
 
@@ -33,7 +38,7 @@ def _cossin_rope():
   )
 
 
-def _qwen3_block(fuse_qkv: bool, rope=None):
+def _qwen3_block(rope=None):
   return _build_qwen3_layers(
       n_layers=1,
       dim=_DIM,
@@ -41,13 +46,12 @@ def _qwen3_block(fuse_qkv: bool, rope=None):
       n_kv_heads=2,
       head_dim=_HEAD_DIM,
       hidden_dim=256,
-      fuse_qkv=fuse_qkv,
       attn_backend="sdpa",
       rope=rope or _cossin_rope(),
   )[0]
 
 
-def _llama3_block(fuse_qkv: bool, real: bool):
+def _llama3_block(real: bool):
   rope = ComplexRoPE.Config(
       dim=_HEAD_DIM, max_context_length=_MAX_LEN, theta=500000.0
   )
@@ -59,26 +63,46 @@ def _llama3_block(fuse_qkv: bool, real: bool):
       n_heads=4,
       n_kv_heads=2,
       hidden_dim=256,
-      fuse_qkv=fuse_qkv,
       attn_backend="sdpa",
       rope=rope,
   )[0]
 
 
 def _packed_qwen3_block():
-  return TpuPackedQKVConverter.Config().build().convert(_qwen3_block(True))
+  return TpuPackedQKVConverter.Config().build().convert(_qwen3_block())
+
+
+def _packed_qwen3_keqv_block():
+  block = _qwen3_block()
+  qkv = block.attention.qkv_linear
+  block.attention.qkv_linear = FusedQKVLinearKeqV.Config(
+      n_heads=qkv.n_heads,
+      n_kv_heads=qkv.n_kv_heads,
+      head_dim=qkv.head_dim,
+      wqkv=Linear.Config(
+          in_features=_DIM,
+          out_features=(qkv.n_heads + qkv.n_kv_heads) * qkv.head_dim,
+          bias=True,
+          param_init=fused_qk_param_init(
+              {"weight": torch.nn.init.normal_, "bias": torch.nn.init.zeros_},
+              n_heads=qkv.n_heads,
+              n_kv_heads=qkv.n_kv_heads,
+              head_dim=qkv.head_dim,
+          ),
+      ),
+  )
+  return TpuPackedQKVConverter.Config().build().convert(block)
 
 
 _BLOCKS = {
-    "qwen3_qkv": lambda: _qwen3_block(False),
-    "qwen3_fused": lambda: _qwen3_block(True),
+    "qwen3_fused": _qwen3_block,
     "qwen3_packed": _packed_qwen3_block,
+    "qwen3_packed_keqv": _packed_qwen3_keqv_block,
     "qwen3_bf16_rope": lambda: _qwen3_block(
-        False, tpu_activation_dtype_cossin_rope(_cossin_rope())
+        tpu_activation_dtype_cossin_rope(_cossin_rope())
     ),
-    "llama3_complex": lambda: _llama3_block(True, real=False),
-    "llama3_real": lambda: _llama3_block(True, real=True),
-    "llama3_qkv_real": lambda: _llama3_block(False, real=True),
+    "llama3_complex": lambda: _llama3_block(real=False),
+    "llama3_real": lambda: _llama3_block(real=True),
 }
 
 
@@ -140,7 +164,7 @@ class BLDLayoutTest(parameterized.TestCase):
       torch.testing.assert_close(g_actual, g_expected, rtol=1e-4, atol=1e-4)
 
   def test_idempotent(self):
-    _, bld = _build_pair("qwen3_qkv")
+    _, bld = _build_pair("qwen3_fused")
     self.assertEqual(apply_bld_layout(bld), 1)
     cls, attn_cls = type(bld), type(bld.attention)
     self.assertEqual(apply_bld_layout(bld), 1)
@@ -148,7 +172,7 @@ class BLDLayoutTest(parameterized.TestCase):
     self.assertIs(type(bld.attention), attn_cls)
 
   def test_ineligible_block_is_untouched(self):
-    _, block = _build_pair("qwen3_qkv")
+    _, block = _build_pair("qwen3_fused")
 
     class CustomRoPE(type(block.attention.rope)):
 
@@ -161,7 +185,7 @@ class BLDLayoutTest(parameterized.TestCase):
     self.assertIs(type(block), cls)
 
   @parameterized.named_parameters(
-      ("qkv", "qwen3_qkv"), ("fused", "llama3_real"), ("packed", "qwen3_packed")
+      ("fused", "llama3_real"), ("packed", "qwen3_packed")
   )
   def test_qkv_subclass_swapped_later(self, name):
     # SimpleFSDP swaps parametrized modules to generated subclasses after the
@@ -183,7 +207,7 @@ class BLDLayoutTest(parameterized.TestCase):
   def test_instance_forward_wrapper_is_untouched(self):
     # e.g. the graph trainer's `annotate_module_fqns`: a class swap after it
     # would not take effect, so the block must be left alone.
-    _, block = _build_pair("qwen3_qkv")
+    _, block = _build_pair("qwen3_fused")
     block.attention.forward = block.attention.forward
     cls = type(block)
     self.assertEqual(apply_bld_layout(block), 0)

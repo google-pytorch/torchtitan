@@ -264,6 +264,14 @@ class Qwen35ForwardTest(absltest.TestCase):
       with self.subTest(config_cls.__qualname__):
         self.assertIs(tpu_model_class(config_cls).forward, _layer_loop_forward)
 
+  def test_the_tpu_model_is_rewritten(self) -> None:
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.experiments.tpu.qwen3_5.model import _tpu_layer_loop_forward, TpuQwen35Model
+
+    self.assertIs(
+        tpu_model_class(TpuQwen35Model.Config).forward, _tpu_layer_loop_forward
+    )
+
 
 class ConfigRewriteTest(absltest.TestCase):
 

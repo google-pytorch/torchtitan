@@ -822,7 +822,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             base.compile,
             fsdp_barrier_policy="interleave",
             fsdp_allreduce_slice_parameter_patterns=(
-                "layers.*.feed_forward.w13.weight",
+                "layers.*.feed_forward.w13_packed.weight",
             ),
             fsdp_allreduce_slice_max_input_bytes=25600 * 5120 * 4,
         ),

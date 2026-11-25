@@ -679,7 +679,17 @@ class _GatheredSwiGLUExperts(torch.nn.Module):
         self.w2 = init(hidden, dim)
 
     def unshard_weights(self):
-        return tuple(_AllGather.apply(w) for w in (self.w1, self.w2, self.w3))
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            FSDP_PARAM_FQNS_META,
+        )
+
+        # As SimpleFSDP's parametrization does: GraphTrainer finds a parameter's
+        # unshard by this provenance on the all-gather and its wait.
+        weights = []
+        for name in ("w1", "w2", "w3"):
+            with torch.fx.traceback.annotate({FSDP_PARAM_FQNS_META: (name,)}):
+                weights.append(_AllGather.apply(getattr(self, name)))
+        return tuple(weights)
 
     def forward(
         self, x_RD, num_tokens_per_expert_E, row_scale_R=None, *, pre_unsharded_weights

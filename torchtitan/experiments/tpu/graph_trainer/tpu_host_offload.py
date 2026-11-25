@@ -243,11 +243,11 @@ def offload_scan_activations(
     getting it gives a correct run at the wrong memory.
     """
     found = dict.fromkeys(names, 0)
-    forward_scans = 0
+    num_forward_scans = 0
     for node in gm.graph.find_nodes(op="call_function", target=_SCAN_HOP):
         if _is_backward_node(node):
             continue
-        forward_scans += 1
+        num_forward_scans += 1
         body = _scan_body(gm, node)
         outs = _outputs(body)
         for name in names:
@@ -257,14 +257,14 @@ def offload_scan_activations(
             for index in saved:
                 _offload_one(gm, node, index, name)
                 found[name] += 1
-    if not forward_scans:
+    if not num_forward_scans:
         raise RuntimeError(
             "scan offload found no forward scan; it needs "
             "--compile.use-scan-layers."
         )
     if found.get(SAVED_CARRY) == 0:
         raise RuntimeError(
-            f"scan offload: {forward_scans} forward scans, none saves its "
+            f"scan offload: {num_forward_scans} forward scans, none saves its "
             "carry (is the layer input recomputed instead of saved?)"
         )
     missing = [name for name, count in found.items() if not count]

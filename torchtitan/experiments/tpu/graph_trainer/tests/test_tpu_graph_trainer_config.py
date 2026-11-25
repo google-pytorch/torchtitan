@@ -486,6 +486,18 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, error):
       self._qwen3_graph_config(config)
 
+  def test_scan_offload_warns_that_the_budget_is_ignored(self) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "full_and_scan_offload"
+    config.compile.cpu_offload_budget_gb = 4.5
+
+    with self.assertLogs(level="WARNING") as logs:
+      self._qwen3_graph_config(config)
+    self.assertTrue(
+        any("cpu_offload_budget_gb is ignored" in m for m in logs.output)
+    )
+
   @parameterized.parameters(
       "default", "full", "eager", "sac_and_offload", "full_and_offload"
   )

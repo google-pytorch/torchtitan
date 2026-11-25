@@ -51,7 +51,8 @@ import torch
 from torch import nn
 from torch._higher_order_ops.scan import scan
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.func import functional_call
 
 from torchtitan.config import derive
@@ -225,6 +226,125 @@ class LayerStackHolder(Module):
         # Meshes used to view one layer of a flattened stack in its original
         # shape, keyed by (FSDP mesh, size of the first per-layer axis).
         self.split_meshes: dict[tuple[DeviceMesh, int], DeviceMesh] = {}
+        # Expert-parallel (EP) stacks: stack name -> the per-layer axis EP
+        # shards. They skip dense SimpleFSDP and live on the expert mesh
+        # instead; see `stash_expert_stacks` and `place_expert_stacks`.
+        self.ep_dims: dict[str, int] = {}
+        self._ep_pending: dict[str, nn.Parameter] = {}
+
+    def stash_expert_stacks(self, ep_dims: dict[str, int]) -> None:
+        """Takes the EP-sharded stacks out before dense SimpleFSDP sees them.
+
+        Dense SimpleFSDP would shard them over every rank, and the scan body
+        would then gather all experts on every rank. ``place_expert_stacks``
+        puts them back on ``([dp_replicate,] efsdp, ep)`` once dense FSDP is
+        done. Idempotent: it runs on each ``configure_simple_fsdp_shard_dims``.
+        """
+        for name, dim in ep_dims.items():
+            if name in self.ep_dims:
+                continue
+            self._ep_pending[name] = self._parameters.pop(name)
+            self.ep_dims[name] = dim
+
+    def place_expert_stacks(self, parallel_dims) -> None:
+        """Puts the stashed stacks back, laid out as the splitter lays out one layer.
+
+        The splitter shards a layer's expert weight ``[E, X, Y]`` with
+        ``Shard(0)`` on ``ep`` and then SimpleFSDP shards each EP rank's block
+        again on ``efsdp`` (``_StridedShard(0, split_factor=ep)`` over the
+        spanned ``(efsdp, ep)`` mesh). A stack row gets the same placement, one
+        axis further in, so the rank at ``(efsdp=i, ep=j)`` holds piece ``i`` of
+        EP block ``j``, and an all-gather over ``efsdp`` gives EP block ``j``
+        whole: the experts this rank's EP dispatch sends tokens to.
+        ``efsdp = 1`` replicates on that axis. If the expert axis does not
+        split ``efsdp * ep`` ways, ``efsdp`` shards per-layer axis 1 instead,
+        as ``apply_qwen3_5_simple_fsdp`` does.
+        """
+        if not self._ep_pending:
+            return
+        names = (
+            ["dp_replicate", "efsdp", "ep"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp", "ep"]
+        )
+        mesh = parallel_dims.get_mesh(names)
+        efsdp, ep = mesh["efsdp"].size(), mesh["ep"].size()
+        coord = mesh.get_coordinate()
+        for name, param in list(self._ep_pending.items()):
+            d = self.ep_dims[name] + 1  # stack axis = per-layer axis + 1
+            if param.shape[d] % ep:
+                raise ValueError(
+                    f"{name} has {param.shape[d]} experts on axis {d}, which "
+                    f"ep={ep} cannot split evenly"
+                )
+            if efsdp == 1:
+                efsdp_pl = Replicate()
+            elif param.shape[d] % (efsdp * ep) == 0:
+                efsdp_pl = _StridedShard(d, split_factor=ep)
+            elif d != 2 and param.ndim > 2 and param.shape[2] % efsdp == 0:
+                efsdp_pl = Shard(2)
+            else:
+                raise ValueError(
+                    f"cannot shard {name} {tuple(param.shape)} over efsdp="
+                    f"{efsdp} x ep={ep}"
+                )
+            placements = (
+                (Replicate(),) if len(names) == 3 else ()
+            ) + (efsdp_pl, Shard(d))
+            local_shape = list(param.shape)
+            local_shape[d] //= ep
+            # `_StridedShard` is not a `Shard` subclass in this torch.
+            if isinstance(efsdp_pl, (Shard, _StridedShard)):
+                local_shape[efsdp_pl.dim] //= efsdp
+            if param.is_meta or coord is None:
+                local = torch.empty(local_shape, dtype=param.dtype, device=param.device)
+            else:
+                i, j = coord[-2], coord[-1]
+                blk = param.shape[d] // ep
+                local = param.detach().narrow(d, j * blk, blk)
+                if isinstance(efsdp_pl, (Shard, _StridedShard)):
+                    k = efsdp_pl.dim
+                    local = local.narrow(k, i * local_shape[k], local_shape[k])
+                local = local.contiguous()
+            self._parameters[name] = nn.Parameter(
+                DTensor.from_local(
+                    local,
+                    mesh,
+                    placements,
+                    run_check=False,
+                    shape=param.shape,
+                    stride=param.stride(),
+                ),
+                requires_grad=param.requires_grad,
+            )
+            del self._ep_pending[name]
+        logger.info(
+            "Placed %d expert stacks on %s (efsdp=%d, ep=%d)",
+            len(self.ep_dims),
+            names,
+            efsdp,
+            ep,
+        )
+
+    def layer_view(self, name: str, stack: torch.Tensor, row: int) -> torch.Tensor:
+        """Row ``row`` of stack ``name`` as one layer's weight, sharing storage."""
+        if name not in self.ep_dims:
+            return self.as_layer_shape(name, stack[row])
+        # `stack[row]` on a strided-sharded DTensor is not a view; build the row
+        # from the local rows with the placements shifted one axis in.
+        def shift(p):
+            if isinstance(p, _StridedShard):
+                return _StridedShard(p.dim - 1, split_factor=p.split_factor)
+            return Shard(p.dim - 1) if isinstance(p, Shard) else p
+
+        return DTensor.from_local(
+            stack.to_local()[row],
+            stack.device_mesh,
+            tuple(shift(p) for p in stack.placements),
+            run_check=False,
+            shape=stack.shape[1:],
+            stride=torch.empty(stack.shape[1:], device="meta").stride(),
+        )
 
     def flatten_for(self, degree: int) -> dict[str, torch.Size]:
         """Flattens axes 1 and 2 of stacks that can't be sharded evenly on axis 1.
@@ -471,6 +591,47 @@ class LayerStack:
                     mod = getattr(mod, part)
                 yield i, i // self.period, name, key, mod, attr
 
+    def expert_parallel_dims(self) -> dict[str, int]:
+        """Stack key -> the per-layer axis expert parallelism shards.
+
+        Read off the owning module's declared ``state_shardings`` (an ``ep``
+        entry of ``S(d)``), not off parameter names, so any model whose
+        experts declare an EP placement is covered. A module that declares an
+        EP placement must resolve one for every weight it owns: otherwise that
+        stack would be sharded by dense FSDP, and the scan body would gather
+        every expert onto every rank. That raises.
+        """
+
+        def ep_dim(layout) -> int | None:
+            t = layout.local_type.get("ep")
+            return getattr(t, "dim", None)
+
+        dims: dict[str, int] = {}
+        for i, _, name, key, mod, attr in self._slots():
+            if i >= self.period:  # Positions 0..period-1 cover every key.
+                break
+            cfg = getattr(mod, "_sharding_config", None)
+            if cfg is None:
+                continue
+            declared = {
+                n: ep_dim(l) for n, l in cfg.state_shardings.items()
+                if ep_dim(l) is not None
+            }
+            if not declared:
+                continue
+            if attr in declared:
+                dims[key] = declared[attr]
+            elif len(set(declared.values())) == 1:
+                # TpuGroupedExperts renames its weights to the kernel-native
+                # names only when it parallelizes, after this runs.
+                dims[key] = next(iter(declared.values()))
+            else:
+                raise ValueError(
+                    f"layers.{i}.{name}: its module declares EP placements "
+                    f"{declared} but none for {attr!r}; cannot place its stack"
+                )
+        return dims
+
     # -- construction ------------------------------------------------------
 
     def unregister_and_allocate(self) -> None:
@@ -555,7 +716,7 @@ class LayerStack:
             #
             # Registered by hand, because `setattr` would go through SimpleFSDP's
             # parametrization instead of the raw slot.
-            layer = self.holder.as_layer_shape(key, stack[row])
+            layer = self.holder.layer_view(key, stack, row)
             view = nn.Parameter(layer, requires_grad=stack.requires_grad)
             mod._parameters[attr] = view
             self._views[(i, name)] = view
@@ -883,6 +1044,13 @@ class LayerStack:
             with scan_body_remat_window():
                 h, _ = scan(scan_body, h, xs)
         else:
+            if self.holder.ep_dims:
+                # The loop reads whole stacks; an expert stack holds only this
+                # rank's EP block, and nothing here gathers efsdp.
+                raise NotImplementedError(
+                    "expert-parallel stacks run only as a scan "
+                    "(--compile.use-scan-layers)"
+                )
             stacks = {k: getattr(self.holder, k) for k in keys}
             for c in range(self.n_cycles):
                 h = body(h, {k: stacks[k][c] for k in keys})

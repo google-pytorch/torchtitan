@@ -530,6 +530,210 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertFalse(any("index_add" in name for name in op_names))
     self.assertFalse(any("local_scalar_dense" in name for name in op_names))
 
+  def test_packed_row_tile_and_2d_gather_selection(self):
+    self.assertEqual(ragged_gather_tc._packed_row_tile(4), 8)
+    self.assertEqual(ragged_gather_tc._packed_row_tile(2), 16)
+    self.assertEqual(ragged_gather_tc._packed_row_tile(1), 32)
+
+    # The 2D store needs cap to be a multiple of the dtype's row tile, and a
+    # zero-padded tail keeps the 3D gather.
+    self.assertTrue(ragged_gather_tc.roe_gather_out_2d(1024, 2, False))
+    self.assertFalse(ragged_gather_tc.roe_gather_out_2d(1024, 2, True))
+    self.assertFalse(ragged_gather_tc.roe_gather_out_2d(1000, 2, False))
+    self.assertTrue(ragged_gather_tc.roe_gather_out_2d(1000, 4, False))
+    self.assertFalse(ragged_gather_tc.roe_gather_out_2d(8, 2, False))
+
+    # The 2D gather stages each block twice in VMEM, so it fits fewer rows per
+    # block, and its block stays a multiple of the row tile.
+    for hidden_dim in (4096, 16384, 65536):
+      for itemsize in (4, 2):
+        with self.subTest(hidden_dim=hidden_dim, itemsize=itemsize):
+          block_3d = ragged_gather_tc.safe_gather_block_size(
+              hidden_dim, itemsize, 1024
+          )
+          block_2d = ragged_gather_tc.safe_gather_block_size(
+              hidden_dim, itemsize, 1024, out_2d=True
+          )
+          self.assertLessEqual(block_2d, block_3d)
+          self.assertEqual(
+              block_2d % ragged_gather_tc._packed_row_tile(itemsize), 0
+          )
+
+  def test_2d_gather_path_matches_reference_and_ignores_tail_rows(self):
+    """cap = 1024 takes the 2D gathers and the valid-prefix 2D -> 3D repack."""
+    self._require_tpu()
+    dev = self.accelerator_device
+    torch.manual_seed(5)
+
+    num_experts = 8
+    ep_size = 2
+    top_k = 4
+    num_out_tokens = 320
+    d_dim = 256
+    gather_block_size = 128
+    reduce_block_size = 128
+    ids_list = []
+    for t in range(num_out_tokens):
+      if t % 3 == 0:
+        ids_list.append([0, 1, 2, 3])
+      elif t % 3 == 1:
+        ids_list.append([0, 2, 4, 6])
+      else:
+        ids_list.append([1, 3, 5, 7])
+    ids_flat_M = torch.tensor(ids_list, device=dev, dtype=torch.int32).reshape(
+        -1
+    )
+    ep_rank_1 = torch.zeros((1,), device=dev, dtype=torch.int32)
+
+    # cap = 1024 is a multiple of the bf16 row tile (2D gathers) and of the
+    # 512-row repack block. count = 854 ends inside a gather block, inside a
+    # row tile of that block.
+    cap = 1024
+    self.assertTrue(ragged_gather_tc.roe_gather_out_2d(cap, 2, False))
+    (
+        _,
+        token_ids_sorted_M,
+        window_slot_order_cap,
+        start_count_2,
+        src_rows,
+        tokens,
+        blocks,
+    ) = ragged_gather_tc.roe_compute_routing(
+        ids_flat_M,
+        ep_rank_1,
+        num_experts=num_experts,
+        ep_size=ep_size,
+        top_k=top_k,
+        num_out_tokens=num_out_tokens,
+        cap=cap,
+        reduce_block_size=reduce_block_size,
+    )
+    start = int(start_count_2[0].item())
+    count = int(start_count_2[1].item())
+    self.assertEqual(count, 854)
+    self.assertNotEqual(count % 16, 0)
+    sorted_tokens = token_ids_sorted_M[start : start + count].long()
+
+    x = (
+        torch.randn(num_out_tokens, d_dim, device=dev, dtype=torch.bfloat16)
+        * 0.25
+    )
+    gather_kwargs = dict(
+        cap=cap,
+        top_k=top_k,
+        gather_block_size=gather_block_size,
+        reduce_block_size=reduce_block_size,
+    )
+    routing = (token_ids_sorted_M, start_count_2, src_rows, tokens, blocks)
+    nan_tail = torch.full(
+        (cap - count, d_dim), float("nan"), device=dev, dtype=torch.bfloat16
+    )
+
+    # 1) Gather: the routed rows are exact copies, the same as the 3D gather
+    # (zero_pad_tail=True keeps the 3D path), and the rest of the last gather
+    # block is zero.
+    x_2d = x.clone().requires_grad_(True)
+    gathered_2d = ragged_gather_tc.roe_sort_gather(
+        x_2d, *routing, **gather_kwargs
+    )
+    gathered_3d = ragged_gather_tc.roe_sort_gather(
+        x, *routing, zero_pad_tail=True, **gather_kwargs
+    )
+    torch.testing.assert_close(
+        gathered_2d[:count], x[sorted_tokens], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        gathered_2d[:count], gathered_3d[:count], rtol=0, atol=0
+    )
+    block_end = -(-count // gather_block_size) * gather_block_size
+    self.assertTrue(bool((gathered_2d[count:block_end] == 0).all()))
+
+    # 2) Gather backward repacks only the valid prefix: NaN gradient rows past
+    # count must not reach the input gradient.
+    grad_valid = (
+        torch.randn(count, d_dim, device=dev, dtype=torch.bfloat16) * 0.25
+    )
+    (dx_2d,) = torch.autograd.grad(
+        gathered_2d, (x_2d,), torch.cat([grad_valid, nan_tail], dim=0)
+    )
+    dx_expected = torch.zeros(
+        num_out_tokens, d_dim, device=dev, dtype=torch.float32
+    ).index_add_(0, sorted_tokens, grad_valid.float())
+    self.assertTrue(bool(torch.isfinite(dx_2d).all()))
+    self.assertLessEqual(_relative_l2_error(dx_2d, dx_expected), 1e-2)
+
+    # 3) Combine (valid-prefix repack forward, 2D gather backward) and the
+    # unweighted reduce, with NaN rows past count, against the FP32 reference.
+    scores = 0.1 + torch.rand(
+        num_out_tokens * top_k, device=dev, dtype=torch.float32
+    )
+    grad_out = (
+        torch.randn(num_out_tokens, d_dim, device=dev, dtype=torch.bfloat16)
+        * 0.25
+    )
+    for weighted in (True, False):
+      with self.subTest(weighted=weighted):
+        x_ref = x.clone().requires_grad_(True)
+        scores_ref = scores.clone().requires_grad_(True)
+        out_ref = _roe_reference(
+            x_ref,
+            ids_flat_M,
+            scores_ref,
+            ep_rank=0,
+            num_experts=num_experts,
+            ep_size=ep_size,
+            top_k=top_k,
+            weighted=weighted,
+        )
+        x_k = x.clone().requires_grad_(True)
+        scores_k = scores.clone().requires_grad_(True)
+        gathered = ragged_gather_tc.roe_sort_gather(
+            x_k, *routing, **gather_kwargs
+        )
+        routed = torch.cat([gathered[:count], nan_tail], dim=0)
+        if weighted:
+          out = ragged_gather_tc.roe_unsort_combine(
+              routed,
+              scores_k,
+              token_ids_sorted_M,
+              window_slot_order_cap,
+              start_count_2,
+              src_rows,
+              tokens,
+              blocks,
+              num_out_tokens=num_out_tokens,
+              top_k=top_k,
+              gather_block_size=gather_block_size,
+              reduce_block_size=reduce_block_size,
+          )
+          dx, dscores = torch.autograd.grad(out, (x_k, scores_k), grad_out)
+          dx_ref, dscores_ref = torch.autograd.grad(
+              out_ref, (x_ref, scores_ref), grad_out
+          )
+          self.assertTrue(bool(torch.isfinite(dscores).all()))
+          self.assertLessEqual(
+              _relative_l2_error(dscores, dscores_ref), 1e-2
+          )
+        else:
+          out = ragged_gather_tc.roe_unsort_reduce(
+              routed,
+              token_ids_sorted_M,
+              start_count_2,
+              src_rows,
+              tokens,
+              blocks,
+              num_out_tokens=num_out_tokens,
+              top_k=top_k,
+              gather_block_size=gather_block_size,
+              reduce_block_size=reduce_block_size,
+          )
+          (dx,) = torch.autograd.grad(out, (x_k,), grad_out)
+          (dx_ref,) = torch.autograd.grad(out_ref, (x_ref,), grad_out)
+        self.assertTrue(bool(torch.isfinite(out).all()))
+        self.assertTrue(bool(torch.isfinite(dx).all()))
+        self.assertLessEqual(_relative_l2_error(out, out_ref), 1e-2)
+        self.assertLessEqual(_relative_l2_error(dx, dx_ref), 1e-2)
+
 
 if __name__ == "__main__":
   absltest.main()

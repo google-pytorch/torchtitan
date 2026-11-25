@@ -9,6 +9,10 @@ of the environment as it loads.
 
 Their override precedence is as follows:
 
+  0. Parallelism defaults: under expert parallelism on libtpu older than
+     0.0.51, ``expert_parallel_libtpu_flags`` (``TENSORCORE_RAGGED_ALL_TO_ALL``).
+     They sit under the config's set, so replacing that set leaves them in
+     place; ``!flag`` in the CLI layer drops one.
   1. Config: the whole set a recipe declares. Setting ``--libtpu-init-flags`` or
      ``--xla-flags`` on the command line replaces that set.
   2. CLI: ``--extra-libtpu-init-flags`` and ``--extra-xla-flags`` add flags the
@@ -23,7 +27,9 @@ only make sense together are the named bundles below, composed with
 ``merge_flags``.
 """
 
+import importlib.metadata
 import os
+import re
 from typing import Iterable, Mapping, MutableMapping
 
 import tyro
@@ -117,6 +123,9 @@ def apply_init_flags(
   The consumer latches their values while the first program is compiled, so
   flags applied after that point are silently ignored.
 
+  ``LIBTPU_INIT_ARGS`` also gets ``expert_parallel_libtpu_flags``, under the
+  config's own flags.
+
   Args:
     config: The trainer config carrying the four flag fields.
     environ: The environment to render into, ``os.environ`` by default. Passing
@@ -128,7 +137,10 @@ def apply_init_flags(
     environ = os.environ
   _apply_flags(
       "LIBTPU_INIT_ARGS",
-      config.libtpu_init_flags,
+      # Under the config's flags, so a recipe that sets the same flag wins.
+      merge_flags(
+          expert_parallel_libtpu_flags(config), config.libtpu_init_flags
+      ),
       config.extra_libtpu_init_flags,
       environ,
   )
@@ -136,6 +148,75 @@ def apply_init_flags(
       "XLA_FLAGS",
       config.xla_flags,
       config.extra_xla_flags,
+      environ,
+  )
+
+
+def expert_parallel_libtpu_flags(config) -> FlagMap:
+  """The libtpu flags a config gets for ``expert_parallel_degree > 1``.
+
+  ``TENSORCORE_RAGGED_ALL_TO_ALL`` while the installed libtpu needs it (see
+  ``libtpu_needs_tensorcore_ragged_all_to_all``). Empty without expert
+  parallelism, or for a config with no ``parallelism``.
+  """
+  parallelism = getattr(config, "parallelism", None)
+  if getattr(parallelism, "expert_parallel_degree", 1) <= 1:
+    return FlagMap()
+  if not libtpu_needs_tensorcore_ragged_all_to_all(_installed_libtpu_version()):
+    return FlagMap()
+  return merge_flags(TENSORCORE_RAGGED_ALL_TO_ALL)
+
+
+# The first libtpu release whose SparseCore all-to-all and ragged-all-to-all
+# support TPU subslice programs (see TENSORCORE_RAGGED_ALL_TO_ALL).
+_FIRST_SUBSLICE_SPARSECORE_A2A_LIBTPU = (0, 0, 51)
+
+
+def _installed_libtpu_version() -> str | None:
+  """The installed ``libtpu`` package's version, or None if there is none."""
+  try:
+    return importlib.metadata.version("libtpu")
+  except importlib.metadata.PackageNotFoundError:
+    return None
+
+
+def libtpu_needs_tensorcore_ragged_all_to_all(version: str | None) -> bool:
+  """Whether expert parallelism must keep ragged-all-to-all on the TensorCore.
+
+  True for libtpu releases before 0.0.51 and their pre-releases
+  (``0.0.51.dev...``, ``0.0.51rc1``), and for an unknown or unparsable version,
+  where the TensorCore lowering is the safe choice.
+  """
+  match = re.match(r"(\d+)\.(\d+)\.(\d+)(.*)", version or "")
+  if match is None:
+    return True
+  release = tuple(int(part) for part in match.groups()[:3])
+  if release != _FIRST_SUBSLICE_SPARSECORE_A2A_LIBTPU:
+    return release < _FIRST_SUBSLICE_SPARSECORE_A2A_LIBTPU
+  return re.match(r"\.?(dev|a|b|rc)", match.group(4)) is not None
+
+
+def apply_expert_parallel_init_flags(
+    config,
+    *,
+    environ: MutableMapping[str, str] | None = None,
+) -> None:
+  """Applies only ``expert_parallel_libtpu_flags``; the environment still wins.
+
+  For launchers that start the trainer without ``apply_init_flags``, and so
+  without a recipe's flags, such as the distributed test harness: they still
+  need the expert-parallel defaults to run EP the way training does.
+
+  Args:
+    config: The trainer config; only ``parallelism`` is read.
+    environ: The environment to render into, ``os.environ`` by default.
+  """
+  if environ is None:
+    environ = os.environ
+  _apply_flags(
+      "LIBTPU_INIT_ARGS",
+      expert_parallel_libtpu_flags(config),
+      FlagMap(),
       environ,
   )
 
@@ -213,6 +294,29 @@ SPARSECORE_COLLECTIVE_OFFLOAD: FlagMap = {
     "xla_tpu_enable_sparse_core_collective_offload_reduce_scatter": "true",
 }
 
+# The second-generation SparseCore reduce-scatter lowering.
+SPARSECORE_REDUCE_SCATTER_V2: FlagMap = {
+    "xla_tpu_enable_sparse_core_reduce_scatter_v2": "true",
+}
+
+# Let the latency-hiding layer scheduler overlap collectives that depend on
+# each other, such as an expert-parallel token all-gather and the expert-FSDP
+# weight all-gather of the same layer.
+LAYER_SCHEDULER_FOR_DEPENDENT_COLLECTIVES: FlagMap = {
+    "xla_tpu_enable_layer_scheduler_for_dependent_collectives": "true",
+}
+
+# Keep gathers and copies on the TensorCore instead of offloading them to the
+# SparseCores. Under expert parallelism these are small routing-weight gathers
+# and ragged-buffer layout copies, which ran faster on the TensorCore in the
+# Qwen3.5-397B-A17B EP runs. Don't add `xla_tpu_enable_async_all_to_all` for
+# the ragged all-to-all: it halts the SparseCore sequencer on small
+# `ragged_all_to_all` tensors.
+EP_GATHER_COPY_ON_TENSORCORE: FlagMap = {
+    "xla_tpu_enable_offloading_gather_to_sparsecore": "false",
+    "xla_tpu_enable_offloading_copy_to_sparsecore": "false",
+}
+
 # Request TPU7x performance state 7, the throughput-oriented operating point.
 # This trades higher device power for faster compute; it does not change the
 # graph.
@@ -225,6 +329,18 @@ TPU7X_THROUGHPUT_P_STATE: FlagMap = {
 # absent; recipes benchmarked with it set explicitly keep it explicit.
 DISABLE_ENHANCED_LAUNCH_BARRIER: FlagMap = {
     "xla_tpu_use_enhanced_launch_barrier": "false",
+}
+
+# Keep ragged-all-to-all on the TensorCore. libtpu offloads it to the SparseCore
+# by default on TPU7x only. torch_tpu compiles an expert-parallel group whose
+# devices form a box of chips smaller than the slice as a TPU subslice program,
+# and libtpu before 0.0.51 doesn't support subslice programs in its SparseCore
+# all-to-all and ragged-all-to-all: every such group away from the slice origin
+# halts or hangs its SparseCores. v5e and v6e already use the TensorCore
+# lowering. expert_parallel_libtpu_flags adds this under expert parallelism on
+# libtpu older than 0.0.51.
+TENSORCORE_RAGGED_ALL_TO_ALL: FlagMap = {
+    "xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all": "false",
 }
 
 

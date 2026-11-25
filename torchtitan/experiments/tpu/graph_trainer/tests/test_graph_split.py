@@ -1025,6 +1025,70 @@ class GraphSplitTest(absltest.TestCase):
       self.assertNotIn(launch, owners)
     with self.assertRaisesRegex(ValueError, "neither a parameter gather"):
       graph_split_lib._collect_backward_collective_owners(chains, 4, ("rs",))
+    # On another process group (e.g. a context-parallel K/V gradient
+    # reduce-scatter) it is not FSDP traffic: it stays with its inputs even
+    # when RS are pipelined.
+    group_index = [a.name for a in launch.target._schema.arguments].index(
+        "group_name"
+    )
+    cp_args = (
+        launch.args[:group_index]
+        + ("cp_group",)
+        + launch.args[group_index + 1 :]
+    )
+    fsdp_args, launch.args = launch.args, cp_args
+    try:
+      owners = graph_split_lib._collect_backward_collective_owners(
+          chains, 4, ("ag", "rs")
+      )
+    finally:
+      launch.args = fsdp_args
+    self.assertNotIn(launch, owners)
+    self.assertEqual(
+        graph_split_lib._collective_group_name(launch),
+        launch.args[group_index],
+    )
+    # A gather fed only by graph inputs on another process group (e.g. a
+    # context-parallel K/V gather of activations saved from forward) is not a
+    # parameter gather: it stays with its consumer layer as "act", is never
+    # pipelined, and does not count as that layer's FSDP AG.
+    chains = collectives_lib.collect_collective_chains(backward)
+    fsdp_owners = graph_split_lib._collect_backward_collective_owners(
+        chains, 4, ("ag", "rs")
+    )
+    gather = next(
+        n
+        for n, (kind, _) in fsdp_owners.items()
+        if kind == "ag" and collectives_lib.is_gather(n)
+    )
+    gather_layer = fsdp_owners[gather][1]
+    group_index = [a.name for a in gather.target._schema.arguments].index(
+        "group_name"
+    )
+    fsdp_args = gather.args
+    gather.args = (
+        fsdp_args[:group_index] + ("cp_group",) + fsdp_args[group_index + 1 :]
+    )
+    try:
+      for pipelined_kinds in ((), ("ag", "rs")):
+        owners = graph_split_lib._collect_backward_collective_owners(
+            chains, 4, pipelined_kinds
+        )
+        self.assertEqual(owners[gather], ("act", gather_layer))
+      with self.assertRaisesRegex(
+          ValueError, "requires AG and RS ownership for every layer"
+      ):
+        split_backward_graph_by_layer(
+            backward, n_layers=4, pipeline_collectives=True
+        )
+      unpipelined = split_backward_graph_by_layer(backward, n_layers=4)
+      self.assertEqual(
+          unpipelined.partition_map[gather],
+          unpipelined.layer_to_partition[gather_layer],
+      )
+    finally:
+      gather.args = fsdp_args
+
     with self.assertRaisesRegex(ValueError, "at least one of pipeline_kinds"):
       split_backward_graph_by_layer(
           backward, n_layers=4, pipeline_collectives=True, pipeline_kinds=()

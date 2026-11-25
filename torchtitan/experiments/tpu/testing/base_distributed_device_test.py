@@ -26,6 +26,7 @@ from torchtitan.experiments.tpu.distributed import device_env
 from torchtitan.experiments.tpu.distributed import distributed_utils
 from torchtitan.experiments.tpu.testing import numerical_validation
 from torchtitan.experiments.tpu.testing import test_utils
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu import train_minimal
 from torchtitan.experiments.tpu.distributed.cp_attention import revert_tpu_context_parallel
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -772,6 +773,12 @@ class _DistributedInitWrapper:
   CLOUD_TPU_TASK_ID) from LOCAL_RANK / WORLD_SIZE, which only torchrun-spawned
   workers have, so the spawning process cannot do it on their behalf.
 
+  Of gmain's init flags, only the expert-parallel libtpu defaults are applied
+  (tpu_flags.apply_expert_parallel_init_flags), so EP tests run
+  ragged_all_to_all on the lowering training uses. The harness has never
+  applied a recipe's own flags, and turning them on would change unrelated
+  tests.
+
   A class rather than a closure because elastic_launch pickles the entry point,
   and it carries __name__ because gdist.torchrun uses it for the launch role.
   """
@@ -782,6 +789,9 @@ class _DistributedInitWrapper:
     self.__qualname__ = self.__name__
 
   def __call__(self, *args, **kwargs):
+    if args:
+      # Before the worker's first TPU op, when libtpu reads LIBTPU_INIT_ARGS.
+      tpu_flags.apply_expert_parallel_init_flags(args[0])
     distributed_utils.maybe_init_distributed()
     return self.fn(*args, **kwargs)
 

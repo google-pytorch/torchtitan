@@ -343,7 +343,10 @@ def chunked_gated_delta(
   a = (k_beta @ k.transpose(-1, -2) * decay).tril(-1)
   rhs = torch.cat([k_beta * state_decay.unsqueeze(-1), v * beta], dim=-1)
   wu = torch.linalg.solve_triangular(a, rhs, upper=False, unitriangular=True)
-  w, u = wu[..., :d_k], wu[..., d_k:]
+  # Contiguous: as strided views of `wu` (saved by selective AC), `w` and `u`
+  # cross per-block compiled backward boundaries with a storage span that does
+  # not match their shape, which XLA rejects (RuntimeProgramInputMismatch).
+  w, u = wu[..., :d_k].contiguous(), wu[..., d_k:].contiguous()
 
   # State-independent per-chunk terms, batched over all chunks.
   qk = q @ k.transpose(-1, -2) * decay  # Causal, including the diagonal.
@@ -504,12 +507,26 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
       conv_v_weight_C1W: torch.Tensor,
       A_log_H: torch.Tensor,
       dt_bias_H: torch.Tensor,
-      cu_seqlens: torch.Tensor,
+      cu_seqlens: torch.Tensor | None,
       *,
       key_head_dim: int,
       value_head_dim: int,
       positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    """``InnerGatedDeltaNet.forward`` over ``[B, S]`` rows, with resets.
+
+    Takes upstream's arguments; only those that differ are listed.
+
+    Args:
+      cu_seqlens: Unused (rows come from ``set_unflatten_seq_len``); may be
+        ``None``.
+      positions: Per-token positions; packed documents (``positions == 0``)
+        restart the convolution and the recurrence. ``None`` runs each row as
+        one stream.
+
+    Returns:
+      The ``(T, H, V)`` output.
+    """
     del cu_seqlens  # Rows come from set_unflatten_seq_len instead.
     num_tokens = query_TC.shape[0]
     g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
@@ -629,6 +646,8 @@ class TpuGatedDeltaNet(GatedDeltaNet):
   recurrence at every packed document. Upstream instead passes ``cu_seqlens``
   document offsets, which ``Qwen35Model`` only builds for the flex and varlen
   attention backends and whose shape changes with the number of documents.
+  Under context parallelism it also passes ``full_positions`` to the CP inner
+  module (``cp_gated_delta.CPTpuInnerGatedDeltaNet``).
 
   ``Config.document_resets.enabled=False`` drops ``positions`` instead, so the
   convolution and the recurrence run over each ``[B, S]`` row as one stream, as
@@ -665,7 +684,22 @@ class TpuGatedDeltaNet(GatedDeltaNet):
       x_TD: torch.Tensor,
       attention_masks: VarlenMetadata | None = None,
       positions: torch.Tensor | None = None,
+      *,
+      full_positions: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    """GatedDeltaNet forward (upstream, plus positions).
+
+    Args:
+      x_TD: The layer input.
+      attention_masks: Varlen metadata, used for ``cu_seqlens`` only.
+      positions: Per-token positions; packed documents start at 0.
+      full_positions: Under context parallelism, every token's position in
+        sequence order (``TpuQwen35Model.forward``'s ``cp_full_positions``), so
+        the CP inner module does not all-gather ``positions``.
+
+    Returns:
+      The layer output.
+    """
     num_tokens = x_TD.shape[0]
     if attention_masks is not None:
       cu_seqlens = attention_masks.cu_seq_q
@@ -684,6 +718,11 @@ class TpuGatedDeltaNet(GatedDeltaNet):
     gate_TC = self.in_proj_z(x_TD)
     a_TH = self.in_proj_a(x_TD)
     b_TH = self.in_proj_b(x_TD)
+    position_kwargs = {}
+    if self.reset_at_documents:
+      position_kwargs["positions"] = positions
+      if full_positions is not None:
+        position_kwargs["full_positions"] = full_positions
 
     output_THV = self.inner_gated_delta_net(
         query_TC,
@@ -701,7 +740,7 @@ class TpuGatedDeltaNet(GatedDeltaNet):
         value_head_dim=self.value_head_dim,
         # TPU: pass `positions` so packed documents restart conv + recurrence,
         # unless document resets are disabled (pretraining).
-        positions=positions if self.reset_at_documents else None,
+        **position_kwargs,
     )
     gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
     output_THV = self.norm(output_THV, gate_THV)

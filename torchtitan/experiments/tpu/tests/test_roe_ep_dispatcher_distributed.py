@@ -9,9 +9,11 @@ ragged all-to-all logic.
 
 from unittest import mock
 
-import pytest
+from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 import torch.nn.functional as F
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -187,24 +189,23 @@ def _run_ep_roe_parity(device, rank, world_size, mode, fuse_score_bwd):
     )
 
 
-@pytest.mark.parametrize(
-    "ep_size, mode, fuse_score_bwd",
-    [
+class RoeEpParityTest(parameterized.TestCase):
+
+    @parameterized.parameters(
         (2, "random", False),
         (2, "skewed", True),
         (2, "empty", False),
         (4, "random", True),
         (4, "skewed", False),
-    ],
-)
-def test_roe_ep_matches_ep1(ep_size, mode, fuse_score_bwd):
-    distributed.run_distributed(
-        ep_size,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_ep_roe_parity,
-        mode,
-        fuse_score_bwd,
     )
+    def test_roe_ep_matches_ep1(self, ep_size, mode, fuse_score_bwd):
+        distributed.run_distributed(
+            ep_size,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_ep_roe_parity,
+            mode,
+            fuse_score_bwd,
+        )
 
 
 def _run_auto_ep_transport(device, rank, world_size, top_k, expect_roe):
@@ -266,22 +267,21 @@ def _run_auto_ep_transport(device, rank, world_size, top_k, expect_roe):
     torch.testing.assert_close(local_scores.grad, ref_scores.grad[s:e])
 
 
-@pytest.mark.parametrize(
-    "ep_size, top_k, expect_roe",
-    [
+class AutoEpTransportParityTest(parameterized.TestCase):
+
+    @parameterized.parameters(
         (2, 2, True),
         (4, 2, False),
         (4, 4, True),
-    ],
-)
-def test_auto_ep_transport_matches_ep1(ep_size, top_k, expect_roe):
-    distributed.run_distributed(
-        ep_size,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_auto_ep_transport,
-        top_k,
-        expect_roe,
     )
+    def test_auto_ep_transport_matches_ep1(self, ep_size, top_k, expect_roe):
+        distributed.run_distributed(
+            ep_size,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_auto_ep_transport,
+            top_k,
+            expect_roe,
+        )
 
 
 def _run_ep_scale_before_down_proj(device, rank, world_size, ep_transport):
@@ -381,96 +381,89 @@ def _run_ep_scale_before_down_proj(device, rank, world_size, ep_transport):
     )
 
 
-@pytest.mark.parametrize(
-    "ep_size, ep_transport",
-    [
+class TokenDispatcherTest(parameterized.TestCase):
+
+    @parameterized.parameters(
         (2, "ring_of_experts"),
         (4, "ring_of_experts"),
         (2, "ragged_all_to_all"),
         (4, "ragged_all_to_all"),
         (2, "auto"),
         (4, "auto"),
-    ],
-)
-def test_ep_scale_before_down_proj_matches_ep1(ep_size, ep_transport):
-    distributed.run_distributed(
-        ep_size,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_ep_scale_before_down_proj,
-        ep_transport,
     )
-
-
-def test_auto_transport_resolution():
-    x = torch.zeros(2, 128)
-    reference = ReferenceRoETokenDispatcher.Config(
-        num_experts=16, top_k=4, ep_transport="auto"
-    ).build()
-    assert reference._resolve_ep_transport(2, x) == "ring_of_experts"
-    assert reference._resolve_ep_transport(4, x) == "ring_of_experts"
-    assert reference._resolve_ep_transport(8, x) == "ragged_all_to_all"
-
-    dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=16, top_k=4, ep_transport="auto"
-    ).build()
-    # Off TPU the Pallas Ring-of-Experts cannot run, so auto picks ragged.
-    assert dispatcher._resolve_ep_transport(2, x) == "ragged_all_to_all"
-    with mock.patch.object(
-        dispatcher, "ring_of_experts_unsupported_reason", return_value=None
-    ):
-        assert dispatcher._resolve_ep_transport(4, x) == "ring_of_experts"
-        assert dispatcher._resolve_ep_transport(8, x) == "ragged_all_to_all"
-
-
-def test_ring_of_experts_unsupported_reason():
-    dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=16, top_k=4, ep_transport="ring_of_experts"
-    ).build()
-    assert dispatcher.ring_of_experts_unsupported_reason("tpu", 256) is None
-    assert dispatcher.ring_of_experts_unsupported_reason("tpu") is None
-    assert "needs a TPU" in dispatcher.ring_of_experts_unsupported_reason(
-        "cpu", 256
-    )
-    assert "% 128" in dispatcher.ring_of_experts_unsupported_reason("tpu", 96)
-
-
-def test_explicit_ring_of_experts_raises_when_pallas_cannot_run():
-    dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=4, top_k=2, ep_transport="ring_of_experts"
-    ).build()
-    ep_mesh = mock.Mock()
-    ep_mesh.size.return_value = 2
-    dispatcher.ep_mesh = ep_mesh
-    holder = _RankHolder(0)  # bind_ep_rank_holder keeps only a weak reference
-    dispatcher.bind_ep_rank_holder(holder)
-    with pytest.raises(ValueError, match="ring_of_experts.*needs a TPU"):
-        dispatcher.dispatch(
-            torch.randn(2, 128),
-            torch.randn(2, 2),
-            torch.zeros(2, 2, dtype=torch.long),
-            torch.tensor([4, 0, 0, 0]),
+    def test_ep_scale_before_down_proj_matches_ep1(self, ep_size, ep_transport):
+        distributed.run_distributed(
+            ep_size,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_ep_scale_before_down_proj,
+            ep_transport,
         )
-    with mock.patch.object(
-        dispatcher,
-        "ring_of_experts_unsupported_reason",
-        side_effect=lambda device_type, hidden_dim=None: (
-            TpuAllToAllTokenDispatcher.ring_of_experts_unsupported_reason(
-                dispatcher, "tpu", hidden_dim
-            )
-        ),
-    ):
-        with pytest.raises(ValueError, match="hidden_dim % 128"):
+
+    def test_auto_transport_resolution(self):
+        x = torch.zeros(2, 128)
+        reference = ReferenceRoETokenDispatcher.Config(
+            num_experts=16, top_k=4, ep_transport="auto"
+        ).build()
+        assert reference._resolve_ep_transport(2, x) == "ring_of_experts"
+        assert reference._resolve_ep_transport(4, x) == "ring_of_experts"
+        assert reference._resolve_ep_transport(8, x) == "ragged_all_to_all"
+
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=16, top_k=4, ep_transport="auto"
+        ).build()
+        # Off TPU the Pallas Ring-of-Experts cannot run, so auto picks ragged.
+        assert dispatcher._resolve_ep_transport(2, x) == "ragged_all_to_all"
+        with mock.patch.object(
+            dispatcher, "ring_of_experts_unsupported_reason", return_value=None
+        ):
+            assert dispatcher._resolve_ep_transport(4, x) == "ring_of_experts"
+            assert dispatcher._resolve_ep_transport(8, x) == "ragged_all_to_all"
+
+    def test_ring_of_experts_unsupported_reason(self):
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=16, top_k=4, ep_transport="ring_of_experts"
+        ).build()
+        assert dispatcher.ring_of_experts_unsupported_reason("tpu", 256) is None
+        assert dispatcher.ring_of_experts_unsupported_reason("tpu") is None
+        assert "needs a TPU" in dispatcher.ring_of_experts_unsupported_reason(
+            "cpu", 256
+        )
+        assert "% 128" in dispatcher.ring_of_experts_unsupported_reason("tpu", 96)
+
+    def test_explicit_ring_of_experts_raises_when_pallas_cannot_run(self):
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport="ring_of_experts"
+        ).build()
+        ep_mesh = mock.Mock()
+        ep_mesh.size.return_value = 2
+        dispatcher.ep_mesh = ep_mesh
+        holder = _RankHolder(0)  # bind_ep_rank_holder keeps only a weak reference
+        dispatcher.bind_ep_rank_holder(holder)
+        with self.assertRaisesRegex(ValueError, "ring_of_experts.*needs a TPU"):
             dispatcher.dispatch(
-                torch.randn(2, 96),
+                torch.randn(2, 128),
                 torch.randn(2, 2),
                 torch.zeros(2, 2, dtype=torch.long),
                 torch.tensor([4, 0, 0, 0]),
             )
+        with mock.patch.object(
+            dispatcher,
+            "ring_of_experts_unsupported_reason",
+            side_effect=lambda device_type, hidden_dim=None: (
+                TpuAllToAllTokenDispatcher.ring_of_experts_unsupported_reason(
+                    dispatcher, "tpu", hidden_dim
+                )
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "hidden_dim % 128"):
+                dispatcher.dispatch(
+                    torch.randn(2, 96),
+                    torch.randn(2, 2),
+                    torch.zeros(2, 2, dtype=torch.long),
+                    torch.tensor([4, 0, 0, 0]),
+                )
 
-
-@pytest.mark.parametrize(
-    "factor, num_routed, ep_size, align, expected",
-    [
+    @parameterized.parameters(
         (None, 512, 4, 1024, 2048),  # dropless worst case, never rounded
         (2.0, 512, 4, 1024, 1024),  # already aligned
         (3.0, 512, 4, 1024, 2048),  # 1536 -> 2048, clamped to worst case
@@ -480,289 +473,289 @@ def test_explicit_ring_of_experts_raises_when_pallas_cannot_run():
         (0.75, 8, 4, 1, 6),  # no alignment (ragged all-to-all, reference)
         (3.0, 512, 4, 1, 1536),
         (2.0, 0, 4, 1024, 1),  # no routes
-    ],
-)
-def test_ep_buffer_capacity_rounding(factor, num_routed, ep_size, align, expected):
-    dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=8, top_k=2, ep_capacity_factor=factor
-    ).build()
-    cap = dispatcher._ep_buffer_capacity(num_routed, ep_size, align_rows=align)
-    assert cap == expected
-    assert cap <= ep_size * max(num_routed, 1)
-    if factor is not None and num_routed > 0 and cap < ep_size * num_routed:
-        assert cap % align == 0
-
-
-def test_roe_metadata_is_not_local_metadata():
-    assert not issubclass(TpuRoEDispatchMetadata, LocalDispatchMetadata)
-
-
-@pytest.mark.parametrize("ep_transport", ["ring_of_experts", "auto"])
-def test_roe_dispatch_without_rank_owner_raises(ep_transport):
-    dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=4, top_k=2, ep_transport=ep_transport
-    ).build()
-    ep_mesh = mock.Mock()
-    ep_mesh.size.return_value = 2
-    dispatcher.ep_mesh = ep_mesh
-    with pytest.raises(RuntimeError, match="bound to a"):
-        dispatcher.dispatch(
-            torch.randn(2, 4),
-            torch.randn(2, 2),
-            torch.zeros(2, 2, dtype=torch.long),
-            torch.tensor([4, 0, 0, 0]),
-        )
-
-
-def test_roe_tracing_off_tpu_raises_instead_of_repeating_shards():
-    from torchtitan.experiments.tpu.components.token_dispatcher import (
-        _EpAllGather,
-        _EpReduceScatter,
     )
+    def test_ep_buffer_capacity_rounding(
+        self, factor, num_routed, ep_size, align, expected
+    ):
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=8, top_k=2, ep_capacity_factor=factor
+        ).build()
+        cap = dispatcher._ep_buffer_capacity(num_routed, ep_size, align_rows=align)
+        assert cap == expected
+        assert cap <= ep_size * max(num_routed, 1)
+        if factor is not None and num_routed > 0 and cap < ep_size * num_routed:
+            assert cap % align == 0
 
-    ep_mesh = mock.Mock()
-    ep_mesh.size.return_value = 2
-    ep_mesh.get_local_rank.return_value = 0
-    ep_mesh.get_group.return_value = mock.Mock()
+    def test_roe_metadata_is_not_local_metadata(self):
+        assert not issubclass(TpuRoEDispatchMetadata, LocalDispatchMetadata)
 
-    with pytest.raises(NotImplementedError, match="Ring-of-Experts"):
-        make_fx(lambda x: _EpAllGather.apply(x, ep_mesh, ep_mesh.get_group()))(
-            torch.randn(2, 4)
+    @parameterized.parameters("ring_of_experts", "auto")
+    def test_roe_dispatch_without_rank_owner_raises(self, ep_transport):
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport=ep_transport
+        ).build()
+        ep_mesh = mock.Mock()
+        ep_mesh.size.return_value = 2
+        dispatcher.ep_mesh = ep_mesh
+        with self.assertRaisesRegex(RuntimeError, "bound to a"):
+            dispatcher.dispatch(
+                torch.randn(2, 4),
+                torch.randn(2, 2),
+                torch.zeros(2, 2, dtype=torch.long),
+                torch.tensor([4, 0, 0, 0]),
+            )
+
+    def test_roe_tracing_off_tpu_raises_instead_of_repeating_shards(self):
+        from torchtitan.experiments.tpu.components.token_dispatcher import (
+            _EpAllGather,
+            _EpReduceScatter,
         )
-    with pytest.raises(NotImplementedError, match="Ring-of-Experts"):
-        make_fx(
-            lambda x: _EpReduceScatter.apply(x, ep_mesh, ep_mesh.get_group())
-        )(torch.randn(4, 4))
 
-    dispatcher = ReferenceRoETokenDispatcher.Config(
-        num_experts=4, top_k=2, ep_transport="ring_of_experts"
-    ).build()
-    dispatcher.ep_mesh = ep_mesh
-    holder = _RankHolder(0)
-    dispatcher.bind_ep_rank_holder(holder)
+        ep_mesh = mock.Mock()
+        ep_mesh.size.return_value = 2
+        ep_mesh.get_local_rank.return_value = 0
+        ep_mesh.get_group.return_value = mock.Mock()
 
-    def step(x, scores, ids, counts):
-        return dispatcher.dispatch(x, scores, ids, counts)
+        with self.assertRaisesRegex(NotImplementedError, "Ring-of-Experts"):
+            make_fx(lambda x: _EpAllGather.apply(x, ep_mesh, ep_mesh.get_group()))(
+                torch.randn(2, 4)
+            )
+        with self.assertRaisesRegex(NotImplementedError, "Ring-of-Experts"):
+            make_fx(
+                lambda x: _EpReduceScatter.apply(x, ep_mesh, ep_mesh.get_group())
+            )(torch.randn(4, 4))
 
-    with pytest.raises(NotImplementedError):
-        make_fx(step)(
-            torch.randn(2, 4),
-            torch.randn(2, 2),
-            torch.zeros(2, 2, dtype=torch.long),
-            torch.tensor([4, 0, 0, 0]),
-        )
+        dispatcher = ReferenceRoETokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport="ring_of_experts"
+        ).build()
+        dispatcher.ep_mesh = ep_mesh
+        holder = _RankHolder(0)
+        dispatcher.bind_ep_rank_holder(holder)
 
+        def step(x, scores, ids, counts):
+            return dispatcher.dispatch(x, scores, ids, counts)
 
-@pytest.mark.parametrize(
-    "ep_transport, use_pallas, expected_zero_pad",
-    [
+        with self.assertRaises(NotImplementedError):
+            make_fx(step)(
+                torch.randn(2, 4),
+                torch.randn(2, 2),
+                torch.zeros(2, 2, dtype=torch.long),
+                torch.tensor([4, 0, 0, 0]),
+            )
+
+    @parameterized.parameters(
         ("ring_of_experts", False, True),
         ("ring_of_experts", True, False),
         ("auto", False, True),
         ("auto", True, False),
-    ],
-)
-def test_parallelize_registers_rank_buffer_and_sets_tail_zero_pad(
-    ep_transport, use_pallas, expected_zero_pad
-):
-    routed = TpuRoutedExperts.Config(
-        inner_experts=TpuGroupedExperts.Config(
-            dim=128,
-            hidden_dim=128,
-            num_experts=4,
-            use_pallas_grouped_mm=use_pallas,
-        ),
-        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
-            num_experts=4, top_k=2, ep_transport=ep_transport
-        ),
-    ).build()
-    mesh = mock.Mock()
-    mesh.device_type = "tpu"
-    mesh.get_local_rank.return_value = 1
-    parallel_dims = mock.Mock()
-    parallel_dims.get_optional_mesh.side_effect = (
-        lambda name: mesh if name == "ep" else None
     )
-    with mock.patch("torchtitan.models.common.moe.RoutedExperts.parallelize"):
-        routed.parallelize(parallel_dims)
-    assert "_ep_local_rank" in dict(routed.named_buffers())
-    assert int(routed._ep_local_rank.item()) == 1
-    assert routed.token_dispatcher.roe_zero_pad_tail is expected_zero_pad
-
-
-@pytest.mark.parametrize(
-    "ep_transport, raises",
-    [("ring_of_experts", True), ("auto", False), ("ragged_all_to_all", False)],
-)
-def test_parallelize_rejects_explicit_ring_of_experts_off_tpu(
-    ep_transport, raises
-):
-    routed = TpuRoutedExperts.Config(
-        inner_experts=GroupedExperts.Config(dim=128, hidden_dim=128, num_experts=4),
-        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
-            num_experts=4, top_k=2, ep_transport=ep_transport
-        ),
-    ).build()
-    mesh = mock.Mock()
-    mesh.device_type = "cpu"
-    mesh.get_local_rank.return_value = 0
-    parallel_dims = mock.Mock()
-    parallel_dims.get_optional_mesh.side_effect = (
-        lambda name: mesh if name == "ep" else None
-    )
-    with mock.patch(
-        "torchtitan.models.common.moe.RoutedExperts.parallelize"
-    ) as parent_parallelize:
-        if raises:
-            with pytest.raises(ValueError, match="ring_of_experts.*needs a TPU"):
-                routed.parallelize(parallel_dims)
-            parent_parallelize.assert_not_called()
-        else:
-            routed.parallelize(parallel_dims)
-            parent_parallelize.assert_called_once()
-
-
-@pytest.mark.parametrize("cap_factor", [None, 1.5])
-def test_drop_stats_stay_off_until_configured(cap_factor):
-    routed = TpuRoutedExperts.Config(
-        inner_experts=GroupedExperts.Config(dim=16, hidden_dim=16, num_experts=4),
-        token_dispatcher=TpuAllToAllTokenDispatcher.Config(
-            num_experts=4,
-            top_k=2,
-            ep_transport="ring_of_experts",
-            ep_capacity_factor=cap_factor,
-        ),
-    ).build()
-    mesh = mock.Mock()
-    mesh.device_type = "tpu"
-    mesh.get_local_rank.return_value = 0
-    parallel_dims = mock.Mock()
-    parallel_dims.get_optional_mesh.side_effect = (
-        lambda name: mesh if name == "ep" else None
-    )
-    with mock.patch("torchtitan.models.common.moe.RoutedExperts.parallelize"):
-        routed.parallelize(parallel_dims)
-
-    # Off after parallelize: only a trainer that returns the counts from its
-    # step turns them on, and only capacity-bounded layers have any.
-    assert routed.collect_ep_drop_stats is False
-    capacity_bounded = cap_factor is not None
-    assert ep_capacity_bounded([routed]) is capacity_bounded
-    assert configure_ep_drop_stats([routed], enabled=True) is capacity_bounded
-    assert routed.collect_ep_drop_stats is capacity_bounded
-    if capacity_bounded:
-        with pytest.raises(RuntimeError, match="did not record"):
-            collect_ep_drop_stat_tensors([routed])
-    else:
-        assert collect_ep_drop_stat_tensors([routed]) == []
-    assert configure_ep_drop_stats([routed], enabled=False) is False
-    assert routed.collect_ep_drop_stats is False
-
-
-def test_traced_dropped_count_is_kept_only_for_a_collecting_owner():
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=4, top_k=2, ep_transport="ring_of_experts", ep_capacity_factor=1.0
-    ).build()
-    holder = _RankHolder(0)
-    holder.collect_ep_drop_stats = False
-    dispatcher.bind_ep_rank_holder(holder)
-    with FakeTensorMode():
-        x = torch.empty(2, 4)
-        dropped = torch.zeros((), dtype=torch.int32)
-
-    # A traced count must not outlive its trace unless the step returns it.
-    dispatcher._record_dropped_count(x, dropped)
-    assert dispatcher.last_dropped_count is None
-    holder.collect_ep_drop_stats = True
-    dispatcher._record_dropped_count(x, dropped)
-    assert dispatcher.last_dropped_count is dropped
-
-
-def test_use_expert_parallel_defaults_to_auto_and_handles_scale_before_down_proj():
-    class _ModelCfg:
-        def __init__(self, routed):
-            self.routed = routed
-
-        def traverse(self, config_type):
-            if isinstance(self.routed, config_type):
-                yield "routed", self.routed, self, "routed"
-            if isinstance(self.routed.inner_experts, config_type):
-                yield (
-                    "routed.inner_experts",
-                    self.routed.inner_experts,
-                    self.routed,
-                    "inner_experts",
-                )
-            if isinstance(self.routed.token_dispatcher, config_type):
-                yield (
-                    "routed.token_dispatcher",
-                    self.routed.token_dispatcher,
-                    self.routed,
-                    "token_dispatcher",
-                )
-
-    cfg = _ModelCfg(
-        RoutedExperts.Config(
+    def test_parallelize_registers_rank_buffer_and_sets_tail_zero_pad(
+        self, ep_transport, use_pallas, expected_zero_pad
+    ):
+        routed = TpuRoutedExperts.Config(
             inner_experts=TpuGroupedExperts.Config(
                 dim=128,
                 hidden_dim=128,
-                num_experts=8,
-                use_pallas_grouped_mm=True,
-                use_pallas_paired_grouped_mm=True,
+                num_experts=4,
+                use_pallas_grouped_mm=use_pallas,
             ),
             token_dispatcher=TpuAllToAllTokenDispatcher.Config(
-                num_experts=8, top_k=2, fuse_route_score_backward=True
+                num_experts=4, top_k=2, ep_transport=ep_transport
             ),
+        ).build()
+        mesh = mock.Mock()
+        mesh.device_type = "tpu"
+        mesh.get_local_rank.return_value = 1
+        parallel_dims = mock.Mock()
+        parallel_dims.get_optional_mesh.side_effect = (
+            lambda name: mesh if name == "ep" else None
         )
-    )
-    use_expert_parallel(
-        cfg,
-        ep_degree=2,
-        scale_before_down_proj=True,
-        ep_capacity_factor=1.5,
-    )
-    assert isinstance(cfg.routed, TpuRoutedExperts.Config)
-    assert cfg.routed.scale_before_down_proj is True
-    assert cfg.routed.token_dispatcher.ep_transport == "auto"
-    assert cfg.routed.token_dispatcher.ep_capacity_factor == 1.5
-    assert cfg.routed.token_dispatcher.fuse_route_score_backward is False
-    assert cfg.routed.inner_experts.use_pallas_paired_grouped_mm is False
+        with mock.patch("torchtitan.models.common.moe.RoutedExperts.parallelize"):
+            routed.parallelize(parallel_dims)
+        assert "_ep_local_rank" in dict(routed.named_buffers())
+        assert int(routed._ep_local_rank.item()) == 1
+        assert routed.token_dispatcher.roe_zero_pad_tail is expected_zero_pad
 
-    # Explicit non-default transport and capacity factor on dispatcher are
-    # preserved when overrides are None.
-    cfg2 = _ModelCfg(
-        TpuRoutedExperts.Config(
-            inner_experts=GroupedExperts.Config(dim=16, hidden_dim=16, num_experts=8),
+    @parameterized.parameters(
+        ("ring_of_experts", True), ("auto", False), ("ragged_all_to_all", False)
+    )
+    def test_parallelize_rejects_explicit_ring_of_experts_off_tpu(
+        self, ep_transport, raises
+    ):
+        routed = TpuRoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(dim=128, hidden_dim=128, num_experts=4),
             token_dispatcher=TpuAllToAllTokenDispatcher.Config(
-                num_experts=8,
+                num_experts=4, top_k=2, ep_transport=ep_transport
+            ),
+        ).build()
+        mesh = mock.Mock()
+        mesh.device_type = "cpu"
+        mesh.get_local_rank.return_value = 0
+        parallel_dims = mock.Mock()
+        parallel_dims.get_optional_mesh.side_effect = (
+            lambda name: mesh if name == "ep" else None
+        )
+        with mock.patch(
+            "torchtitan.models.common.moe.RoutedExperts.parallelize"
+        ) as parent_parallelize:
+            if raises:
+                with self.assertRaisesRegex(ValueError, "ring_of_experts.*needs a TPU"):
+                    routed.parallelize(parallel_dims)
+                parent_parallelize.assert_not_called()
+            else:
+                routed.parallelize(parallel_dims)
+                parent_parallelize.assert_called_once()
+
+    @parameterized.parameters(None, 1.5)
+    def test_drop_stats_stay_off_until_configured(self, cap_factor):
+        routed = TpuRoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(dim=16, hidden_dim=16, num_experts=4),
+            token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+                num_experts=4,
                 top_k=2,
-                ep_transport="ragged_all_to_all",
-                ep_capacity_factor=2.0,
+                ep_transport="ring_of_experts",
+                ep_capacity_factor=cap_factor,
             ),
+        ).build()
+        mesh = mock.Mock()
+        mesh.device_type = "tpu"
+        mesh.get_local_rank.return_value = 0
+        parallel_dims = mock.Mock()
+        parallel_dims.get_optional_mesh.side_effect = (
+            lambda name: mesh if name == "ep" else None
         )
-    )
-    use_expert_parallel(cfg2, ep_degree=2)
-    assert cfg2.routed.token_dispatcher.ep_transport == "ragged_all_to_all"
-    assert cfg2.routed.token_dispatcher.ep_capacity_factor == 2.0
+        with mock.patch("torchtitan.models.common.moe.RoutedExperts.parallelize"):
+            routed.parallelize(parallel_dims)
 
+        # Off after parallelize: only a trainer that returns the counts from its
+        # step turns them on, and only capacity-bounded layers have any.
+        assert routed.collect_ep_drop_stats is False
+        capacity_bounded = cap_factor is not None
+        assert ep_capacity_bounded([routed]) is capacity_bounded
+        assert configure_ep_drop_stats([routed], enabled=True) is capacity_bounded
+        assert routed.collect_ep_drop_stats is capacity_bounded
+        if capacity_bounded:
+            with self.assertRaisesRegex(RuntimeError, "did not record"):
+                collect_ep_drop_stat_tensors([routed])
+        else:
+            assert collect_ep_drop_stat_tensors([routed]) == []
+        assert configure_ep_drop_stats([routed], enabled=False) is False
+        assert routed.collect_ep_drop_stats is False
 
-@pytest.mark.parametrize(
-    "inner_experts",
-    [
+    def test_traced_dropped_count_is_kept_only_for_a_collecting_owner(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=4,
+            top_k=2,
+            ep_transport="ring_of_experts",
+            ep_capacity_factor=1.0,
+        ).build()
+        holder = _RankHolder(0)
+        holder.collect_ep_drop_stats = False
+        dispatcher.bind_ep_rank_holder(holder)
+        with FakeTensorMode():
+            x = torch.empty(2, 4)
+            dropped = torch.zeros((), dtype=torch.int32)
+
+        # A traced count must not outlive its trace unless the step returns it.
+        dispatcher._record_dropped_count(x, dropped)
+        assert dispatcher.last_dropped_count is None
+        holder.collect_ep_drop_stats = True
+        dispatcher._record_dropped_count(x, dropped)
+        assert dispatcher.last_dropped_count is dropped
+
+    def test_use_expert_parallel_defaults_to_auto_and_handles_scale_before_down_proj(
+        self,
+    ):
+        class _ModelCfg:
+            def __init__(self, routed):
+                self.routed = routed
+
+            def traverse(self, config_type):
+                if isinstance(self.routed, config_type):
+                    yield "routed", self.routed, self, "routed"
+                if isinstance(self.routed.inner_experts, config_type):
+                    yield (
+                        "routed.inner_experts",
+                        self.routed.inner_experts,
+                        self.routed,
+                        "inner_experts",
+                    )
+                if isinstance(self.routed.token_dispatcher, config_type):
+                    yield (
+                        "routed.token_dispatcher",
+                        self.routed.token_dispatcher,
+                        self.routed,
+                        "token_dispatcher",
+                    )
+
+        cfg = _ModelCfg(
+            RoutedExperts.Config(
+                inner_experts=TpuGroupedExperts.Config(
+                    dim=128,
+                    hidden_dim=128,
+                    num_experts=8,
+                    use_pallas_grouped_mm=True,
+                    use_pallas_paired_grouped_mm=True,
+                ),
+                token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+                    num_experts=8, top_k=2, fuse_route_score_backward=True
+                ),
+            )
+        )
+        use_expert_parallel(
+            cfg,
+            ep_degree=2,
+            scale_before_down_proj=True,
+            ep_capacity_factor=1.5,
+        )
+        assert isinstance(cfg.routed, TpuRoutedExperts.Config)
+        assert cfg.routed.scale_before_down_proj is True
+        assert cfg.routed.token_dispatcher.ep_transport == "auto"
+        assert cfg.routed.token_dispatcher.ep_capacity_factor == 1.5
+        assert cfg.routed.token_dispatcher.fuse_route_score_backward is False
+        # The paired W1+W3 kernel skips rows past the routed count, so it stays
+        # on by default.
+        assert cfg.routed.inner_experts.use_pallas_paired_grouped_mm is True
+        use_expert_parallel(cfg, ep_degree=2, paired_grouped_mm=False)
+        assert cfg.routed.inner_experts.use_pallas_paired_grouped_mm is False
+
+        # Explicit non-default transport and capacity factor on dispatcher are
+        # preserved when overrides are None.
+        cfg2 = _ModelCfg(
+            TpuRoutedExperts.Config(
+                inner_experts=GroupedExperts.Config(
+                    dim=16, hidden_dim=16, num_experts=8
+                ),
+                token_dispatcher=TpuAllToAllTokenDispatcher.Config(
+                    num_experts=8,
+                    top_k=2,
+                    ep_transport="ragged_all_to_all",
+                    ep_capacity_factor=2.0,
+                ),
+            )
+        )
+        use_expert_parallel(cfg2, ep_degree=2)
+        assert cfg2.routed.token_dispatcher.ep_transport == "ragged_all_to_all"
+        assert cfg2.routed.token_dispatcher.ep_capacity_factor == 2.0
+
+    @parameterized.parameters(
         # Stock experts: no TpuGroupedExperts.Config in the tree at all.
         GroupedExperts.Config(dim=16, hidden_dim=16, num_experts=8),
         TpuGroupedExperts.Config(
             dim=128, hidden_dim=128, num_experts=8, use_pallas_grouped_mm=False
         ),
-    ],
-)
-def test_use_expert_parallel_scale_before_down_proj_needs_pallas_gmm(inner_experts):
-    cfg = _routed_model_cfg(TpuAllToAllTokenDispatcher.Config(num_experts=8, top_k=2))
-    cfg.routed.inner_experts = inner_experts
-    with pytest.raises(ValueError, match="needs the Pallas grouped matmuls"):
-        use_expert_parallel(cfg, ep_degree=2, scale_before_down_proj=True)
+    )
+    def test_use_expert_parallel_scale_before_down_proj_needs_pallas_gmm(
+        self, inner_experts
+    ):
+        cfg = _routed_model_cfg(
+            TpuAllToAllTokenDispatcher.Config(num_experts=8, top_k=2)
+        )
+        cfg.routed.inner_experts = inner_experts
+        with self.assertRaisesRegex(ValueError, "needs the Pallas grouped matmuls"):
+            use_expert_parallel(cfg, ep_degree=2, scale_before_down_proj=True)
 
 
 def _routed_model_cfg(token_dispatcher):
@@ -789,9 +782,9 @@ def _routed_model_cfg(token_dispatcher):
     )
 
 
-@pytest.mark.parametrize(
-    "dispatcher_transport, override, expected",
-    [
+class UseExpertParallelTransportTest(parameterized.TestCase):
+
+    @parameterized.parameters(
         # Unset (None) on the TPU config, or no field on upstream's: "auto".
         (None, None, "auto"),
         ("upstream", None, "auto"),
@@ -804,46 +797,44 @@ def _routed_model_cfg(token_dispatcher):
         ("all_to_all", "ragged_all_to_all", "ragged_all_to_all"),
         (None, "all_to_all", "all_to_all"),
         ("upstream", "ring_of_experts", "ring_of_experts"),
-    ],
-)
-def test_use_expert_parallel_keeps_explicit_transport(
-    dispatcher_transport, override, expected
-):
-    if dispatcher_transport == "upstream":
-        dispatcher = AllToAllTokenDispatcher.Config(num_experts=8, top_k=2)
-    else:
-        dispatcher = TpuAllToAllTokenDispatcher.Config(
-            num_experts=8, top_k=2, ep_transport=dispatcher_transport
+    )
+    def test_use_expert_parallel_keeps_explicit_transport(
+        self, dispatcher_transport, override, expected
+    ):
+        if dispatcher_transport == "upstream":
+            dispatcher = AllToAllTokenDispatcher.Config(num_experts=8, top_k=2)
+        else:
+            dispatcher = TpuAllToAllTokenDispatcher.Config(
+                num_experts=8, top_k=2, ep_transport=dispatcher_transport
+            )
+        cfg = _routed_model_cfg(dispatcher)
+        use_expert_parallel(cfg, ep_degree=2, ep_transport=override)
+        assert isinstance(
+            cfg.routed.token_dispatcher, TpuAllToAllTokenDispatcher.Config
         )
-    cfg = _routed_model_cfg(dispatcher)
-    use_expert_parallel(cfg, ep_degree=2, ep_transport=override)
-    assert isinstance(cfg.routed.token_dispatcher, TpuAllToAllTokenDispatcher.Config)
-    assert cfg.routed.token_dispatcher.ep_transport == expected
+        assert cfg.routed.token_dispatcher.ep_transport == expected
 
+    def test_unset_ep_transport_runs_upstream_all_to_all(self):
+        config = TpuAllToAllTokenDispatcher.Config(num_experts=8, top_k=2)
+        assert config.ep_transport is None
+        dispatcher = config.build()
+        assert dispatcher.ep_transport == "all_to_all"
+        with self.assertRaisesRegex(ValueError, "ep_transport must be"):
+            TpuAllToAllTokenDispatcher.Config(
+                num_experts=8, top_k=2, ep_transport="ring"  # type: ignore[arg-type]
+            ).build()
 
-def test_unset_ep_transport_runs_upstream_all_to_all():
-    config = TpuAllToAllTokenDispatcher.Config(num_experts=8, top_k=2)
-    assert config.ep_transport is None
-    dispatcher = config.build()
-    assert dispatcher.ep_transport == "all_to_all"
-    with pytest.raises(ValueError, match="ep_transport must be"):
-        TpuAllToAllTokenDispatcher.Config(
-            num_experts=8, top_k=2, ep_transport="ring"  # type: ignore[arg-type]
-        ).build()
-
-
-@pytest.mark.parametrize(
-    "bad_factor",
-    [0.0, -1.0, float("nan"), float("inf"), -float("inf"), True, False],
-)
-def test_invalid_ep_capacity_factor_raises(bad_factor):
-    with pytest.raises(ValueError, match="ep_capacity_factor"):
-        TpuAllToAllTokenDispatcher.Config(
-            num_experts=8,
-            top_k=2,
-            ep_transport="ring_of_experts",
-            ep_capacity_factor=bad_factor,  # type: ignore[arg-type]
-        ).build()
+    @parameterized.parameters(
+        0.0, -1.0, float("nan"), float("inf"), -float("inf"), True, False
+    )
+    def test_invalid_ep_capacity_factor_raises(self, bad_factor):
+        with self.assertRaisesRegex(ValueError, "ep_capacity_factor"):
+            TpuAllToAllTokenDispatcher.Config(
+                num_experts=8,
+                top_k=2,
+                ep_transport="ring_of_experts",
+                ep_capacity_factor=bad_factor,  # type: ignore[arg-type]
+            ).build()
 
 
 def _run_ep_capacity_no_overflow(
@@ -956,20 +947,22 @@ def _run_ep_capacity_no_overflow(
     )
 
 
-@pytest.mark.parametrize(
-    "ep_transport", ["ring_of_experts", "ragged_all_to_all"]
-)
-@pytest.mark.parametrize("scale_before_w2", [False, True])
-def test_ep_capacity_factor_no_overflow_matches_ep1(
-    ep_transport, scale_before_w2
-):
-    distributed.run_distributed(
-        4,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_ep_capacity_no_overflow,
-        ep_transport,
-        scale_before_w2,
+class EpCapacityNoOverflowTest(parameterized.TestCase):
+
+    @parameterized.product(
+        ep_transport=["ring_of_experts", "ragged_all_to_all"],
+        scale_before_w2=[False, True],
     )
+    def test_ep_capacity_factor_no_overflow_matches_ep1(
+        self, ep_transport, scale_before_w2
+    ):
+        distributed.run_distributed(
+            4,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_ep_capacity_no_overflow,
+            ep_transport,
+            scale_before_w2,
+        )
 
 
 def _run_ep_capacity_forced_overflow(device, rank, world_size, scale_before_w2):
@@ -1094,14 +1087,21 @@ def _run_ep_capacity_forced_overflow(device, rank, world_size, scale_before_w2):
         torch.testing.assert_close(roe_t, ra2a_t, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("scale_before_w2", [False, True])
-def test_ep_capacity_factor_forced_overflow_roe_matches_ragged_a2a(
-    scale_before_w2,
-):
-    distributed.run_distributed(
-        4,
-        device_type.AcceleratorDeviceType.CPU,
-        _run_ep_capacity_forced_overflow,
-        scale_before_w2,
-    )
+class EpCapacityForcedOverflowTest(parameterized.TestCase):
 
+    @parameterized.parameters(False, True)
+    def test_ep_capacity_factor_forced_overflow_roe_matches_ragged_a2a(
+        self,
+        scale_before_w2,
+    ):
+        distributed.run_distributed(
+            4,
+            device_type.AcceleratorDeviceType.CPU,
+            _run_ep_capacity_forced_overflow,
+            scale_before_w2,
+        )
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
+    absltest.main()

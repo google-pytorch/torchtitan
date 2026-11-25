@@ -8,6 +8,7 @@
 
 import operator
 from types import SimpleNamespace
+import typing
 import unittest
 from unittest import mock
 
@@ -33,6 +34,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
 )
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _find_fsdp_unshard_save_nodes,
+    tag_with_memory_policy_pass,
 )
 from torchtitan.experiments.graph_trainer.registry import MEMORY_POLICY_REGISTRY
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
@@ -45,15 +47,24 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
 )
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+    TpuGraphTrainerMemoryPolicy,
+)
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _optimization_barrier,
     apply_tpu_remat_schedule,
 )
+from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
+    construct_tpu_transform_passes,
+)
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    _LOOP_HOPS,
     full_remat_with_saves,
     is_splash_forward_op_name,
     resolve_save_regions,
     ROUTING_REGION,
+    save_loop_nodes_pass,
     SaveRegion,
     select_ffn_down_projection,
     select_route_permutations,
@@ -882,6 +893,150 @@ class TestSplashAttentionRegion(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not return"):
             select_splash_attention(gm)
+
+
+def _lane_memory_policies(policy=TpuGraphTrainerMemoryPolicy) -> list[str]:
+    """Every name in the TPU lane's memory-policy Literal, nested ones included."""
+    names = []
+    for arg in typing.get_args(policy):
+        names.extend([arg] if isinstance(arg, str) else _lane_memory_policies(arg))
+    return names
+
+
+# One saved row per layer; big enough that the offload policies take it.
+_ROW = (512, 256)
+
+
+def _loop_graph() -> tuple[torch.fx.GraphModule, list[torch.fx.Node]]:
+    """A joint graph with one forward node of each loop HOP; returns it and them.
+
+    The scan pair is what scanned layers trace to: the forward loop saves a
+    copy of its carry (the layer input) per layer and the backward loop reads
+    that stack by index, which ``full_and_scan_offload`` needs. The other
+    loops sit inside a layer, next to the ``feed_forward.w2`` matmuls that
+    ``tpu_selective`` saves.
+    """
+    root = nn.Module()
+    graph = torch.fx.Graph()
+
+    def tensor(node, shape, fqn="", bwd=False):
+        node.meta["val"] = torch.empty(shape)
+        node.meta["autograd_backward"] = bwd
+        if fqn:
+            node.meta["custom"] = {"module_fqn": fqn}
+        return node
+
+    def mm(g, src, shape, fqn="", bwd=False):
+        node = g.call_function(torch.ops.aten.mm.default, args=(src, src))
+        return tensor(node, shape, fqn, bwd)
+
+    def body(name, *placeholders, reads_row=False):
+        g = torch.fx.Graph()
+        nodes = [tensor(g.placeholder(p), shape) for p, shape in placeholders]
+        if reads_row:
+            row = g.call_function(
+                torch.ops.aten.index_select.default, args=(nodes[2], 0, nodes[1])
+            )
+            g.output((mm(g, tensor(row, _ROW), (4, 4)),))
+        else:
+            saved = tensor(
+                g.call_function(torch.ops.aten.clone.default, args=(nodes[0],)), _ROW
+            )
+            # The tag scan_remat_policy puts on the saved carry; scan offload
+            # picks its value by this tag.
+            saved.meta["custom"] = {REMAT_REGION: "layer_input"}
+            g.output((mm(g, nodes[0], (4, 4)), saved))
+        root.add_module(name, torch.fx.GraphModule(nn.Module(), g))
+        return graph.get_attr(name)
+
+    def getitems(loop, n, fqn=""):
+        return [
+            tensor(graph.call_function(operator.getitem, (loop, i)), (4, 4), fqn)
+            for i in range(n)
+        ]
+
+    x = tensor(graph.placeholder("x"), (4, 4))
+    outputs = [mm(graph, x, (4, 4), f"layers.{i}.feed_forward.w2") for i in (0, 1)]
+
+    fwd = graph.call_function(
+        torch.ops.higher_order.scan,
+        (body("fwd_body", ("carry", (4, 4)), ("x", (4, 4))), [x], [x], ()),
+    )
+    tensor(fwd, (4, 4))
+    carry, stack = getitems(fwd, 2)
+    stack.meta["val"] = torch.empty(2, *_ROW)
+    counter = mm(graph, x, (2,), bwd=True)
+    bwd_body = body(
+        "bwd_body", ("grad", (4, 4)), ("i", ()), ("stack", (2, *_ROW)), reads_row=True
+    )
+    bwd = graph.call_function(
+        torch.ops.higher_order.scan, (bwd_body, [carry], [counter], (stack,))
+    )
+    outputs.append(tensor(bwd, (4, 4), bwd=True))
+
+    loops = [fwd]
+    for target, args in (
+        (torch.ops.higher_order.while_loop, (None, None, (x,), ())),
+        (torch.ops.higher_order.while_loop_stack_output, (None, None, (x,), ())),
+        (torch.ops.higher_order.map_impl, (None, [x], ())),
+    ):
+        loop = tensor(graph.call_function(target, args), (4, 4), "layers.0.mixer")
+        loops.append(loop)
+        for item in getitems(loop, 1, "layers.0.mixer"):
+            outputs.append(mm(graph, item, (4, 4), bwd=True))
+    graph.output(tuple(outputs))
+    return torch.fx.GraphModule(root, graph), loops
+
+
+class TestLoopNodesAreSaved(unittest.TestCase):
+    def test_no_policy_recomputes_a_loop(self) -> None:
+        """Recomputing a loop node reruns the whole loop in backward.
+
+        No symptom shows: the loss stays exact and the saved set shrinks, while
+        the step does twice the forward work. So every policy the lane accepts
+        runs through the lane's own pass list, and must leave each loop saved.
+        """
+        self.assertCountEqual(
+            _LOOP_HOPS,
+            [
+                torch.ops.higher_order.scan,
+                torch.ops.higher_order.while_loop,
+                torch.ops.higher_order.while_loop_stack_output,
+                torch.ops.higher_order.map_impl,
+            ],
+        )
+        policies = [p for p in _lane_memory_policies() if p != "none"]
+        self.assertIn("full_and_scan_offload", policies)
+        for policy in policies:
+            with self.subTest(policy=policy):
+                selective = policy.startswith("tpu_selective")
+                # The real config class, so a field a pass starts reading
+                # comes with its default instead of an AttributeError.
+                config = SimpleNamespace(
+                    compile=TpuGraphTrainerCompileConfig(
+                        memory_policy=policy,
+                        cpu_offload_budget_gb=100.0,
+                        save_regions=(FEED_FORWARD_W2,) if selective else (),
+                    ),
+                    parallelism=_parallelism("always"),
+                )
+                passes = construct_tpu_transform_passes(
+                    SimpleNamespace(num_static_inputs=0), config
+                )
+                # Up to and including the re-tag, which must follow the policy.
+                end = passes.index(save_loop_nodes_pass)
+                self.assertIs(passes[end - 1].func, tag_with_memory_policy_pass)
+                gm, loops = _loop_graph()
+                for graph_pass in passes[: end + 1]:
+                    graph_pass(gm, None)
+
+                for loop in loops:
+                    for node in (loop, *loop.users):
+                        self.assertEqual(
+                            node.meta["recompute"],
+                            CheckpointPolicy.MUST_SAVE,
+                            node.name,
+                        )
 
 
 if __name__ == "__main__":

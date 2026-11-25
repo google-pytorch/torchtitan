@@ -612,6 +612,7 @@ def _testmodel(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     vocab_size = 2048
     return Qwen3Model.Config(
         vocab_size=vocab_size,
+        max_context_length=seq_len,
         dim=dim,
         norm=_qwen3_norm(dim),
         enable_weight_tying=True,

@@ -49,6 +49,11 @@ class MultimodalModel(Decoder):
 
         with get_spmd_context(parallel_dims=parallel_dims):
             self._parallelize(parallel_dims)
+            # Fork divergence from upstream pytorch/torchtitan: wire the meshes
+            # the fork's MoE auxiliary losses reduce over.
+            from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
+
+            configure_moe_aux_loss_reduction(self, parallel_dims)
             encoders = [
                 encoder
                 for encoder_fqn in self.multimodal_encoder_fqns

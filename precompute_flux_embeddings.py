@@ -88,7 +88,7 @@ def main():
         tokenizer=tokenizer,
     )
 
-    model_args = config.model_spec.model
+    model_args = config.model
 
     logger.info("Loading Autoencoder...")
     autoencoder = load_ae(

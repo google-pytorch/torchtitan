@@ -40,6 +40,8 @@ def graph_trainer_qwen3_14b() -> GraphTrainer.Config:
 
 
 def graph_trainer_qwen3_30b_a3b_global_aux() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(qwen3_30b_a3b_global_aux(), model_registry)
-    config.compile = GraphTrainerCompileConfig(enable=True)
+    config = to_graph_trainer_config(
+        qwen3_30b_a3b_global_aux(), GraphTrainerQwen3Model.Config
+    )
+    config.compile = GraphTrainerCompileConfig()
     return config

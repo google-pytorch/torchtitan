@@ -268,6 +268,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         )
         self._initialize_forward_backward()
 
+    def _build_model(self) -> BaseModel:
+        return self.model_config.build()
+
     def _initialize_model(
         self,
         *,
@@ -291,7 +294,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[self.config.training.dtype]),
         ):
-            model = self.model_config.build()
+            model = self._build_model()
         self.model_cls = type(model)
         adapter_cls = type(model).state_dict_adapter_cls
         self.state_dict_adapter = (
@@ -374,14 +377,22 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def _initialize_optimizer(self) -> None:
         """Construct optimizers and learning-rate schedulers."""
         self.optimizers = self.config.optimizer.build(model_parts=self.model_parts)
+        self._register_optimizer_hooks()
+        self.lr_schedulers = self.config.lr_scheduler.build(
+            optimizers=self.optimizers,
+            training_steps=self.config.training.steps,
+        )
+
+    def _register_optimizer_hooks(self) -> None:
+        """Run the model's optimizer hooks, before the LR schedulers are built.
+
+        Fork divergence from upstream pytorch/torchtitan: a method, so the TPU
+        engines can regroup the optimizer param groups at this point.
+        """
         self.model_cls._register_optimizer_hooks(
             self.optimizers,
             self.model_parts,
             self.parallel_dims,
-        )
-        self.lr_schedulers = self.config.lr_scheduler.build(
-            optimizers=self.optimizers,
-            training_steps=self.config.training.steps,
         )
 
     def _initialize_checkpointer(

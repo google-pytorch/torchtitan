@@ -336,7 +336,7 @@ def qwen3_30b_a3b_global_aux(seq_len: int | None = None) -> Trainer.Config:
     """Qwen3 30B-A3B with a globally-normalized MoE auxiliary loss."""
     seq_len = 2048 if seq_len is None else seq_len
     config = qwen3_30b_a3b(seq_len=seq_len)
-    config.model_spec = model_registry("30B-A3B-global-aux", seq_len=seq_len)
+    config.model = model_registry("30B-A3B-global-aux", seq_len=seq_len)
     config.metrics = MetricsProcessor.Config(log_freq=1, enable_moe_routing=True)
     config.optimizer = default_adamw(lr=3e-4)
     config.lr_scheduler = LRSchedulersContainer.Config(

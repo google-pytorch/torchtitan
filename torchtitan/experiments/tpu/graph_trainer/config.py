@@ -206,17 +206,6 @@ def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:
 
 def _validate_graph_split(config: "TpuGraphTrainer.Config") -> None:
   graph_split = config.compile.graph_split
-  if (
-      config.parallelism.expert_parallel_degree > 1
-      and graph_split.enabled
-      and graph_split.backward_partition_mode == "fsdp_pipeline"
-  ):
-    raise ValueError(
-        "compile.graph_split.backward_partition_mode='fsdp_pipeline' does not "
-        "support expert_parallel_degree > 1 because EP emits activation "
-        "collectives in backward; pass "
-        "--compile.graph_split.backward_partition_mode=by_layer"
-    )
   # Knobs that would leave the split unchanged are rejected, so a sweep cannot
   # record a no-op arm as a real result.
   kinds = graph_split.pipeline_kinds

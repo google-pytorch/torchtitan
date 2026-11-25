@@ -255,9 +255,9 @@ def _use_expert_parallel(
     experts live on the `(efsdp, ep)` mesh. `DEFER_AND_FUSE` fuses the eager
     norm across parameters.
   - One layer per forward and backward executable, with
-    `backward_partition_mode="by_layer"`: `fsdp_pipeline` treats every
-    backward all-gather and reduce-scatter as an FSDP collective, and the EP
-    token exchange isn't one.
+    `backward_partition_mode="by_layer"`. `fsdp_pipeline` also works with
+    EP (it moves only collectives on the FSDP groups; the EP token exchange
+    stays with its layer) and is used by the 64K recipes (`_397b_64k_cp`).
   - The topology-aware device mesh stays on (inherited from the base
     recipe): `ParallelDims.build_mesh` registers each mesh axis's logical
     layout with `spmd_types`, so the `efsdp` and `ep` axes pass its
@@ -771,6 +771,79 @@ def _split_tokamax_benchmark_for_cp(cp: int) -> TpuGraphTrainer.Config:
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 65536 * cp
   cfg.splash_attention_kernel.sa_use_document_aware_block_skipping = False
   return cfg
+
+
+def _397b_64k_cp(
+    strategy: Literal["ulysses", "all_gather"], cp: int
+) -> TpuGraphTrainer.Config:
+  """``qwen35_moe_397b_split_tokamax_ep_benchmark`` tuned for 64K context.
+
+  One 65,536-token sequence per CP group (65,536 / ``cp`` tokens per rank,
+  bf16 parameters and optimizer state as in the 8K recipe). Measured on
+  tpu7x-4x4x8 (128 chips, 256 ranks) with Ulysses CP 2, adding one change at
+  a time to the 8K recipe's settings (MFU, mean of steps 6-12):
+
+  - EP 8, 2,048-token expert chunks, worst-case expert buffers: 14.8%.
+  - ``ep_capacity_factor`` 1.5: 18.8%. Dropless EP sizes each chunk's expert
+    buffer for the worst case (``ep_degree * T * top_k`` rows, about 8x the
+    routed rows), and copying those buffers dominated the MoE layers. Routes
+    beyond the capacity are dropped and logged (``[ep_capacity]``): from
+    random initialization, 0.1% at step 1 and 7.4% at step 40.
+  - Two layers per forward and backward executable and BF16 cross-chunk expert
+    dW, 4,096-token chunks: 20.5%.
+  - EP 4: 21.5%.
+  - 16,384-token chunks (two per MoE layer at 32K tokens per rank): 25.3%.
+  - Splash blocks of 2,048 query and key/value rows (1,024 per compute step):
+    26.2%. 4,096-row blocks do not compile (VMEM), and the stock fused
+    Splash backward runs out of HBM at 64K.
+  - ``backward_partition_mode="fsdp_pipeline"`` (each backward executable's
+    expert/FSDP gathers issued one executable early and its gradient
+    reduce-scatters one late): 26.5%. With ``--debug.seed`` fixed, losses
+    match ``by_layer`` at steps 1-2 and within 1e-4 relative afterwards.
+  - Tokamax Splash with 16 stacked query heads (``sa_num_stacked_q_heads``),
+    fused backward, 128-row Q blocks and 1,024-row KV blocks: 28.0%. The stock
+    Splash kernel runs these MQA heads one at a time at ~40% of peak. Q 256
+    or KV 2,048 blocks measure the same (27.9-28.1%). KV all-gather CP 2:
+    27.4%.
+
+  Without the capacity cap (``--tpu_config.ep_capacity_factor None``), 16K-
+  token chunks run out of HBM; with ``--tpu_config.ep_token_chunks=8`` the
+  dropless run measures 20.3%. KV all-gather CP 2 measures 24.4% before the
+  Splash block change.
+  """
+  cfg = qwen35_moe_397b_split_tokamax_ep_benchmark()
+  cfg.training.max_context_length = 65536
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 65536
+  # Tokamax Splash with the 16 query heads that share each KV head (per rank
+  # under CP 2) stacked into one tile: a 128-row Q block becomes a 2,048-row
+  # MXU tile. Tokamax supports only the fused backward, which fits at 64K.
+  splash = cfg.splash_attention_kernel
+  splash.sa_use_document_aware_block_skipping = False
+  splash.use_tokamax_splash_attention_kernel = True
+  splash.use_batch_loop_fwd = True
+  splash.sa_num_stacked_q_heads = 16
+  splash.sa_use_fused_bwd_kernel = True
+  splash.sa_block_q = 128
+  for name in ("kv", "kv_compute", "q_dkv", "kv_dkv", "kv_dkv_compute"):
+    setattr(splash, f"sa_block_{name}", 1024)
+  cfg.parallelism.expert_parallel_degree = 4
+  cfg.tpu_config.ep_token_chunks = max(1, 65536 // cp // 16384)
+  cfg.tpu_config.ep_capacity_factor = 1.5
+  cfg.tpu_config.ep_chunk_dw_fp32 = False
+  cfg.compile.graph_split.forward_layers_per_executable = 2
+  cfg.compile.graph_split.backward_layers_per_executable = 2
+  cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
+  return _qwen35_cp(cfg, strategy=strategy, cp_degree=cp)
+
+
+def qwen35_moe_397b_64k_ulysses_cp2() -> TpuGraphTrainer.Config:
+  """397B-A17B, 64K context, Ulysses CP 2, EP 4 (see `_397b_64k_cp`)."""
+  return _397b_64k_cp("ulysses", 2)
+
+
+def qwen35_moe_397b_64k_allgather_cp2() -> TpuGraphTrainer.Config:
+  """397B-A17B, 64K context, KV all-gather CP 2, EP 4 (see `_397b_64k_cp`)."""
+  return _397b_64k_cp("all_gather", 2)
 
 
 def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (

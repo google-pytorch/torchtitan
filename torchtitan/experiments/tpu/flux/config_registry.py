@@ -35,7 +35,7 @@ def flux_testmodel() -> FluxTrainer.Config:
     The trainer config.
   """
   config = flux_debugmodel()
-  config.model_spec = model_registry("flux-test")
+  config.model = model_registry("flux-test")
   config.hf_assets_path = f"{_TEST_ASSETS}tokenizer"
   config.tokenizer.test_mode = True
   config.tokenizer.t5_tokenizer_path = f"{_TEST_ASSETS}tokenizer"

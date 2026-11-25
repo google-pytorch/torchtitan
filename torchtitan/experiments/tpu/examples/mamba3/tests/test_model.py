@@ -105,13 +105,11 @@ class Mamba3ModelTest(absltest.TestCase):
     )
 
   def test_model_registry_and_configs(self):
-    spec = mamba3.model_registry("2.7B")
-    self.assertEqual(spec.name, "mamba3")
-    self.assertEqual(spec.flavor, "2.7B")
+    cfg = mamba3.model_registry("2.7B")
+    self.assertIsInstance(cfg, model.Mamba3Config)
 
     cfg_2_7b_256k = mamba3.mamba3_2_7b_256k()
-    self.assertEqual(cfg_2_7b_256k.model_spec.name, "mamba3")
-    self.assertEqual(cfg_2_7b_256k.model_spec.flavor, "2.7B")
+    self.assertIsInstance(cfg_2_7b_256k.model, model.Mamba3Config)
 
 
 if __name__ == "__main__":

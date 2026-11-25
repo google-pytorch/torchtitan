@@ -52,7 +52,7 @@ _GDN_STRATEGIES = ("all_to_all", "allgather_reducescatter")
 
 def _set_gated_delta(cfg, **fields):
   """Sets ``fields`` on every ``TpuGatedDeltaNet`` config of ``cfg``'s model."""
-  for _, delta_net, _, _ in cfg.model_spec.model.traverse(
+  for _, delta_net, _, _ in cfg.model.traverse(
       TpuGatedDeltaNet.Config
   ):
     for name, value in fields.items():
@@ -501,7 +501,7 @@ def _cp_shard_per_rank(owner, batch, load_balancer, cp):
 
 def _small_vocab(cfg, vocab_size: int = 512):
   """Shrinks the debug model's 248K vocabulary for fast CPU tests."""
-  model = cfg.model_spec.model
+  model = cfg.model
   model.vocab_size = vocab_size
   model.tok_embeddings.num_embeddings = vocab_size
   model.lm_head.out_features = vocab_size
@@ -512,7 +512,7 @@ def _agrs_delta_net_config(load_balancer, n_key_heads, n_value_heads):
   """The debug model's ``allgather_reducescatter`` layer, other head counts."""
   model_cfg = GatedDeltaNetContextParallelTransform(
       load_balancer=load_balancer, cp_strategy="allgather_reducescatter"
-  ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+  ).transform(config_registry.qwen35_debugmodel().model)
   _, cfg, _, _ = next(iter(model_cfg.traverse(CPTpuGatedDeltaNet.Config)))
   key_dim = n_key_heads * cfg.key_head_dim
   value_dim = n_value_heads * cfg.value_head_dim
@@ -700,9 +700,9 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
       _set_gated_delta(ref_cfg, reset_at_documents=False)
       _set_gated_delta(cp_cfg, reset_at_documents=False)
     with torch.device("cpu"):
-      ref_model = ref_cfg.model_spec.model.build()
+      ref_model = ref_cfg.model.build()
       ref_model.init_states(buffer_device=torch.device("cpu"))
-      cp_model = cp_cfg.model_spec.model.build()
+      cp_model = cp_cfg.model.build()
     if out_proj_bias:
       for model in (ref_model, cp_model):
         for module in model.modules():
@@ -721,7 +721,7 @@ class CPQwen35ModelParityTest(parameterized.TestCase):
     positions = _packed_positions(_DOCS)
     ranks = _Ranks(cp)
     # The real cp_shard of the recipe's CP attention.
-    owner = cp_cfg.model_spec.model.first_full_attention_backend._owner
+    owner = cp_cfg.model.first_full_attention_backend._owner
     with set_unflatten_seq_len(_SEQ_LEN):
       shards = _cp_shard_per_rank(
           owner,
@@ -831,7 +831,7 @@ class CompiledAllGatherReduceScatterGatedDeltaNetTest(parameterized.TestCase):
 
     model_cfg = GatedDeltaNetContextParallelTransform(
         load_balancer=load_balancer, cp_strategy="allgather_reducescatter"
-    ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+    ).transform(config_registry.qwen35_debugmodel().model)
     _, delta_cfg, _, _ = next(
         iter(model_cfg.traverse(CPTpuGatedDeltaNet.Config))
     )
@@ -900,7 +900,7 @@ class AllGatherReduceScatterChecksTest(absltest.TestCase):
     )
     model_cfg = GatedDeltaNetContextParallelTransform(
         load_balancer=None, cp_strategy="allgather_reducescatter"
-    ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+    ).transform(config_registry.qwen35_debugmodel().model)
     _, delta_cfg, _, _ = next(
         iter(model_cfg.traverse(CPTpuGatedDeltaNet.Config))
     )
@@ -959,7 +959,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
   )
   def test_recipes_convert_every_layer(self, recipe, load_balancer):
     cfg = getattr(config_registry, recipe)()
-    model = cfg.model_spec.model
+    model = cfg.model
     self.assertEqual(cfg.parallelism.context_parallel_degree, 2)
     self.assertEqual(
         cfg.parallelism.context_parallel_load_balancer, load_balancer
@@ -986,7 +986,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     cfg.parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(
         strategy
     )
-    inner = cfg.model_spec.model.first_full_attention_backend
+    inner = cfg.model.first_full_attention_backend
     transforms = [
         ContextParallelTransform(
             inner_attention=tpu_cp_inner_attention(inner._owner, strategy)
@@ -1017,7 +1017,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     cfg.parallelism.tensor_parallel_degree = 2
     with self.assertRaisesRegex(NotImplementedError, "tensor parallelism"):
       cp_gated_delta.validate_gated_delta_context_parallel(
-          cfg.model_spec.model, cfg.parallelism
+          cfg.model, cfg.parallelism
       )
 
   def test_rejects_expert_parallelism(self):
@@ -1025,14 +1025,14 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     cfg.parallelism.expert_parallel_degree = 2
     with self.assertRaisesRegex(NotImplementedError, "expert parallelism"):
       cp_gated_delta.validate_gated_delta_context_parallel(
-          cfg.model_spec.model, cfg.parallelism
+          cfg.model, cfg.parallelism
       )
 
   def test_rejects_vision_encoder(self):
     cfg = self._cp_config(gated_delta_lb=None)
-    model = mock.Mock(wraps=cfg.model_spec.model)
+    model = mock.Mock(wraps=cfg.model)
     model.vision_encoder = object()
-    model.traverse = cfg.model_spec.model.traverse
+    model.traverse = cfg.model.traverse
     with self.assertRaisesRegex(NotImplementedError, "text-only"):
       cp_gated_delta.validate_gated_delta_context_parallel(
           model, cfg.parallelism
@@ -1040,7 +1040,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
 
   def test_transform_is_idempotent_and_keeps_the_kernel(self):
     cfg = config_registry.qwen35_debugmodel()
-    model = cfg.model_spec.model
+    model = cfg.model
     for _ in range(2):
       model = GatedDeltaNetContextParallelTransform(
           load_balancer="headtail"
@@ -1054,7 +1054,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
   def test_revert_restores_single_device_gated_delta(self):
     """revert_tpu_context_parallel also reverts the GatedDeltaNet (cp == 1)."""
     cfg = config_registry.qwen35_debugmodel_allgather_cp2()
-    model = cfg.model_spec.model
+    model = cfg.model
     cp_attention.revert_tpu_context_parallel(model)
     delta_nets = list(model.traverse(GatedDeltaNet.Config))
     self.assertNotEmpty(delta_nets)
@@ -1077,7 +1077,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
             )
         ],
     )
-    model = cfg.model_spec.model
+    model = cfg.model
     cp_attention.revert_tpu_context_parallel(model)
     delta_nets = list(model.traverse(GatedDeltaNet.Config))
     self.assertNotEmpty(delta_nets)
@@ -1132,7 +1132,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
 
   def test_transform_strategy_converts_gated_delta_nets(self):
     cfg = config_registry.qwen35_debugmodel()
-    model = cfg.model_spec.model
+    model = cfg.model
     for _ in range(2):
       model = GatedDeltaNetContextParallelTransform(
           load_balancer=None,
@@ -1150,7 +1150,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
       )
 
   def test_transform_overrides_an_earlier_strategy(self):
-    model = config_registry.qwen35_debugmodel().model_spec.model
+    model = config_registry.qwen35_debugmodel().model
     for strategy in ("allgather_reducescatter", "all_to_all"):
       model = GatedDeltaNetContextParallelTransform(
           load_balancer=None, cp_strategy=strategy
@@ -1160,7 +1160,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
 
   def test_transform_default_strategy_keeps_gated_delta_nets(self):
     model = GatedDeltaNetContextParallelTransform(load_balancer=None).transform(
-        config_registry.qwen35_debugmodel().model_spec.model
+        config_registry.qwen35_debugmodel().model
     )
     for _, delta_net, _, _ in model.traverse(GatedDeltaNet.Config):
       self.assertIs(type(delta_net), TpuGatedDeltaNet.Config)
@@ -1169,14 +1169,14 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "strategy"):
       GatedDeltaNetContextParallelTransform(
           load_balancer=None, cp_strategy="ring"
-      ).transform(config_registry.qwen35_debugmodel().model_spec.model)
+      ).transform(config_registry.qwen35_debugmodel().model)
 
   def test_tpu_model_cp_shard_uses_inner_attention(self):
     """TpuQwen35Model shards CP inputs through the CP attention's cp_shard."""
     cfg = _small_vocab(config_registry.qwen35_debugmodel_allgather_cp2())
     with torch.device("cpu"):
-      model = cfg.model_spec.model.build()
-    owner = cfg.model_spec.model.first_full_attention_backend._owner
+      model = cfg.model.build()
+    owner = cfg.model.first_full_attention_backend._owner
     tokens = torch.arange(2 * _SEQ_LEN)
     batch = {"input": tokens, "labels": tokens, "positions": tokens % _SEQ_LEN}
     parallel_dims = mock.Mock(cp_enabled=True)
@@ -1221,7 +1221,7 @@ class CPQwen35ConfigTest(parameterized.TestCase):
   ):
     cfg = _small_vocab(config_registry.qwen35_debugmodel_allgather_cp2())
     with torch.device("cpu"):
-      model = cfg.model_spec.model.build()
+      model = cfg.model.build()
     tokens = torch.arange(2 * _SEQ_LEN)
     batch = {"input": tokens, "labels": tokens, "positions": tokens % _SEQ_LEN}
     batch[key] = value

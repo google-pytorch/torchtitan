@@ -8,8 +8,6 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torchtitan.distributed.compile import apply_compile
-from torchtitan.distributed.fsdp import apply_fsdp_to_decoder, resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.tpu.components.activation_checkpoint import tpu_selective_ac_config
@@ -20,8 +18,8 @@ from torchtitan.tools.utils import device_type
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
-from torchtitan.models.common.moe import configure_moe_aux_loss_reduction, MoE
-from torchtitan.models.qwen3_5 import parallelize as dtensor_parallelize
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.multimodal import MultimodalModel
 
 
 def apply_qwen3_5_simple_fsdp(
@@ -116,54 +114,31 @@ def _parallelize_text_qwen3_5_with_cp(
     dump_folder: str,
     skip_dp: bool,
 ) -> nn.Module:
-  """Upstream ``parallelize_qwen3_5`` for a text-only model, allowing CP.
+  """``Qwen35Model.parallelize`` for a text-only model, allowing CP.
 
-  Upstream rejects context parallelism because its GatedDeltaNet needs the
-  whole sequence; the TPU CP recipes run it head-parallel instead
-  (``cp_gated_delta``) and validate that in ``validate_tpu_context_parallel``.
-  The steps are upstream's: sharding annotations, activation checkpointing,
-  per-block compile and FSDP2 (on the ``(dp_shard, cp)`` mesh).
-
-  Keep in sync with the text-only path of
-  ``torchtitan/models/qwen3_5/parallelize.py::parallelize_qwen3_5``.
+  Upstream's ``Qwen35Model.parallelize`` rejects context parallelism because
+  its GatedDeltaNet needs the whole sequence; the TPU CP recipes run it
+  head-parallel instead (``cp_gated_delta``) and validate that in
+  ``validate_tpu_context_parallel``. This skips only that check and runs the
+  shared ``MultimodalModel.parallelize`` lifecycle that
+  ``Qwen35Model.parallelize`` delegates to: sharding annotations, the MoE
+  auxiliary-loss mesh check, activation checkpointing, per-block compile and
+  FSDP2 (on the ``(dp_shard, cp)`` mesh).
   """
   if model.vision_encoder is not None:
     raise NotImplementedError(
         "Qwen3.5 context parallelism on TPU is text-only."
     )
-  model.parallelize(parallel_dims)  # pyrefly: ignore[not-callable]
-  # Not in upstream's text path (which rejects CP): raises for MoE auxiliary
-  # losses, which would treat each CP rank's token shard as whole sequences.
-  configure_moe_aux_loss_reduction(model, parallel_dims)
-  if ac_config is not None:
-    ac_config.build(dump_folder=dump_folder).apply(model)
-  if compile_config.enable and "model" in compile_config.components:
-    apply_compile(
-        model, compile_config=compile_config, parallel_dims=parallel_dims
-    )
-  if skip_dp:
-    return model
-  dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-  edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-  apply_fsdp_to_decoder(
+  return MultimodalModel.parallelize(
       model,  # pyrefly: ignore[bad-argument-type]
-      dp_mesh,
-      param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
-          training.mixed_precision_param
-      ],
-      reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
-          training.mixed_precision_reduce
-      ],
-      pp_enabled=parallel_dims.pp_enabled,
-      cpu_offload=training.enable_cpu_offload,
-      reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-      ep_degree=parallel_dims.ep,
-      edp_mesh=edp_mesh,
-      dp_mesh_dims=dp_mesh_dims,
-      edp_mesh_dims=edp_mesh_dims,
-      symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+      parallel_dims=parallel_dims,
+      training=training,
+      parallelism=parallelism,
+      compile_config=compile_config,
+      ac_config=ac_config,
+      dump_folder=dump_folder,
+      skip_dp=skip_dp,
   )
-  return model
 
 
 def parallelize_qwen3_5(
@@ -243,7 +218,7 @@ def parallelize_qwen3_5(
   parallelize = (
       _parallelize_text_qwen3_5_with_cp
       if parallel_dims.cp_enabled
-      else dtensor_parallelize.parallelize_qwen3_5
+      else type(model).parallelize
   )
   parallelize(
       model,  # pyrefly: ignore[bad-argument-type]

@@ -15,7 +15,6 @@ from torchtitan.experiments.tpu.testing.base_distributed_device_test import Inpu
 import torchtitan.experiments.tpu.deepseek_v3 as deepseek_v3_tpu
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.models.deepseek_v3.model import DeepSeekV3Model
-import torchtitan.models.deepseek_v3.parallelize as deepseek_v3_dtensor_parallelize
 
 
 # Constants for test parameters
@@ -69,8 +68,7 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
 
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
-    deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
-        model,
+    model.parallelize(
         ac_config=SelectiveAC.Config(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
@@ -114,8 +112,7 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
 
   def apply_tp_wrapper(model):
     # pytype: disable=wrong-arg-types
-    deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
-        model,
+    model.parallelize(
         ac_config=SelectiveAC.Config(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",
@@ -171,8 +168,7 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
 
   def apply_fsdp_wrapper(model):
     # pytype: disable=wrong-arg-types
-    deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
-        model,
+    model.parallelize(
         ac_config=SelectiveAC.Config(),
         compile_config=TpuTrainerCompileConfig(enable=False),
         dump_folder="",

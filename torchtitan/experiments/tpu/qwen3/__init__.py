@@ -15,8 +15,8 @@ __all__ = [
     "TESTMODEL_MAX_CONTEXT_LENGTH",
 ]
 
-# Context length of `_testmodel_moe`, named so the `ModelSpec.max_context_length`
-# that upstream d771abb0 made required can reuse the exact value its RoPE config
+# Context length of `_testmodel_moe`, named so the model config's
+# `max_context_length` can reuse the exact value its RoPE config
 # is built with (matches upstream's `("testmodel", 128)`).
 TESTMODEL_MAX_CONTEXT_LENGTH = 128
 
@@ -30,6 +30,7 @@ def _testmodel_moe(
     n_layers = 3
     vocab_size = 2048
     return Qwen3Model.Config(
+        max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),

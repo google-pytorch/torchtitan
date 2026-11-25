@@ -48,7 +48,7 @@ def cpu_reference_config(cfg):
   matmuls are TPU-only.
   """
   cfg.parallelism.expert_parallel_degree = 1
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
+  for _, experts, _, _ in cfg.model.traverse(
       TpuGroupedExperts.Config
   ):
     experts.use_pallas_grouped_mm = False
@@ -58,7 +58,7 @@ def cpu_reference_config(cfg):
 def cpu_reference_config_torch_grouped_mm(cfg):
   """CPU reference at EP = 1 with `torch._grouped_mm` instead of Pallas."""
   cfg = cpu_reference_config(cfg)
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
+  for _, experts, _, _ in cfg.model.traverse(
       TpuGroupedExperts.Config
   ):
     experts.use_pallas_paired_grouped_mm = False

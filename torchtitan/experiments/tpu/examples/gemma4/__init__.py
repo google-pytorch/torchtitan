@@ -27,7 +27,6 @@ from torchtitan.config.transform import (
     ModelConfigConverter,
     validate_converter_compatibility,
 )
-from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import (
     QKVLinearKeqV,
@@ -584,7 +583,7 @@ def model_registry(
     enable_ep: bool = False,
     converters: list[ModelConfigConverter.Config] | None = None,
     enable_weight_tying: bool = True,
-) -> ModelSpec:
+) -> Gemma4Model.Config:
     config = _build_flavor_config(
         flavor,
         attn_backend=attn_backend,
@@ -596,13 +595,5 @@ def model_registry(
         enable_weight_tying=enable_weight_tying,
     )
     assert config.layers[0].attention.rope is not None
-    return ModelSpec(
-        name="gemma4",
-        flavor=flavor,
-        model=config,
-        max_context_length=config.layers[0].attention.rope.max_context_length,
-        parallelize_fn=parallelize_gemma4,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=Gemma4StateDictAdapter,
-    )
+    config.max_context_length = config.layers[0].attention.rope.max_context_length
+    return config

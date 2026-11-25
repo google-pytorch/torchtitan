@@ -8,10 +8,9 @@ from torchtitan.components.optimizer.optimizer import (
 from torchtitan.components.validate import Validator
 from torchtitan.experiments.tpu.components.datasets import c4_test_dataloader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.protocols.model_spec import ModelSpec
 # NOTE: these are named directly rather than reached via
 # `TPUTrainerConfig().<field>.__class__`. Upstream d771abb0 made
-# `model_spec` a required field, so the no-arg `TPUTrainerConfig()` that
+# the model config a required field, so the no-arg `TPUTrainerConfig()` that
 # idiom relied on now raises.
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.tpu.tpu_job_config import (
@@ -26,22 +25,8 @@ from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_c
 from torchtitan.distributed.activation_checkpoint import FullAC
 
 
-def _conformer_model_spec(flavor: str) -> ModelSpec:
-  model_config = tpu_conformer.conformer_args[flavor]
-  # Upstream d771abb0 made ModelSpec.max_context_length required. The conformer
-  # config already declares its own context bound as `max_seq_len` (see
-  # `ConformerModelArgs`, which also rewrites it from
-  # `training.max_context_length` in `update_from_config`), so use that.
-  return ModelSpec(
-      name="conformer_tpu",
-      flavor=flavor,
-      model=model_config,
-      max_context_length=model_config.max_seq_len,
-      parallelize_fn=parallelize_conformer,
-      pipelining_fn=None,
-      post_optimizer_build_fn=None,
-      state_dict_adapter=None,
-  )
+def _conformer_model_config(flavor: str):
+  return tpu_conformer.conformer_args[flavor]
 
 
 def conformer_test() -> TPUTrainerConfig:
@@ -50,7 +35,7 @@ def conformer_test() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="tests/assets/tokenizer",
       dump_folder=os.environ.get("TEST_TMPDIR", ".") + "/outputs",
-      model_spec=_conformer_model_spec("test"),
+      model=_conformer_model_config("test"),
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
       dataloader=c4_test_dataloader(),
@@ -88,7 +73,7 @@ def conformer_test() -> TPUTrainerConfig:
 def conformer_debugmodel() -> TPUTrainerConfig:
   """Conformer debug model configuration for TPU."""
   config = conformer_test()
-  config.model_spec = _conformer_model_spec("debugmodel")
+  config.model = _conformer_model_config("debugmodel")
   config.training = config.training.__class__(
       num_tokens_per_microbatch_per_dp_rank=4 * 128,
       max_context_length=128,

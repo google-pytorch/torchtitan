@@ -280,6 +280,14 @@ class Mamba3LM(_BaseModel):
   def verify_module_protocol(self) -> None:
     pass
 
+  def _apply_fsdp(self, *, parallel_dims, training, parallelism) -> None:
+    del parallel_dims, training, parallelism
+
+  def parallelize(self, **kwargs):
+    from .parallelize import parallelize_mamba3
+
+    return parallelize_mamba3(self, **kwargs)
+
   def init_weights(self, buffer_device=None, **kwargs) -> None:
     if self.enable_weight_tying:
       self.lm_head.weight = self.tok_embeddings.weight

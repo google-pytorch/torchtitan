@@ -17,7 +17,6 @@ from torchtitan.experiments.tpu.graph_trainer.simple_fsdp import (
     install_tpu_replicate_computation,
 )
 from torchtitan.experiments.tpu.distributed.spmd_utils import apply_spmd_safe
-from torchtitan.models.llama3 import parallelize as dtensor_parallelize
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +65,15 @@ def parallelize_llama(
 
   if parallelism.use_simple_fsdp:
     # Apply all other parallelisms but skip data parallelism
-    dtensor_parallelize.parallelize_llama(
-          model,  # pyrefly: ignore[bad-argument-type]
-          ac_config=ac_config,
-          compile_config=effective_compile_config,
-          dump_folder=dump_folder,
-          parallel_dims=parallel_dims,
-          parallelism=parallelism,
-          training=training,
-          skip_dp=True,
-      )
+    model.parallelize(
+        ac_config=ac_config,
+        compile_config=effective_compile_config,
+        dump_folder=dump_folder,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        training=training,
+        skip_dp=True,
+    )
 
     model = apply_simple_fsdp(
         model,
@@ -84,16 +82,15 @@ def parallelize_llama(
     )
     install_tpu_replicate_computation(model)
   else:
-    dtensor_parallelize.parallelize_llama(
-          model,  # pyrefly: ignore[bad-argument-type]
-          ac_config=ac_config,
-          compile_config=effective_compile_config,
-          dump_folder=dump_folder,
-          parallel_dims=parallel_dims,
-          parallelism=parallelism,
-          training=training,
-          skip_dp=skip_dp,
-      )
+    model.parallelize(
+        ac_config=ac_config,
+        compile_config=effective_compile_config,
+        dump_folder=dump_folder,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        training=training,
+        skip_dp=skip_dp,
+    )
   if compile_mode == "fullgraph":
     apply_spmd_safe(model)
     model = torch.compile(model, fullgraph=True, backend="tpu")

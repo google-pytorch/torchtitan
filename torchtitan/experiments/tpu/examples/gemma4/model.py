@@ -611,8 +611,20 @@ class Gemma4TransformerBlock(TransformerBlock):
 class Gemma4Model(Decoder):
     """Gemma4 text decoder model supporting hybrid sliding/global attention and dense/MoE blocks."""
 
+    @classmethod
+    def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
+        from torchtitan.components.optimizer import register_moe_load_balancing_hook
+
+        register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+
+    def parallelize(self, **kwargs):
+        from .infra.parallelize import parallelize_gemma4
+
+        return parallelize_gemma4(self, **kwargs)
+
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
+        max_context_length: int = 131072
         dim: int = 5376
         vocab_size: int = 262144
         enable_weight_tying: bool = True
@@ -854,6 +866,11 @@ class Gemma4Model(Decoder):
             max_num_documents=max_num_documents,
             max_context_length=max_context_length,
         )
+
+
+from .state_dict_adapter import Gemma4StateDictAdapter
+
+Gemma4Model.state_dict_adapter_cls = Gemma4StateDictAdapter
 
 
 __all__ = [

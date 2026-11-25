@@ -33,7 +33,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as graph_trainer_model_registry,
-    to_graph_trainer_model_spec,
+    to_graph_trainer_model_config,
     with_maxtext_flops,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
@@ -41,7 +41,6 @@ from torchtitan.experiments.tpu.components.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVConverter
 import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
 from torchtitan.experiments.tpu.qwen3 import model_registry
-from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.components.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -62,8 +61,6 @@ from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
-from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
-from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.observability.profiler import Profiler
 
 
@@ -154,12 +151,12 @@ def _use_maxtext_flops(config: TPUTrainerConfig) -> None:
   MaxText's published numbers. MaxText halves attention FLOPs for the causal
   mask; torchtitan does not discount causal sparsity.
   """
-  assert config.model_spec is not None
-  model = config.model_spec.model
+  assert config.model is not None
+  model = config.model
   if isinstance(model, GraphTrainerQwen3Model.Config):
-    config.model_spec.model = with_maxtext_flops(model)
+    config.model = with_maxtext_flops(model)
   else:
-    config.model_spec.model = MaxTextQwen3Config.from_qwen3(model)
+    config.model = MaxTextQwen3Config.from_qwen3(model)
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -171,8 +168,8 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
 
 def _use_global_batch_aux_loss(config: TPUTrainerConfig) -> None:
   """Use Qwen's global auxiliary load-balancing loss for every MoE layer."""
-  assert config.model_spec is not None
-  for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config):
+  assert config.model is not None
+  for _, moe, _, _ in config.model.traverse(MoE.Config):
     moe.load_balance_coeff = None
     moe.router.aux_loss = make_aux_loss_config(
         type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
@@ -182,10 +179,9 @@ def _use_global_batch_aux_loss(config: TPUTrainerConfig) -> None:
 def qwen3_debugmodel() -> TPUTrainerConfig:
   """Qwen3 debug model configuration for TPU."""
 
-  model_spec = model_registry("debugmodel", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_qwen3
-
-  model_config = cast(Qwen3Model.Config, model_spec.model)
+  model_config = cast(
+      Qwen3Model.Config, model_registry("debugmodel", attn_backend="sdpa")
+  )
   # Disable weight tying to mimic the configuration of larger Qwen3 models
   # (e.g. 8B, 14B, 32B). Note that this is different from the non-TPU
   # "debugmodel" in the config registry.
@@ -196,7 +192,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_config,
       optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -235,22 +231,8 @@ def graph_trainer_qwen3_debugmodel() -> TpuGraphTrainer.Config:
 def qwen3_moe_testmodel() -> TPUTrainerConfig:
   """Qwen3 MoE test model configuration for TPU."""
   cfg = qwen3_debugmodel()
-  config = tpu_qwen3.qwen3_configs["testmodel_moe"]
-  # Upstream d771abb0 made ModelSpec.max_context_length required.
-  # `testmodel_moe` is built by `_testmodel_moe`, whose RoPE config pins
-  # `TESTMODEL_MAX_CONTEXT_LENGTH`; `training.max_context_length` below is set
-  # to the same value.
-  cfg.model_spec = ModelSpec(
-      name="qwen3_tpu",
-      flavor="testmodel_moe",
-      model=config,
-      max_context_length=tpu_qwen3.TESTMODEL_MAX_CONTEXT_LENGTH,
-      parallelize_fn=tpu_parallelize_qwen3,
-      pipelining_fn=None,
-      post_optimizer_build_fn=None,
-      state_dict_adapter=Qwen3StateDictAdapter,
-  )
-  cfg.model_spec.model.enable_weight_tying = False
+  cfg.model = tpu_qwen3.qwen3_configs["testmodel_moe"]
+  cfg.model.enable_weight_tying = False
 
   # Override with previous debug_model train_config values
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
@@ -264,18 +246,18 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
 
 def qwen3_1_7b() -> TPUTrainerConfig:
   """Qwen3 1.7B model configuration for TPU."""
-  model_spec = model_registry("1.7B", attn_backend="sdpa")
-  model_config = cast(Qwen3Model.Config, model_spec.model)
+  model_config = cast(
+      Qwen3Model.Config, model_registry("1.7B", attn_backend="sdpa")
+  )
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
       "weight": partial(nn.init.normal_, std=1.0)
   }
-  model_spec.parallelize_fn = tpu_parallelize_qwen3
 
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_config,
       optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
@@ -328,12 +310,12 @@ def qwen3_1_7b() -> TPUTrainerConfig:
 
 def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU (regular trainer)."""
-  model_spec = _qwen3_dense_model_spec("8B")
+  model_config = _qwen3_dense_model_config("8B")
 
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_config,
       # Keep the established dense optimizer path until native fused AdamW has
       # a dedicated long-convergence validation for this recipe.
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
@@ -400,12 +382,12 @@ def _qwen3_cp(
   core ContextParallelTransform with the TPU CP inner attention for the
   model's attention backend.
   """
-  assert config.model_spec is not None
+  assert config.model is not None
   config.parallelism.context_parallel_degree = cp_degree
   config.parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(
       strategy
   )
-  model = cast(Qwen3Model.Config, config.model_spec.model)
+  model = cast(Qwen3Model.Config, config.model)
   inner_attention = model.first_full_attention_backend
   assert inner_attention is not None
   cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
@@ -421,8 +403,8 @@ def qwen3_debugmodel_allgather_cp2() -> TPUTrainerConfig:
   to its plain-PyTorch reference attention, which is fine at this size.
   """
   config = _qwen3_cp(qwen3_debugmodel(), strategy="all_gather", cp_degree=2)
-  assert config.model_spec is not None
-  for _, attn, _, _ in config.model_spec.model.traverse(BaseAttention.Config):
+  assert config.model is not None
+  for _, attn, _, _ in config.model.traverse(BaseAttention.Config):
     attn.inner_attention.allow_reference_attention = True
   return config
 
@@ -450,70 +432,8 @@ def qwen3_1_7b_ulysses_cp4() -> TPUTrainerConfig:
   return _qwen3_cp(_qwen3_1_7b_32k(), strategy="ulysses", cp_degree=4)
 
 
-def _qwen3_cp(
-    config: TPUTrainerConfig,
-    *,
-    strategy: Literal["ulysses", "all_gather"],
-    cp_degree: int,
-) -> TPUTrainerConfig:
-  """Enables TPU context parallelism, following pattern set by upstream torchtitan_recipes/muse_glimmer.py for CUDA.
-
-  Sets the CP degree and the load balancer, then applies
-  core ContextParallelTransform with the TPU CP inner attention for the
-  model's attention backend.
-  """
-  assert config.model_spec is not None
-  config.parallelism.context_parallel_degree = cp_degree
-  config.parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(
-      strategy
-  )
-  model = cast(Qwen3Model.Config, config.model_spec.model)
-  inner_attention = model.first_full_attention_backend
-  assert inner_attention is not None
-  cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
-  return apply_transforms(
-      config, [ContextParallelTransform(inner_attention=cp_inner_attention)]
-  )
-
-
-def qwen3_debugmodel_allgather_cp2() -> TPUTrainerConfig:
-  """Qwen3 debug model with load-balanced KV all-gather CP degree 2.
-
-  The debug model runs without the Splash kernel, so KV all-gather CP opts in
-  to its plain-PyTorch reference attention, which is fine at this size.
-  """
-  config = _qwen3_cp(qwen3_debugmodel(), strategy="all_gather", cp_degree=2)
-  assert config.model_spec is not None
-  for _, attn, _, _ in config.model_spec.model.traverse(BaseAttention.Config):
-    attn.inner_attention.allow_reference_attention = True
-  return config
-
-
-def qwen3_debugmodel_ulysses_cp2() -> TPUTrainerConfig:
-  """Qwen3 debug model with Ulysses (all-to-all) CP degree 2."""
-  return _qwen3_cp(qwen3_debugmodel(), strategy="ulysses", cp_degree=2)
-
-
-def _qwen3_1_7b_32k() -> TPUTrainerConfig:
-  """Qwen3 1.7B at 32k context, one sequence per data-parallel rank."""
-  config = qwen3_1_7b()
-  config.training.max_context_length = 32768
-  config.training.num_tokens_per_microbatch_per_dp_rank = 32768
-  return config
-
-
-def qwen3_1_7b_allgather_cp4() -> TPUTrainerConfig:
-  """Qwen3 1.7B at 32k context with load-balanced KV all-gather CP degree 4."""
-  return _qwen3_cp(_qwen3_1_7b_32k(), strategy="all_gather", cp_degree=4)
-
-
-def qwen3_1_7b_ulysses_cp4() -> TPUTrainerConfig:
-  """Qwen3 1.7B at 32k context with Ulysses (all-to-all) CP degree 4."""
-  return _qwen3_cp(_qwen3_1_7b_32k(), strategy="ulysses", cp_degree=4)
-
-
-def _qwen3_dense_model_spec(flavor: str) -> ModelSpec:
-  """Upstream dense Qwen3 flavor with the TPU parallelizer and packed QKV.
+def _qwen3_dense_model_config(flavor: str) -> Qwen3Model.Config:
+  """Upstream dense Qwen3 flavor with packed QKV.
 
   Packed QKV keeps upstream's single fused ``wqkv`` parameter (one FSDP
   all-gather per layer) but stores it as contiguous [Q; K; V] rows, which
@@ -521,26 +441,25 @@ def _qwen3_dense_model_spec(flavor: str) -> ModelSpec:
   and -19.7 GiB peak HBM on 32B at local batch 8. Qwen3-8B used separate
   wq/wk/wv projections for the same reason before packed QKV existed.
   """
-  model_spec = model_registry(flavor, attn_backend="sdpa")
-  model_spec.model = (
-      TpuPackedQKVConverter.Config().build().convert(model_spec.model)
+  model_config = model_registry(flavor, attn_backend="sdpa")
+  model_config = cast(
+      Qwen3Model.Config,
+      TpuPackedQKVConverter.Config().build().convert(model_config),
   )
-  model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
       "weight": partial(nn.init.normal_, std=1.0)
   }
-  model_spec.parallelize_fn = tpu_parallelize_qwen3
-  return model_spec
+  return model_config
 
 
 def qwen3_8b() -> TpuGraphTrainer.Config:
   """Qwen3 8B model configuration for TPU."""
-  model_spec = _qwen3_dense_model_spec("8B")
+  model_config = _qwen3_dense_model_config("8B")
 
   config = TPUTrainerConfig(
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_config,
       # Keep the established dense optimizer path until native fused AdamW has
       # a dedicated long-convergence validation for this recipe.
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
@@ -655,7 +574,7 @@ def qwen3_32b() -> TpuGraphTrainer.Config:
   gathered BF16 weights resident.
   """
   cfg = qwen3_8b_zero3()
-  cfg.model_spec = to_graph_trainer_model_spec(_qwen3_dense_model_spec("32B"))
+  cfg.model = to_graph_trainer_model_config(_qwen3_dense_model_config("32B"))
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. Set the context length first; the budgets are 8 local and
   # 1024 global sequences at that context.
@@ -704,7 +623,7 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   """TPU specialization of the global-aux Qwen3 30B recipe."""
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
   cfg.loss = CrossEntropyLoss.Config()
-  cfg.model_spec = model_registry(
+  cfg.model = model_registry(
       "30B-A3B-global-aux",
       attn_backend="sdpa",
       converters=[
@@ -713,7 +632,6 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
           TpuRoutedExpertsConverter.Config(),
       ],
   )
-  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   # Real C4 as on main, through the TPU loader so `--dataloader.dataset_path`
   # can point at a local mirror. Upstream's GrainDataLoader shuffles by
   # default; main's HuggingFaceTextDataLoader did not. Keep main's data order.
@@ -774,11 +692,11 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
       # explicit while Zero-3 memory/overlap policy is tuned separately.
       fsdp_reshard_after_forward="never",
   )
-  assert cfg.model_spec is not None
-  cfg.model_spec.model = (
-      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  assert cfg.model is not None
+  cfg.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model)
   )
-  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
+  for _, experts, _, _ in cfg.model.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
@@ -901,8 +819,8 @@ def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TpuGraphTrainer.Config:
 
 def _scale_routes_before_down_proj(cfg: TPUTrainerConfig) -> None:
   """Apply routing scores before W2 so remat does not replay the W2 forward."""
-  assert cfg.model_spec is not None
-  routed = list(cfg.model_spec.model.traverse(TpuRoutedExperts.Config))
+  assert cfg.model is not None
+  routed = list(cfg.model.traverse(TpuRoutedExperts.Config))
   if not routed:
     raise ValueError("Scaling routes before W2 needs TpuRoutedExperts")
   for _, config, _, _ in routed:
@@ -933,7 +851,7 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   # policy.
   cfg.compile.memory_policy = "full"
   cfg.compile.save_regions = ()
-  cfg.model_spec = to_graph_trainer_model_spec(
+  cfg.model = to_graph_trainer_model_config(
       model_registry(
           "235B-A22B",
           attn_backend="sdpa",
@@ -944,8 +862,8 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
           ],
       )
   )
-  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
-  # Replacing model_spec also replaces nested MoE policy inherited from the
+  model_config = cast(Qwen3Model.Config, cfg.model)
+  # Replacing the model config also replaces nested MoE policy inherited from the
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
   _use_q235_tokamax_attention(cfg)
@@ -1111,8 +1029,8 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(
 def qwen3_moe_235b_fsdp_smoke() -> TpuGraphTrainer.Config:
   """Four-layer FSDP512 smoke for the production 235B execution path."""
   cfg = _qwen3_moe_235b_fsdp_only()
-  assert cfg.model_spec is not None
-  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  assert cfg.model is not None
+  model_config = cast(Qwen3Model.Config, cfg.model)
   model_config.layers = model_config.layers[:4]
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. Set the context length first; the microbatch budget below is
@@ -1141,7 +1059,7 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   message that reads like a scan error.
   """
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
-  cfg.model_spec = to_graph_trainer_model_spec(
+  cfg.model = to_graph_trainer_model_config(
       model_registry(
           "235B-A22B",
           attn_backend="sdpa",
@@ -1154,10 +1072,10 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   )
   # Store the QKV weights as [all Q][all K][all V] rather than grouped per KV
   # head, so attention reads Q, K and V without per-layer copies.
-  cfg.model_spec.model = (
-      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  cfg.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model)
   )
-  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config = cast(Qwen3Model.Config, cfg.model)
   _use_global_batch_aux_loss(cfg)
   _scale_routes_before_down_proj(cfg)
   _use_q235_tokamax_attention(cfg)
@@ -1222,7 +1140,7 @@ def qwen3_moe_235b_scan_torchao_float8() -> TpuGraphTrainer.Config:
   kernels, which torchao's converters do not target.
   """
   cfg = qwen3_moe_235b_scan()
-  assert cfg.model_spec is not None
+  assert cfg.model is not None
   # Imported here so that only float8 configs require torchao.
   from torchtitan.experiments.tpu.components.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
 
@@ -1236,7 +1154,7 @@ def qwen3_moe_235b_scan_torchao_float8() -> TpuGraphTrainer.Config:
   converter = TpuFloat8LinearConverter.Config(
       recipe_name="rowwise", filter_fqns=["router.gate", "lm_head"]
   ).build()
-  cfg.model_spec.model = converter.convert(cfg.model_spec.model)
+  cfg.model = converter.convert(cfg.model)
   return cfg
 
 
@@ -1248,8 +1166,8 @@ def qwen3_moe_235b_scan_proxy() -> TpuGraphTrainer.Config:
   changes, which is the one thing scan is meant not to care about.
   """
   cfg = qwen3_moe_235b_scan()
-  assert cfg.model_spec is not None
-  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  assert cfg.model is not None
+  model_config = cast(Qwen3Model.Config, cfg.model)
   model_config.layers = model_config.layers[:12]
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets. `qwen3_moe_235b_scan` leaves max_context_length at 4096.
@@ -1259,8 +1177,8 @@ def qwen3_moe_235b_scan_proxy() -> TpuGraphTrainer.Config:
 
 
 def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
-  assert cfg.model_spec is not None
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
+  assert cfg.model is not None
+  for _, experts, _, _ in cfg.model.traverse(
       TpuGroupedExperts.Config
   ):
     experts.use_fp8_grouped_mm = True
@@ -1269,9 +1187,9 @@ def _with_fp8_experts(cfg: TpuGraphTrainer.Config) -> TpuGraphTrainer.Config:
   # The FP8 fused SwiGLU + W2 op cannot apply the routing scores before W2, so
   # keep the score multiply after the experts, with its backward in one FP32
   # fusion.
-  for _, routed, _, _ in cfg.model_spec.model.traverse(TpuRoutedExperts.Config):
+  for _, routed, _, _ in cfg.model.traverse(TpuRoutedExperts.Config):
     routed.scale_before_down_proj = False
-  for _, dispatcher, _, _ in cfg.model_spec.model.traverse(
+  for _, dispatcher, _, _ in cfg.model.traverse(
       TpuAllToAllTokenDispatcher.Config
   ):
     dispatcher.fuse_route_score_backward = True
@@ -1307,8 +1225,8 @@ def qwen3_moe_235b_scan_maxtext() -> TpuGraphTrainer.Config:
 def qwen3_moe_30b_proxy() -> TpuGraphTrainer.Config:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()
-  assert cfg.model_spec is not None
-  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  assert cfg.model is not None
+  model_config = cast(Qwen3Model.Config, cfg.model)
   # Slice layers to only keep 4 layers to save memory and compile time
   model_config.layers = model_config.layers[:4]
   return cfg

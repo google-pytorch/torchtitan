@@ -80,10 +80,11 @@ _TPU_FLAVORS = {
 def _model_registry(flavor: str, *, seq_len: int):
   """The backend's model_registry, extended with this lane's own flavors."""
   if flavor in _TPU_FLAVORS and flavor not in _shared_flavors:
-    spec = model_registry(next(iter(_shared_flavors)), seq_len=seq_len)
-    spec.flavor = flavor
-    spec.model = _TPU_FLAVORS[flavor]
-    return spec
+    import copy
+
+    cfg = copy.deepcopy(_TPU_FLAVORS[flavor])
+    cfg.max_seq_len = seq_len
+    return cfg
   return model_registry(flavor, seq_len=seq_len)
 
 def _fused_ce_loss() -> PallasCrossEntropyLoss.Config:
@@ -197,18 +198,17 @@ def _tpu_hf_config(
     use_pallas_grouped_mm: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
-  model_spec = _model_registry(flavor, seq_len=seq_len)
+  model_config = _model_registry(flavor, seq_len=seq_len)
   # The TPU subclass carries everything the lane changes about the model
   # object (structural part resolution, attached head/norm, fused-loss
   # return, ...); the shared backend only has the hooks. Re-classing a copy
   # also leaves the shared flavors table untouched.
-  model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
+  model_config = as_tpu_model_config(model_config, fused_loss=fused_loss)
   # Sets TpuGroupedExperts.Config.use_pallas_grouped_mm on the swapped MoE
   # experts instead of upstream's torch._grouped_mm (see
   # model._use_pallas_grouped_mm).
-  model_spec.model.use_pallas_grouped_mm = use_pallas_grouped_mm
-  model_spec.parallelize_fn = parallelize_hf_transformers_tpu
-  _set_attn_mask_type(model_spec.model, attn_mask_type)
+  model_config.use_pallas_grouped_mm = use_pallas_grouped_mm
+  _set_attn_mask_type(model_config, attn_mask_type)
   # flex attention has no TPU lowering. "sdpa" is the portable default;
   # "splash_tpu" routes attention through the TPU splash kernel via HF's
   # AttentionInterface (see attention.py), which works for any architecture
@@ -216,12 +216,12 @@ def _tpu_hf_config(
   # Go through _configure_hf_attention rather than setting the attribute:
   # it also updates _titan_injected_model_args, which update_from_config
   # re-applies afterwards and would otherwise overwrite a bare assignment.
-  _set_attn_implementation(model_spec.model, attn)
+  _set_attn_implementation(model_config, attn)
   return TPUTransformersBackendConfig(
       hf_model=hf_model,
       loss=_fused_ce_loss() if fused_loss else CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
+      model=model_config,
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -416,7 +416,7 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   The mask derivation itself is checked against HF's mask functions by
   ``tests/test_attention_masks.py``.
   """
-  model_config = config.model_spec.model
+  model_config = config.model
   if getattr(model_config, "fused_loss", False):
     model_config.fused_loss = False
     config.loss = CrossEntropyLoss.Config()

@@ -258,6 +258,9 @@ class Conformer(BaseModel):
 
   Config = ConformerModelArgs
 
+  def _apply_fsdp(self, *, parallel_dims, training, parallelism) -> None:
+    del parallel_dims, training, parallelism
+
   def __init__(self, config: ConformerModelArgs) -> None:
     super().__init__()
     self.config = config

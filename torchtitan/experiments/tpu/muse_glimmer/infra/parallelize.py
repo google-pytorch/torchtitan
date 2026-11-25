@@ -165,7 +165,7 @@ def parallelize_muse_glimmer(
   if tpu_compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
-  model.parallelize(parallel_dims)
+  model._parallelize(parallel_dims)
 
   if ac_config is not None:
     ac_config.build(dump_folder=dump_folder).apply(model)

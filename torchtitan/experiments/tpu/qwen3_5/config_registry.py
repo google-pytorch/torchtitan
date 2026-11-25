@@ -91,16 +91,16 @@ def _use_tpu_moe_kernels(cfg: TPUTrainerConfig, *, tile_m: int = 256) -> None:
   Pallas paired grouped matmuls with kernel-native expert weights, and dScore
   in one fused FP32 reduction instead of saving an FP32 copy of every expert
   output. These are per-model-config settings, so a recipe that replaces
-  `model_spec` must apply them again.
+  the model config must apply them again.
 
   Args:
     cfg: The recipe to update in place.
     tile_m: Forward and dWeight row tile size for the Pallas grouped matmuls.
   """
-  assert cfg.model_spec is not None
-  experts = list(cfg.model_spec.model.traverse(TpuGroupedExperts.Config))
+  assert cfg.model is not None
+  experts = list(cfg.model.traverse(TpuGroupedExperts.Config))
   dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+      cfg.model.traverse(TpuAllToAllTokenDispatcher.Config)
   )
   if not experts or not dispatchers:
     raise ValueError(
@@ -128,10 +128,10 @@ def _no_gated_delta_document_resets(cfg: TPUTrainerConfig) -> None:
   Args:
     cfg: The recipe to update in place.
   """
-  assert cfg.model_spec is not None
-  delta_nets = list(cfg.model_spec.model.traverse(TpuGatedDeltaNet.Config))
+  assert cfg.model is not None
+  delta_nets = list(cfg.model.traverse(TpuGatedDeltaNet.Config))
   if not delta_nets:
-    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model_spec.model")
+    raise ValueError("Expected TpuGatedDeltaNet layers in cfg.model")
   for _, delta_net, _, _ in delta_nets:
     delta_net.reset_at_documents = False
 
@@ -304,7 +304,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("debugmodel", seq_len=256),
+      model=model_registry("debugmodel", seq_len=256),
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -332,7 +332,7 @@ def qwen35_debugmodel() -> TPUTrainerConfig:
 def qwen35_moe_debugmodel() -> TPUTrainerConfig:
   """Debug config for 4-layer hybrid Qwen3.5 MoE on TPU."""
   cfg = qwen35_debugmodel()
-  cfg.model_spec = model_registry(
+  cfg.model = model_registry(
       "debugmodel_moe", seq_len=256, converters=_TPU_MOE_CONVERTERS
   )
   return cfg
@@ -358,8 +358,8 @@ def qwen35_moe_debugmodel_pallas_gmm() -> TPUTrainerConfig:
   grouped matmuls take per-row scales.
   """
   cfg = qwen35_moe_debugmodel()
-  assert cfg.model_spec is not None
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
+  assert cfg.model is not None
+  for _, experts, _, _ in cfg.model.traverse(
       TpuGroupedExperts.Config
   ):
     experts.use_pallas_grouped_mm = True
@@ -390,8 +390,8 @@ def qwen35_moe_debugmodel_pallas_experts() -> TPUTrainerConfig:
   (`test_ep_parity_distributed`).
   """
   cfg = qwen35_moe_debugmodel_pallas_gmm()
-  assert cfg.model_spec is not None
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
+  assert cfg.model is not None
+  for _, experts, _, _ in cfg.model.traverse(
       TpuGroupedExperts.Config
   ):
     experts.use_pallas_paired_grouped_mm = True
@@ -451,7 +451,7 @@ def qwen35_moe_35b(flavor: str = "35B-A3B") -> TPUTrainerConfig:
       # Logging syncs the host on the loss; every 5 steps lets the host
       # dispatch the next step while the current one runs.
       metrics=MetricsProcessor.Config(log_freq=5),
-      model_spec=model_registry(flavor, converters=_TPU_MOE_CONVERTERS),
+      model=model_registry(flavor, converters=_TPU_MOE_CONVERTERS),
       optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       # A 2-step warmup to the peak LR diverged the randomly initialized
       # 40-layer model (loss 12.77 -> 6.45 -> 8.48 -> NaN at step 4 on
@@ -635,7 +635,7 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   cfg.training.max_context_length = 8192
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 3 * 8192
   _enable_pallas_cross_entropy(cfg)
-  for _, experts, _, _ in cfg.model_spec.model.traverse(
+  for _, experts, _, _ in cfg.model.traverse(
       TpuGroupedExperts.Config
   ):
     # Untiled, the paired W1 + W3 dWeight needs two FP32 (K, N) accumulators
@@ -683,11 +683,11 @@ def _qwen35_cp(
   Returns:
     A validated copy of ``config`` with CP enabled.
   """
-  assert config.model_spec is not None
+  assert config.model is not None
   load_balancer = tpu_cp_load_balancer(strategy)
   config.parallelism.context_parallel_degree = cp_degree
   config.parallelism.context_parallel_load_balancer = load_balancer
-  inner_attention = config.model_spec.model.first_full_attention_backend
+  inner_attention = config.model.first_full_attention_backend
   assert inner_attention is not None
   return apply_transforms(
       config,
@@ -708,8 +708,8 @@ def _qwen35_cp(
 
 def _allow_reference_attention(cfg: TPUTrainerConfig) -> None:
   """Lets KV all-gather CP run its plain-PyTorch attention (no Splash)."""
-  assert cfg.model_spec is not None
-  for _, attn, _, _ in cfg.model_spec.model.traverse(BaseAttention.Config):
+  assert cfg.model is not None
+  for _, attn, _, _ in cfg.model.traverse(BaseAttention.Config):
     attn.inner_attention.allow_reference_attention = True
 
 

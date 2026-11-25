@@ -84,7 +84,7 @@ def _parallelize_gemma4(
       compile_config.enable and "model" in compile_config.components
   )
 
-  model.parallelize(parallel_dims)
+  model._parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
 

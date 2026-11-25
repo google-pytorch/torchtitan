@@ -156,14 +156,11 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
       self.assertEqual(attention.window_size is None, attention.rope is None)
 
   def test_model_registry_uses_tpu_parallelize(self):
-    """Tests that every flavor uses the TPU parallelize fn and attention."""
+    """Tests that every flavor uses the TPU attention."""
     for flavor in ("testmodel", "debugmodel", "30B"):
       with self.subTest(flavor=flavor):
-        spec = muse_glimmer_tpu.model_registry(flavor)
-        self.assertEqual(spec.name, "muse_glimmer")
-        self.assertIs(spec.parallelize_fn, parallelize_muse_glimmer)
-        self.assertIsNone(spec.pipelining_fn)
-        for layer in spec.model.layers:
+        model_cfg = muse_glimmer_tpu.model_registry(flavor)
+        for layer in model_cfg.layers:
           self.assertIsInstance(
               layer.attention.inner_attention,
               tpu_attention.SlidingWindowScaledDotProductInnerAttention.Config,
@@ -186,7 +183,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     """Tests that every layer uses the positions-forwarding TPU attention."""
     for flavor in ("testmodel", "debugmodel", "30B"):
       with self.subTest(flavor=flavor):
-        for layer in muse_glimmer_tpu.model_registry(flavor).model.layers:
+        for layer in muse_glimmer_tpu.model_registry(flavor).layers:
           self.assertIsInstance(
               layer.attention, tpu_attention.TpuMuseGlimmerAttention.Config
           )
@@ -292,7 +289,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
   def test_fused_ce_recipe_carries_soft_cap_into_loss(self):
     """Tests the *_fused_ce recipe: wrapper head + capped fused loss."""
     base = config_registry.muse_glimmer_debugmodel()
-    base_head = base.model_spec.model.lm_head
+    base_head = base.model.lm_head
     self.assertIsInstance(base_head, upstream_model.SoftCappedLinear.Config)
     self.assertIsNotNone(base_head.output_soft_cap_temp)
 
@@ -309,13 +306,13 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     )
 
     apply_overrides(config.override, config)
-    head = config.model_spec.model.lm_head
+    head = config.model.lm_head
     self.assertIsInstance(head, fused_loss.FusedLossLinearWrapper.Config)
     self.assertEqual(head.soft_cap, base_head.output_soft_cap_temp)
     self.assertEqual(head.output_multiplier, base_head.output_multiplier)
 
     with torch.device("meta"):
-      model = config.model_spec.model.build()
+      model = config.model.build()
     self.assertIsInstance(model.lm_head, fused_loss.FusedLossLinearWrapper)
     # The checkpoint key is unchanged, so plain-CE checkpoints load.
     self.assertEqual(
@@ -326,7 +323,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
   def _build_fused_ce_model(self, config):
     apply_overrides(config.override, config)
     with torch.device("meta"):
-      return config.model_spec.model.build()
+      return config.model.build()
 
   def test_fused_ce_recipe_passes_logit_transform_check(self):
     """Tests that the *_fused_ce recipe's head and loss agree."""
@@ -366,7 +363,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
   def test_30b_recipes_share_upstream_model_and_flags(self, name):
     """Tests the 30B recipes: upstream model/data settings, 4x4x4 flags."""
     config = getattr(config_registry, name)()
-    self.assertEqual(config.model_spec.flavor, "30B")
+    self.assertLen(config.model.layers, 52)
     self.assertEqual(config.training.max_context_length, 16384)
     self.assertEqual(
         config.training.num_tokens_per_microbatch_per_dp_rank, 16384
@@ -494,7 +491,7 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
   def test_recipes_use_packed_qkv(self, name, expected_layers):
     """Tests that GraphTrainer and 30B recipes convert all layers to TpuPackedQKVLinear."""
     config = getattr(config_registry, name)()
-    packed = list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config))
+    packed = list(config.model.traverse(TpuPackedQKVLinear.Config))
     self.assertLen(packed, expected_layers)
 
 

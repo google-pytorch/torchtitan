@@ -14,6 +14,7 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
   n_heads = 8
   n_layers = 1
   return llama3_models.Llama3Model.Config(
+      max_context_length=512,
       dim=dim,
       vocab_size=128,
       tok_embeddings=common_models.Embedding.Config(

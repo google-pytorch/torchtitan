@@ -34,6 +34,10 @@ def use_expert_parallel(
     max_inflight_chunks: int | None = None,
     accumulate_chunk_weight_grads_fp32: bool | None = None,
     paired_grouped_mm: bool | None = None,
+    roe_window_routing: bool | None = None,
+    roe_save_routing_metadata: bool | None = None,
+    roe_reduce_block_size: int | None = None,
+    roe_fused_w13_gather: bool | None = None,
 ) -> None:
   """Configures a MoE model config for expert parallelism on TPU.
 
@@ -111,6 +115,8 @@ def use_expert_parallel(
         ep_experts.accumulate_chunk_weight_grads_fp32 = (
             accumulate_chunk_weight_grads_fp32
         )
+      if roe_fused_w13_gather is not None:
+        ep_experts.roe_fused_w13_gather = roe_fused_w13_gather
       # Routing weights before W2 pass `row_scale_R`, which only the Pallas
       # grouped matmuls accept (stock `GroupedExperts` has no such argument).
       # Fail at config time, not in the first forward, and leave the kernel
@@ -151,6 +157,12 @@ def use_expert_parallel(
         derive_kwargs = {"ep_transport": chosen_transport}
         if ep_capacity_factor is not None:
           derive_kwargs["ep_capacity_factor"] = ep_capacity_factor
+        if roe_window_routing is not None:
+          derive_kwargs["roe_window_routing"] = roe_window_routing
+        if roe_save_routing_metadata is not None:
+          derive_kwargs["roe_save_routing_metadata"] = roe_save_routing_metadata
+        if roe_reduce_block_size is not None:
+          derive_kwargs["roe_reduce_block_size"] = roe_reduce_block_size
         ep_dispatcher = torchtitan.config.derive(
             dispatcher,
             TpuAllToAllTokenDispatcher.Config,

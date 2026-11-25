@@ -26,6 +26,7 @@ optionally bounds each rank's expert buffer on both ``ragged_all_to_all`` and
 bounds on each).
 """
 
+import contextlib
 from dataclasses import dataclass, replace
 import math
 from typing import Literal, get_args
@@ -49,6 +50,7 @@ from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
     MOE_EP_DISPATCH,
+    MOE_ROE_ROUTING,
     MOE_ROUTING,
 )
 from torchtitan.models.common.moe import _tokens_per_expert, RoutedExperts
@@ -418,6 +420,9 @@ class TpuRoEDispatchMetadata(TpuEpDispatchMetadata):
   gather_block_size: int
   reduce_block_size: int
   zero_pad_tail: bool
+  # roe_fused_w13_gather: dispatch returned the gathered tokens (not the
+  # sorted expert buffer), and the experts return the partial combine.
+  fused_gmm: bool = False
 
 
 def _ring_of_experts_unavailable_message(reason: str) -> str:
@@ -662,6 +667,13 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     roe_gather_block_size: int = 1024
     roe_reduce_block_size: int = 896
     roe_zero_pad_tail: bool = False
+    # Ring-of-Experts routing tables cover only this rank's [cap] window of the
+    # expert-sorted slots.
+    roe_window_routing: bool = False
+    # Put the Ring-of-Experts routing tables in the `moe.roe_routing` save
+    # region so selective rematerialization can keep them for backward.
+    roe_save_routing_metadata: bool = False
+    roe_run_reduce: bool = False
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -693,6 +705,9 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     self.roe_gather_block_size = config.roe_gather_block_size
     self.roe_reduce_block_size = config.roe_reduce_block_size
     self.roe_zero_pad_tail = config.roe_zero_pad_tail
+    self.roe_window_routing = config.roe_window_routing
+    self.roe_save_routing_metadata = config.roe_save_routing_metadata
+    self.roe_run_reduce = config.roe_run_reduce
     self._scale_before_down_proj = False
     self._ep_rank_holder_ref: weakref.ReferenceType | None = None
     self._ep_local_rank_buf: torch.Tensor | None = None
@@ -1024,24 +1039,35 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         ids_i32_TK = topk_expert_ids_TK.to(torch.int32).contiguous()
         with annotate_region(MOE_ROUTING):
           ids_all_GK = _ep_all_gather_impl(ids_i32_TK, self.ep_mesh, pg)
-        (
-            num_global_tokens_per_local_expert_e,
-            token_ids_sorted_M,
-            window_slot_order_cap,
-            start_count_2,
-            src_rows,
-            tokens,
-            blocks,
-        ) = roe_compute_routing(
-            ids_all_GK.reshape(-1),
-            rank_idx_i32,
-            num_experts=self.num_experts,
-            ep_size=ep_size,
-            top_k=self.top_k,
-            num_out_tokens=g_tokens,
-            cap=cap,
-            reduce_block_size=reduce_block,
-        )
+        # With `roe_save_routing_metadata`, the routing tables form the
+        # `moe.roe_routing` save region, so a policy that saves it keeps them
+        # for backward instead of recomputing the id all-gather and expert
+        # sort there.
+        with (
+            annotate_region(MOE_ROE_ROUTING)
+            if self.roe_save_routing_metadata
+            else contextlib.nullcontext()
+        ):
+          (
+              num_global_tokens_per_local_expert_e,
+              token_ids_sorted_M,
+              window_slot_order_cap,
+              start_count_2,
+              src_rows,
+              tokens,
+              blocks,
+          ) = roe_compute_routing(
+              ids_all_GK.reshape(-1),
+              rank_idx_i32,
+              num_experts=self.num_experts,
+              ep_size=ep_size,
+              top_k=self.top_k,
+              num_out_tokens=g_tokens,
+              cap=cap,
+              reduce_block_size=reduce_block,
+              window_routing=self.roe_window_routing,
+              run_reduce=self.roe_run_reduce,
+          )
         valid_count = start_count_2[1]
         if is_capped:
           rel_ids_GK = ids_all_GK - rank_idx_i32 * e
@@ -1054,22 +1080,34 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         self._record_dropped_count(x_TD, dropped_count)
 
       with annotate_region(MOE_EP_DISPATCH):
-        x_all_GD = _EpAllGather.apply(x_TD, self.ep_mesh, pg)
+        # Gather in the TC ragged-gather kernel's (rows, D / 128, 128) layout:
+        # relayouting this rank's T rows is EP times cheaper than relayouting
+        # the gathered EP * T rows.
+        x_all_GD = _EpAllGather.apply(
+            x_TD.reshape(x_TD.shape[0], x_TD.shape[1] // 128, 128),
+            self.ep_mesh,
+            pg,
+        )
         scores_all_GK = _EpAllGather.apply(topk_scores_TK, self.ep_mesh, pg)
 
-      routed_input_RD = roe_sort_gather(
-          x_all_GD,
-          token_ids_sorted_M,
-          start_count_2,
-          src_rows,
-          tokens,
-          blocks,
-          cap=cap,
-          top_k=self.top_k,
-          gather_block_size=gather_block,
-          reduce_block_size=reduce_block,
-          zero_pad_tail=self.roe_zero_pad_tail,
-      )
+      fused_gmm = bool(getattr(self, "roe_fused_gmm", False))
+      if fused_gmm:
+        # The experts gather inside their W1/W3 matmul (roe_fused_gmm).
+        routed_input_RD = x_all_GD
+      else:
+        routed_input_RD = roe_sort_gather(
+            x_all_GD,
+            token_ids_sorted_M,
+            start_count_2,
+            src_rows,
+            tokens,
+            blocks,
+            cap=cap,
+            top_k=self.top_k,
+            gather_block_size=gather_block,
+            reduce_block_size=reduce_block,
+            zero_pad_tail=self.roe_zero_pad_tail,
+        )
       row_scale_R = None
       if self._scale_before_down_proj:
         row_scale_R = roe_gather_row_scales(
@@ -1092,6 +1130,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           gather_block_size=gather_block,
           reduce_block_size=reduce_block,
           zero_pad_tail=self.roe_zero_pad_tail,
+          fused_gmm=fused_gmm,
       )
       return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
 
@@ -1120,7 +1159,10 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
     with maybe_set_sparse_mesh():
       pg = self.ep_mesh.get_group()
-      if metadata.row_scale_applied:
+      if metadata.fused_gmm:
+        # The experts already reduced (roe_fused_w2_combine).
+        partial_GD = routed_output_RD
+      elif metadata.row_scale_applied:
         partial_GD = roe_unsort_reduce(
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
@@ -1132,6 +1174,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             top_k=self.top_k,
             gather_block_size=metadata.gather_block_size,
             reduce_block_size=metadata.reduce_block_size,
+            out_3d=True,
         )
       else:
         partial_GD = roe_unsort_combine(
@@ -1149,7 +1192,8 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             reduce_block_size=metadata.reduce_block_size,
             zero_pad_tail=metadata.zero_pad_tail,
         )
-      return _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
+      out = _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
+      return out.reshape(x_TD.shape)
 
   @annotate_fn({"EP": "dispatch"})
   def dispatch(
@@ -1300,23 +1344,12 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           dropped_count = valid_count.new_zeros(())
         self._record_dropped_count(x_TD, dropped_count)
 
-      routed_input_RD = self._ragged_all_to_all(
-          routed_input_ND,
-          r_static,
-          disp_input_offsets,
-          disp_send_sizes,
-          disp_output_offsets,
-          disp_recv_sizes,
-          comb_input_offsets,
-          comb_send_sizes,
-          comb_output_offsets,
-          comb_recv_sizes,
-          pg,
-      )
-      row_scale_R = None
-      if self._scale_before_down_proj:
-        row_scale_R = self._ragged_all_to_all(
-            topk_scores_experts_sorted_N.unsqueeze(-1),
+      # Marked so the tpu_selective policy can save the received rows
+      # (``--compile.save_regions moe.ep_dispatch``) instead of repeating the
+      # dispatch all-to-all when backward recomputes the layer.
+      with annotate_region(MOE_EP_DISPATCH):
+        routed_input_RD = self._ragged_all_to_all(
+            routed_input_ND,
             r_static,
             disp_input_offsets,
             disp_send_sizes,
@@ -1327,7 +1360,22 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             comb_output_offsets,
             comb_recv_sizes,
             pg,
-        ).squeeze(-1)
+        )
+        row_scale_R = None
+        if self._scale_before_down_proj:
+          row_scale_R = self._ragged_all_to_all(
+              topk_scores_experts_sorted_N.unsqueeze(-1),
+              r_static,
+              disp_input_offsets,
+              disp_send_sizes,
+              disp_output_offsets,
+              disp_recv_sizes,
+              comb_input_offsets,
+              comb_send_sizes,
+              comb_output_offsets,
+              comb_recv_sizes,
+              pg,
+          ).squeeze(-1)
 
     metadata = TpuRaggedDispatchMetadata(
         token_indices_experts_sorted_N=token_indices_experts_sorted_N,
@@ -1428,6 +1476,7 @@ class TpuRoutedExperts(RoutedExperts):
     num_token_chunks: int = 1
     max_inflight_chunks: int = 2
     accumulate_chunk_weight_grads_fp32: bool = True
+    roe_fused_w13_gather: bool = False
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -1450,6 +1499,7 @@ class TpuRoutedExperts(RoutedExperts):
     self.accumulate_chunk_weight_grads_fp32 = (
         config.accumulate_chunk_weight_grads_fp32
     )
+    self.roe_fused_w13_gather = config.roe_fused_w13_gather
     self._warned_chunk_snap: set[tuple[int, int]] = set()
     self.scale_before_down_proj = config.scale_before_down_proj
     if not self.scale_before_down_proj:
@@ -1549,6 +1599,23 @@ class TpuRoutedExperts(RoutedExperts):
       total = torch.full_like(dropped, num_tokens * self.token_dispatcher.top_k)
       self._last_ep_drop_stats_2 = torch.stack([dropped, total])
 
+  def _set_roe_fused_gmm(self, allowed: bool) -> None:
+    """Selects the fused-gather RoE W1/W3 experts when configured and usable.
+
+    They need the routing weights applied before W2 and the BF16 paired
+    Pallas grouped matmuls; the dispatcher then skips its sort gather.
+    """
+    if not isinstance(self.token_dispatcher, TpuAllToAllTokenDispatcher):
+      return
+    supports = getattr(self.inner_experts, "supports_roe_fused_gmm", None)
+    self.token_dispatcher.roe_fused_gmm = bool(
+        allowed
+        and self.roe_fused_w13_gather
+        and self.scale_before_down_proj
+        and supports is not None
+        and supports()
+    )
+
   def _forward_ep_chunked(
       self,
       x_TD: torch.Tensor,
@@ -1571,6 +1638,7 @@ class TpuRoutedExperts(RoutedExperts):
         == "ring_of_experts"
     )
     needs_chunk_counts = not is_roe
+    self._set_roe_fused_gmm(is_roe)
 
     unsharded_weights = None
     if hasattr(self.inner_experts, "unshard_weights"):
@@ -1647,12 +1715,22 @@ class TpuRoutedExperts(RoutedExperts):
                 " row_scale_R populated"
             )
           with maybe_set_sparse_mesh():
-            routed_output_c = self.inner_experts(
-                routed_input_c,
-                num_tokens_per_expert_e,
-                row_scale_R=metadata_c.row_scale_R,
-                **extra_expert_kwargs,
-            )
+            if getattr(metadata_c, "fused_gmm", False):
+              routed_output_c = self.inner_experts.forward_roe_fused(
+                  routed_input_c,
+                  num_tokens_per_expert_e,
+                  metadata_c,
+                  top_k=self.token_dispatcher.top_k,
+                  row_scale_R=metadata_c.row_scale_R,
+                  **extra_expert_kwargs,
+              )
+            else:
+              routed_output_c = self.inner_experts(
+                  routed_input_c,
+                  num_tokens_per_expert_e,
+                  row_scale_R=metadata_c.row_scale_R,
+                  **extra_expert_kwargs,
+              )
           metadata_c = replace(metadata_c, row_scale_applied=True)
         else:
           with maybe_set_sparse_mesh():
@@ -1745,9 +1823,11 @@ class TpuRoutedExperts(RoutedExperts):
         )
 
     if not self.scale_before_down_proj:
+      self._set_roe_fused_gmm(False)
       return super().forward(
           x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
       )
+    self._set_roe_fused_gmm(True)
     routed_input_RD, num_tokens_per_expert_e, metadata = (
         self.token_dispatcher.dispatch(
             x_TD,
@@ -1763,11 +1843,20 @@ class TpuRoutedExperts(RoutedExperts):
             " row_scale_R populated"
         )
       with maybe_set_sparse_mesh():
-        routed_output_RD = self.inner_experts(
-            routed_input_RD,
-            num_tokens_per_expert_e,
-            row_scale_R=metadata.row_scale_R,
-        )
+        if getattr(metadata, "fused_gmm", False):
+          routed_output_RD = self.inner_experts.forward_roe_fused(
+              routed_input_RD,
+              num_tokens_per_expert_e,
+              metadata,
+              top_k=self.token_dispatcher.top_k,
+              row_scale_R=metadata.row_scale_R,
+          )
+        else:
+          routed_output_RD = self.inner_experts(
+              routed_input_RD,
+              num_tokens_per_expert_e,
+              row_scale_R=metadata.row_scale_R,
+          )
       return self.token_dispatcher.combine(
           routed_output_RD,
           replace(metadata, row_scale_applied=True),

@@ -34,7 +34,10 @@ from torchtitan.experiments.graph_trainer.registry import register_memory_policy
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
+    LAYER_ALL,
+    LAYER_MIXER,
     MOE_EP_DISPATCH,
+    MOE_ROE_ROUTING,
     MOE_ROUTING,
     REMAT_REGION,
 )
@@ -296,6 +299,64 @@ def select_ep_dispatch(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 EP_DISPATCH_REGION = SaveRegion(name=MOE_EP_DISPATCH, select=select_ep_dispatch)
 
+
+def select_roe_routing(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return the Ring-of-Experts routing-table nodes marked in dispatch."""
+    return [
+        node
+        for node in _forward_call_nodes(gm)
+        if _in_remat_region(node, MOE_ROE_ROUTING)
+    ]
+
+
+ROE_ROUTING_REGION = SaveRegion(name=MOE_ROE_ROUTING, select=select_roe_routing)
+
+def select_layer_values(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return every forward node inside a transformer layer.
+
+    Saving all of them means backward recomputes nothing for that layer;
+    data dependencies still free values that backward never reads.
+    """
+    return [
+        node
+        for node in _forward_call_nodes(gm)
+        if _get_layer_id(node) >= 0 and _has_tensor_value(node)
+    ]
+
+
+def _has_tensor_value(node: torch.fx.Node) -> bool:
+    value = node.meta.get("val")
+    values = value if isinstance(value, (tuple, list)) else (value,)
+    return bool(values) and all(isinstance(v, torch.Tensor) for v in values)
+
+
+LAYER_ALL_REGION = SaveRegion(name=LAYER_ALL, select=select_layer_values)
+
+
+def select_layer_mixer_values(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return every forward node in each layer before its FFN/MoE sub-block.
+
+    Stops at the first ``ffn_norm`` / ``moe`` / ``feed_forward`` node of each
+    layer, so the attention or GatedDeltaNet mixer and the post-mixer residual
+    are saved without saving the 16x gathered MoE token buffers.
+    """
+    seen_ffn: set[int] = set()
+    selected: list[torch.fx.Node] = []
+    for node in _forward_call_nodes(gm):
+        layer_id = _get_layer_id(node)
+        if layer_id < 0 or layer_id in seen_ffn:
+            continue
+        fqn = _get_module_fqn(node) or ""
+        if ".ffn_norm" in fqn or ".moe" in fqn or ".feed_forward" in fqn:
+            seen_ffn.add(layer_id)
+            continue
+        if _has_tensor_value(node):
+            selected.append(node)
+    return selected
+
+
+LAYER_MIXER_REGION = SaveRegion(name=LAYER_MIXER, select=select_layer_mixer_values)
+
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
@@ -303,6 +364,9 @@ SAVE_REGIONS: dict[str, SaveRegion] = {
         SPLASH_ATTENTION_REGION,
         FFN_W2_REGION,
         EP_DISPATCH_REGION,
+        ROE_ROUTING_REGION,
+        LAYER_ALL_REGION,
+        LAYER_MIXER_REGION,
     )
 }
 

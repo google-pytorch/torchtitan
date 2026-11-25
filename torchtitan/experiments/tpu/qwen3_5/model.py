@@ -181,6 +181,16 @@ class TpuQwen35Model(Qwen35Model):
               tpu_cfg, "ep_chunk_dw_fp32", None
           ),
           paired_grouped_mm=getattr(tpu_cfg, "ep_paired_grouped_mm", None),
+          roe_window_routing=getattr(tpu_cfg, "ep_roe_window_routing", None),
+          roe_save_routing_metadata=getattr(
+              tpu_cfg, "ep_roe_save_routing_metadata", None
+          ),
+          roe_reduce_block_size=getattr(
+              tpu_cfg, "ep_roe_reduce_block_size", None
+          ),
+          roe_fused_w13_gather=getattr(
+              tpu_cfg, "ep_roe_fused_w13_gather", None
+          ),
       )
 
   def forward(  # pyrefly: ignore [bad-override]

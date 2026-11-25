@@ -277,6 +277,22 @@ class GraphSplitter:
       raise ValueError(
           "forward_layers_per_executable must be -1 or positive"
       )
+    if (
+        split_config.forward_prefetch_parameter_gathers
+        and split_config.forward_layers_per_executable < 1
+    ):
+      raise ValueError(
+          "forward_prefetch_parameter_gathers requires "
+          "forward_layers_per_executable > 0"
+      )
+    if split_config.forward_prefetch_pin_fraction is not None:
+      if not split_config.forward_prefetch_parameter_gathers:
+        raise ValueError(
+            "forward_prefetch_pin_fraction requires "
+            "forward_prefetch_parameter_gathers"
+        )
+      if not 0.0 < split_config.forward_prefetch_pin_fraction < 1.0:
+        raise ValueError("forward_prefetch_pin_fraction must be in (0, 1)")
     if split_config.backward_partition_mode not in (
         "none",
         "by_layer",
@@ -285,6 +301,16 @@ class GraphSplitter:
       raise ValueError(
           "backward_partition_mode must be none, by_layer, or fsdp_pipeline"
       )
+    if split_config.backward_pin_deferred_rs_fraction is not None:
+      if split_config.backward_partition_mode != "fsdp_pipeline":
+        raise ValueError(
+            "backward_pin_deferred_rs_fraction requires "
+            "backward_partition_mode='fsdp_pipeline'"
+        )
+      if not 0.0 < split_config.backward_pin_deferred_rs_fraction < 1.0:
+        raise ValueError("backward_pin_deferred_rs_fraction must be in (0, 1)")
+    if split_config.backward_pin_deferred_rs_max_bytes < 0:
+      raise ValueError("backward_pin_deferred_rs_max_bytes must be nonnegative")
     if split_config.backward_layers_per_executable < 1:
       raise ValueError(
           "backward_layers_per_executable must be at least 1"
@@ -355,6 +381,10 @@ class GraphSplitter:
           split.forward_graph,
           self.config.forward_layers_per_executable,
           isolate_prefix=self.config.forward_isolate_prefix,
+          prefetch_parameter_gathers=(
+              self.config.forward_prefetch_parameter_gathers
+          ),
+          prefetch_pin_fraction=self.config.forward_prefetch_pin_fraction,
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
@@ -380,6 +410,12 @@ class GraphSplitter:
           pipeline_kinds=self.config.pipeline_kinds or ("ag", "rs"),
           cpu_offload_prefetch_executables=(
               self.config.cpu_offload_prefetch_executables
+          ),
+          pin_deferred_rs_fraction=(
+              self.config.backward_pin_deferred_rs_fraction
+          ),
+          pin_deferred_rs_max_bytes=(
+              self.config.backward_pin_deferred_rs_max_bytes
           ),
       )
       split.backward_graph = backward.module
@@ -558,13 +594,403 @@ def _preserves_numel(view: torch.fx.Node) -> bool:
   )
 
 
+def _prefetch_forward_parameter_gathers(
+    gm: torch.fx.GraphModule,
+    partition_map: dict[torch.fx.Node, int],
+    layer_nodes: dict[int, set[torch.fx.Node]],
+    *,
+    hoist: bool = False,
+) -> set[str]:
+  """Move each forward parameter gather one executable before its consumer.
+
+  A parameter gather (``classify_fsdp_roles`` role ``"ag"``) reads only graph
+  inputs, so it can run in any earlier executable. Issuing it in the previous
+  executable lets that executable's compute hide it, at the cost of holding
+  one executable's gathered parameters across the boundary. Gathers whose
+  first consumer is in the first executable stay put. Moved nodes leave
+  ``layer_nodes``: they no longer run with their layer's compute.
+  """
+  early_names: set[str] = set()
+  for node in gm.graph.nodes:
+    node.meta.pop(_HOIST_META, None)
+  chains = collect_collective_chains(gm)
+  roles = classify_fsdp_roles(chains)
+  first = min(partition_map.values())
+  moved = Counter()
+  for launch, role in roles.items():
+    if role != "ag":
+      continue
+    chain_nodes = chains[launch]
+    if any(node not in partition_map for node in chain_nodes):
+      continue
+    _, users = chain_boundary(chain_nodes)
+    user_partitions = [
+        partition_map[user] for user in users if user in partition_map
+    ]
+    if not user_partitions:
+      continue
+    target = max(first, min(user_partitions) - 1)
+    current = {partition_map[node] for node in chain_nodes}
+    if current == {target}:
+      continue
+    partition_map.update(dict.fromkeys(chain_nodes, target))
+    for nodes in layer_nodes.values():
+      nodes.difference_update(chain_nodes)
+    moved[min(user_partitions)] += 1
+    if hoist:
+      after_wait = _downstream_of_waits(chain_nodes)
+      early = {
+          node
+          for node in chain_nodes
+          if not is_wait_tensor(node)
+          and not is_getitem(node)
+          and collective_producer(node) is None
+          and node not in after_wait
+      }
+      # split_module renames nodes but copies their meta.
+      for node in early:
+        node.meta[_HOIST_META] = True
+      early_names.update(node.name for node in early)
+  logger.info(
+      "Prefetched %d forward parameter gathers by one executable (per "
+      "consumer executable: %s)",
+      sum(moved.values()),
+      dict(sorted(moved.items())),
+  )
+  return early_names
+
+
+_HOIST_META = "tt_prefetch_hoist"
+_BWD_RS_META = "tt_bwd_rs_pin"
+
+
+def _mark_deferred_backward_rs(
+    collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
+    owners: dict[torch.fx.Node, tuple[str, int]],
+    *,
+    max_bytes: int = 0,
+) -> None:
+  """Tags the pre-wait nodes of each owned gradient reduction chain."""
+  for node in chain.from_iterable(collective_chains.values()):
+    node.meta.pop(_BWD_RS_META, None)
+  for launch, (kind, _) in owners.items():
+    if kind != "rs":
+      continue
+    if max_bytes > 0 and launch.args:
+      in_val = getattr(launch.args[0], "meta", {}).get("val")
+      if (
+          isinstance(in_val, torch.Tensor)
+          and in_val.numel() * in_val.element_size() > max_bytes
+      ):
+        continue
+    chain_nodes = collective_chains[launch]
+    after_wait = _downstream_of_waits(chain_nodes)
+    for node in chain_nodes:
+      if (
+          not is_wait_tensor(node)
+          and not is_getitem(node)
+          and collective_producer(node) is None
+          and node not in after_wait
+      ):
+        node.meta[_BWD_RS_META] = True
+
+
+def _pin_backward_rs_waits(
+    child: torch.fx.GraphModule,
+    early: list[torch.fx.Node],
+    frac: float,
+    launch_frac: float = 0.0,
+) -> int:
+  """Joins the hoisted reductions' waits with a compute node at ``frac``.
+
+  The waits (and everything downstream of them, which only feeds the outputs)
+  move to an optimization barrier with a compute node ``frac`` of the way
+  through ``child``, so XLA must finish the reductions by then. When
+  ``0 < launch_frac < frac``, the reduction launches also move down to
+  ``launch_frac`` (still strictly before ``pivot``) so they issue after earlier
+  in-layer collectives.
+  """
+  # pylint: disable=g-import-not-at-top
+  import operator
+
+  from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+      _optimization_barrier,
+  )
+  # pylint: enable=g-import-not-at-top
+
+  early_set = set(early)
+  graph = child.graph
+  waits = [
+      n for n in graph.nodes
+      if is_wait_tensor(n) and collective_producer(n) in early_set
+  ]
+  if not waits:
+    return 0
+  waits_set = set(waits)
+  ops = [
+      n for n in graph.nodes
+      if n.op == "call_function" and n not in early_set and n not in waits_set
+  ]
+  candidates = [
+      n for n in ops[int(frac * len(ops)):]
+      if isinstance(n.meta.get("val"), torch.Tensor)
+      and n.users
+      and all(u.op != "output" for u in n.users)
+      and not is_collective(n)
+      and not is_wait_tensor(n)
+  ]
+  if not candidates:
+    return 0
+  pivot = candidates[0]
+  ancestors: set[torch.fx.Node] = set()
+  stack = [pivot]
+  while stack:
+    for i in stack.pop().all_input_nodes:
+      if i not in ancestors:
+        ancestors.add(i)
+        stack.append(i)
+  downstream: set[torch.fx.Node] = set()
+  stack = list(waits)
+  while stack:
+    for u in stack.pop().users:
+      if u.op != "output" and u not in downstream:
+        downstream.add(u)
+        stack.append(u)
+  if pivot in downstream or ancestors & (downstream | waits_set):
+    return 0
+  order = {n: i for i, n in enumerate(graph.nodes)}
+  if 0.0 < launch_frac < frac and all(
+      u in early_set or u in waits_set for n in early for u in n.users
+  ):
+    launch_candidates = [
+        n
+        for n in ops
+        if n not in downstream and order[n] <= order[pivot]
+    ]
+    if launch_candidates:
+      target_idx = min(
+          int(launch_frac * len(ops)), len(launch_candidates) - 1
+      )
+      anchor = launch_candidates[target_idx]
+      for node in early:
+        anchor.prepend(node)
+  # Only nodes before the pivot move; later ones already follow the barrier.
+  moved = sorted(
+      (n for n in downstream if order[n] < order[pivot]), key=order.__getitem__
+  )
+  for wait in waits:
+    pivot.prepend(wait)
+  values = (pivot, *waits)
+  pivot_users = list(pivot.users)
+  wait_users = {w: list(w.users) for w in waits}
+  with graph.inserting_after(pivot):
+    barrier = graph.call_function(_optimization_barrier, args=values)
+  barrier.meta["val"] = tuple(v.meta["val"] for v in values)
+  outputs = []
+  insert_at = barrier
+  for idx, value in enumerate(values):
+    with graph.inserting_after(insert_at):
+      out = graph.call_function(operator.getitem, args=(barrier, idx))
+    out.meta = dict(value.meta)
+    outputs.append(out)
+    insert_at = out
+  for user in pivot_users:
+    user.replace_input_with(pivot, outputs[0])
+  for wait, out in zip(waits, outputs[1:]):
+    for user in wait_users[wait]:
+      user.replace_input_with(wait, out)
+  for node in moved:
+    insert_at.append(node)
+    insert_at = node
+  return len(waits)
+
+
+def _hoist_and_pin_backward_rs(
+    parent: torch.fx.GraphModule, frac: float
+) -> None:
+  """Start deferred gradient reductions early and pin their waits before exit.
+
+  A reduction deferred to this executable reads only its inputs, so its launch
+  moves to right after the placeholders, and an optimization barrier joins its
+  wait to a compute node ``frac`` of the way through the executable: XLA must
+  finish it by then and so cannot leave it as a serial tail at executable exit.
+  """
+  hoisted = pinned = 0
+  for call in parent.graph.nodes:
+    if call.op != "call_module":
+      continue
+    child = parent.get_submodule(call.target)
+    nodes = list(child.graph.nodes)
+    ok: set[torch.fx.Node] = set()
+    for n in nodes:
+      if (
+          n.op == "call_function"
+          and n.meta.get(_BWD_RS_META, False)
+          and all(i.op == "placeholder" or i in ok for i in n.all_input_nodes)
+      ):
+        ok.add(n)
+    early = [n for n in nodes if n in ok]
+    if not early:
+      continue
+    first_op = next(n for n in nodes if n.op != "placeholder")
+    for node in early:
+      if node is first_op:
+        first_op = node.next
+        continue
+      first_op.prepend(node)
+    pinned += _pin_backward_rs_waits(child, early, frac)
+    child.graph.lint()
+    child.recompile()
+    hoisted += len(early)
+  logger.info(
+      "Hoisted %d deferred gradient-reduction nodes, pinned %d waits "
+      "(pin_frac=%.2f)",
+      hoisted,
+      pinned,
+      frac,
+  )
+
+
+def _downstream_of_waits(chain_nodes: set[torch.fx.Node]) -> set[torch.fx.Node]:
+  """Chain nodes that read a wait (directly or through other chain nodes)."""
+  out: set[torch.fx.Node] = set()
+  pending = [n for n in chain_nodes if is_wait_tensor(n)]
+  while pending:
+    for user in pending.pop().users:
+      if user in chain_nodes and user not in out:
+        out.add(user)
+        pending.append(user)
+  return out
+
+
+def _hoist_prefetched_gathers(
+    parent: torch.fx.GraphModule,
+    early_names: set[str],
+    pin_fraction: float | None = None,
+) -> None:
+  """Move prefetched parameter-gather nodes to right after the placeholders."""
+  del early_names
+  hoisted = 0
+  pinned = 0
+  for call in parent.graph.nodes:
+    if call.op != "call_module":
+      continue
+    child = parent.get_submodule(call.target)
+    nodes = list(child.graph.nodes)
+    early = [
+        n for n in nodes
+        if n.op == "call_function" and n.meta.get(_HOIST_META, False)
+    ]
+    if not early:
+      continue
+    first_op = next(n for n in nodes if n.op != "placeholder")
+    for node in early:
+      if node is first_op:
+        first_op = node.next
+        continue
+      first_op.prepend(node)
+    if pin_fraction is not None:
+      pinned += _pin_prefetched_waits(child, early, frac=pin_fraction)
+    child.graph.lint()
+    child.recompile()
+    hoisted += len(early)
+  logger.info(
+      "Hoisted %d prefetched parameter-gather nodes, pinned %d waits",
+      hoisted,
+      pinned,
+  )
+
+
+def _pin_prefetched_waits(
+    child: torch.fx.GraphModule,
+    early: list[torch.fx.Node],
+    frac: float = 0.4,
+    only_after_pivot: bool = False,
+) -> int:
+  """Force the hoisted gathers' waits before a compute node early in ``child``.
+
+  An optimization barrier joins the waits with a compute node about ``frac``
+  of the way through the child's compute, so XLA must finish the gathers by
+  then and therefore starts them at the beginning of the executable, where they
+  overlap compute.
+  """
+  # pylint: disable=g-import-not-at-top
+  import operator
+
+  from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+      _optimization_barrier,
+  )
+  # pylint: enable=g-import-not-at-top
+
+  early_set = set(early)
+  graph = child.graph
+  waits = [
+      n for n in graph.nodes
+      if is_wait_tensor(n) and collective_producer(n) in early_set
+  ]
+  if not waits:
+    return 0
+  ops = [
+      n for n in graph.nodes
+      if n.op == "call_function" and n not in early_set and n not in waits
+  ]
+  candidates = [
+      n for n in ops[int(frac * len(ops)):]
+      if isinstance(n.meta.get("val"), torch.Tensor)
+      and n.users
+      and all(u.op != "output" for u in n.users)
+      and not is_collective(n)
+      and not is_wait_tensor(n)
+  ]
+  if not candidates:
+    return 0
+  pivot = candidates[0]
+  if only_after_pivot:
+    # Waits already before the pivot are early enough; moving them down would
+    # put their users before the barrier.
+    position = {n: i for i, n in enumerate(graph.nodes)}
+    waits = [w for w in waits if position[w] > position[pivot]]
+    if not waits:
+      return 0
+  # Waits read only hoisted launches, so they may move up to the pivot.
+  for wait in waits:
+    pivot.prepend(wait)
+  values = (pivot, *waits)
+  pivot_users = list(pivot.users)
+  wait_users = {w: list(w.users) for w in waits}
+  with graph.inserting_after(pivot):
+    barrier = graph.call_function(_optimization_barrier, args=values)
+  barrier.meta["val"] = tuple(v.meta["val"] for v in values)
+  outputs = []
+  insert_at = barrier
+  for idx, value in enumerate(values):
+    with graph.inserting_after(insert_at):
+      out = graph.call_function(operator.getitem, args=(barrier, idx))
+    out.meta = dict(value.meta)
+    outputs.append(out)
+    insert_at = out
+  for user in pivot_users:
+    user.replace_input_with(pivot, outputs[0])
+  for wait, out in zip(waits, outputs[1:]):
+    for user in wait_users[wait]:
+      user.replace_input_with(wait, out)
+  return len(waits)
+
+
 def split_forward_graph_by_layer(
     gm: torch.fx.GraphModule,
     layers_per_executable: int,
     *,
     isolate_prefix: bool = False,
+    prefetch_parameter_gathers: bool = False,
+    prefetch_pin_fraction: float | None = None,
 ) -> PartitionedGraph:
-  """Split forward into ascending, complete transformer-layer ranges."""
+  """Split forward into ascending, complete transformer-layer ranges.
+
+  With ``prefetch_parameter_gathers``, each parameter all-gather runs in the
+  executable before the one that reads it (see
+  ``_prefetch_forward_parameter_gathers``).
+  """
   if layers_per_executable < 1:
     raise ValueError(
         "layers_per_executable must be at least 1, got "
@@ -679,9 +1105,22 @@ def split_forward_graph_by_layer(
 
   place_ao_transfer_pairs(gm, partition_map)
 
+  early_names: set[str] = set()
+  if prefetch_parameter_gathers:
+    early_names = _prefetch_forward_parameter_gathers(
+        gm,
+        partition_map,
+        layer_nodes,
+        hoist=prefetch_pin_fraction is not None,
+    )
+
   chunked = _materialize_partitioned_graph(
       gm, partition_map, layer_nodes
   )
+  if early_names:
+    _hoist_prefetched_gathers(
+        chunked.module, early_names, pin_fraction=prefetch_pin_fraction
+    )
   target_count = (
       len(layer_ids) + layers_per_executable - 1
   ) // layers_per_executable + partition_offset
@@ -786,8 +1225,8 @@ def _validate_backward_partitions(
     partition_map: dict[torch.fx.Node, int],
     collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
 ) -> None:
-  for producer, chain in collective_chains.items():
-    partitions = {partition_map[node] for node in chain}
+  for producer, chain_nodes in collective_chains.items():
+    partitions = {partition_map[node] for node in chain_nodes}
     if len(partitions) != 1:
       raise ValueError(
           f"Collective {producer.name!r} spans backward partitions "
@@ -812,6 +1251,8 @@ def split_backward_graph_by_layer(
     pipeline_collectives: bool = False,
     pipeline_kinds: tuple[str, ...] = ("ag", "rs"),
     cpu_offload_prefetch_executables: int = 0,
+    pin_deferred_rs_fraction: float | None = None,
+    pin_deferred_rs_max_bytes: int = 0,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
 
@@ -947,12 +1388,20 @@ def split_backward_graph_by_layer(
       backward_prefetch_executables=cpu_offload_prefetch_executables,
   )
   _validate_backward_partitions(partition_map, collective_chains)
+  pin_bwd_rs = pipeline_collectives and pin_deferred_rs_fraction is not None
+  if pin_bwd_rs:
+    _mark_deferred_backward_rs(
+        collective_chains, owners, max_bytes=pin_deferred_rs_max_bytes
+    )
   chunked = _materialize_partitioned_graph(
       gm,
       partition_map,
       layer_nodes,
       raw_collective_partitions,
   )
+  if pin_bwd_rs:
+    assert pin_deferred_rs_fraction is not None
+    _hoist_and_pin_backward_rs(chunked.module, pin_deferred_rs_fraction)
   logger.info(
       "Split TPU backward into %d executables with at most %d layers each "
       "(pipeline_collectives=%s): compute=%s collectives=%s",

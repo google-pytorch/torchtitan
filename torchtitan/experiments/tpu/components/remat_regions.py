@@ -32,11 +32,22 @@ ATTENTION_INNER_ATTENTION = "attention.inner_attention"
 # expert-sort permutation that ``token_dispatcher.local_reorder`` computes from
 # them.
 MOE_ROUTING = "moe.routing"
+# Ring-of-Experts routing tables (expert sort, window, gather-reduce block
+# tables) computed from the all-gathered top-k ids; small integer tensors.
+MOE_ROE_ROUTING = "moe.roe_routing"
 # Expert-parallel activation all-gather outputs in Ring-of-Experts dispatch.
 MOE_EP_DISPATCH = "moe.ep_dispatch"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"
+# Every forward value of a transformer layer: a layer saved this way is not
+# recomputed in backward. Meant for ``compile.save_last_n_layers`` when HBM
+# allows keeping some layers whole.
+LAYER_ALL = "layer.all"
+# Every forward value of a transformer layer before its FFN/MoE sub-block (the
+# attention or GatedDeltaNet mixer plus the post-mixer residual). Avoids saving
+# the 16x gathered MoE token buffers while skipping mixer recompute in backward.
+LAYER_MIXER = "layer.mixer"
 
 
 def annotate_region(name: str) -> AbstractContextManager[None]:

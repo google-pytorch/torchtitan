@@ -21,7 +21,10 @@ import torch
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
-from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpertsConverter
+from torchtitan.experiments.tpu.components.grouped_experts import (
+    TpuGroupedExperts,
+    TpuGroupedExpertsConverter,
+)
 from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.qwen3_5 import use_tpu_modules
@@ -394,6 +397,10 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       "qwen38_debugmodel",
       "qwen38_moe_debugmodel",
       "qwen38_moe_debugmodel_ep8",
+      "qwen38_2_4t_a95b_proxy",
+      "qwen38_2_4t_a95b_proxy_tpu7x",
+      "qwen38_2_4t_a95b_proxy_tpu7x_8l",
+      "qwen38_2_4t_a95b",
   )
   def test_recipe_parses(self, config_name: str):
     cfg = ConfigManager().parse_args([
@@ -447,6 +454,85 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       # pylint: disable-next=protected-access
       resolved = dispatcher._resolve_ep_transport(2, x_TD)
       self.assertEqual(resolved, "ragged_all_to_all")
+
+
+  @parameterized.parameters(
+      "qwen38_2_4t_a95b_proxy",
+      "qwen38_2_4t_a95b_proxy_tpu7x",
+      "qwen38_2_4t_a95b_proxy_tpu7x_8l",
+  )
+  def test_proxies_hold_the_full_models_experts_per_rank(self, config_name):
+    """Proxies keep 8 routed experts per EP rank, as EP=64 on 512 experts."""
+    cfg = getattr(config_registry, config_name)()
+    moes = [m for _, m, _, _ in cfg.model_spec.model.traverse(MoE.Config)]
+    self.assertNotEmpty(moes)
+    for moe in moes:
+      self.assertEqual(
+          moe.num_experts // cfg.parallelism.expert_parallel_degree, 8
+      )
+      self.assertEqual(moe.router.gate.out_features, moe.num_experts)
+
+  # The argument sets of the launch commands in
+  # recipes/ironwood/qwen3.8-2.4t-a95b/tpu7x-4x4x4/README.md; keep in sync.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="_job_a_smoke",
+          args=[
+              "--config=qwen38_2_4t_a95b_proxy_tpu7x",
+              "--dump_folder=/data/qwen38/job-a/smoke",
+              "--training.steps=1",
+              "--metrics.log_freq=1",
+          ],
+      ),
+      dict(
+          testcase_name="_job_a",
+          args=[
+              "--config=qwen38_2_4t_a95b_proxy_tpu7x",
+              "--dump_folder=/data/qwen38/job-a/main",
+              "--training.steps=10",
+              "--metrics.log_freq=1",
+              "--metrics.enable_tensorboard",
+              "--profiler.enable_profiling",
+              "--profiler.profile_freq=8",
+              "--profiler.profiler_warmup=3",
+              "--profiler.profiler_active=1",
+          ],
+      ),
+      dict(
+          testcase_name="_job_b_point",
+          args=[
+              "--config=qwen38_2_4t_a95b_proxy_tpu7x_8l",
+              "--dump_folder=/data/qwen38/job-b/8l-t2048-float32",
+              "--training.steps=10",
+              "--metrics.log_freq=1",
+              "--metrics.enable_tensorboard",
+              "--training.max_context_length=2048",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--training.dtype=float32",
+          ],
+      ),
+  )
+  def test_launch_configs_parse(self, args):
+    cfg = ConfigManager().parse_args(
+        ["--module", "torchtitan.experiments.tpu.qwen3_8", *args]
+    )
+    self.assertEqual(cfg.parallelism.expert_parallel_degree, 64)
+    self.assertEqual(
+        cfg.training.num_tokens_per_microbatch_per_dp_rank,
+        cfg.training.max_context_length,
+    )
+    # A --training.max_context_length override does not resize the model's
+    # RoPE table; positions past it fail at run time.
+    self.assertGreaterEqual(
+        cfg.model_spec.max_context_length, cfg.training.max_context_length
+    )
+    self.assertIn("xla_tpu_scoped_vmem_limit_kib", cfg.libtpu_init_flags)
+    # The XLA grouped matmul overflows TPU7x VMEM at these shapes.
+    for _, experts, _, _ in cfg.model_spec.model.traverse(
+        TpuGroupedExperts.Config
+    ):
+      self.assertTrue(experts.use_pallas_grouped_mm)
+      self.assertEqual(experts.pallas_grouped_mm_tile_k, 2048)
 
 
 if __name__ == "__main__":

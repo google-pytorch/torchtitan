@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Replicate, Shard
 import torch.nn.functional as F
 import torch_remat as remat
 
@@ -43,6 +43,19 @@ def _packed_w13_param_init(
       name: _PackedW13Init(initializer)
       for name, initializer in param_init.items()
   }
+
+
+def _logical_placements(tensor: DTensor) -> list[Shard | Replicate]:
+  """Placements for the logical w1/w3 checkpoint entries.
+
+  w1 and w3 are split along dim 0 of the packed parameter, so a matrix stays
+  sharded on dim 1 and each device keeps holding 1/N of it: the checkpointer's
+  ``ModelWrapper`` caches these entries for the whole run, and replicating
+  them would keep the full unsharded FFN on every device. A bias is 1-D and
+  small, so it is replicated.
+  """
+  placement = Shard(1) if tensor.ndim > 1 else Replicate()
+  return [placement] * tensor.device_mesh.ndim
 
 
 class TpuPackedFeedForward(FeedForward):
@@ -113,7 +126,7 @@ class TpuPackedFeedForward(FeedForward):
       if isinstance(tensor, DTensor):
         tensor = tensor.redistribute(
             tensor.device_mesh,
-            [Replicate()] * tensor.device_mesh.ndim,
+            _logical_placements(tensor),
         )
       unpacked = tensor.view(2, -1, *tensor.shape[1:])
       state_dict[f"{prefix}w1.{param_name}"] = unpacked[0].contiguous()
@@ -130,7 +143,7 @@ class TpuPackedFeedForward(FeedForward):
       gate = state_dict.pop(gate_key)
       up = state_dict.pop(up_key)
       if isinstance(gate, DTensor):
-        placements = [Replicate()] * gate.device_mesh.ndim
+        placements = _logical_placements(gate)
         gate = gate.redistribute(gate.device_mesh, placements)
         up = up.redistribute(up.device_mesh, placements)
       state_dict[f"{prefix}w13_packed.{param_name}"] = torch.stack(

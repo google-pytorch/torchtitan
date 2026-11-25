@@ -56,7 +56,7 @@ _RAGGED_GATHER_TC_NUM_BUFFERS = 2
 _RAGGED_GATHER_REDUCE_TC_NUM_BUFFERS = 4
 _RAGGED_GATHER_REDUCE_TC_LOOKAHEAD = _RAGGED_GATHER_REDUCE_TC_NUM_BUFFERS - 2
 _RAGGED_GATHER_REDUCE_TC_ISSUE_UNROLL = 64
-_RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL = 8
+_RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL = 16
 _RAGGED_GATHER_REDUCE_TC_ALIGN = 128
 _RAGGED_GATHER_REDUCE_TC_SEARCH_CHUNK = 64
 _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS = 4
@@ -76,6 +76,14 @@ class RaggedGatherReduceMetadata:
   blocks: jax.Array
   block_size: int
   num_indices: int
+
+
+# Tests set this to run the Pallas TC kernels in TPU interpret mode on CPU.
+_INTERPRET = False
+
+
+def _interpret_kwargs() -> dict[str, object]:
+  return {"interpret": pltpu.InterpretParams()} if _INTERPRET else {}
 
 
 def _token_vmem_bytes(hidden_dim: int, itemsize: int) -> int:
@@ -492,7 +500,153 @@ def ragged_gather_reduce_tc(
   rounded to ``x.dtype`` in VMEM before FP32 token accumulation, matching
   ``scale_route_weights`` + ``stable_grouped_reduce`` without reading or
   writing HBM past ``count``.
+
+  If ``metadata.blocks`` carries the run tables of
+  ``append_ragged_gather_reduce_run_tables`` after the block table, each
+  block's rows are fetched with one DMA per (expert segment, power-of-two
+  piece) instead of one DMA per row.
   """
+  max_blocks, _, slots_len = _ragged_gather_reduce_tc_layout(
+      metadata.num_indices,
+      top_k,
+      metadata.block_size,
+      num_out_tokens=num_out_tokens,
+  )
+  head_len = 1 + _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS * max_blocks
+  extra = metadata.blocks.shape[0] - head_len
+  if extra > 0:
+    runs_len = max_blocks * _RUN_STRIDE
+    if extra != runs_len + slots_len:
+      raise ValueError(
+          f"Unexpected ragged_gather_reduce_tc block table length"
+          f" {metadata.blocks.shape[0]} (head {head_len}, slots {slots_len},"
+          f" max_blocks {max_blocks})."
+      )
+    head = metadata.blocks[:head_len]
+    runs = metadata.blocks[head_len : head_len + runs_len]
+    pos = metadata.blocks[head_len + runs_len :]
+    return _ragged_gather_reduce_tc_impl(
+        x,
+        dataclasses.replace(metadata, blocks=head),
+        num_out_tokens=num_out_tokens,
+        top_k=top_k,
+        weights=weights,
+        runs=runs,
+        pos=pos,
+    )
+  return _ragged_gather_reduce_tc_impl(
+      x,
+      metadata,
+      num_out_tokens=num_out_tokens,
+      top_k=top_k,
+      weights=weights,
+  )
+
+
+# Words per block in the run table: (row start, row count) for up to 63
+# expert segments, padded to an aligned SMEM DMA; the last word holds the
+# number of segments.
+_RUN_STRIDE = 128
+
+
+def append_ragged_gather_reduce_run_tables(
+    metadata: RaggedGatherReduceMetadata,
+    indices: jax.Array,
+    count: jax.Array,
+    segment_offsets: jax.Array,
+    *,
+    num_out_tokens: int,
+    top_k: int,
+) -> RaggedGatherReduceMetadata:
+  """Appends per-block expert-segment run tables to ``metadata.blocks``.
+
+  ``indices[:count]`` must be the token of each buffer row in (segment,
+  token)-sorted order, with segment ``s`` covering rows
+  ``[segment_offsets[s], segment_offsets[s + 1])`` (start 0 window routing).
+  A reduce block covers whole tokens ``[token_start, token_start +
+  num_tokens)``, so its rows in each segment are one contiguous run. The
+  appended tables are ``runs[max_blocks, _RUN_STRIDE]`` (``(start, length)``
+  per segment) and ``pos[slots_len]``, the VMEM row of each compacted slot
+  when the block's runs are fetched back to back after its token rows.
+  """
+  num_segments = segment_offsets.shape[0] - 1
+  if 2 * num_segments > _RUN_STRIDE - 1:
+    raise ValueError(
+        f"At most {(_RUN_STRIDE - 1) // 2} segments, got {num_segments}."
+    )
+  num_indices = indices.shape[0]
+  max_blocks, _, slots_len = _ragged_gather_reduce_tc_layout(
+      num_indices, top_k, metadata.block_size, num_out_tokens=num_out_tokens
+  )
+  fields = _RAGGED_GATHER_REDUCE_TC_BLOCK_FIELDS
+  blocks = metadata.blocks
+  num_blocks = blocks[0]
+  table = blocks[1 : 1 + fields * max_blocks].reshape(max_blocks, fields)
+  slot_start, token_start, num_tokens = table[:, 0], table[:, 2], table[:, 3]
+  block_live = jnp.arange(max_blocks, dtype=jnp.int32) < num_blocks
+
+  segment_offsets = segment_offsets.astype(jnp.int32)
+  rows = jnp.arange(num_indices, dtype=jnp.int32)
+  valid = rows < count
+  seg_of_row = jnp.sum(
+      rows[:, None] >= segment_offsets[None, 1:num_segments], axis=1,
+      dtype=jnp.int32,
+  )
+  g = jnp.int32(num_out_tokens)
+  int_max = jnp.iinfo(jnp.int32).max
+  key = jnp.where(valid, seg_of_row * g + indices.astype(jnp.int32), int_max)
+  seg_ids = jnp.arange(num_segments, dtype=jnp.int32)
+  q_lo = seg_ids[None, :] * g + token_start[:, None]
+  q_hi = q_lo + num_tokens[:, None]
+  lo = jnp.searchsorted(key, q_lo.reshape(-1), side="left").reshape(
+      max_blocks, num_segments
+  ).astype(jnp.int32)
+  hi = jnp.searchsorted(key, q_hi.reshape(-1), side="left").reshape(
+      max_blocks, num_segments
+  ).astype(jnp.int32)
+  length = jnp.where(block_live[:, None], hi - lo, 0)
+  lo = jnp.where(block_live[:, None], lo, 0)
+  cum = jnp.cumsum(length, axis=1) - length
+  runs = jnp.zeros((max_blocks, _RUN_STRIDE), jnp.int32)
+  runs = runs.at[:, 0 : 2 * num_segments : 2].set(lo)
+  runs = runs.at[:, 1 : 2 * num_segments : 2].set(length)
+  runs = runs.at[:, _RUN_STRIDE - 1].set(num_segments)
+
+  # VMEM row of each compacted slot.
+  slots = jnp.arange(slots_len, dtype=jnp.int32)
+  live_starts = jnp.where(block_live, slot_start, int_max)
+  blk_of_slot = jnp.clip(
+      jnp.sum(slots[:, None] >= live_starts[None, 1:], axis=1, dtype=jnp.int32),
+      0,
+      max_blocks - 1,
+  )
+  src = metadata.src_rows.astype(jnp.int32)
+  safe_src = jnp.clip(src, 0, max(num_indices - 1, 0))
+  seg_of_slot = seg_of_row[safe_src]
+  pos = (
+      num_tokens[blk_of_slot]
+      + cum[blk_of_slot, seg_of_slot]
+      + src
+      - lo[blk_of_slot, seg_of_slot]
+  )
+  pos = jnp.where(slots < count, pos, 0).astype(jnp.int32)
+  return dataclasses.replace(
+      metadata,
+      blocks=jnp.concatenate([blocks, runs.reshape(-1), pos]).astype(jnp.int32),
+  )
+
+
+def _ragged_gather_reduce_tc_impl(
+    x: jax.Array,
+    metadata: RaggedGatherReduceMetadata,
+    *,
+    num_out_tokens: int,
+    top_k: int,
+    weights: jax.Array | None = None,
+    runs: jax.Array | None = None,
+    pos: jax.Array | None = None,
+) -> jax.Array:
+  """``ragged_gather_reduce_tc`` body; ``runs``/``pos`` select run DMAs."""
   max_input_tokens, dim0, dim1 = x.shape
   block_size = metadata.block_size
   num_buffers = _RAGGED_GATHER_REDUCE_TC_NUM_BUFFERS
@@ -507,40 +661,28 @@ def ragged_gather_reduce_tc(
   lookahead = _RAGGED_GATHER_REDUCE_TC_LOOKAHEAD
   ring = lookahead + 2
   has_weights = weights is not None
+  use_runs = runs is not None
+  bulk_zero = True
+  two_streams = False
+  reduce_unroll = _RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL
+  run_stride = _RUN_STRIDE
+  run_bits = block_size.bit_length()
 
   def _ragged_gather_reduce_kernel(*args):
-    if has_weights:
-      (
-          blocks_smem_ref,
-          src_hbm_ref,
-          tok_hbm_ref,
-          w_hbm_ref,
-          x_hbm_ref,
-          o_hbm_ref,
-          vmem_ref,
-          src_smem_ref,
-          tok_smem_ref,
-          w_smem_ref,
-          recv_sem,
-          send_sem,
-          slots_sem,
-      ) = args
-    else:
-      (
-          blocks_smem_ref,
-          src_hbm_ref,
-          tok_hbm_ref,
-          x_hbm_ref,
-          o_hbm_ref,
-          vmem_ref,
-          src_smem_ref,
-          tok_smem_ref,
-          recv_sem,
-          send_sem,
-          slots_sem,
-      ) = args
-      w_hbm_ref = None
-      w_smem_ref = None
+    args = list(args)
+    blocks_smem_ref = args.pop(0)
+    src_hbm_ref = args.pop(0)
+    tok_hbm_ref = args.pop(0)
+    w_hbm_ref = args.pop(0) if has_weights else None
+    runs_hbm_ref = args.pop(0) if use_runs else None
+    x_hbm_ref = args.pop(0)
+    o_hbm_ref = args.pop(0)
+    vmem_ref = args.pop(0)
+    src_smem_ref = args.pop(0)
+    tok_smem_ref = args.pop(0)
+    w_smem_ref = args.pop(0) if has_weights else None
+    runs_smem_ref = args.pop(0) if use_runs else None
+    recv_sem, send_sem, slots_sem = args
 
     num_blocks = blocks_smem_ref[0]
 
@@ -557,7 +699,7 @@ def ragged_gather_reduce_tc(
       pairs = [(src_hbm_ref, src_smem_ref), (tok_hbm_ref, tok_smem_ref)]
       if has_weights:
         pairs.append((w_hbm_ref, w_smem_ref))
-      return [
+      loads = [
           pltpu.make_async_copy(
               hbm_ref.at[pl.ds(window_start, window)],
               smem_ref.at[pl.ds(r * window, window)],
@@ -565,6 +707,23 @@ def ragged_gather_reduce_tc(
           )
           for hbm_ref, smem_ref in pairs
       ]
+      if use_runs:
+        loads.append(
+            pltpu.make_async_copy(
+                runs_hbm_ref.at[
+                    pl.ds(
+                        pl.multiple_of(
+                            jnp.asarray(blk, jnp.int32) * run_stride,
+                            run_stride,
+                        ),
+                        run_stride,
+                    )
+                ],
+                runs_smem_ref.at[pl.ds(r * run_stride, run_stride)],
+                slots_sem.at[r],
+            )
+        )
+      return loads
 
     def _slot_base(blk):
       slot_start = _block(blk)[0]
@@ -615,7 +774,38 @@ def ragged_gather_reduce_tc(
 
       return _issue
 
+    def _in_start_runs(blk):
+      # One DMA per (segment run, power-of-two piece of its length); the runs
+      # land back to back after the block's token rows.
+      b = blk % num_buffers
+      rbase = (blk % ring) * run_stride
+      num_seg = runs_smem_ref[rbase + run_stride - 1]
+
+      def _seg(e, dst):
+        lo = runs_smem_ref[rbase + 2 * e]
+        ln = runs_smem_ref[rbase + 2 * e + 1]
+        off = 0
+        for k in reversed(range(run_bits)):
+          size = 1 << k
+          bit = ln & size
+
+          def _copy(off=off, size=size):
+            pltpu.make_async_copy(
+                x_hbm_ref.at[pl.ds(lo + off, size), :, :],
+                vmem_ref.at[b, pl.ds(dst + off, size), :, :],
+                recv_sem.at[b],
+            ).start()
+
+          pl.when(bit != 0)(_copy)
+          off = off + bit
+        return dst + ln
+
+      jax.lax.fori_loop(0, num_seg, _seg, _block(blk)[3])
+
     def _in_start(blk):
+      if use_runs:
+        _in_start_runs(blk)
+        return
       _dynamic_fori(
           0,
           _block(blk)[1],
@@ -631,16 +821,27 @@ def ragged_gather_reduce_tc(
       b = blk % num_buffers
       _, _, token_start, num_tokens = _block(blk)
 
-      @pl.loop(0, num_tokens)
-      def _zero_token(t):
-        vmem_ref[b, t, :, :] = jnp.zeros((dim0, dim1), x.dtype)
+      if bulk_zero:
+        # A few large static-size stores instead of one loop trip per token.
+        def _zero_rows(off, size):
+          vmem_ref[b, pl.ds(off, size), :, :] = jnp.zeros(
+              (size, dim0, dim1), x.dtype
+          )
+
+        _pow2_chunks(num_tokens, _zero_rows)
+      else:
+
+        @pl.loop(0, num_tokens)
+        def _zero_token(t):
+          vmem_ref[b, t, :, :] = jnp.zeros((dim0, dim1), x.dtype)
 
       base = _slot_base(blk)
 
       def _reduce(i, carry):
         prev_t, total = carry
         t = tok_smem_ref[base + i] - token_start
-        row = vmem_ref[b, num_tokens + i, :, :].astype(jnp.float32)
+        row_idx = src_smem_ref[base + i] if use_runs else num_tokens + i
+        row = vmem_ref[b, row_idx, :, :].astype(jnp.float32)
         if has_weights:
           w = w_smem_ref[base + i]
           row = (row * w).astype(x.dtype).astype(jnp.float32)
@@ -698,28 +899,74 @@ def ragged_gather_reduce_tc(
       def _wait_next_slots():
         _slots_wait(nxt)
 
-      nxt = jnp.minimum(nxt, num_blocks - 1)
-      num_reduce = _block(i)[1]
-      num_issue = jnp.where(has_nxt, _block(nxt)[1], 0)
-      num_both = jnp.minimum(num_reduce, num_issue)
-      issue = _issuer(nxt)
-      reduce = _reducer(i)
-
-      def _issue_and_reduce(j, carry):
-        issue(j, ())
-        return reduce(j, carry)
-
-      unroll = _RAGGED_GATHER_REDUCE_TC_REDUCE_UNROLL
+      unroll = reduce_unroll
       carry = (jnp.int32(-1), jnp.zeros((dim0, dim1), jnp.float32))
-      carry = _dynamic_fori(0, num_both, unroll, _issue_and_reduce, carry)
-      _dynamic_fori(num_both, num_reduce, unroll, reduce, carry)
-      _dynamic_fori(
-          num_both,
-          num_issue,
-          _RAGGED_GATHER_REDUCE_TC_ISSUE_UNROLL,
-          issue,
-          (),
-      )
+      num_reduce = _block(i)[1]
+      if use_runs:
+        @pl.when(has_nxt)
+        def _issue_next_runs():
+          _in_start_runs(nxt)
+
+        _dynamic_fori(0, num_reduce, unroll, _reducer(i), carry)
+      elif two_streams:
+        # Issue the next block's row DMAs first, then reduce this block as two
+        # independent token ranges whose FP32 carry chains interleave.
+        nxt = jnp.minimum(nxt, num_blocks - 1)
+        num_issue = jnp.where(has_nxt, _block(nxt)[1], 0)
+        _dynamic_fori(
+            0,
+            num_issue,
+            _RAGGED_GATHER_REDUCE_TC_ISSUE_UNROLL,
+            _issuer(nxt),
+            (),
+        )
+        reduce = _reducer(i)
+        _, _, token_start, num_tokens = _block(i)
+        base = _slot_base(i)
+        target = num_tokens // 2
+
+        def _bisect(_, lo_hi):
+          lo, hi = lo_hi
+          mid = (lo + hi) // 2
+          active = lo < hi
+          below = tok_smem_ref[base + mid] - token_start < target
+          lo = jnp.where(active & below, mid + 1, lo)
+          hi = jnp.where(active & jnp.logical_not(below), mid, hi)
+          return lo, hi
+
+        split, _ = jax.lax.fori_loop(
+            0, block_size.bit_length() + 1, _bisect, (jnp.int32(0), num_reduce)
+        )
+        both = jnp.minimum(split, num_reduce - split)
+
+        def _two(j, carries):
+          return (reduce(j, carries[0]), reduce(split + j, carries[1]))
+
+        carry_a, carry_b = _dynamic_fori(
+            0, both, max(1, unroll // 2), _two, (carry, carry)
+        )
+        _dynamic_fori(both, split, unroll, reduce, carry_a)
+        _dynamic_fori(split + both, num_reduce, unroll, reduce, carry_b)
+      else:
+        nxt = jnp.minimum(nxt, num_blocks - 1)
+        num_issue = jnp.where(has_nxt, _block(nxt)[1], 0)
+        num_both = jnp.minimum(num_reduce, num_issue)
+        issue = _issuer(nxt)
+        reduce = _reducer(i)
+
+        def _issue_and_reduce(j, carry):
+          issue(j, ())
+          return reduce(j, carry)
+
+        carry = _dynamic_fori(0, num_both, unroll, _issue_and_reduce, carry)
+        _dynamic_fori(num_both, num_reduce, unroll, reduce, carry)
+        _dynamic_fori(
+            num_both,
+            num_issue,
+            _RAGGED_GATHER_REDUCE_TC_ISSUE_UNROLL,
+            issue,
+            (),
+        )
       _out_start(i)
 
       @pl.when(i + ring < num_blocks)
@@ -736,48 +983,32 @@ def ragged_gather_reduce_tc(
   out_shape = jax.ShapeDtypeStruct((num_out_tokens, dim0, dim1), x.dtype)
   hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
   dma_sems = pltpu.SemaphoreType.DMA((num_buffers,))
+  in_specs = [pl.BlockSpec(memory_space=pltpu.SMEM), hbm_spec, hbm_spec]
+  # In run mode the kernel reads each compacted slot's VMEM row (`pos`) where
+  # it otherwise reads its source buffer row.
+  call_args = [metadata.blocks, pos if use_runs else metadata.src_rows]
+  call_args.append(metadata.tokens)
+  scratch_shapes = [
+      pltpu.VMEM((num_buffers, block_size, dim0, dim1), x.dtype),
+      pltpu.SMEM((ring * window,), jnp.int32),
+      pltpu.SMEM((ring * window,), jnp.int32),
+  ]
   if has_weights:
-    in_specs = [
-        pl.BlockSpec(memory_space=pltpu.SMEM),
-        hbm_spec,
-        hbm_spec,
-        hbm_spec,
-        hbm_spec,
-    ]
-    scratch_shapes = [
-        pltpu.VMEM((num_buffers, block_size, dim0, dim1), x.dtype),
-        pltpu.SMEM((ring * window,), jnp.int32),
-        pltpu.SMEM((ring * window,), jnp.int32),
-        pltpu.SMEM((ring * window,), jnp.float32),
-        dma_sems,
-        dma_sems,
-        pltpu.SemaphoreType.DMA((ring,)),
-    ]
-    call_args = (
-        metadata.blocks,
-        metadata.src_rows,
-        metadata.tokens,
-        weights.astype(jnp.float32),
-        x,
-    )
-    kernel_name = "ragged_gather_weighted_reduce_tc"
-  else:
-    in_specs = [
-        pl.BlockSpec(memory_space=pltpu.SMEM),
-        hbm_spec,
-        hbm_spec,
-        hbm_spec,
-    ]
-    scratch_shapes = [
-        pltpu.VMEM((num_buffers, block_size, dim0, dim1), x.dtype),
-        pltpu.SMEM((ring * window,), jnp.int32),
-        pltpu.SMEM((ring * window,), jnp.int32),
-        dma_sems,
-        dma_sems,
-        pltpu.SemaphoreType.DMA((ring,)),
-    ]
-    call_args = (metadata.blocks, metadata.src_rows, metadata.tokens, x)
-    kernel_name = "ragged_gather_reduce_tc"
+    in_specs.append(hbm_spec)
+    call_args.append(weights.astype(jnp.float32))
+    scratch_shapes.append(pltpu.SMEM((ring * window,), jnp.float32))
+  if use_runs:
+    in_specs.append(hbm_spec)
+    call_args.append(runs)
+    scratch_shapes.append(pltpu.SMEM((ring * run_stride,), jnp.int32))
+  in_specs.append(hbm_spec)
+  call_args.append(x)
+  scratch_shapes += [dma_sems, dma_sems, pltpu.SemaphoreType.DMA((ring,))]
+  kernel_name = (
+      "ragged_gather_weighted_reduce_tc" if has_weights else "ragged_gather_reduce_tc"
+  )
+  if use_runs:
+    kernel_name = kernel_name.replace("_tc", "_runs_tc")
 
   return pl.pallas_call(
       _ragged_gather_reduce_kernel,
@@ -789,6 +1020,7 @@ def ragged_gather_reduce_tc(
           vmem_limit_bytes=pallas_vmem.vmem_limit_bytes(),
       ),
       name=kernel_name,
+      **_interpret_kwargs(),
   )(*call_args)
 
 
@@ -914,6 +1146,90 @@ def _ragged_scale_and_dscore_tc(
 # --- PyTorch <-> JAX Custom Operators (@pallas.jax_op) ---
 
 
+def _roe_window_routing_metadata(
+    ids_flat_M: jax.Array,
+    ep_rank_1: jax.Array,
+    *,
+    num_experts: int,
+    ep_size: int,
+    top_k: int,
+    num_out_tokens: int,
+    cap: int,
+    reduce_block_size: int,
+    run_reduce: bool = False,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]:
+  """Ring-of-Experts routing that keeps only this shard's ``[cap]`` window.
+
+  Same routing as the full-``M`` version, but every table after the expert
+  sort covers only this rank's window ``[start, start + cap)`` of the sorted
+  slots (as JAX's ``moe_tc_window_routing``): the token ids are ``[cap]`` and
+  the returned ``start`` is 0, so the reduce metadata sorts and scans ``cap``
+  instead of ``M = G * top_k`` slots. Kernel inputs and outputs are bitwise
+  identical to the full version.
+  """
+  m = ids_flat_M.shape[0]
+  sorted_experts_M, slot_order_M = packed_stable_sort(
+      ids_flat_M, num_experts - 1
+  )
+  group_offsets_Ep1 = _sorted_expert_offsets(sorted_experts_M, num_experts)
+  shard_idx = ep_rank_1[0].astype(jnp.int32)
+  local_num_experts = num_experts // ep_size
+  local_offsets_ep1 = jax.lax.dynamic_slice_in_dim(
+      group_offsets_Ep1,
+      shard_idx * local_num_experts,
+      local_num_experts + 1,
+      axis=0,
+  )
+  start = local_offsets_ep1[0]
+  clamped_offsets_ep1 = jnp.minimum(local_offsets_ep1, start + cap)
+  local_group_sizes_e = jnp.diff(clamped_offsets_ep1).astype(jnp.int32)
+  count = (clamped_offsets_ep1[local_num_experts] - start).astype(jnp.int32)
+
+  # Rows past `count` hold other shards' slots or padding; every consumer
+  # masks them with `count`.
+  window_slot_order_cap = jax.lax.dynamic_slice_in_dim(
+      jnp.pad(slot_order_M.astype(jnp.int32), (0, cap)), start, cap, axis=0
+  )
+  token_ids_sorted_cap = window_slot_order_cap // top_k
+  del m
+  meta = ragged_gather_reduce_tc_metadata(
+      token_ids_sorted_cap,
+      0,
+      count,
+      top_k=top_k,
+      block_size=reduce_block_size,
+      num_out_tokens=num_out_tokens,
+      packed_sort=True,
+  )
+  if run_reduce:
+    meta = append_ragged_gather_reduce_run_tables(
+        meta,
+        token_ids_sorted_cap,
+        count,
+        clamped_offsets_ep1 - start,
+        num_out_tokens=num_out_tokens,
+        top_k=top_k,
+    )
+  start_count_2 = jnp.stack([jnp.int32(0), count]).astype(jnp.int32)
+  return (
+      local_group_sizes_e,
+      token_ids_sorted_cap,
+      window_slot_order_cap,
+      start_count_2,
+      meta.src_rows,
+      meta.tokens,
+      meta.blocks,
+  )
+
+
 @pallas.jax_op("tt_moe::roe_routing_metadata")
 def _roe_routing_metadata_tpu(
     ids_flat_M: jax.Array,
@@ -924,6 +1240,8 @@ def _roe_routing_metadata_tpu(
     num_out_tokens: int,
     cap: int,
     reduce_block_size: int,
+    window_routing: bool = False,
+    run_reduce: bool = False,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -934,6 +1252,18 @@ def _roe_routing_metadata_tpu(
     jax.Array,
 ]:
   m = ids_flat_M.shape[0]
+  if window_routing and m > 0:
+    return _roe_window_routing_metadata(
+        ids_flat_M,
+        ep_rank_1,
+        num_experts=num_experts,
+        ep_size=ep_size,
+        top_k=top_k,
+        num_out_tokens=num_out_tokens,
+        cap=cap,
+        reduce_block_size=reduce_block_size,
+        run_reduce=run_reduce,
+    )
   sorted_experts_M, slot_order_M = packed_stable_sort(
       ids_flat_M, num_experts - 1
   )
@@ -991,8 +1321,13 @@ def _roe_gather_fwd(
     gather_block_size: int,
     zero_pad_tail: bool,
 ) -> jax.Array:
-  g_tokens, d_dim = x_all_GD.shape
-  x3d = x_all_GD.reshape(g_tokens, d_dim // 128, 128)
+  if x_all_GD.ndim == 3:
+    # Already in the kernel's (rows, D / 128, 128) layout: no relayout copy.
+    x3d = x_all_GD
+    d_dim = x3d.shape[1] * x3d.shape[2]
+  else:
+    g_tokens, d_dim = x_all_GD.shape
+    x3d = x_all_GD.reshape(g_tokens, d_dim // 128, 128)
   out3d = ragged_gather_tc(
       x3d,
       token_ids_sorted_M,
@@ -1018,6 +1353,7 @@ def _roe_gather_bwd(
     num_out_tokens: int,
     top_k: int,
     reduce_block_size: int,
+    out_3d: bool = False,
 ) -> jax.Array:
   cap, d_dim = grad_routed_RD.shape
   meta = RaggedGatherReduceMetadata(
@@ -1035,6 +1371,8 @@ def _roe_gather_bwd(
       top_k=top_k,
       weights=None,
   )
+  if out_3d:
+    return out3d
   return out3d.reshape(num_out_tokens, d_dim)
 
 
@@ -1277,6 +1615,8 @@ def roe_compute_routing(
     num_out_tokens: int,
     cap: int,
     reduce_block_size: int,
+    window_routing: bool = False,
+    run_reduce: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1286,7 +1626,14 @@ def roe_compute_routing(
     torch.Tensor,
     torch.Tensor,
 ]:
-  """Computes Ring-of-Experts Pallas TC routing metadata on TPU."""
+  """Computes Ring-of-Experts Pallas TC routing metadata on TPU.
+
+  With ``window_routing`` the token-id and reduce tables cover only this rank's
+  ``[cap]`` window of the expert-sorted slots and ``start_count_2[0]`` is 0.
+  With ``run_reduce`` (window routing only) the reduce block table also carries
+  per-block expert-segment runs, so the gather-reduce kernels fetch rows with
+  one DMA per run piece instead of one per row.
+  """
   if ids_flat_M.dtype != torch.int32:
     ids_flat_M = ids_flat_M.to(torch.int32)
   if ep_rank_1.dtype != torch.int32:
@@ -1300,6 +1647,8 @@ def roe_compute_routing(
       num_out_tokens,
       cap,
       reduce_block_size,
+      window_routing,
+      window_routing and run_reduce,
   )
 
 
@@ -1324,6 +1673,7 @@ class _RoESortGather(torch.autograd.Function):
     ctx.save_for_backward(src_rows, tokens, blocks)
     ctx.num_indices = token_ids_sorted_M.shape[0]
     ctx.num_out_tokens = x_all_GD.shape[0]
+    ctx.x_3d = x_all_GD.ndim == 3
     ctx.top_k = top_k
     ctx.reduce_block_size = reduce_block_size
     return _roe_gather_fwd(
@@ -1347,6 +1697,7 @@ class _RoESortGather(torch.autograd.Function):
         ctx.num_out_tokens,
         ctx.top_k,
         ctx.reduce_block_size,
+        ctx.x_3d,
     )
     return (grad_x_all_GD,) + (None,) * 10
 
@@ -1436,10 +1787,13 @@ class _RoEUnsortReduce(torch.autograd.Function):
       top_k: int,
       gather_block_size: int,
       reduce_block_size: int,
+      out_3d: bool,
   ) -> torch.Tensor:
     ctx.save_for_backward(token_ids_sorted_M, start_count_2)
     ctx.cap = routed_output_RD.shape[0]
     ctx.gather_block_size = gather_block_size
+    # When out_3d=True, returns (G, D / 128, 128), the kernel layout, so the EP
+    # reduce-scatter runs on it without a relayout copy of the gathered buffer.
     return _roe_gather_bwd(
         routed_output_RD.contiguous(),
         src_rows,
@@ -1449,6 +1803,7 @@ class _RoEUnsortReduce(torch.autograd.Function):
         num_out_tokens,
         top_k,
         reduce_block_size,
+        out_3d,
     )
 
   @staticmethod
@@ -1462,7 +1817,7 @@ class _RoEUnsortReduce(torch.autograd.Function):
         ctx.gather_block_size,
         False,
     )
-    return (grad_routed_RD,) + (None,) * 9
+    return (grad_routed_RD,) + (None,) * 10
 
 
 def roe_unsort_reduce(
@@ -1477,8 +1832,9 @@ def roe_unsort_reduce(
     top_k: int,
     gather_block_size: int = 1024,
     reduce_block_size: int = 896,
+    out_3d: bool = False,
 ) -> torch.Tensor:
-  """Unweighted FP32 gather-reduce of ``routed_output_RD`` back to ``[G, D]``."""
+  """Unweighted FP32 gather-reduce of ``routed_output_RD`` to ``[G, D]`` (or 3D)."""
   return _RoEUnsortReduce.apply(
       routed_output_RD,
       token_ids_sorted_M,
@@ -1490,6 +1846,7 @@ def roe_unsort_reduce(
       top_k,
       gather_block_size,
       reduce_block_size,
+      out_3d,
   )
 
 

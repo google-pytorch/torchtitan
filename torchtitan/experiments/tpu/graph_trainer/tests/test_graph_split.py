@@ -881,6 +881,69 @@ class GraphSplitTest(absltest.TestCase):
     self.assertIsNone(roles[ids_ag])
     self.assertEqual(roles[weight_ag], "ag")
 
+  def test_prefetch_hoists_and_pins_gathers_to_executable_start(self):
+    """prefetch_pin_fraction hoists prefetched gathers and pins their waits."""
+    split = self._trace_simple_fsdp(n_layers=4)
+    for frac in (0.3, 0.5):
+      with self.subTest(frac=frac):
+        chunked = split_forward_graph_by_layer(
+            split.forward_graph,
+            1,
+            prefetch_parameter_gathers=True,
+            prefetch_pin_fraction=frac,
+        )
+        hoisted_any = False
+        for call in chunked.module.graph.nodes:
+          if call.op != "call_module":
+            continue
+          child = chunked.module.get_submodule(call.target)
+          ops = [n for n in child.graph.nodes if n.op == "call_function"]
+          launches = [
+              i for i, n in enumerate(ops) if collectives_lib.is_gather(n)
+          ]
+          if not launches or call.target == "submod_0":
+            continue
+          feeds = set()
+          for i in launches:
+            pending = [ops[i]]
+            while pending:
+              node = pending.pop()
+              for inp in node.all_input_nodes:
+                if inp.op == "call_function" and inp not in feeds:
+                  feeds.add(inp)
+                  pending.append(inp)
+          first_other = next(
+              (i for i, n in enumerate(ops)
+               if not collectives_lib.is_gather(n) and n not in feeds),
+              len(ops),
+          )
+          if max(launches) < first_other:
+            hoisted_any = True
+        self.assertTrue(hoisted_any)
+        child_graphs = [
+            chunked.module.get_submodule(c.target).graph
+            for c in chunked.module.graph.nodes if c.op == "call_module"
+        ]
+        for g in child_graphs:
+          g.lint()
+
+  def test_backward_pin_deferred_rs_hoists_and_pins_waits(self):
+    """pin_deferred_rs_fraction hoists deferred RS launches and lints cleanly."""
+    split = self._trace_simple_fsdp(n_layers=4)
+    for frac, max_bytes in ((0.4, 0), (0.75, 1_000_000)):
+      with self.subTest(frac=frac, max_bytes=max_bytes):
+        chunked = split_backward_graph_by_layer(
+            split.backward_graph,
+            n_layers=4,
+            layers_per_executable=1,
+            pipeline_collectives=True,
+            pin_deferred_rs_fraction=frac,
+            pin_deferred_rs_max_bytes=max_bytes,
+        )
+        for call in chunked.module.graph.nodes:
+          if call.op == "call_module":
+            chunked.module.get_submodule(call.target).graph.lint()
+
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.
 
@@ -919,6 +982,29 @@ class GraphSplitTest(absltest.TestCase):
         )
         self.assertEqual(chunked.layer_to_partition, expected)
 
+    # Prefetch: each layer's parameter gather moves to the executable before
+    # its consumer, except where the consumer is the first executable.
+    for graph, isolate_prefix in itertools.product(
+        (forward, dim_split.forward_graph), (False, True)
+    ):
+      with self.subTest(direction="forward-prefetch", prefix=isolate_prefix):
+        chunked = split_forward_graph_by_layer(
+            graph,
+            1,
+            isolate_prefix=isolate_prefix,
+            prefetch_parameter_gathers=True,
+        )
+        self._assert_collective_chains_are_atomic(graph, chunked.partition_map)
+        chains = collectives_lib.collect_collective_chains(graph)
+        roles = collectives_lib.classify_fsdp_roles(chains)
+        gathers = [launch for launch, role in roles.items() if role == "ag"]
+        self.assertGreaterEqual(len(gathers), 4)
+        for launch in gathers:
+          _, users = collectives_lib.chain_boundary(chains[launch])
+          consumer = min(chunked.partition_map[user] for user in users)
+          self.assertEqual(
+              chunked.partition_map[launch], max(0, consumer - 1), launch.name
+          )
     by_layer_one = (1, 2, 3, 4)
     by_layer_three = (1, 1, 1, 2)
     backward_scenarios = (

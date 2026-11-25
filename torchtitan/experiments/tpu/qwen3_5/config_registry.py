@@ -846,6 +846,75 @@ def qwen35_moe_397b_64k_allgather_cp2() -> TpuGraphTrainer.Config:
   return _397b_64k_cp("all_gather", 2)
 
 
+def qwen35_moe_397b_4k_ep16_benchmark() -> TpuGraphTrainer.Config:
+  """397B-A17B, 4K context, 8K tokens/rank, EP 16 Ring-of-Experts on 4x4x8.
+
+  Matches the TPU7x-4x4x8 (128 chips, 256 ranks) pure-BF16 benchmark setting:
+  ``max_context_length = 4096``, ``num_tokens_per_microbatch_per_dp_rank =
+  8192`` (2 sequences per rank), capacity factor 1.05 (zero dropped routes
+  under load-balanced routing ``--debug.moe_force_load_balance``).
+
+  Measured progression on tpu7x-4x4x8 (mean of steady-state steps, 0 drops):
+
+  - Untuned ``qwen35_moe_397b_split_tokamax_ep_benchmark`` @ 4K: 5.40% MFU
+    (13.79 s/step).
+  - EP 16 ``ragged_all_to_all`` + save ``moe.ep_dispatch`` + 1 layer/exec:
+    11.54% MFU (6.45 s/step).
+  - Explicit ``ep_transport="ring_of_experts"`` at EP 16 (SparseCore token
+    all-gather + combine reduce-scatter instead of TensorCore ragged a2a) +
+    ``ep_token_chunks=2``: 15.31% MFU (4.86 s/step).
+  - 3D ``(T, D // 128, 128)`` Ring-of-Experts token layout across the EP
+    all-gather and combine reduce-scatter + ZeRO-2
+    (``fsdp_reshard_after_forward="never"``, ``pipeline_kinds=("rs",)``) +
+    forward parameter-gather prefetch: 16.52% MFU (4.51 s/step).
+  - Windowed RoE routing metadata saved for backward (``moe.roe_routing``) +
+    bulk VMEM zeroing & unroll-16 in ``ragged_gather_reduce_tc`` + fused 2D
+    dispatch gather in paired W1/W3 grouped matmul: 17.46% MFU (4.26 s/step).
+  - Optimization-barrier pinning of prefetched forward parameter gathers
+    (``forward_prefetch_pin_fraction=0.4``) and dense backward gradient
+    reduce-scatters (``backward_pin_deferred_rs_fraction=0.75``,
+    ``backward_pin_deferred_rs_max_bytes=150_000_000``) +
+    ``xla_latency_hiding_scheduler_rerun=2``: 17.97% MFU (4.15 s/step,
+    207.2 TFLOPS/device, 0 dropped routes over 20 steps).
+  """
+  cfg = qwen35_moe_397b_split_tokamax_ep_benchmark()
+  cfg.training.max_context_length = 4096
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 8192
+  splash = cfg.splash_attention_kernel
+  splash.use_tokamax_splash_attention_kernel = True
+  splash.use_batch_loop_fwd = True
+  splash.sa_num_stacked_q_heads = 16
+  splash.sa_use_fused_bwd_kernel = True
+  splash.sa_block_q = 128
+  for name in ("kv", "kv_compute", "q_dkv", "kv_dkv", "kv_dkv_compute"):
+    setattr(splash, f"sa_block_{name}", 1024)
+  cfg.parallelism.expert_parallel_degree = 16
+  cfg.parallelism.fsdp_reshard_after_forward = "never"
+  cfg.tpu_config.ep_transport = "ring_of_experts"
+  cfg.tpu_config.ep_token_chunks = 2
+  cfg.tpu_config.ep_capacity_factor = 1.05
+  cfg.tpu_config.ep_chunk_dw_fp32 = False
+  cfg.tpu_config.ep_roe_window_routing = True
+  cfg.tpu_config.ep_roe_save_routing_metadata = True
+  cfg.tpu_config.ep_roe_reduce_block_size = 1792
+  cfg.tpu_config.ep_roe_fused_w13_gather = True
+  cfg.compile.save_regions = ("attention.inner_attention", "moe.roe_routing")
+  graph_split = cfg.compile.graph_split
+  graph_split.forward_layers_per_executable = 1
+  graph_split.backward_layers_per_executable = 1
+  graph_split.backward_partition_mode = "fsdp_pipeline"
+  graph_split.pipeline_kinds = ("rs",)
+  graph_split.forward_prefetch_parameter_gathers = True
+  graph_split.forward_prefetch_pin_fraction = 0.4
+  graph_split.backward_pin_deferred_rs_fraction = 0.75
+  graph_split.backward_pin_deferred_rs_max_bytes = 150_000_000
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      {"xla_latency_hiding_scheduler_rerun": "2"},
+  )
+  return cfg
+
+
 def qwen35_moe_35b_split_tokamax_benchmark_allgather_cp2() -> (
     TpuGraphTrainer.Config
 ):

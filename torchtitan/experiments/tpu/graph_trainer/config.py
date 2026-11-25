@@ -87,6 +87,16 @@ class GraphSplitterConfig:
   forward_layers_per_executable: int = -1
   # Assign non-layer work before the first transformer layer to its own partition.
   forward_isolate_prefix: bool = False
+  # Issue each forward parameter all-gather (FSDP/expert-FSDP weights) in the
+  # forward executable before the one that reads it, so the previous
+  # executable's compute hides it. Holds one executable's gathered weights
+  # across the boundary. Needs ``forward_layers_per_executable`` > 0.
+  forward_prefetch_parameter_gathers: bool = False
+  # When set to a fraction in (0, 1), hoist prefetched forward parameter
+  # gathers to the start of their executable and join their waits with a
+  # compute node at this fraction of the executable via an optimization
+  # barrier, forcing XLA to start them at executable entry.
+  forward_prefetch_pin_fraction: float | None = None
   # Backward subdivision applied after the top-level forward/backward split.
   # ``by_layer`` groups adjacent layer backward computations and co-locates any
   # attributable FSDP collective chains with their layer. ``fsdp_pipeline``
@@ -96,6 +106,17 @@ class GraphSplitterConfig:
   # executable. Grouping layers widens the compiler scheduling window without
   # changing activation-checkpoint boundaries.
   backward_layers_per_executable: int = 1
+  # ``fsdp_pipeline`` only: when set to a fraction in (0, 1), hoist deferred
+  # gradient reductions to the start of their backward executable and join
+  # their waits with a compute node at this fraction via an optimization
+  # barrier so XLA overlaps them with backward compute instead of leaving a
+  # serial tail at executable exit.
+  backward_pin_deferred_rs_fraction: float | None = None
+  # Positive value restricts ``backward_pin_deferred_rs_fraction`` to gradient
+  # reductions whose input buffer is at most this many bytes (for example,
+  # pinning dense FSDP reductions on SC1 without pinning large expert dW
+  # reductions that also occupy SC0).
+  backward_pin_deferred_rs_max_bytes: int = 0
   # Reuse dead internal split-boundary buffers through XLA input donation.
   # Without it, every executable queued ahead of the device reserves fresh
   # HBM for its outputs at enqueue time. TorchTPU includes donation in its

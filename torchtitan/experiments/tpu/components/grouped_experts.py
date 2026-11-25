@@ -505,6 +505,112 @@ class TpuGroupedExperts(GroupedExperts):
             transpose_rhs=self._use_transposed_w2_rhs,
         )[:num_rows].type_as(x_RD)
 
+    def supports_roe_fused_gmm(self) -> bool:
+        """Whether ``forward_roe_fused`` can run (BF16 paired Pallas path)."""
+        return (
+            self.use_pallas_grouped_mm
+            and self.use_pallas_paired_grouped_mm
+            and not self.use_fp8_grouped_mm
+        )
+
+    def forward_roe_fused(
+        self,
+        x_all_GD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+        roe_metadata,
+        *,
+        top_k: int,
+        row_scale_R: torch.Tensor | None = None,
+        pre_unsharded_weights: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> torch.Tensor:
+        """Ring-of-Experts experts on the gathered tokens, returning the partial
+        combine ``[G, D / 128, 128]`` (before the EP reduce-scatter).
+
+        Fuses the dispatch gather with the paired W1/W3 grouped matmul so the
+        dispatch gather writes ``(cap, D)`` directly in VMEM without an HBM
+        relayout copy, then runs W2 and ``roe_unsort_reduce`` into 3D.
+        """
+        from torchtitan.experiments.tpu.kernels.ragged_gather_tc import (
+            roe_unsort_reduce,
+        )
+        from torchtitan.experiments.tpu.kernels.roe_fused_gmm import (
+            roe_fused_w13,
+        )
+
+        if not self.supports_roe_fused_gmm():
+            raise ValueError("forward_roe_fused needs the BF16 paired Pallas path")
+        w1_EKN, w2_EKN, w3_EKN = (
+            pre_unsharded_weights
+            if pre_unsharded_weights is not None
+            else self.unshard_weights()
+        )
+        md = roe_metadata
+        cap = md.window_slot_order_cap.shape[0]
+        tile_m = self.pallas_grouped_mm_tile_m
+        tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
+        w2_tgmm_tiling = self.pallas_grouped_mm_w2_tgmm_tiling or tgmm_tiling
+        if self._use_transposed_w2_rhs:
+            w2_tgmm_tiling = (
+                self.pallas_grouped_mm_w2_transposed_tgmm_tiling or w2_tgmm_tiling
+            )
+        row_align = math.lcm(
+            tile_m, max(1, tgmm_tiling[0]), max(1, w2_tgmm_tiling[0])
+        )
+        if cap % row_align:
+            raise ValueError(
+                f"RoE fused GMM needs the expert buffer ({cap} rows) to be a"
+                f" multiple of the grouped matmul M tiles ({row_align})"
+            )
+        gather_block = 512 if cap % 512 == 0 else row_align
+        gate_RF, up_RF = roe_fused_w13(
+            x_all_GD.bfloat16(),
+            w1_EKN.bfloat16(),
+            w3_EKN.bfloat16(),
+            md.token_indices_experts_sorted_N,
+            md.start_count_2,
+            num_tokens_per_expert_E,
+            md.src_rows,
+            md.tokens,
+            md.blocks,
+            cap=cap,
+            top_k=top_k,
+            gather_block_size=gather_block,
+            reduce_block_size=md.reduce_block_size,
+            tile_m=tile_m,
+            tgmm_tile_m=tgmm_tiling[0],
+            tgmm_tile_k=tgmm_tiling[1],
+        )
+        hidden_RF = self._activation_fn(gate_RF) * up_RF
+        if row_scale_R is not None:
+            hidden_RF = (hidden_RF.float() * row_scale_R.reshape(-1, 1)).to(
+                hidden_RF.dtype
+            )
+        y_RD = segment_matmul_pallas_2d(
+            hidden_RF,
+            w2_EKN.bfloat16(),
+            num_tokens_per_expert_E,
+            tile_m=tile_m,
+            tile_k=self.pallas_grouped_mm_tile_k,
+            tile_n=self.pallas_grouped_mm_tile_n,
+            tgmm_tiling=w2_tgmm_tiling,
+            transpose_rhs=self._use_transposed_w2_rhs,
+        )
+        return roe_unsort_reduce(
+            y_RD,
+            md.token_indices_experts_sorted_N,
+            md.start_count_2,
+            md.src_rows,
+            md.tokens,
+            md.blocks,
+            num_out_tokens=md.num_global_tokens,
+            top_k=top_k,
+            gather_block_size=md.gather_block_size,
+            reduce_block_size=md.reduce_block_size,
+            out_3d=True,
+        ).type_as(x_all_GD)
+
     def _fp8_experts_forward(
         self,
         x_RD: torch.Tensor,

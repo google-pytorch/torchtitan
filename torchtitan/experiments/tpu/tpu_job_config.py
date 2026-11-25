@@ -56,6 +56,13 @@ class TPUConfig:
   ep_chunk_dw_fp32: bool | None = None
   # False switches paired W1+W3 Pallas grouped matmuls to unpaired under EP.
   ep_paired_grouped_mm: bool | None = None
+  # Ring-of-Experts options: compute routing tables over this rank's [cap]
+  # window only, include them in the `moe.roe_routing` save region, override
+  # the gather-reduce token block size, and fuse the dispatch gather into W1/W3.
+  ep_roe_window_routing: bool | None = None
+  ep_roe_save_routing_metadata: bool | None = None
+  ep_roe_reduce_block_size: int | None = None
+  ep_roe_fused_w13_gather: bool | None = None
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]

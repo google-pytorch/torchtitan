@@ -809,7 +809,7 @@ def _run_chunked_ep_capacity_overflow(device, rank, world_size):
             persistent=False,
         )
         routed.token_dispatcher.bind_ep_rank_holder(routed)
-        routed._ep_mesh = ep_mesh  # As TpuRoutedExperts.parallelize does.
+        routed._ep_mesh = ep_mesh  # As TpuRoutedExperts._parallelize does.
         assert configure_ep_drop_stats([routed], enabled=True)
 
         out = routed(x_in, sc_in, local_ids, local_counts)

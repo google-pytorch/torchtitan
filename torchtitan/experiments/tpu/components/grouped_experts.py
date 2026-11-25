@@ -247,7 +247,7 @@ class TpuGroupedExperts(GroupedExperts):
             self._native_sharding_applied = True
         super()._distribute_states(parallel_dims)
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallel_dims) -> None:
         # The paired W1+W3 GEMM is EP-safe: like the unpaired kernels it skips
         # rows past sum(num_tokens_per_expert_E), and its forward zeroes each
         # output tile on first visit, so the stale tail of a static-size EP
@@ -261,7 +261,7 @@ class TpuGroupedExperts(GroupedExperts):
             and parallel_dims.get_optional_mesh("ep") is not None
         ):
             raise ValueError("FP8 grouped matmul requires EP=1 exact-row dispatch")
-        super().parallelize(parallel_dims)
+        super()._parallelize(parallel_dims)
 
     @staticmethod
     def _canonical_weights_on_save(module, state_dict, prefix, local_metadata) -> None:

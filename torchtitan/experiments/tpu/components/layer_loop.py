@@ -139,7 +139,7 @@ def tpu_model_class(config_cls: type) -> type:
     Put the recipe on the new ``Config`` with ``derive``. Do it last: any later
     rewrite that rebuilds the root config from a fixed class undoes this one,
     which is also why it cannot go on a recipe -- ``experiments/tpu/train.py``
-    rebuilds ``model_spec`` from the graph-trainer registry.
+    rebuilds the model config in the graph-trainer class.
 
     One class per config class, cached.
     """

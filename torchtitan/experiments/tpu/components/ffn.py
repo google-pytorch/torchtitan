@@ -165,13 +165,13 @@ class TpuPackedFeedForward(TpuTwoProjFeedForward):
     self.register_state_dict_post_hook(self._stack_w13_on_save)
     self.register_load_state_dict_pre_hook(self._flatten_w13_on_load)
 
-  def parallelize(self, parallel_dims: ParallelDims) -> None:
+  def _parallelize(self, parallel_dims: ParallelDims) -> None:
     if parallel_dims.tp > 1:
       raise ValueError(
           "TpuPackedFeedForward does not support tensor parallelism "
           f"(parallel_dims.tp={parallel_dims.tp})"
       )
-    super().parallelize(parallel_dims)
+    super()._parallelize(parallel_dims)
 
   @staticmethod
   def _stack_w13_on_save(module, state_dict, prefix, _local_metadata) -> None:

@@ -570,8 +570,8 @@ class TokenDispatcherTest(parameterized.TestCase):
         parallel_dims.get_optional_mesh.side_effect = (
             lambda name: mesh if name == "ep" else None
         )
-        with mock.patch("torchtitan.models.common.moe.RoutedExperts.parallelize"):
-            routed.parallelize(parallel_dims)
+        with mock.patch("torchtitan.models.common.moe.RoutedExperts._parallelize"):
+            routed._parallelize(parallel_dims)
         assert "_ep_local_rank" in dict(routed.named_buffers())
         assert int(routed._ep_local_rank.item()) == 1
         assert routed.token_dispatcher.roe_zero_pad_tail is expected_zero_pad
@@ -596,14 +596,14 @@ class TokenDispatcherTest(parameterized.TestCase):
             lambda name: mesh if name == "ep" else None
         )
         with mock.patch(
-            "torchtitan.models.common.moe.RoutedExperts.parallelize"
+            "torchtitan.models.common.moe.RoutedExperts._parallelize"
         ) as parent_parallelize:
             if raises:
                 with self.assertRaisesRegex(ValueError, "ring_of_experts.*needs a TPU"):
-                    routed.parallelize(parallel_dims)
+                    routed._parallelize(parallel_dims)
                 parent_parallelize.assert_not_called()
             else:
-                routed.parallelize(parallel_dims)
+                routed._parallelize(parallel_dims)
                 parent_parallelize.assert_called_once()
 
     @parameterized.parameters(None, 1.5)
@@ -624,8 +624,8 @@ class TokenDispatcherTest(parameterized.TestCase):
         parallel_dims.get_optional_mesh.side_effect = (
             lambda name: mesh if name == "ep" else None
         )
-        with mock.patch("torchtitan.models.common.moe.RoutedExperts.parallelize"):
-            routed.parallelize(parallel_dims)
+        with mock.patch("torchtitan.models.common.moe.RoutedExperts._parallelize"):
+            routed._parallelize(parallel_dims)
 
         # Off after parallelize: only a trainer that returns the counts from its
         # step turns them on, and only capacity-bounded layers have any.
@@ -890,7 +890,7 @@ def _run_ep_capacity_no_overflow(
         persistent=False,
     )
     routed.token_dispatcher.bind_ep_rank_holder(routed)
-    # As TpuRoutedExperts.parallelize and TpuGraphTrainer do.
+    # As TpuRoutedExperts._parallelize and TpuGraphTrainer do.
     routed._ep_mesh = ep_mesh
     assert configure_ep_drop_stats([routed], enabled=True)
 

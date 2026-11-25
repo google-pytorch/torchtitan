@@ -680,8 +680,8 @@ class KVAllGatherCPInnerAttention(_TPUCPInnerAttention):
     # The local attention kernel, plugged in with set_local_attention.
     self.set_local_attention(None)
 
-  def parallelize(self, parallel_dims: Any) -> None:
-    super().parallelize(parallel_dims)  # pyrefly: ignore[missing-attribute]
+  def _parallelize(self, parallel_dims: Any) -> None:
+    super()._parallelize(parallel_dims)  # pyrefly: ignore[missing-attribute]
     register_cp_rank_buffer(self, parallel_dims)
 
   def _init_self_buffers(
@@ -1494,7 +1494,8 @@ def install_tpu_cp_patches() -> None:
       shard = DeviceMesh._concatenate([mesh["dp_replicate"], shard])
     return shard, None
 
-  # Model parallelize modules bind the function at import time.
+  # `torchtitan.distributed.fsdp` itself (the models' `_apply_fsdp` import the
+  # function from it when called) and any module that bound it at import time.
   for name, mod in list(sys.modules.items()):
     if (
         name.startswith("torchtitan.")

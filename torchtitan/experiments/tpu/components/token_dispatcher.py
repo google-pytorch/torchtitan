@@ -35,6 +35,7 @@ import weakref
 import torch
 from torch.autograd.function import once_differentiable
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed._functional_collectives import (
     AsyncCollectiveTensor,
     all_gather_single,
@@ -45,7 +46,7 @@ from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.fx.traceback import annotate, annotate_fn
 
 from torchtitan.config import derive
-from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_sparse_mesh
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
@@ -685,6 +686,28 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     self._ep_local_rank_buf: torch.Tensor | None = None
     self.last_dropped_count: torch.Tensor | None = None
 
+  # Set through the ``ep_mesh`` setter; ``None`` uses the SPMD runtime's mesh.
+  _pinned_ep_mesh: DeviceMesh | None = None
+
+  @property
+  def ep_mesh(self) -> DeviceMesh | None:
+    """The EP mesh: upstream's ambient SPMD sparse mesh, unless one was set.
+
+    Upstream resolves the EP mesh from the SPMD runtime that the trainers
+    register (``get_spmd_context``). Assigning ``ep_mesh`` pins a mesh instead,
+    for code that drives a dispatcher without that runtime (unit tests).
+    """
+    if self._pinned_ep_mesh is not None:
+      return self._pinned_ep_mesh
+    # Upstream's `BaseEPTokenDispatcher.ep_mesh`, inlined: Dynamo resolves
+    # `super().ep_mesh` to the property object instead of calling it.
+    mesh = spmd_sparse_mesh()
+    return None if mesh is None else mesh["ep"]
+
+  @ep_mesh.setter
+  def ep_mesh(self, ep_mesh: DeviceMesh | None) -> None:
+    self._pinned_ep_mesh = ep_mesh
+
   def init_buffer(self) -> None:
     super().init_buffer()
     self._ep_local_rank_buf = None
@@ -807,7 +830,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             " TpuRoutedExperts' `_ep_local_rank` buffer as a graph input on"
             f" the input's device (buffer: {found}; input:"
             f" {type(x).__name__} on {x.device}). A constant would bake this"
-            " rank's index into the graph. TpuRoutedExperts.parallelize"
+            " rank's index into the graph. TpuRoutedExperts._parallelize"
             " registers the buffer; trace with module buffers as graph"
             " inputs, as TpuGraphTrainer does."
         )
@@ -1464,7 +1487,7 @@ class TpuRoutedExperts(RoutedExperts):
           [int(ep_mesh.get_local_rank())], dtype=torch.long
       ).to(device=target_dev)
 
-  def parallelize(self, parallel_dims) -> None:
+  def _parallelize(self, parallel_dims) -> None:
     # Upstream's `all_to_all` transport keeps routing scores on the source rank
     # while W2 runs on the expert's rank after dispatch. The TPU EP transports
     # (`ring_of_experts`, `ragged_all_to_all`, `auto`) move per-row scores to
@@ -1495,7 +1518,7 @@ class TpuRoutedExperts(RoutedExperts):
       reason = dispatcher.ring_of_experts_unsupported_reason(mesh_device_type)
       if reason is not None:
         raise ValueError(_ring_of_experts_unavailable_message(reason))
-    super().parallelize(parallel_dims)
+    super()._parallelize(parallel_dims)
     if ep_mesh is not None and callable(getattr(ep_mesh, "get_local_rank", None)):
       if ep_transport in ("ragged_all_to_all", "ring_of_experts", "auto"):
         self._ep_mesh = ep_mesh

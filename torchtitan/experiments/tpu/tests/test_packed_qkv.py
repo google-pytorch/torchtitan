@@ -90,7 +90,7 @@ def test_converter_validates_supported_config():
     converter.convert(invalid_rows).build()
 
   with pytest.raises(ValueError, match="supports TP=1 only"):
-    converted.build().parallelize(SimpleNamespace(tp=2))
+    converted.build()._parallelize(SimpleNamespace(tp=2))
 
 
 def test_packed_qkv_matches_fused_semantics_and_checkpoint():

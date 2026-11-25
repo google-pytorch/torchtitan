@@ -275,7 +275,7 @@ class RaggedDispatcherTracingTest(parameterized.TestCase):
         mesh.get_local_rank.return_value = 0
         parallel_dims = mock.Mock()
         parallel_dims.get_optional_mesh.return_value = mesh if has_ep else None
-        routed.parallelize(parallel_dims)
+        routed._parallelize(parallel_dims)
         assert ("_ep_local_rank" in dict(routed.named_buffers())) == registers
 
 

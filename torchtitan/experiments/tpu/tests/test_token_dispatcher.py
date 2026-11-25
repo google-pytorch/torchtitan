@@ -247,12 +247,19 @@ def test_ep_combine_delegates_to_standard_dispatcher():
     dispatcher = TpuAllToAllTokenDispatcher.Config(
         num_experts=2, top_k=2
     ).build()
-    dispatcher.ep_mesh = object()
     expected = torch.tensor([1.0])
 
-    with mock.patch.object(
-        AllToAllTokenDispatcher, "combine", return_value=expected
-    ) as combine:
+    with (
+        mock.patch.object(
+            TpuAllToAllTokenDispatcher,
+            "ep_mesh",
+            new_callable=mock.PropertyMock,
+            return_value=object(),
+        ),
+        mock.patch.object(
+            AllToAllTokenDispatcher, "combine", return_value=expected
+        ) as combine,
+    ):
         actual = dispatcher.combine(
             torch.empty(0), mock.sentinel.metadata, torch.empty(0)
         )
@@ -395,19 +402,19 @@ def _parallel_dims_with_ep(has_ep):
 def test_scale_before_down_proj_refuses_expert_parallelism_at_parallelize():
   routed = _row_scaled_routed_experts()
   with mock.patch(
-      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+      "torchtitan.models.common.moe.RoutedExperts._parallelize"
   ) as parent_parallelize:
     with pytest.raises(ValueError, match="expert_parallel_degree=1"):
-      routed.parallelize(_parallel_dims_with_ep(has_ep=True))
+      routed._parallelize(_parallel_dims_with_ep(has_ep=True))
   parent_parallelize.assert_not_called()
 
 
 def test_scale_before_down_proj_allows_ep1_parallelize():
   routed = _row_scaled_routed_experts()
   with mock.patch(
-      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+      "torchtitan.models.common.moe.RoutedExperts._parallelize"
   ) as parent_parallelize:
-    routed.parallelize(_parallel_dims_with_ep(has_ep=False))
+    routed._parallelize(_parallel_dims_with_ep(has_ep=False))
   parent_parallelize.assert_called_once()
 
 
@@ -425,9 +432,9 @@ def test_scale_before_down_proj_allows_tpu_ep_transports_at_parallelize(
       scale_before_down_proj=True,
   ).build()
   with mock.patch(
-      "torchtitan.models.common.moe.RoutedExperts.parallelize"
+      "torchtitan.models.common.moe.RoutedExperts._parallelize"
   ) as parent_parallelize:
-    routed.parallelize(_parallel_dims_with_ep(has_ep=True))
+    routed._parallelize(_parallel_dims_with_ep(has_ep=True))
   parent_parallelize.assert_called_once()
 
 

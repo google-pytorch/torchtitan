@@ -46,7 +46,7 @@ class TpuGroupedExpertsFp8ConfigTest(absltest.TestCase):
         return object() if name == "ep" else None
 
     with self.assertRaisesRegex(ValueError, "FP8 grouped matmul requires EP=1"):
-      experts.parallelize(ParallelDimsWithEp())
+      experts._parallelize(ParallelDimsWithEp())
 
   def test_fp8_rows_are_padded_to_the_fp8_m_tiles(self):
     # The BF16 tiles of qwen3_moe_235b_scan align rows to 512, but the FP8

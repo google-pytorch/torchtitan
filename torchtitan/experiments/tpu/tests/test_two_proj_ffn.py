@@ -192,7 +192,7 @@ def test_packed_converter_selects_the_packed_class():
   assert type(module) is TpuPackedFeedForward
   assert tuple(module.w13.weight.shape) == (2 * HIDDEN_DIM, DIM)
   with pytest.raises(ValueError, match="tensor parallelism"):
-    converted.build().parallelize(SimpleNamespace(tp=2))
+    converted.build()._parallelize(SimpleNamespace(tp=2))
 
 
 @pytest.mark.parametrize("bias", [False, True])
@@ -260,10 +260,10 @@ def test_graph_trainer_packs_only_non_scan_zero3_without_tp():
       cfg.compile.enable_remat_barriers = True
       cfg.compile.fsdp_barrier_policy = "interleave"
     apply_tpu_graph_trainer_model_transforms(cfg)
-    assert list(cfg.model_spec.model.traverse(FeedForward.Config))
+    assert list(cfg.model.traverse(FeedForward.Config))
     return [
         type(c)
-        for _, c, _, _ in cfg.model_spec.model.traverse(
+        for _, c, _, _ in cfg.model.traverse(
             TpuTwoProjFeedForward.Config
         )
     ]

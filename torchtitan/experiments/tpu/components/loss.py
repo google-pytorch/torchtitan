@@ -116,7 +116,7 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
   override replaced: the wrapper only hands over ``(hidden, weight.T)``, so the
   head's elementwise logit transform (Muse Glimmer's ``SoftCappedLinear``) is
   re-applied here, inside the kernel. Recipes copy the two values from
-  ``model_spec.model.lm_head`` when they select this loss.
+  ``config.model.lm_head`` when they select this loss.
   """
 
   @dataclass(kw_only=True, slots=True)

@@ -126,14 +126,14 @@ class TpuPackedQKVLinear(Module):
     self.register_state_dict_post_hook(self._split_qkv_on_save)
     self.register_load_state_dict_pre_hook(self._merge_qkv_on_load)
 
-  def parallelize(self, parallel_dims: ParallelDims) -> None:
+  def _parallelize(self, parallel_dims: ParallelDims) -> None:
     if parallel_dims.tp > 1:
       raise ValueError(
           "TpuPackedQKVLinear supports TP=1 only; a global contiguous "
           "[Q; K; V] layout is incompatible with the existing Shard(0) "
           "tensor-parallel plan"
       )
-    super().parallelize(parallel_dims)
+    super()._parallelize(parallel_dims)
 
   @spmd.local_map(
       out_types=(

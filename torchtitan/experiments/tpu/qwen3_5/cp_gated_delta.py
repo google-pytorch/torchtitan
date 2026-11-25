@@ -241,8 +241,8 @@ class CPTpuInnerGatedDeltaNet(TpuInnerGatedDeltaNet):
       )
     self.load_balancer = config.load_balancer
 
-  def parallelize(self, parallel_dims: Any) -> None:
-    super().parallelize(parallel_dims)
+  def _parallelize(self, parallel_dims: Any) -> None:
+    super()._parallelize(parallel_dims)
     register_cp_rank_buffer(self, parallel_dims)
 
   def _init_self_buffers(

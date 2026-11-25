@@ -38,7 +38,10 @@ class _RankHolder(torch.nn.Module):
         )
 
 
-def _test_ep_ragged_all_to_all(device, rank, world_size, ep_size, mode):
+def _test_ep_ragged_all_to_all(
+    device, rank, world_size, ep_size, mode, capacity_factor=None
+):
+    """EP=ep_size vs EP=1. ``capacity_factor`` runs ep_capacity_overflow="grow"."""
     del ep_size  # == world_size
     bsz, seq_len, num_experts, top_k, dim = 2, 5, 8, 2, 16
     total_tokens = bsz * seq_len * world_size
@@ -65,8 +68,16 @@ def _test_ep_ragged_all_to_all(device, rank, world_size, ep_size, mode):
     )
     local_expert_ids = global_expert_ids[local_start:local_end]
 
+    capacity_kwargs = (
+        {}
+        if capacity_factor is None
+        else dict(ep_capacity_factor=capacity_factor, ep_capacity_overflow="grow")
+    )
     dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=num_experts, top_k=top_k, ep_transport="ragged_all_to_all"
+        num_experts=num_experts,
+        top_k=top_k,
+        ep_transport="ragged_all_to_all",
+        **capacity_kwargs,
     ).build()
     dispatcher.ep_mesh = init_device_mesh(
         device.type, (world_size,), mesh_dim_names=("ep",)
@@ -87,6 +98,27 @@ def _test_ep_ragged_all_to_all(device, rank, world_size, ep_size, mode):
         num_global_tokens_e,
         global_counts[rank * local_e : (rank + 1) * local_e].to(torch.int32),
     )
+
+    if capacity_factor is not None:
+      # "grow": the buffer holds the largest receive count of any rank, starts
+      # from the capped size and doubles, never exceeds the worst case, and
+      # drops nothing.
+      num_routed = local_expert_ids.numel()
+      max_received = int(
+          max(
+              global_counts[r * local_e : (r + 1) * local_e].sum()
+              for r in range(world_size)
+          )
+      )
+      worst_case = world_size * num_routed
+      expected = min(max(int(num_routed * capacity_factor), 1), worst_case)
+      while expected < max_received:
+        expected *= 2
+      expected = min(expected, worst_case)
+      rows = routed_input.shape[0]
+      assert rows == expected, (rows, expected, max_received)
+      assert rows >= max_received, (rows, max_received)
+      assert int(metadata.dropped_count) == 0
 
     # Rows past the routed count are stale in a real receive buffer; make them
     # NaN so any read of them shows up in the outputs or gradients.
@@ -136,6 +168,77 @@ class RaggedEpDispatcherDistributedTest(parameterized.TestCase):
             ep_size,
             mode,
         )
+
+    @parameterized.product(
+        ep_size_and_mode=[
+            (2, "random"), (2, "skewed"), (2, "empty"), (4, "random"), (4, "skewed")
+        ],
+        # 2.0 usually fits the capped size; 0.05 never does, so the buffer
+        # doubles (up to the worst case on skewed routing).
+        capacity_factor=[2.0, 0.05],
+    )
+    def test_ragged_ep_grow_matches_ep1_without_drops(
+        self, ep_size_and_mode, capacity_factor
+    ):
+        ep_size, mode = ep_size_and_mode
+        distributed.run_distributed(
+            ep_size,
+            device_type.AcceleratorDeviceType.CPU,
+            _test_ep_ragged_all_to_all,
+            ep_size,
+            mode,
+            capacity_factor,
+        )
+
+    def test_grow_config_validation(self):
+        with self.assertRaisesRegex(ValueError, "needs ep_capacity_factor"):
+            TpuAllToAllTokenDispatcher.Config(
+                num_experts=8,
+                top_k=2,
+                ep_transport="ragged_all_to_all",
+                ep_capacity_overflow="grow",
+            ).build()
+        with self.assertRaisesRegex(ValueError, "ragged_all_to_all' only"):
+            TpuAllToAllTokenDispatcher.Config(
+                num_experts=8,
+                top_k=2,
+                ep_transport="ring_of_experts",
+                ep_capacity_factor=2.0,
+                ep_capacity_overflow="grow",
+            ).build()
+        with self.assertRaisesRegex(ValueError, "must be 'drop' or 'grow'"):
+            TpuAllToAllTokenDispatcher.Config(
+                num_experts=8,
+                top_k=2,
+                ep_transport="ragged_all_to_all",
+                ep_capacity_factor=2.0,
+                ep_capacity_overflow="spill",
+            ).build()
+
+    def test_grown_capacity_doubles_and_refuses_tracing(self):
+        dispatcher = TpuAllToAllTokenDispatcher.Config(
+            num_experts=8,
+            top_k=2,
+            ep_transport="ragged_all_to_all",
+            ep_capacity_factor=2.0,
+            ep_capacity_overflow="grow",
+        ).build()
+        # 2 EP ranks x 4 local experts; rank 1 receives 10 rows, rank 0 two.
+        counts_SDE = torch.zeros(2, 2, 4, dtype=torch.int32)
+        counts_SDE[0, 1, 0] = 6
+        counts_SDE[1, 1, 3] = 4
+        counts_SDE[1, 0, 2] = 2
+        self.assertEqual(dispatcher._ep_grown_capacity(6, counts_SDE, 64), 12)
+        self.assertEqual(dispatcher._ep_grown_capacity(3, counts_SDE, 64), 12)
+        self.assertEqual(dispatcher._ep_grown_capacity(12, counts_SDE, 64), 12)
+        self.assertEqual(dispatcher._ep_grown_capacity(3, counts_SDE, 8), 8)
+        with self.assertRaisesRegex(RuntimeError, "cannot be traced"):
+            make_fx(
+                lambda c: torch.zeros(
+                    dispatcher._ep_grown_capacity(3, c, 64)
+                ),
+                tracing_mode="fake",
+            )(counts_SDE)
 
     def test_config_rejects_unknown_transport(self):
         with self.assertRaisesRegex(ValueError, "ep_transport must be"):

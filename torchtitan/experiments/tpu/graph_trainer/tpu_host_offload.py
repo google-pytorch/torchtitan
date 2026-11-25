@@ -50,20 +50,26 @@ SAVED_CARRY = "layer_input"
 
 
 def _scan_body(gm: torch.fx.GraphModule, scan_node: Node) -> torch.fx.GraphModule:
+    """The loop body of ``scan_node``, a submodule of ``gm``."""
     # `trace_scan` registers the body as a submodule of the root graph.
     return getattr(gm, scan_node.args[0].target)
 
 
 def _outputs(body: torch.fx.GraphModule) -> list:
+    """The body's output values, in order."""
     return list(next(iter(body.graph.find_nodes(op="output"))).args[0])
 
 
 def _placeholder(body: torch.fx.GraphModule, index: int) -> Node:
+    """The body's input number ``index``."""
     return body.graph.find_nodes(op="placeholder")[index]
 
 
 def _is_saved_carry(body: torch.fx.GraphModule, node: object) -> bool:
-    # How scan returns a body input that min-cut saved; the carry is input 0.
+    """Whether ``node`` is the saved layer input.
+
+    Scan saves a carried input as ``clone(input)``, and the carry is input 0.
+    """
     return (
         isinstance(node, Node)
         and node.target is torch.ops.aten.clone.default
@@ -72,6 +78,8 @@ def _is_saved_carry(body: torch.fx.GraphModule, node: object) -> bool:
 
 
 def _is_named_save(body: torch.fx.GraphModule, node: object, name: str) -> bool:
+    """Whether ``node`` is the save called ``name``: the saved layer input for
+    ``"layer_input"``, else an output labeled with region ``name``."""
     if name == SAVED_CARRY:
         return _is_saved_carry(body, node)
     # Scan returns a saved op output as is, with the op's region label.
@@ -82,10 +90,10 @@ def _is_named_save(body: torch.fx.GraphModule, node: object, name: str) -> bool:
 
 
 def _only_read_by(node: Node, scan: Node) -> bool:
-    """Whether ``scan`` is the only live reader of ``node`` or a view of it.
+    """Whether ``scan`` is the only live reader of ``node`` or its views.
 
-    Any other reader would silently get host memory. Dead users don't count:
-    tracing ``scan`` leaves unused element-0 slices of its operands.
+    Any other reader would get host memory. Dead users (unused slices that
+    tracing ``scan`` leaves) don't count.
     """
     pending, seen = [node], set()
     while pending:
@@ -187,6 +195,11 @@ def _reload_body_slice(body: torch.fx.GraphModule, index: int) -> None:
 def _offload_one(
     gm: torch.fx.GraphModule, fwd_scan: Node, index: int, name: str
 ) -> None:
+    """Move output ``index`` of ``fwd_scan`` to host.
+
+    Offloads it in the forward body and reloads one row per step in the
+    backward body. Raises if anything but the backward scan reads it.
+    """
     # A scan node returns what its body returns, so getitem index = body output.
     stacks = [
         u for u in fwd_scan.users

@@ -292,11 +292,9 @@ def _stub_inputs(tokens: int):
 class ChunkedRoutedExpertsTest(parameterized.TestCase):
     """Single-process checks of chunked TpuRoutedExperts."""
 
-    @parameterized.parameters(
-        (True, torch.float32), (False, torch.bfloat16)
-    )
-    def test_chunked_forward_unshards_once_and_widens_weights(
-        self, accumulate_fp32, weight_dtype
+    @parameterized.parameters(True, False)
+    def test_chunked_forward_unshards_once_and_keeps_bf16_weights(
+        self, accumulate_fp32
     ):
         torch.manual_seed(0)
         dim, tokens = 8, 12
@@ -306,13 +304,58 @@ class ChunkedRoutedExpertsTest(parameterized.TestCase):
         experts = routed.inner_experts
         assert experts.unshard_calls == 1
         assert chunk_rows == [3, 3, 3, 3]
-        assert experts.weight_dtypes == [weight_dtype] * 4
+        # FP32 dW accumulation no longer widens the weights the chunks read.
+        assert experts.weight_dtypes == [torch.bfloat16] * 4
         torch.testing.assert_close(
             out, (x.bfloat16() @ experts.w.bfloat16()).float(), rtol=1e-2, atol=1e-2
         )
         out.sum().backward()
         assert experts.w.grad is not None
         assert experts.w.grad.dtype == torch.bfloat16
+
+    def test_chunked_backward_saves_one_weight_storage(self):
+        torch.manual_seed(0)
+        dim, tokens, num_chunks = 8, 12, 4
+        routed, _ = _stub_chunked_routed(dim, num_chunks, True)
+        weight = routed.inner_experts.w
+        saved_weight_storages = []
+
+        def pack(saved):
+            if saved.shape == weight.shape:
+                saved_weight_storages.append(saved.untyped_storage().data_ptr())
+            return saved
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda saved: saved):
+            # x needs a gradient too, or the matmuls don't save the weight.
+            x = torch.randn(tokens, dim, requires_grad=True)
+            routed(x, *_stub_inputs(tokens))
+        # Each chunk's matmul saves the weight, all the same BF16 storage.
+        assert len(saved_weight_storages) == num_chunks
+        assert set(saved_weight_storages) == {weight.untyped_storage().data_ptr()}
+
+    def test_fp32_chunk_weight_grads_match_widened_weight_reference(self):
+        torch.manual_seed(0)
+        dim, tokens, num_chunks = 8, 16, 4
+        x = torch.randn(tokens, dim)
+        grad_out = torch.randn(tokens, dim)
+        routed, _ = _stub_chunked_routed(dim, num_chunks, True)
+        # The FP32 widening this replaces: the chunks read an FP32 copy of the
+        # weight, so autograd sums the BF16 casts' FP32 gradients across chunks.
+        reference, _ = _stub_chunked_routed(dim, num_chunks, False)
+        ref_experts = reference.inner_experts
+        with torch.no_grad():
+            ref_experts.w.copy_(routed.inner_experts.w)
+        ref_experts.unshard_weights = lambda: tuple(
+            w.float() for w in (ref_experts.w,) * 3
+        )
+
+        for module in (routed, reference):
+            module(x, *_stub_inputs(tokens)).backward(grad_out)
+        assert ref_experts.weight_dtypes == [torch.float32] * num_chunks
+        # Both sum the same per-chunk FP32 gradients in the same order.
+        torch.testing.assert_close(
+            routed.inner_experts.w.grad, ref_experts.w.grad, rtol=0, atol=0
+        )
 
     @parameterized.parameters(
         (True, torch.float32), (False, torch.bfloat16)
@@ -415,7 +458,7 @@ class ChunkedRoutedExpertsTest(parameterized.TestCase):
             routed(torch.randn(8, 8), *_stub_inputs(8))
 
 
-def _tag(node, val, *, fqn=None, chunk=None, bwd=False):
+def _tag(node, val, *, fqn=None, chunk=None, bwd=False, chunk_weight=False):
     node.meta["val"] = val
     custom = {}
     if fqn is not None:
@@ -423,6 +466,8 @@ def _tag(node, val, *, fqn=None, chunk=None, bwd=False):
     if chunk is not None:
         custom["ep_chunk_idx"] = chunk
         custom["ep_max_inflight_chunks"] = 2
+    if chunk_weight:
+        custom["ep_chunk_weight"] = True
     if custom:
         node.meta["custom"] = custom
     if bwd:
@@ -452,11 +497,10 @@ def _chunked_moe_graph(num_layers=2, num_chunks=4, rows=2, dim=4):
     for layer in range(num_layers):
         fqn = f"layers.{layer}.moe.routed_experts"
         h = _tag(graph.call_function(aten.relu.default, (h,)), bf16(tokens, dim), fqn=fqn)
-        w_fp32 = _tag(
-            graph.call_function(
-                aten._to_copy.default, (weights[layer],), {"dtype": torch.float32}
-            ),
-            f32(dim, dim),
+        # Stands in for the unshard (all-gather) output every chunk reads.
+        w_unsharded = _tag(
+            graph.call_function(aten.clone.default, (weights[layer],)),
+            bf16(dim, dim),
             fqn=fqn,
         )
         ys = []
@@ -468,12 +512,11 @@ def _chunked_moe_graph(num_layers=2, num_chunks=4, rows=2, dim=4):
                 chunk=c,
             )
             w_c = _tag(
-                graph.call_function(
-                    aten._to_copy.default, (w_fp32,), {"dtype": torch.bfloat16}
-                ),
+                graph.call_function(aten.alias.default, (w_unsharded,)),
                 bf16(dim, dim),
                 fqn=fqn,
                 chunk=c,
+                chunk_weight=True,
             )
             ys.append(
                 _tag(
@@ -526,6 +569,8 @@ def _chunked_moe_graph(num_layers=2, num_chunks=4, rows=2, dim=4):
                 fqn=fqn,
                 chunk=c,
                 bwd=True,
+                # `_ChunkWeight`'s backward inherits its forward annotation.
+                chunk_weight=True,
             )
             # Autograd's cross-chunk accumulation carries no module_fqn.
             acc = (
@@ -576,10 +621,15 @@ class EpChunkBarrierPassTest(parameterized.TestCase):
         # layers * (C - W) barriers per phase, with W = 2.
         assert len(fwd) == num_layers * (num_chunks - 2)
         assert len(bwd) == num_layers * (num_chunks - 2)
-        # The BF16 -> FP32 weight widening stays out of forward barriers, so XLA can
-        # fold bf16(fp32(w)) back to w instead of materializing FP32 weights.
+        # The shared unsharded weight each chunk reads through its
+        # `_ChunkWeight` view stays out of forward barriers.
         for barrier in fwd:
             assert all(arg.meta["val"].dtype == torch.bfloat16 for arg in barrier.args)
+            assert not [
+                arg
+                for arg in barrier.args
+                if arg.target is torch.ops.aten.clone.default
+            ]
         # Backward barriers hold the running FP32 weight-gradient accumulators.
         fp32_accumulators = [
             arg
@@ -640,17 +690,86 @@ class _GatheredSwiGLUExperts(torch.nn.Module):
         return (h @ w2.bfloat16()).to(x_RD.dtype)
 
 
+_GATHERED_DIM, _GATHERED_HIDDEN = 24, 40
+_GATHERED_WEIGHT_SHAPES = frozenset(
+    {(_GATHERED_DIM, _GATHERED_HIDDEN), (_GATHERED_HIDDEN, _GATHERED_DIM)}
+)
+
+
+def _trace_gathered_chunked_step(num_chunks, tokens=32):
+    """Joint graph of chunked EP over all-gathered experts, FP32 dW sums on."""
+    from torchtitan.experiments.graph_trainer.common_utils import _MODULE_FQN
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+        minimal_fx_tracer,
+    )
+
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        routed = TpuRoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(
+                dim=_GATHERED_DIM, hidden_dim=_GATHERED_HIDDEN, num_experts=2
+            ),
+            token_dispatcher=ReferenceRoETokenDispatcher.Config(
+                num_experts=2, top_k=1, ep_transport="ring_of_experts"
+            ),
+            num_token_chunks=num_chunks,
+            accumulate_chunk_weight_grads_fp32=True,
+        ).build()
+        routed.inner_experts = _GatheredSwiGLUExperts(_GATHERED_DIM, _GATHERED_HIDDEN)
+        dispatcher = routed.token_dispatcher
+        ep_mesh = mock.Mock()
+        ep_mesh.size.return_value = 2
+        dispatcher.ep_mesh = ep_mesh
+        dispatcher.dispatch = lambda x_c, s_c, i_c, c_c: (x_c, c_c, None)
+        dispatcher.combine = lambda out_c, meta_c, x_c: out_c
+
+        def step(x, scores, ids, counts):
+            with torch.fx.traceback.annotate({_MODULE_FQN: "layers.0.moe.experts"}):
+                out = routed(x, scores, ids, counts)
+            params = [p for p in routed.parameters() if p.requires_grad]
+            return torch.autograd.grad(out.float().sum(), [x, *params])
+
+        return minimal_fx_tracer(step, module=routed)(
+            torch.randn(tokens, _GATHERED_DIM, requires_grad=True),
+            *_stub_inputs(tokens),
+        ).gm
+    finally:
+        if created_group:
+            dist.destroy_process_group()
+
+
+def _is_gathered_weight(arg):
+    val = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
+    return isinstance(val, torch.Tensor) and tuple(val.shape) in _GATHERED_WEIGHT_SHAPES
+
+
+class Zero2EpChunkUnshardTest(parameterized.TestCase):
+    """The unshard output GraphTrainer ZeRO-2 saves under chunked EP."""
+
+    def test_zero2_saves_bf16_unshard_outputs(self):
+        from torchtitan.experiments.graph_trainer.fsdp_patterns import (
+            find_fsdp_unshard_save_nodes,
+        )
+
+        gm = _trace_gathered_chunked_step(num_chunks=4)
+        save_nodes = []
+        for placeholder in gm.graph.find_nodes(op="placeholder"):
+            save_nodes.extend(find_fsdp_unshard_save_nodes(placeholder))
+        assert len(save_nodes) == 3, save_nodes
+        # The BF16 all-gather output, not an FP32 copy of it.
+        assert all(_is_gathered_weight(n) for n in save_nodes), save_nodes
+        assert {n.meta["val"].dtype for n in save_nodes} == {torch.bfloat16}
+
+
 class Zero3EpChunkBarrierTest(parameterized.TestCase):
     """EP chunk barriers under ZeRO-3 (full recompute) on a 1-rank gloo group."""
 
-    def test_zero3_backward_barriers_keep_fp32_weight_widen_out(self):
-        """ZeRO-3 recomputes the FP32 weight widen in backward; barriers skip it."""
+    def test_zero3_barriers_keep_unsharded_weights_out(self):
+        """ZeRO-3 recomputes the all-gathers in backward; barriers skip them."""
         from torchtitan.experiments.graph_trainer.common_utils import (
             _is_backward_node,
-            _MODULE_FQN,
-        )
-        from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-            minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.memory_policy import (
             _make_full_memory_policy,
@@ -660,52 +779,12 @@ class Zero3EpChunkBarrierTest(parameterized.TestCase):
             selective_activation_remat_pass,
         )
 
-        dim, hidden, tokens, num_chunks = 24, 40, 32, 4
-        weight_shapes = {(dim, hidden), (hidden, dim)}
-        created_group = not dist.is_initialized()
-        if created_group:
-            dist.init_process_group(
-                "gloo", rank=0, world_size=1, store=dist.HashStore()
-            )
-        try:
-            routed = TpuRoutedExperts.Config(
-                inner_experts=GroupedExperts.Config(
-                    dim=dim, hidden_dim=hidden, num_experts=2
-                ),
-                token_dispatcher=ReferenceRoETokenDispatcher.Config(
-                    num_experts=2, top_k=1, ep_transport="ring_of_experts"
-                ),
-                num_token_chunks=num_chunks,
-                accumulate_chunk_weight_grads_fp32=True,
-            ).build()
-            routed.inner_experts = _GatheredSwiGLUExperts(dim, hidden)
-            dispatcher = routed.token_dispatcher
-            ep_mesh = mock.Mock()
-            ep_mesh.size.return_value = 2
-            dispatcher.ep_mesh = ep_mesh
-            dispatcher.dispatch = lambda x_c, s_c, i_c, c_c: (x_c, c_c, None)
-            dispatcher.combine = lambda out_c, meta_c, x_c: out_c
-
-            def step(x, scores, ids, counts):
-                with torch.fx.traceback.annotate({_MODULE_FQN: "layers.0.moe.experts"}):
-                    out = routed(x, scores, ids, counts)
-                params = [p for p in routed.parameters() if p.requires_grad]
-                return torch.autograd.grad(out.float().sum(), [x, *params])
-
-            gm = minimal_fx_tracer(step, module=routed)(
-                torch.randn(tokens, dim, requires_grad=True), *_stub_inputs(tokens)
-            ).gm
-            # ZeRO-3: full recompute, including the SimpleFSDP all-gathers.
-            tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
-            selective_activation_remat_pass(gm)
-            apply_ep_chunk_barrier_pass(gm)
-        finally:
-            if created_group:
-                dist.destroy_process_group()
-
-        def is_weight(arg):
-            val = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
-            return isinstance(val, torch.Tensor) and tuple(val.shape) in weight_shapes
+        num_chunks = 4
+        gm = _trace_gathered_chunked_step(num_chunks)
+        # ZeRO-3: full recompute, including the SimpleFSDP all-gathers.
+        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+        selective_activation_remat_pass(gm)
+        apply_ep_chunk_barrier_pass(gm)
 
         barriers = [
             n
@@ -715,23 +794,18 @@ class Zero3EpChunkBarrierTest(parameterized.TestCase):
         fwd = [b for b in barriers if not _is_backward_node(b)]
         bwd = [b for b in barriers if _is_backward_node(b)]
         assert len(fwd) == len(bwd) == num_chunks - 2
-        # The recomputed bf16 -> fp32 weight widen (`_to_copy*_recomputed`) is not a
-        # barrier operand in either phase.
-        weight_args = [a for b in barriers for a in b.args if is_weight(a)]
-        recomputed_fp32 = [
-            a.name
+        # No barrier operand is an (original or recomputed) BF16 unsharded
+        # weight: the weight-shaped operands are the backward FP32 dW partials
+        # and their running sums.
+        assert not [a for b in fwd for a in b.args if _is_gathered_weight(a)]
+        weight_args = [a for b in bwd for a in b.args if _is_gathered_weight(a)]
+        assert any(a.target is torch.ops.aten.add.Tensor for a in weight_args)
+        bad_args = [
+            (a.name, a.target, a.meta["val"].dtype)
             for a in weight_args
-            if "recomputed" in a.name and a.meta["val"].dtype == torch.float32
+            if a.meta["val"].dtype != torch.float32
         ]
-        assert not recomputed_fp32, recomputed_fp32
-        assert not [a for b in fwd for a in b.args if is_weight(a)]
-        # Backward barriers still order the FP32 dW accumulators.
-        assert any(
-            a.target is torch.ops.aten.add.Tensor and a.meta["val"].dtype == torch.float32
-            for b in bwd
-            for a in b.args
-            if is_weight(a)
-        )
+        assert not bad_args, bad_args
 
 
 class DefaultNumTokenChunksTest(parameterized.TestCase):

@@ -31,6 +31,7 @@ import math
 from typing import Literal, get_args
 import weakref
 
+import spmd_types as spmd
 import torch
 from torch.autograd.function import once_differentiable
 import torch.nn.functional as F
@@ -1415,6 +1416,68 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     )
 
 
+# Custom FX node metadata on each EP chunk's `_ChunkWeight` node; read by
+# `insert_ep_chunk_barriers`, which keeps the shared expert weight it reads out
+# of the chunk barriers.
+_EP_CHUNK_WEIGHT_KEY = "ep_chunk_weight"
+
+
+class _Fp32GradAccumulator(torch.autograd.Function):
+  """An FP32 sum point for the gradients ``_ChunkWeight`` sends to ``weight``.
+
+  The forward returns a storage-free FP32 tensor with the weight's shape (a
+  scalar zero expanded with zero strides). Each EP chunk's ``_ChunkWeight``
+  returns its weight gradient, widened to FP32, as this tensor's gradient, so
+  autograd sums the chunks' gradients in FP32. The backward rounds the sum to
+  the weight's dtype once.
+  """
+
+  @staticmethod
+  def forward(ctx, weight: torch.Tensor) -> torch.Tensor:
+    ctx.set_materialize_grads(False)
+    ctx.weight_dtype = weight.dtype
+    return weight.new_zeros((), dtype=torch.float32).expand(weight.shape)
+
+  @staticmethod
+  def spmd_typecheck(result, *, weight):
+    spmd.rules.output(result, weight)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_fp32: torch.Tensor | None):
+    if grad_fp32 is None:
+      return None
+    return grad_fp32.to(ctx.weight_dtype)
+
+
+class _ChunkWeight(torch.autograd.Function):
+  """Returns ``weight`` and sends its gradient to ``accumulator`` in FP32.
+
+  Every chunk's matmul reads the same ``weight`` tensor, so backward saves one
+  copy of it however many chunks there are.
+  """
+
+  @staticmethod
+  def forward(
+      ctx, weight: torch.Tensor, accumulator: torch.Tensor
+  ) -> torch.Tensor:
+    del accumulator  # Only routes the gradient.
+    ctx.set_materialize_grads(False)
+    return weight
+
+  @staticmethod
+  def spmd_typecheck(result, *, weight, accumulator):
+    spmd.rules.ignore(accumulator)
+    spmd.rules.output(result, weight)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_weight: torch.Tensor | None):
+    if grad_weight is None:
+      return None, None
+    return None, grad_weight.float()
+
+
 class TpuRoutedExperts(RoutedExperts):
   """Routed experts that can apply the routing scores before W2.
 
@@ -1579,28 +1642,22 @@ class TpuRoutedExperts(RoutedExperts):
     needs_chunk_counts = not is_roe
 
     unsharded_weights = None
+    weight_grad_accumulators = None
     if hasattr(self.inner_experts, "unshard_weights"):
       # Unshard the SimpleFSDP expert parameters once, outside the chunk loop
       # (`TpuGroupedExperts.unshard_weights` explains how its all-gathers keep
-      # the experts' `module_fqn` for SimpleFSDP bucketing). Widening the
-      # unsharded weights to FP32 here causes ``TpuGroupedExperts.forward``'s
-      # per-chunk ``.bfloat16()`` casts to widen each chunk's dWeight to FP32
-      # before PyTorch autograd sums across chunks; ``insert_ep_chunk_barriers``
-      # keeps those widening casts out of forward barriers so XLA folds
-      # ``bf16(fp32(w_bf16))`` to ``w_bf16``.
+      # the experts' `module_fqn` for SimpleFSDP bucketing).
       with maybe_set_sparse_mesh():
         unsharded_weights = self.inner_experts.unshard_weights()
-        # TODO(b/587943723): TpuGraphTrainer ZeRO-3 with chunk barriers folds
-        # this cast away (see insert_ep_chunk_barriers), but the eager trainer
-        # without activation checkpointing saves one BF16 weight copy per
-        # chunk (each chunk's `.bfloat16()` re-cast), and GraphTrainer ZeRO-2
-        # saves this FP32 cast as the unshard output
-        # (graph_trainer/fsdp_patterns.py, `_find_last_user_in_wait_chain`).
-        # Fix with a storage-free FP32 grad accumulator that keeps the forward
-        # weights in BF16.
-        if self.accumulate_chunk_weight_grads_fp32:
-          unsharded_weights = tuple(
-              w.float() if w.dtype != torch.float32 else w
+        # Sum the chunks' weight gradients in FP32 without an FP32 copy of
+        # the weights: every chunk reads the unsharded weight itself (so
+        # backward saves it once) through a `_ChunkWeight` that routes its
+        # gradient, widened to FP32, to a storage-free accumulator.
+        if self.accumulate_chunk_weight_grads_fp32 and torch.is_grad_enabled():
+          weight_grad_accumulators = tuple(
+              _Fp32GradAccumulator.apply(w)
+              if w.requires_grad and w.dtype != torch.float32
+              else None
               for w in unsharded_weights
           )
 
@@ -1608,11 +1665,6 @@ class TpuRoutedExperts(RoutedExperts):
     score_chunks = topk_scores_TK.chunk(num_chunks, dim=0)
     id_chunks = topk_expert_ids_TK.chunk(num_chunks, dim=0)
     num_experts = num_local_tokens_per_expert_E.numel()
-    extra_expert_kwargs = (
-        {"pre_unsharded_weights": unsharded_weights}
-        if unsharded_weights is not None
-        else {}
-    )
 
     out_chunks: list[torch.Tensor] = []
     dropped_chunks: list[torch.Tensor] = []
@@ -1628,6 +1680,16 @@ class TpuRoutedExperts(RoutedExperts):
           "ep_chunk_idx": chunk_idx,
           "ep_max_inflight_chunks": self.max_inflight_chunks,
       }):
+        extra_expert_kwargs = {}
+        if unsharded_weights is not None:
+          chunk_weights = unsharded_weights
+          if weight_grad_accumulators is not None:
+            with annotate({_EP_CHUNK_WEIGHT_KEY: True}):
+              chunk_weights = tuple(
+                  w if acc is None else _ChunkWeight.apply(w, acc)
+                  for w, acc in zip(unsharded_weights, weight_grad_accumulators)
+              )
+          extra_expert_kwargs["pre_unsharded_weights"] = chunk_weights
         counts_c = (
             _tokens_per_expert(ids_c, num_experts)
             if needs_chunk_counts

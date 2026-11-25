@@ -43,6 +43,8 @@ from torchtitan.tools.logging import logger
 
 _CHUNK_IDX_KEY = "ep_chunk_idx"
 _MAX_INFLIGHT_KEY = "ep_max_inflight_chunks"
+# Set on each chunk's `_ChunkWeight` (`TpuRoutedExperts._forward_ep_chunked`).
+_CHUNK_WEIGHT_KEY = "ep_chunk_weight"
 _DEFAULT_MAX_INFLIGHT_CHUNKS = 2
 
 
@@ -60,33 +62,24 @@ def _max_inflight_chunks(node: torch.fx.Node) -> int:
     return max(1, int(custom.get(_MAX_INFLIGHT_KEY, _DEFAULT_MAX_INFLIGHT_CHUNKS)))
 
 
-def _is_bf16_to_fp32_weight_widen(node: torch.fx.Node) -> bool:
-    """True for unchunked ``bfloat16 -> float32`` casts used for FP32 dW sums.
+def _reads_shared_chunk_weight(node: torch.fx.Node) -> bool:
+    """True for a chunk's view of the layer's shared unsharded expert weight.
 
-    These casts are never chunk-entry barrier operands, in forward or in
-    backward. A barrier operand is materialized, so keeping the cast out lets
-    XLA fold ``bf16(fp32(w_bf16))`` back to ``w_bf16`` and no FP32 copy of the
-    expert weights lives in HBM. In backward this matters under ZeRO-3, where
-    rematerialization recomputes the all-gather and the widening cast
-    (``_to_copy_recomputed``) for the backward chunks. Ordering is unaffected:
-    the cast only reads the unsharded weight, which every chunk shares. The
-    per-chunk FP32 dW partials and their running ``aten.add`` accumulators are
-    chunk exits, not entries, so they stay barrier operands.
+    With FP32 cross-chunk weight-gradient accumulation, each chunk reads the
+    unsharded expert weight through a ``_ChunkWeight`` view. The weight it
+    reads is never a chunk-entry barrier operand, in forward or in backward
+    (where ZeRO-3 rematerialization recomputes the all-gather and the views
+    for the backward chunks). Ordering is unaffected: every chunk reads the
+    same weight. The per-chunk FP32 dW partials and their running
+    ``aten.add`` accumulators are chunk exits, not entries, so they stay
+    barrier operands. Only the view is matched, not the FP32 cast of its
+    gradient that carries the same annotation in backward.
     """
-    if (
-        node.op != "call_function"
-        or node.target is not torch.ops.aten._to_copy.default
-        or not node.args
-        or not isinstance(node.args[0], torch.fx.Node)
-    ):
-        return False
-    src_val = node.args[0].meta.get("val")
-    dst_val = node.meta.get("val")
+    custom = node.meta.get("custom")
     return (
-        isinstance(src_val, torch.Tensor)
-        and isinstance(dst_val, torch.Tensor)
-        and src_val.dtype == torch.bfloat16
-        and dst_val.dtype == torch.float32
+        isinstance(custom, dict)
+        and bool(custom.get(_CHUNK_WEIGHT_KEY))
+        and bool(getattr(node.target, "is_view", False))
     )
 
 
@@ -195,13 +188,14 @@ def apply_ep_chunk_barrier_pass(
 
             entry_users: dict[torch.fx.Node, list[torch.fx.Node]] = {}
             for curr_node in curr_nodes:
+                if _reads_shared_chunk_weight(curr_node):
+                    continue
                 for inp in curr_node.all_input_nodes:
                     if (
                         inp in curr_set
                         or inp.op != "call_function"
                         or order[inp] >= first_curr_pos
                         or not isinstance(inp.meta.get("val"), torch.Tensor)
-                        or _is_bf16_to_fp32_weight_widen(inp)
                     ):
                         continue
                     users = entry_users.setdefault(inp, [])

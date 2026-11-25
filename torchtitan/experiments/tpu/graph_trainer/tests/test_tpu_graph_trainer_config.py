@@ -490,6 +490,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, error):
       self._qwen3_graph_config(config)
 
+  def test_scan_offload_rejects_a_last_n_only_region(self) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "tpu_selective_and_offload"
+    config.compile.save_last_n_layers = {"attention.inner_attention": 4}
+    config.compile.scan_offload = ("layer_input", "attention.inner_attention")
+
+    with self.assertRaisesRegex(ValueError, "save_last_n_layers region"):
+      self._qwen3_graph_config(config)
+
+  def test_scan_last_n_rejects_graph_split(self) -> None:
+    # The layers run as several scans, and the fence pass skips split graphs.
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "tpu_selective"
+    config.compile.save_last_n_layers = {"attention.inner_attention": 4}
+    config.compile.graph_split.enabled = True
+
+    with self.assertRaisesRegex(ValueError, "fence_scan_segments"):
+      self._qwen3_graph_config(config)
+
   def test_scan_offload_warns_that_the_budget_is_ignored(self) -> None:
     config = qwen3_8b()
     config.compile.use_scan_layers = True

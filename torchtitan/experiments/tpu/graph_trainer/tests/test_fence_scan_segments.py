@@ -79,8 +79,7 @@ class FenceScanSegmentsTest(absltest.TestCase):
         # fwd_a's carry and fwd_b's weights; the stack saved for backward,
         # which may be on host, stays out.
         values = fences[0].args[0]
-        self.assertEqual([v.args[0] for v in values[:1]], [fwd_a])
-        self.assertEqual(values[0].args[1], 0)
+        self.assertEqual(values[0].args, (fwd_a, 0))
         self.assertEqual(values[1:], [self.w])
         for arg in (fwd_b.args[1][0], fwd_b.args[2][0]):
             self.assertIs(arg.args[0], fences[0])
@@ -103,6 +102,20 @@ class FenceScanSegmentsTest(absltest.TestCase):
             torch.fx.GraphModule(torch.nn.Module(), self.graph), barrier=_fence
         )
         self.assertFalse(gm.graph.find_nodes(op="call_function", target=_fence))
+
+    def test_no_pair_raises_when_last_n_splits_the_layers(self):
+        _, h, s = self._scan(self.x, bwd=False)
+        _, g, _ = self._scan(h, bwd=True, saved=s)
+        self.graph.output(g)
+        gm = torch.fx.GraphModule(torch.nn.Module(), self.graph)
+        with self.assertRaisesRegex(RuntimeError, "no pair of scans"):
+            fence_scan_segments(gm, barrier=_fence, expects_segments=True)
+
+    def test_no_scan_boundary_is_silent_without_scans(self):
+        # The optimizer and grad-norm graphs have no scan.
+        self.graph.output(self.x)
+        gm = torch.fx.GraphModule(torch.nn.Module(), self.graph)
+        fence_scan_segments(gm, barrier=_fence, expects_segments=True)
 
 
 if __name__ == "__main__":

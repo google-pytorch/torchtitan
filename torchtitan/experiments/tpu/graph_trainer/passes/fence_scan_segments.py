@@ -63,12 +63,18 @@ def _fence_values(a: Node, b: Node) -> list[Node]:
 
 
 def fence_scan_segments(
-    gm: torch.fx.GraphModule, example_inputs=None, *, barrier=None
+    gm: torch.fx.GraphModule,
+    example_inputs=None,
+    *,
+    barrier=None,
+    expects_segments: bool = False,
 ) -> torch.fx.GraphModule:
     """Put an optimization barrier before each scan that follows another.
 
     ``barrier`` defaults to ``tpu::_optimization_barrier``; tests pass a
-    stand-in.
+    stand-in. ``expects_segments`` is set when last-N splits the layers: a
+    graph that has scans but no consecutive pair then raises, rather than
+    running unfenced. Graphs with no scan (optimizer, grad norm) stay silent.
     """
     graph = gm.graph
     scans = list(graph.find_nodes(op="call_function", target=_SCAN))
@@ -78,6 +84,12 @@ def fence_scan_segments(
         if _is_backward_node(a) == _is_backward_node(b)
     ]
     if not pairs:
+        if scans and expects_segments:
+            raise RuntimeError(
+                "fence_scan_segments: compile.save_last_n_layers splits the "
+                f"layers, but no pair of scans in one direction was found among "
+                f"{len(scans)} scans, so no scan boundary is fenced"
+            )
         return gm
     barrier = barrier or torch.ops.tpu._optimization_barrier.default
     for a, b in pairs:

@@ -635,10 +635,12 @@ class LayerStack:
             has_moe = any(isinstance(m, MoE) for m in model.layers.modules())
             logger.info(
                 "Decoder layers run as a scan: the body recomputes everything "
-                "but %ssave regions %s (in the last N layers: %s)",
+                "but %ssave regions %s%s",
                 "its MoE expert counts and " if has_moe else "",
                 list(save_regions),
-                dict(save_last_n_layers),
+                f" (in the last N layers: {dict(save_last_n_layers)})"
+                if save_last_n_layers
+                else "",
             )
         # The container holds the same layer modules, so `self.layers` keeps
         # working and is deliberately not repointed at it.
@@ -881,7 +883,7 @@ def _segments(
 
     One scan body has one partition, so a region saved in only some layers
     needs its own scan. 94 layers, attention saved in the last 36:
-    ``[(0, 58, {}), (58, 94, {"attention.inner_attention"})]``.
+    ``[(0, 58, frozenset()), (58, 94, {"attention.inner_attention"})]``.
     """
     cuts = {max(n_layers - n, 0) for _, n in save_last_n_layers}
     starts = sorted(({0} | cuts) - {n_layers})

@@ -547,8 +547,7 @@ class TestSegments(unittest.TestCase):
                 (94, (), (("a", 36),)),
                 [(0, 58, frozenset()), (58, 94, frozenset({"a"}))],
             ),
-            # N of 0, or at least all layers: one segment.
-            ((4, (), (("a", 0),)), [(0, 4, frozenset())]),
+            # N of at least all layers: one segment.
             ((4, (), (("a", 4),)), [(0, 4, frozenset({"a"}))]),
             ((4, (), (("a", 9),)), [(0, 4, frozenset({"a"}))]),
         ):

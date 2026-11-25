@@ -257,6 +257,17 @@ def _validate_tpu_selective(config: "TpuGraphTrainer.Config") -> None:
           "'tpu_selective_and_offload'"
       )
     return
+  if (
+      compile_config.use_scan_layers
+      and last_n_layers
+      and compile_config.graph_split.enabled
+  ):
+    raise ValueError(
+        "compile.save_last_n_layers with --compile.use-scan-layers runs the "
+        "layers as several scans, which need fence_scan_segments; that pass "
+        "does not run with compile.graph_split.enabled (tpu_backend_pass.py). "
+        "Use compile.save_regions, or turn off the graph split."
+    )
   if compile_config.use_scan_layers:
     unsupported = {*save_regions, *last_n_layers} - SCAN_SAVE_REGIONS
     if unsupported:
@@ -294,6 +305,13 @@ def _validate_scan_offload(config: "TpuGraphTrainer.Config") -> None:
     )
   # `_validate_tpu_selective` already rejects save_regions under other policies.
   saved = set(compile_config.save_regions)
+  last_n_only = [n for n in names if n in compile_config.save_last_n_layers]
+  if last_n_only:
+    raise ValueError(
+        f"compile.scan_offload names {last_n_only}, which are saved only in "
+        "compile.save_last_n_layers; offloading a save_last_n_layers region "
+        "is not supported"
+    )
   not_saved = [n for n in names if n != "layer_input" and n not in saved]
   if not_saved:
     raise ValueError(
@@ -467,7 +485,9 @@ def apply_tpu_graph_trainer_model_transforms(
           else (),
           save_last_n_layers=tuple(
               sorted(compile_config.save_last_n_layers.items())
-          ),
+          )
+          if memory_policy in ("tpu_selective", "tpu_selective_and_offload")
+          else (),
       ),
       parallelize_fn=parallelize_fn_with_shard_dims,
   )

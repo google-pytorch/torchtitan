@@ -609,7 +609,16 @@ def construct_tpu_transform_passes(
             fence_scan_segments,
         )
 
-        passes.append(fence_scan_segments)
+        n_layers = len(config.model_spec.model.layers)
+        passes.append(
+            functools.partial(
+                fence_scan_segments,
+                expects_segments=any(
+                    n < n_layers
+                    for n in config.compile.save_last_n_layers.values()
+                ),
+            )
+        )
 
     if fsdp_barrier_policy != "none":
         model_config = config.model_spec.model

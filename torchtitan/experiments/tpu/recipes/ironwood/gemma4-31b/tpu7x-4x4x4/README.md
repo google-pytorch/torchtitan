@@ -20,7 +20,8 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
   `gemma4_31b` config defaults to 2 sequences, which is what fits a
   `tpu7x-2x2x1` slice; with the weights and optimizer state sharded 128 ways,
   a 4x4x4 slice has room for more. Measured on this slice with the flags below
-  (the 2-sequence row is without the scheduling flags):
+  and the config's default 512 Splash blocks (the 2-sequence row is without the
+  scheduling flags):
 
   | Sequences per rank | Step time | TPS per rank | MFU | Peak HBM |
   |---|---|---|---|---|
@@ -32,6 +33,21 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
   sequences: it gives up 1.8% throughput for 21 GiB less peak HBM per device.
 - **Attention and loss kernels**: Splash attention and the fused soft-capped
   cross entropy are enabled by the `gemma4_31b` config.
+- **Splash block sizes**: the command raises the Splash blocks from the
+  config's 512 to 1024, keeping the compute blocks at 512
+  (`--splash_attention_kernel.sa_block_*`). Measured with the flags below at 8
+  sequences per rank on this slice:
+
+  | Splash blocks (compute blocks) | Step time | TPS per rank | MFU |
+  |---|---|---|---|
+  | 512 (512) | 13.06 s | 2,510 | 41.5% |
+  | 1024 (512) | 12.51 s | 2,619 | 43.3% |
+
+  Peak HBM is the same. Like the VMEM flag, a block-size change reorders
+  floating-point sums: loss matches at step 1 and the grad_norm agrees to
+  0.05%, then trajectories drift apart from random initialization. On a
+  `tpu7x-2x2x2` slice, 1024 compute blocks, 2048 blocks and a 2048 or 512
+  backward Q block were all slower than this setting.
 
 ## libtpu init flags
 
@@ -81,6 +97,15 @@ gcluster job submit \
     --dataloader.dataset_path=tests/assets/c4_test \
     --training.num_tokens_per_microbatch_per_dp_rank=32768 \
     --training.steps=30 \
+    --splash_attention_kernel.sa_block_q=1024 \
+    --splash_attention_kernel.sa_block_kv=1024 \
+    --splash_attention_kernel.sa_block_kv_compute=512 \
+    --splash_attention_kernel.sa_block_dkv=1024 \
+    --splash_attention_kernel.sa_block_q_dkv=1024 \
+    --splash_attention_kernel.sa_block_kv_dkv=1024 \
+    --splash_attention_kernel.sa_block_kv_dkv_compute=512 \
+    --splash_attention_kernel.sa_block_q_dq=1024 \
+    --splash_attention_kernel.sa_block_kv_dq=1024 \
     --libtpu-init-flags='$LIBTPU_INIT_FLAGS'"
 ```
 
@@ -90,19 +115,19 @@ launcher still works and wins over `--libtpu-init-flags` for any flag it names.
 
 ## Benchmark Results
 
-Run Date: 11/24/2026 (mean of steps 10-30, three runs)
+Run Date: 11/25/2026 (mean of steps 10-30, two runs of the command above)
 
-* **MFU:** 41.3%
-* **TPS (Tokens Per Second):** 2,500 per rank (about 320,000 across the slice)
-* **TFLOPS:** 476.9 per core
+* **MFU:** 43.3%
+* **TPS (Tokens Per Second):** 2,619 per rank (about 335,000 across the slice)
+* **TFLOPS:** 499.5 per core
 * **Memory Usage:** 64.72 GiB (67.42%)
-* **Step Time (end-to-end):** 13.11s
+* **Step Time (end-to-end):** 12.51s
 
 Measured at torchtitan `d0f0316e` with torch_tpu 0.3.0 and libtpu 0.0.50. The
-same config with no libtpu flags and 2 sequences per rank reaches 1,969 TPS per
-rank and 32.6% MFU.
+two runs (12.507s and 12.518s per step) have identical loss and grad_norm at
+all 30 steps. The same config with no libtpu flags, 512 Splash blocks and 2
+sequences per rank reaches 1,969 TPS per rank and 32.6% MFU.
 
-The three runs above, and the batch-size table, used
-`xla_tpu_scoped_vmem_limit_kib=65472`. One run of this exact command with
-`65536` (64 MiB) measured 13.06s per step, 2,510 TPS per rank and 41.5% MFU,
-with loss and grad_norm identical to the `65472` runs at all 30 steps.
+The batch-size table in the notes was measured with
+`xla_tpu_scoped_vmem_limit_kib=65472`; a run with `65536` (64 MiB) gave
+identical loss and grad_norm at all 30 steps and the same throughput.

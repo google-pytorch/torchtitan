@@ -1,5 +1,6 @@
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
+import dataclasses
 from typing import Literal, TypeVar
 
 from torchtitan.components.checkpointer.dcp import CheckpointManager
@@ -430,6 +431,68 @@ def graph_trainer_qwen35_moe_debugmodel_tpu_moe_kernels() -> (
   """
   cfg = graph_trainer_qwen35_moe_debugmodel()
   _use_tpu_moe_kernels(cfg)
+  return cfg
+
+
+def _debugmodel_moe_8l16e(cfg: TPUTrainerConfig) -> None:
+  """Gives `cfg` the debug MoE model at 8 layers, 16 experts, top-4.
+
+  Two cycles of period 4 (3 GatedDeltaNet + 1 full attention), so a period-4
+  scan loops twice, and 16 experts split over EP = 2, 4 or 8 on 8 chips with
+  `efsdp = 8 / EP`. Everything else is `debugmodel_moe`'s.
+  """
+  # pylint: disable-next=g-import-not-at-top
+  import torchtitan.models.qwen3_5 as upstream_qwen3_5
+  from torchtitan.experiments.tpu.qwen3_5 import to_tpu_model_spec  # pylint: disable=g-import-not-at-top
+
+  spec = upstream_qwen3_5.model_registry(
+      "debugmodel_moe", seq_len=256, attn_backend="sdpa"
+  )
+  rope = next(l.attention.rope for l in spec.model.layers if l.attention)
+  # pylint: disable-next=protected-access
+  spec.model.layers = upstream_qwen3_5._build_qwen35_moe_layers(
+      rope=rope, attn_backend="sdpa", n_layers=8, dim=256, n_heads=4,
+      n_kv_heads=2, head_dim=64, rotary_dim=16, moe_hidden_dim=256,
+      num_experts=16, top_k=4, shared_expert_hidden_dim=256, n_key_heads=2,
+      n_value_heads=4, key_head_dim=128, value_head_dim=128,
+  )
+  model = spec.model
+  for converter in _TPU_MOE_CONVERTERS:
+    model = converter.build().convert(model)
+  cfg.model_spec = to_tpu_model_spec(dataclasses.replace(spec, model=model))
+
+
+def graph_trainer_qwen35_moe_debugmodel_ep() -> TpuGraphTrainer.Config:
+  """Split (one layer per executable) debug MoE, 8 layers, 16 experts, EP = 2.
+
+  The scan + EP proxy's reference lane. `auto` transport: Ring-of-Experts while
+  EP <= top_k = 4, ragged all-to-all at EP = 8. Two token chunks, the most a
+  scan body allows (`check_scan_expert_parallel`).
+  """
+  base = qwen35_moe_debugmodel()
+  _debugmodel_moe_8l16e(base)
+  cfg = _use_graph_split(
+      base,
+      layers_per_executable=1,
+      memory_policy="tpu_selective",
+      save_regions=("moe.routing",),
+  )
+  _use_expert_parallel(cfg, ep_degree=2, num_token_chunks=2)
+  return cfg
+
+
+def graph_trainer_qwen35_moe_debugmodel_scan_ep() -> TpuGraphTrainer.Config:
+  """`graph_trainer_qwen35_moe_debugmodel_ep` as a period-4 scan (2 cycles)."""
+  cfg = graph_trainer_qwen35_moe_debugmodel_ep()
+  cfg.compile.graph_split = GraphSplitterConfig(enabled=False)
+  cfg.compile.use_scan_layers = True
+  cfg.compile.scan_period = 4
+  cfg.compile.memory_policy = "full"
+  cfg.compile.save_regions = ()
+  cfg.override.imports.append(
+      "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+      ".tpu_discarded_token_counter"
+  )
   return cfg
 
 

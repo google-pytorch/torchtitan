@@ -19,13 +19,14 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Based on the 4x4x4 recipe**: `qwen3_32b_4x8x8` is `qwen3_32b` (see
   [../tpu7x-4x4x4/README.md](../tpu7x-4x4x4/README.md)) with the same local
   batch, launch flags and pure FSDP over all 512 devices, plus two changes.
-- **All-reduce plus slice for w1/w3 gradients**: at world 512 each w1/w3
-  gradient shard is 25600 / 512 = 50 rows. That is not a multiple of 8, so
-  their reduce-scatters run on the TensorCore instead of SparseCore (~2.5 s per
-  step). The recipe reduces those two gradients with an all-reduce plus a local
-  slice (`fsdp_allreduce_slice_parameter_patterns`), which stays on SparseCore.
-  This requires FP32 reductions, so there is no MaxText-parity (BF16
-  reduction) variant at this scale yet.
+- **All-reduce plus slice for the w1/w3 gradient**: w1 and w3 are stored as one
+  packed parameter per layer (`feed_forward.w13_packed.weight`, 51200 x 5120).
+  At world 512 its gradient shard is 51200 / 512 = 100 rows. That is not a
+  multiple of 8, so its reduce-scatter runs on the TensorCore instead of
+  SparseCore (~2.5 s per step). The recipe reduces that gradient with an
+  all-reduce plus a local slice (`fsdp_allreduce_slice_parameter_patterns`),
+  which stays on SparseCore. This requires FP32 reductions, so there is no
+  MaxText-parity (BF16 reduction) variant at this scale yet.
 - **Interleave FSDP schedule**: before the w1/w3 change, interleave beat
   prefetch at this scale by 2.3% step time and 56 GiB peak HBM.
 - **Tokenizer**: as in the 4x4x4 recipe, pass a Qwen3 tokenizer via

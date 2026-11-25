@@ -93,6 +93,7 @@ from torchtitan.experiments.tpu.overrides.real_rope import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
+from torchtitan.experiments.tpu.components.ffn import TpuPackedFeedForward
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
@@ -824,11 +825,24 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             fsdp_allreduce_slice_parameter_patterns=(
                 "layers.*.feed_forward.w13_packed.weight",
             ),
-            fsdp_allreduce_slice_max_input_bytes=25600 * 5120 * 4,
+            fsdp_allreduce_slice_max_input_bytes=51200 * 5120 * 4,
         ),
     )
     self.assertEqual(config.libtpu_init_flags, base.libtpu_init_flags)
-    self._qwen3_graph_config(config)
+    graph_config = self._qwen3_graph_config(config)
+
+    # The limit must fit the FP32 gradient of every parameter the pattern
+    # selects, or the all-reduce pass raises at compile time.
+    assert graph_config.model_spec is not None
+    ffns = list(
+        graph_config.model_spec.model.traverse(TpuPackedFeedForward.Config)
+    )
+    self.assertLen(ffns, 64)
+    for _, ffn, _, _ in ffns:
+      self.assertLessEqual(
+          ffn.w13.out_features * ffn.w13.in_features * 4,
+          config.compile.fsdp_allreduce_slice_max_input_bytes,
+      )
 
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()

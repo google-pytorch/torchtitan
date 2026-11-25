@@ -7,10 +7,8 @@ the eager path. Outputs and gradients are compared against plain single-device
 attention over the unsharded sequences.
 """
 
-import concurrent.futures
 import contextlib
 import sys
-import threading
 import types
 from types import SimpleNamespace
 import unittest
@@ -39,7 +37,6 @@ from torchtitan.experiments.tpu.distributed.cp_attention import (
     UlyssesCPInnerAttention,
     UlyssesCPScaledDotProductInnerAttention,
     UlyssesCPVarlenInnerAttention,
-    reorder_sequence,
     validate_tpu_context_parallel,
 )
 from torchtitan.experiments.tpu.distributed.headtail import headtail_positions
@@ -47,6 +44,14 @@ from torchtitan.experiments.tpu.qwen3 import config_registry
 from torchtitan.experiments.tpu.components.unflatten_shim import get_unflatten_seq_len
 from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.experiments.tpu.testing.cp_test_utils import DOCS as _DOCS
+from torchtitan.experiments.tpu.testing.cp_test_utils import emulated_cp_group as _emulated_cp_group
+from torchtitan.experiments.tpu.testing.cp_test_utils import packed_positions as _packed_positions
+from torchtitan.experiments.tpu.testing.cp_test_utils import Ranks as _Ranks
+from torchtitan.experiments.tpu.testing.cp_test_utils import reset_cp_state as _reset_cp_state
+from torchtitan.experiments.tpu.testing.cp_test_utils import SEQ_LEN as _SEQ_LEN
+from torchtitan.experiments.tpu.testing.cp_test_utils import shard as _shard
+from torchtitan.experiments.tpu.testing.cp_test_utils import unshard as _unshard
 
 _C10D = torch.ops._c10d_functional
 _WAIT = _C10D.wait_tensor.default
@@ -55,163 +60,6 @@ _COLLECTIVES = frozenset({
     _C10D.all_gather_into_tensor.default,
     _C10D.reduce_scatter_tensor.default,
 })
-
-
-class _Ranks:
-  """Runs one function per CP rank on its own thread; emulates collectives."""
-
-  def __init__(self, world_size: int):
-    self.world_size = world_size
-    self._barrier = threading.Barrier(world_size, timeout=120)
-    self._slots = [None] * world_size
-    self._local = threading.local()
-
-  @property
-  def rank(self) -> int:
-    return self._local.rank
-
-  def group(self):
-    return SimpleNamespace(size=lambda: self.world_size, rank=lambda: self.rank)
-
-  def exchange(self, value):
-    """Returns every rank's ``value`` in rank order (an all-gather)."""
-    self._slots[self.rank] = value
-    self._barrier.wait()
-    gathered = list(self._slots)
-    self._barrier.wait()
-    return gathered
-
-  def run(self, fn):
-    def run_rank(rank):
-      self._local.rank = rank
-      try:
-        return fn(rank)
-      except BaseException:
-        self._barrier.abort()  # Unblock the other ranks.
-        raise
-
-    with concurrent.futures.ThreadPoolExecutor(self.world_size) as pool:
-      return list(pool.map(run_rank, range(self.world_size)))
-
-
-def _all_to_all(ranks: _Ranks, x: torch.Tensor) -> torch.Tensor:
-  """Equal-split all-to-all along dim 0: chunk i goes to rank i."""
-  chunks = ranks.exchange(x.chunk(ranks.world_size))
-  return torch.cat([c[ranks.rank] for c in chunks])
-
-
-class _AllToAll(torch.autograd.Function):
-  """``funcol.all_to_all_single`` (differentiable, as on torch >= 2.11)."""
-
-  @staticmethod
-  def forward(ctx, x, ranks):
-    ctx.ranks = ranks
-    return _all_to_all(ranks, x)
-
-  @staticmethod
-  def backward(ctx, grad):
-    return _all_to_all(ctx.ranks, grad.contiguous()), None
-
-
-class _Redistribute(torch.autograd.Function):
-  """``spmd.redistribute`` from S(src_dim) to S(dst_dim), or to R if None."""
-
-  @staticmethod
-  def forward(ctx, x, ranks, src_dim, dst_dim):
-    ctx.ranks, ctx.src_dim, ctx.dst_dim = ranks, src_dim, dst_dim
-    full = torch.cat(ranks.exchange(x), dim=src_dim)
-    if dst_dim is None:
-      return full
-    return full.chunk(ranks.world_size, dim=dst_dim)[ranks.rank].contiguous()
-
-  @staticmethod
-  def backward(ctx, grad):
-    ranks = ctx.ranks
-    if ctx.dst_dim is None:  # All-gather: the gradient is a reduce-scatter.
-      full = torch.stack(ranks.exchange(grad)).sum(0)
-    else:
-      full = torch.cat(ranks.exchange(grad), dim=ctx.dst_dim)
-    shard = full.chunk(ranks.world_size, dim=ctx.src_dim)[ranks.rank]
-    return shard.contiguous(), None, None, None
-
-
-@contextlib.contextmanager
-def _emulated_cp_group(ranks: _Ranks, traced: bool):
-  """Routes the CP attentions' collectives through ``ranks``."""
-
-  def all_to_all_single(x, output_split_sizes, input_split_sizes, group):
-    del group
-    assert output_split_sizes is None and input_split_sizes is None
-    return _AllToAll.apply(x, ranks)
-
-  def all_gather_tensor(x, gather_dim, group):
-    del group
-    return torch.cat(ranks.exchange(x), dim=gather_dim)
-
-  def reduce_scatter_tensor(x, reduce_op, scatter_dim, group):
-    del group
-    assert reduce_op == "sum"
-    full = torch.stack(ranks.exchange(x)).sum(0)
-    return full.chunk(ranks.world_size, dim=scatter_dim)[
-        ranks.rank
-    ].contiguous()
-
-  def redistribute(x, group, *, src, dst, backward_options=None):
-    del group, backward_options
-    dst_dim = dst.dim if isinstance(dst, spmd.Shard) else None
-    return _Redistribute.apply(x, ranks, src.dim, dst_dim)
-
-  with contextlib.ExitStack() as stack:
-    stack.enter_context(
-        mock.patch.object(
-            cp_attention, "spmd_mesh_group", lambda axis: ranks.group()
-        )
-    )
-    if traced:
-      # The branch the CP attentions take under torch.compile.
-      stack.enter_context(
-          mock.patch.object(cp_attention, "_tracing", lambda: True)
-      )
-      for name, fn in (
-          ("all_to_all_single", all_to_all_single),
-          ("all_gather_tensor", all_gather_tensor),
-          ("reduce_scatter_tensor", reduce_scatter_tensor),
-      ):
-        stack.enter_context(mock.patch.object(funcol, name, fn))
-    else:
-      stack.enter_context(mock.patch.object(spmd, "redistribute", redistribute))
-    yield
-
-
-def _shard(x: torch.Tensor, strategy: str, cp: int, rank: int, seq_len: int):
-  """Rank ``rank``'s shard of a folded ``[B * S, ...]`` tensor, as cp_shard lays it out."""
-  if strategy == "ulysses":
-    return x.chunk(cp)[rank]
-  rest = list(x.shape[1:])
-  bsz = x.shape[0] // seq_len
-  x = reorder_sequence(x.reshape([bsz, seq_len] + rest), cp, seq_dim=1)
-  x = x.reshape([bsz, cp, seq_len // cp] + rest).movedim(1, 0)
-  return x[rank].reshape([bsz * seq_len // cp] + rest)
-
-
-def _unshard(shards, strategy: str, cp: int, seq_len: int) -> torch.Tensor:
-  """Inverse of ``_shard`` over all ranks."""
-  x = torch.cat(shards)
-  if strategy == "ulysses":
-    return x
-  rest = list(x.shape[1:])
-  bsz = x.shape[0] // seq_len
-  x = x.reshape([cp, bsz, seq_len // cp] + rest).movedim(0, 1)
-  x = x.reshape([bsz, seq_len] + rest)
-  x = reorder_sequence(x, cp, seq_dim=1, to_contiguous=True)
-  return x.reshape([bsz * seq_len] + rest)
-
-
-def _packed_positions(doc_lengths_per_row) -> torch.Tensor:
-  """Folded ``[B * S]`` positions that restart at 0 for every packed document."""
-  return torch.cat(
-      [torch.arange(n) for row in doc_lengths_per_row for n in row]
-  )
 
 
 def _dense_attention(q, k, v, *, seq_len, segment_ids=None, scale=None):
@@ -248,19 +96,13 @@ def _dense_local_attention(q, k, v, *, segment_ids=None, scale=None, **unused):
   )
 
 
-# Two sequences of 32 tokens, with documents crossing the head-tail chunks.
-_SEQ_LEN = 32
-_DOCS = ((5, 11, 9, 7), (16, 3, 13))
-
-
 class CPAttentionParityTest(parameterized.TestCase):
   """CP attention on emulated multi-rank groups vs single-device attention."""
 
   def setUp(self):
     super().setUp()
     torch.manual_seed(0)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
 
   def _run(
       self, strategy, make_attn, cp, n_heads, n_kv_heads, kwargs_fn, traced
@@ -358,14 +200,43 @@ class CPAttentionParityTest(parameterized.TestCase):
     )
     self._check(inputs, got, use_documents=True)
 
+  @parameterized.product(traced=(False, True), cp=(2, 4))
+  def test_ulysses_sliding_window_matches_single_device(self, traced, cp):
+    """Ulysses CP over the sliding-window SDPA (no kernel) applies it."""
+    from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention, UlyssesCPSlidingWindowScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
+
+    window = 8
+    cls = UlyssesCPSlidingWindowScaledDotProductInnerAttention
+    inputs, got = self._run(
+        "ulysses",
+        lambda: cls(cls.Config(window_size=window)),
+        cp,
+        4,
+        4,
+        lambda local_positions: dict(positions=local_positions),
+        traced,
+    )
+    q, k, v, grad, positions = inputs
+    q, k, v = (t.clone().requires_grad_(True) for t in (q, k, v))
+    single = SlidingWindowScaledDotProductInnerAttention(
+        SlidingWindowScaledDotProductInnerAttention.Config(window_size=window)
+    )
+    with set_unflatten_seq_len(_SEQ_LEN):
+      want = single(q, k, v, positions=positions)
+    want.backward(grad)
+    for name, g, w in zip(
+        ("out", "dq", "dk", "dv"), got, (want.detach(), q.grad, k.grad, v.grad)
+    ):
+      torch.testing.assert_close(g, w, rtol=2e-5, atol=2e-5, msg=name)
+
 
 class CPShardTest(parameterized.TestCase):
   """KV all-gather input sharding and the head-tail order."""
 
   def setUp(self):
     super().setUp()
-    cp_attention._CP_RANK_CACHE.clear()  # cp_shard caches the rank tensor.
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    # cp_shard caches the rank tensor and records its token layout.
+    _reset_cp_state(self)
 
   @parameterized.parameters((2, 1), (2, 3), (4, 1), (4, 2))
   def test_kv_all_gather_cp_shard_layout(self, cp, bsz):
@@ -585,8 +456,7 @@ class CompiledCPCollectivesTest(parameterized.TestCase):
     super().setUp()
     torch._dynamo.reset()
     self.addCleanup(torch._dynamo.reset)
-    cp_attention._CP_RANK_CACHE.clear()
-    self.addCleanup(cp_attention._CP_RANK_CACHE.clear)
+    _reset_cp_state(self)
     self.enter_context(
         mock.patch.object(
             cp_attention, "spmd_mesh_group", lambda axis: dist.group.WORLD
@@ -814,12 +684,56 @@ class CPValidationTest(parameterized.TestCase):
       ):
         config.__post_init__()
 
+  def test_register_rejects_a_second_cp_pair_for_the_same_attention(self):
+    """A second, different CP pair for a registered attention is rejected."""
+
+    class OtherUlysses(UlyssesCPScaledDotProductInnerAttention):
+      pass
+
+    # Re-registering the same pair is a no-op.
+    cp_attention.register_tpu_cp_inner_attention(
+        cp_attention.ScaledDotProductInnerAttention,
+        UlyssesCPScaledDotProductInnerAttention,
+        KVAllGatherCPScaledDotProductInnerAttention,
+    )
+    with self.assertRaisesRegex(ValueError, "already has TPU CP"):
+      cp_attention.register_tpu_cp_inner_attention(
+          cp_attention.ScaledDotProductInnerAttention,
+          OtherUlysses,
+          KVAllGatherCPScaledDotProductInnerAttention,
+      )
+    # The CP versions must subclass the attention and their strategy's mixin.
+    with self.assertRaisesRegex(TypeError, "must subclass"):
+      cp_attention.register_tpu_cp_inner_attention(
+          cp_attention.ScaledDotProductInnerAttention,
+          KVAllGatherCPScaledDotProductInnerAttention,
+          KVAllGatherCPScaledDotProductInnerAttention,
+      )
+
+  def test_cp_rank_tensor_miss_under_non_strict_tracing(self):
+    """A traced miss warns once and returns the rank without caching it."""
+    _reset_cp_state(self)
+    group = mock.Mock()
+    group.rank.return_value = 1
+    with mock.patch.object(cp_attention, "_tracing", return_value=True):
+      with self.assertLogs(cp_attention.logger, level="WARNING") as logs:
+        rank = cp_attention.cp_rank_tensor("cpu", group)
+        cp_attention.cp_rank_tensor("cpu", group)
+    self.assertLen(logs.output, 1)
+    self.assertEqual(rank.tolist(), [1])
+    self.assertEmpty(cp_attention._CP_RANK_CACHE)
+
   def test_rejects_non_causal_kv_all_gather(self):
     config = self._config("all_gather")
     for layer in config.model_spec.model.layers:
       layer.attention.inner_attention = (
           KVAllGatherCPVarlenInnerAttention.Config(window_size=(-1, -1))
       )
+    with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
+      validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
+    # A window parsed from a config file or the command line is a list.
+    for layer in config.model_spec.model.layers:
+      layer.attention.inner_attention.window_size = [-1, -1]
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):
       validate_tpu_context_parallel(config.model_spec.model, config.parallelism)
     with self.assertRaisesRegex(NotImplementedError, "causal attention only"):

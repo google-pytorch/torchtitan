@@ -24,10 +24,11 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 import logging
 import os
-from typing import Any, cast
+from typing import Any, cast, NamedTuple
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer.optimizer import (
@@ -40,6 +41,7 @@ from torchtitan.experiments.graph_trainer.configs import (
     to_graph_trainer_config,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.experiments.tpu import goodput
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
@@ -180,6 +182,9 @@ class TpuGraphTrainer(GraphTrainer):
             config.compile.optimizer_compile == "in_graph"
         )
         if self._optimizer_in_graph:
+            _check_in_graph_optimizer_grad_accum(
+                self.gradient_accumulation_steps
+            )
             for opt in self.optimizers.optimizers:
                 for group in opt.param_groups:
                     group["capturable"] = True
@@ -217,10 +222,47 @@ class TpuGraphTrainer(GraphTrainer):
         self._ep_drop_stats_L2: torch.Tensor | None = None
         self._ep_drop_stats_enabled = self._configure_ep_drop_stats(config)
 
+        self._wrap_goodput_badput()
+
+    def init_distributed(self):
+        """Records process group and device setup as goodput TPU init.
+
+        Also starts goodput training preparation, which covers model build,
+        parallelization and compilation setup. It ends when checkpoint load
+        starts (load is recorded as checkpoint restore), or at the first train
+        step.
+        """
+        with goodput.maybe_record(goodput.GoodputEvent.TPU_INIT):
+            parallel_dims = super().init_distributed()
+        goodput.start_training_preparation()
+        return parallel_dims
+
+    def batch_generator(self, data_iterable):
+        """Records each blocking batch fetch as goodput data loading."""
+        return goodput.record_data_loading(super().batch_generator(data_iterable))
+
+    def _wrap_goodput_badput(self) -> None:
+        """Records checkpoint save/restore and eval badput.
+
+        Checkpoint saves and restores go to the library's native checkpoint
+        buckets; eval (validation) is custom badput.
+        """
+        if not goodput.enabled():
+            return
+        goodput.wrap_checkpointer(
+            getattr(self, "checkpointer", None), get_step=lambda: self.step
+        )
+        validator = getattr(self, "validator", None)
+        if validator is not None and hasattr(validator, "validate"):
+            validator.validate = goodput.wrap_with_custom_badput(
+                validator.validate, goodput.EVAL_BADPUT
+            )
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
         """Run the in-graph optimizer loop when that execution mode is selected."""
+        goodput.record_step_start(self.step)
         if not self._optimizer_in_graph:
             super().train_step(data_iterator)
         else:
@@ -263,18 +305,22 @@ class TpuGraphTrainer(GraphTrainer):
             return False
         return configure_ep_drop_stats(self.model_parts, enabled=True)
 
-    def _pop_ep_drop_stat_outputs(self, outputs: Sequence[Any]) -> Sequence[Any]:
-        """Removes and keeps the output ``_with_ep_drop_stat_outputs`` appended."""
+    def _pop_ep_drop_stat_outputs(self, outputs: Any) -> Any:
+        """Unwraps ``_with_ep_drop_stat_outputs``'s ``(outputs, stats)`` pair.
+
+        Keeps the stats for logging and returns the step's own outputs.
+        """
         if not self._ep_drop_stats_enabled:
             return outputs
-        self._ep_drop_stats_L2 = outputs[-1]
-        return outputs[:-1]
+        outputs, self._ep_drop_stats_L2 = outputs
+        return outputs
 
     def _maybe_log_ep_drop_stats(self) -> torch.Tensor | None:
         """Logs global and worst-layer EP dropped-route rates when capacity-bounded.
 
         Sums the latest step's per-layer ``[dropped, total]`` route counts over
-        the batch mesh and logs one line; with gradient accumulation that is
+        every rank holding distinct tokens (the loss mesh, plus tp under EP)
+        and logs one line; with gradient accumulation that is
         the last microbatch. Runs at only a few steps because it waits for the
         device. Returns the summed int64 ``[n_moe_layers, 2]`` counts on the
         CPU, or ``None`` when the counts aren't collected.
@@ -291,13 +337,26 @@ class TpuGraphTrainer(GraphTrainer):
 
             (local_L2,) = collect_ep_drop_stat_tensors(self.model_parts)
         with torch.no_grad():
-            mesh = (
-                self.parallel_dims.get_mesh("batch")
-                if self.parallel_dims.dp_enabled
+            # A rank counts dropped routes for the rows it receives and total
+            # routes for the tokens it sends, so the sum must span every rank
+            # that holds distinct tokens: dp_replicate x dp_shard x cp, the
+            # `loss` mesh (None when it has size 1). EP can also span tp
+            # (efsdp * ep = dp_shard * cp * tp), and under EP the tp axis
+            # splits the routed tokens like a sequence split (as for upstream's
+            # MoE load-balance counts), so tp is summed too when EP is on.
+            # Without that split, tp ranks would hold the same tokens and must
+            # not be summed; drop stats only exist under EP. pp stages hold
+            # different layers and are not summed.
+            loss_mesh = self.parallel_dims.get_optional_mesh("loss")
+            tp_mesh = (
+                self.parallel_dims.get_optional_mesh("tp")
+                if self.parallel_dims.ep_enabled
                 else None
             )
             global_L2 = dist_utils.dist_sum_tensor(
-                local_L2.detach().to(torch.int64), mesh
+                local_L2.detach().to(torch.int64),
+                loss_mesh,
+                extra_pg=tp_mesh.get_group() if tp_mesh is not None else None,
             ).cpu()
         dropped_L = global_L2[:, 0].to(torch.float64)
         routes_L = global_L2[:, 1].to(torch.float64)
@@ -477,6 +536,7 @@ class TpuGraphTrainer(GraphTrainer):
     ) -> torch.Tensor:
         """Override of GraphTrainer._make_fx_forward_backward_step applying TPU pipeline graph passes."""
         from torchtitan.experiments.graph_trainer.common_utils import (
+            accumulate_param_grads_,
             maybe_register_blockmask_pytree_node,
         )
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -553,18 +613,16 @@ class TpuGraphTrainer(GraphTrainer):
                 extra_kwargs,
             )
         outputs = self._pop_ep_drop_stat_outputs(outputs)
-        loss = outputs[0]
-        grads = outputs[1 : 1 + len(params)]
+        self.last_loss_metrics = outputs.loss_metrics
         if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[1 + len(params) :])
-            )
+            set_moe_routing_metric_tensors([model], list(outputs.routing_metrics))
 
-        for param, grad in zip(params, grads, strict=True):
-            if param.requires_grad and grad is not None:
-                param.grad = grad
+        # Sum, not assign, so gradient accumulation keeps every microbatch.
+        # Each microbatch loss is divided by the whole step's token count, so
+        # the sum is the full-batch mean.
+        accumulate_param_grads_(*_unique_param_grads(params, outputs.grads))
 
-        return loss
+        return outputs.loss
 
     def _clip_grad_norm(self) -> torch.Tensor:
         if self._compiled_grad_norm is None:
@@ -664,38 +722,79 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
         outputs = self._pop_ep_drop_stat_outputs(outputs)
-        loss = outputs[0]
-        n = len(self._optstate_param_fqns)
-        new_params = outputs[1 : 1 + n]
-        new_exp_avgs = outputs[1 + n : 1 + 2 * n]
-        new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
-        new_step = outputs[1 + 3 * n]
+        self.last_loss_metrics = outputs.loss_metrics
         if self._collect_moe_routing_metrics:
-            set_moe_routing_metric_tensors(
-                [model], list(outputs[2 + 3 * n :])
-            )
+            set_moe_routing_metric_tensors([model], list(outputs.routing_metrics))
 
         from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
 
         update_model_and_optstate_buffers(
             model,
             self._optstate_param_fqns,
-            new_params,
-            new_exp_avgs,
-            new_exp_avg_sqs,
+            outputs.params,
+            outputs.exp_avgs,
+            outputs.exp_avg_sqs,
         )
+        new_step = outputs.step
         model._optstate_step.copy_(
             new_step.detach() if isinstance(new_step, torch.Tensor) else new_step
         )
 
-        return loss
+        return outputs.loss
+
+
+def _data_id(t: torch.Tensor) -> int:
+    # run_traced wraps each DTensor output on its own, so two DTensor grads
+    # can share one local tensor behind different wrappers.
+    return id(t._local_tensor if isinstance(t, DTensor) else t)
+
+
+def _unique_param_grads(
+    params: Sequence[torch.Tensor], grads: Sequence[torch.Tensor | None]
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Pairs each trainable param once with a grad tensor it does not share.
+
+    A tied weight is listed once per name, each time with its full gradient,
+    so it is kept only once. The graph can also return one tensor as two
+    params' grads; the second gets a copy, or the next microbatch's in-place
+    add would land in both.
+    """
+    seen_params: set[int] = set()
+    seen_grads: set[int] = set()
+    unique_params, unique_grads = [], []
+    for param, grad in zip(params, grads, strict=True):
+        if not param.requires_grad or grad is None or id(param) in seen_params:
+            continue
+        seen_params.add(id(param))
+        if _data_id(grad) in seen_grads:
+            grad = grad.clone()
+        seen_grads.add(_data_id(grad))
+        unique_params.append(param)
+        unique_grads.append(grad)
+    return unique_params, unique_grads
+
+
+def _check_in_graph_optimizer_grad_accum(
+    gradient_accumulation_steps: int,
+) -> None:
+    # The in-graph step runs AdamW inside every fwd/bwd call, so GA=k would
+    # take k optimizer steps per training step instead of one.
+    if gradient_accumulation_steps > 1:
+        raise ValueError(
+            "compile.optimizer_compile='in_graph' does not support gradient "
+            f"accumulation (got {gradient_accumulation_steps} steps). Use "
+            "'separate_graph', or set training.num_tokens_per_train_step so "
+            "that gradient accumulation is 1."
+        )
 
 
 def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:
-    """Returns ``step_fn`` with the MoE layers' EP drop stats as a last output.
+    """Returns ``step_fn`` with the MoE layers' EP drop stats as an extra output.
 
-    ``TpuGraphTrainer._pop_ep_drop_stat_outputs`` removes it after the step
-    runs, so the positions of the step's other outputs don't change.
+    The step's own outputs (a ``FwdBwdOutputs`` / ``FwdBwdAdamWOutputs``) stay
+    nested as the first element of a ``(outputs, stats)`` pair, so the traced
+    output spec rebuilds them with their field names, and
+    ``TpuGraphTrainer._pop_ep_drop_stat_outputs`` unwraps the pair.
     """
     from torchtitan.experiments.tpu.components.token_dispatcher import (  # pylint: disable=g-import-not-at-top
         collect_ep_drop_stat_tensors,
@@ -704,13 +803,30 @@ def _with_ep_drop_stat_outputs(step_fn: Callable, model: nn.Module) -> Callable:
     def step_with_ep_drop_stats(inputs, labels, global_valid_tokens, extra_kwargs):
         outputs = step_fn(inputs, labels, global_valid_tokens, extra_kwargs)
         (stats_L2,) = collect_ep_drop_stat_tensors([model])
-        return [*outputs, stats_L2]
+        return outputs, stats_L2
 
     return step_with_ep_drop_stats
 
 
 _GRAD_CLIP_EPS = 1e-6
 _GRAD_CLIP_MAX_SCALE = 1.0
+
+
+class FwdBwdAdamWOutputs(NamedTuple):
+    """Outputs of the traced forward, backward and AdamW step (``_make_fwd_bwd_adamw_fn``).
+
+    Flattened in field order in the traced graph and rebuilt by ``run_traced``.
+    """
+
+    loss: torch.Tensor
+    # Updated parameters and optimizer state, in ``param_fqns`` order.
+    params: Sequence[torch.Tensor]
+    exp_avgs: Sequence[torch.Tensor]
+    exp_avg_sqs: Sequence[torch.Tensor]
+    step: torch.Tensor
+    routing_metrics: Sequence[torch.Tensor]
+    # The loss function's metrics (``{}`` for the built-in losses).
+    loss_metrics: Any
 
 
 def _make_fwd_bwd_adamw_fn(
@@ -745,7 +861,7 @@ def _make_fwd_bwd_adamw_fn(
             if collect_moe_routing_metrics
             else []
         )
-        loss = compute_annotated_loss(
+        loss, loss_metrics = compute_annotated_loss(
             loss_fn,
             pred,
             labels,
@@ -794,14 +910,15 @@ def _make_fwd_bwd_adamw_fn(
             foreach=False,
             capturable=capturable,
         )
-        return [
+        return FwdBwdAdamWOutputs(
             loss,
-            *new_params,
-            *new_eas,
-            *new_eass,
+            list(new_params),
+            list(new_eas),
+            list(new_eass),
             new_steps[0],
-            *routing_metrics,
-        ]
+            routing_metrics,
+            loss_metrics,
+        )
 
     return fwd_bwd_adamw
 

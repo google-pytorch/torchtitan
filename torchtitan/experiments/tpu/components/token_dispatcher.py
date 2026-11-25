@@ -31,6 +31,7 @@ import math
 from typing import Literal, get_args
 import weakref
 
+import spmd_types as spmd
 import torch
 from torch.autograd.function import once_differentiable
 import torch.nn.functional as F
@@ -39,8 +40,9 @@ from torch.distributed._functional_collectives import (
     all_gather_single,
     reduce_scatter_single,
 )
+from torch.distributed._composable.fsdp import FSDPModule
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
-from torch.fx.traceback import annotate_fn
+from torch.fx.traceback import annotate, annotate_fn
 
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
@@ -50,17 +52,45 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     MOE_EP_DISPATCH,
     MOE_ROUTING,
 )
-from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.moe import _tokens_per_expert, RoutedExperts
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
 from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.tools.logging import logger
 
 EpTransport = Literal[
     "all_to_all", "ragged_all_to_all", "ring_of_experts", "auto"
 ]
+
+
+def _is_tracing(tensor: torch.Tensor) -> bool:
+  """Whether ``tensor`` is being traced by Dynamo or make_fx / AOT."""
+  return (
+      torch.compiler.is_compiling()
+      or isinstance(tensor, torch._subclasses.FakeTensor)
+      or get_proxy_mode() is not None
+  )
+
+
+def _clone_repeated_tensors(
+    first: torch.Tensor, tensors: list[torch.Tensor]
+) -> list[torch.Tensor]:
+  """``tensors`` with every repeat of ``first`` or of an earlier entry cloned.
+
+  Compares with ``is``, which Dynamo traces for tensors; ``id()`` of a tensor
+  created inside a compiled region is unsupported under ``fullgraph=True``.
+  """
+  out = list(tensors)
+  for i in range(len(out)):
+    repeated = out[i] is first
+    for j in range(i):
+      repeated = repeated or out[i] is out[j]
+    if repeated:
+      out[i] = out[i].clone()
+  return out
 
 
 def _wait(tensor: torch.Tensor) -> torch.Tensor:
@@ -89,11 +119,7 @@ def _ep_all_gather_impl(
           f" group_name; got pg={pg!r}"
       )
     return torch.tpu.ops.all_gather_dim(src, 0, group=pg)
-  if (
-      pg is not None
-      and get_proxy_mode() is None
-      and not isinstance(src, torch._subclasses.FakeTensor)
-  ):
+  if pg is not None and not _is_tracing(src):
     return _wait(all_gather_single(src, gather_dim=0, group=ep_mesh))
   raise NotImplementedError(
       "Ring-of-Experts EP all_gather needs a TPU process group with"
@@ -121,11 +147,7 @@ def _ep_reduce_scatter_sum_impl(
           f" group_name; got pg={pg!r}"
       )
     return torch.tpu.ops.reduce_scatter_dim(src, 0, group=pg, reduce_op="sum")
-  if (
-      pg is not None
-      and get_proxy_mode() is None
-      and not isinstance(src, torch._subclasses.FakeTensor)
-  ):
+  if pg is not None and not _is_tracing(src):
     return _wait(
         reduce_scatter_single(src, reduceOp="sum", scatter_dim=0, group=ep_mesh)
     )
@@ -215,11 +237,7 @@ def _ragged_all_to_all_impl(
     )
 
   # Off TPU: a slow eager reference built from all-gathers, for CPU/gloo tests.
-  if (
-      ep_mesh is not None
-      and get_proxy_mode() is None
-      and not isinstance(src, torch._subclasses.FakeTensor)
-  ):
+  if ep_mesh is not None and not _is_tracing(src):
     ep_size = ep_mesh.size()
     if ep_size <= 1:
       num_updates = input_offsets.numel()
@@ -716,10 +734,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         if self._ep_rank_holder_ref is not None
         else None
     )
-    if getattr(holder, "collect_ep_drop_stats", False) or (
-        get_proxy_mode() is None
-        and not isinstance(x, torch._subclasses.FakeTensor)
-    ):
+    if getattr(holder, "collect_ep_drop_stats", False) or not _is_tracing(x):
       self.last_dropped_count = dropped_count
 
   def enable_row_scale_dispatch(self) -> None:
@@ -785,9 +800,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       ):
         return rank_buf
 
-    if get_proxy_mode() is not None or isinstance(
-        x, torch._subclasses.FakeTensor
-    ):
+    if _is_tracing(x):
       # A traced graph must read the rank from the owner's buffer, a graph
       # input, so that every rank traces the same program. A constant would
       # bake this rank's index into the graph, so fail instead under EP > 1.
@@ -832,8 +845,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     if (
         self.ep_mesh is not None
         and pg is not None
-        and get_proxy_mode() is None
-        and not isinstance(local_counts_E, torch._subclasses.FakeTensor)
+        and not _is_tracing(local_counts_E)
     ):
       return _wait(
           all_gather_single(local_counts_E, gather_dim=0, group=self.ep_mesh)
@@ -859,17 +871,26 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       bwd_recv_sizes: torch.Tensor,
       pg,
   ) -> torch.Tensor:
+    # Combine sizes reuse dispatch tensors (e.g. comb_recv_sizes is
+    # disp_send_sizes), and torch.compile rejects an autograd.Function that
+    # receives the same tensor twice ("duplicate tensor input").
+    size_args = _clone_repeated_tensors(
+        operand,
+        [
+            fwd_input_offsets,
+            fwd_send_sizes,
+            fwd_output_offsets,
+            fwd_recv_sizes,
+            bwd_input_offsets,
+            bwd_send_sizes,
+            bwd_output_offsets,
+            bwd_recv_sizes,
+        ],
+    )
     return _RaggedAllToAll.apply(
         operand,
         output_rows,
-        fwd_input_offsets,
-        fwd_send_sizes,
-        fwd_output_offsets,
-        fwd_recv_sizes,
-        bwd_input_offsets,
-        bwd_send_sizes,
-        bwd_output_offsets,
-        bwd_recv_sizes,
+        *size_args,
         self.ep_mesh,
         pg,
     )
@@ -955,6 +976,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     # pylint: disable=g-import-not-at-top
     from torchtitan.experiments.tpu.kernels.ragged_gather_tc import (
         roe_compute_routing,
+        roe_gather_out_2d,
         roe_gather_row_scales,
         roe_sort_gather,
         safe_gather_block_size,
@@ -990,11 +1012,16 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           top_k=self.top_k,
           requested_block_size=self.roe_reduce_block_size,
       )
+      # The 2D gather stages each block in a second VMEM buffer, so it fits
+      # half as many rows per block.
       gather_block = min(
           safe_gather_block_size(
               hidden_dim=hidden_dim,
               itemsize=x_TD.element_size(),
               requested_block_size=self.roe_gather_block_size,
+              out_2d=roe_gather_out_2d(
+                  cap, x_TD.element_size(), self.roe_zero_pad_tail
+              ),
           ),
           cap,
       )
@@ -1389,6 +1416,68 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     )
 
 
+# Custom FX node metadata on each EP chunk's `_ChunkWeight` node; read by
+# `insert_ep_chunk_barriers`, which keeps the shared expert weight it reads out
+# of the chunk barriers.
+_EP_CHUNK_WEIGHT_KEY = "ep_chunk_weight"
+
+
+class _Fp32GradAccumulator(torch.autograd.Function):
+  """An FP32 sum point for the gradients ``_ChunkWeight`` sends to ``weight``.
+
+  The forward returns a storage-free FP32 tensor with the weight's shape (a
+  scalar zero expanded with zero strides). Each EP chunk's ``_ChunkWeight``
+  returns its weight gradient, widened to FP32, as this tensor's gradient, so
+  autograd sums the chunks' gradients in FP32. The backward rounds the sum to
+  the weight's dtype once.
+  """
+
+  @staticmethod
+  def forward(ctx, weight: torch.Tensor) -> torch.Tensor:
+    ctx.set_materialize_grads(False)
+    ctx.weight_dtype = weight.dtype
+    return weight.new_zeros((), dtype=torch.float32).expand(weight.shape)
+
+  @staticmethod
+  def spmd_typecheck(result, *, weight):
+    spmd.rules.output(result, weight)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_fp32: torch.Tensor | None):
+    if grad_fp32 is None:
+      return None
+    return grad_fp32.to(ctx.weight_dtype)
+
+
+class _ChunkWeight(torch.autograd.Function):
+  """Returns ``weight`` and sends its gradient to ``accumulator`` in FP32.
+
+  Every chunk's matmul reads the same ``weight`` tensor, so backward saves one
+  copy of it however many chunks there are.
+  """
+
+  @staticmethod
+  def forward(
+      ctx, weight: torch.Tensor, accumulator: torch.Tensor
+  ) -> torch.Tensor:
+    del accumulator  # Only routes the gradient.
+    ctx.set_materialize_grads(False)
+    return weight
+
+  @staticmethod
+  def spmd_typecheck(result, *, weight, accumulator):
+    spmd.rules.ignore(accumulator)
+    spmd.rules.output(result, weight)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_weight: torch.Tensor | None):
+    if grad_weight is None:
+      return None, None
+    return None, grad_weight.float()
+
+
 class TpuRoutedExperts(RoutedExperts):
   """Routed experts that can apply the routing scores before W2.
 
@@ -1405,6 +1494,9 @@ class TpuRoutedExperts(RoutedExperts):
   @dataclass(kw_only=True, slots=True)
   class Config(RoutedExperts.Config):
     scale_before_down_proj: bool = False
+    num_token_chunks: int = 1
+    max_inflight_chunks: int = 2
+    accumulate_chunk_weight_grads_fp32: bool = True
 
   def __init__(self, config: Config):
     super().__init__(config)
@@ -1414,6 +1506,20 @@ class TpuRoutedExperts(RoutedExperts):
     # a traced step back to the module; the step returns these as an output.
     self.collect_ep_drop_stats = False
     self._last_ep_drop_stats_2: torch.Tensor | None = None
+    if config.num_token_chunks < 1:
+      raise ValueError(
+          f"num_token_chunks must be >= 1, got {config.num_token_chunks}"
+      )
+    if config.max_inflight_chunks < 1:
+      raise ValueError(
+          f"max_inflight_chunks must be >= 1, got {config.max_inflight_chunks}"
+      )
+    self.num_token_chunks = config.num_token_chunks
+    self.max_inflight_chunks = config.max_inflight_chunks
+    self.accumulate_chunk_weight_grads_fp32 = (
+        config.accumulate_chunk_weight_grads_fp32
+    )
+    self._warned_chunk_snap: set[tuple[int, int]] = set()
     self.scale_before_down_proj = config.scale_before_down_proj
     if not self.scale_before_down_proj:
       return
@@ -1512,6 +1618,128 @@ class TpuRoutedExperts(RoutedExperts):
       total = torch.full_like(dropped, num_tokens * self.token_dispatcher.top_k)
       self._last_ep_drop_stats_2 = torch.stack([dropped, total])
 
+  def _forward_ep_chunked(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+      *,
+      num_chunks: int,
+      ep_size: int,
+  ) -> torch.Tensor:
+    if isinstance(self.inner_experts, FSDPModule):
+      raise NotImplementedError(
+          "EP token chunking unshards the expert weights once per layer and"
+          " needs SimpleFSDP (--parallelism.use_simple_fsdp); FSDP2 reshards"
+          " them when the unshard call returns. Use num_token_chunks=1."
+      )
+    is_roe = (
+        isinstance(self.token_dispatcher, TpuAllToAllTokenDispatcher)
+        and self.token_dispatcher._resolve_ep_transport(ep_size, x_TD)
+        == "ring_of_experts"
+    )
+    needs_chunk_counts = not is_roe
+
+    unsharded_weights = None
+    weight_grad_accumulators = None
+    if hasattr(self.inner_experts, "unshard_weights"):
+      # Unshard the SimpleFSDP expert parameters once, outside the chunk loop
+      # (`TpuGroupedExperts.unshard_weights` explains how its all-gathers keep
+      # the experts' `module_fqn` for SimpleFSDP bucketing).
+      with maybe_set_sparse_mesh():
+        unsharded_weights = self.inner_experts.unshard_weights()
+        # Sum the chunks' weight gradients in FP32 without an FP32 copy of
+        # the weights: every chunk reads the unsharded weight itself (so
+        # backward saves it once) through a `_ChunkWeight` that routes its
+        # gradient, widened to FP32, to a storage-free accumulator.
+        if self.accumulate_chunk_weight_grads_fp32 and torch.is_grad_enabled():
+          weight_grad_accumulators = tuple(
+              _Fp32GradAccumulator.apply(w)
+              if w.requires_grad and w.dtype != torch.float32
+              else None
+              for w in unsharded_weights
+          )
+
+    x_chunks = x_TD.chunk(num_chunks, dim=0)
+    score_chunks = topk_scores_TK.chunk(num_chunks, dim=0)
+    id_chunks = topk_expert_ids_TK.chunk(num_chunks, dim=0)
+    num_experts = num_local_tokens_per_expert_E.numel()
+
+    out_chunks: list[torch.Tensor] = []
+    dropped_chunks: list[torch.Tensor] = []
+    # Sum the chunks' dropped routes eagerly, and when tracing only if this
+    # layer returns drop stats from the step (dropless graphs are unchanged).
+    record_eager_drops = isinstance(
+        self.token_dispatcher, TpuAllToAllTokenDispatcher
+    ) and (self.collect_ep_drop_stats or not _is_tracing(x_TD))
+    for chunk_idx, (x_c, scores_c, ids_c) in enumerate(
+        zip(x_chunks, score_chunks, id_chunks)
+    ):
+      with annotate({
+          "ep_chunk_idx": chunk_idx,
+          "ep_max_inflight_chunks": self.max_inflight_chunks,
+      }):
+        extra_expert_kwargs = {}
+        if unsharded_weights is not None:
+          chunk_weights = unsharded_weights
+          if weight_grad_accumulators is not None:
+            with annotate({_EP_CHUNK_WEIGHT_KEY: True}):
+              chunk_weights = tuple(
+                  w if acc is None else _ChunkWeight.apply(w, acc)
+                  for w, acc in zip(unsharded_weights, weight_grad_accumulators)
+              )
+          extra_expert_kwargs["pre_unsharded_weights"] = chunk_weights
+        counts_c = (
+            _tokens_per_expert(ids_c, num_experts)
+            if needs_chunk_counts
+            else num_local_tokens_per_expert_E
+        )
+        routed_input_c, num_tokens_per_expert_e, metadata_c = (
+            self.token_dispatcher.dispatch(x_c, scores_c, ids_c, counts_c)
+        )
+        if (
+            record_eager_drops
+            and isinstance(metadata_c, TpuEpDispatchMetadata)
+        ):
+          dropped_chunks.append(metadata_c.dropped_count)
+        if self.scale_before_down_proj:
+          if not isinstance(metadata_c, TpuEpDispatchMetadata):
+            raise ValueError(
+                "Chunked EP scale_before_down_proj requires TPU EP dispatch"
+                f" metadata, got {type(metadata_c).__name__}"
+            )
+          if metadata_c.row_scale_R is None:
+            raise ValueError(
+                "scale_before_down_proj expected EP dispatch metadata with"
+                " row_scale_R populated"
+            )
+          with maybe_set_sparse_mesh():
+            routed_output_c = self.inner_experts(
+                routed_input_c,
+                num_tokens_per_expert_e,
+                row_scale_R=metadata_c.row_scale_R,
+                **extra_expert_kwargs,
+            )
+          metadata_c = replace(metadata_c, row_scale_applied=True)
+        else:
+          with maybe_set_sparse_mesh():
+            routed_output_c = self.inner_experts(
+                routed_input_c,
+                num_tokens_per_expert_e,
+                **extra_expert_kwargs,
+            )
+        out_chunks.append(
+            self.token_dispatcher.combine(routed_output_c, metadata_c, x_c)
+        )
+    if dropped_chunks and isinstance(
+        self.token_dispatcher, TpuAllToAllTokenDispatcher
+    ):
+      self.token_dispatcher._record_dropped_count(
+          x_TD, torch.stack(dropped_chunks).sum(dtype=torch.int32)
+      )
+    return torch.cat(out_chunks, dim=0)
+
   def forward(
       self,
       x_TD: torch.Tensor,
@@ -1543,6 +1771,47 @@ class TpuRoutedExperts(RoutedExperts):
       topk_expert_ids_TK: torch.Tensor,
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
+    ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
+    num_tokens = x_TD.shape[0]
+    if (
+        ep_mesh is not None
+        and ep_mesh.size() > 1
+        and self.num_token_chunks > 1
+        and num_tokens > 0
+        and getattr(self.token_dispatcher, "ep_transport", "all_to_all")
+        in ("ring_of_experts", "ragged_all_to_all", "auto")
+    ):
+      num_chunks = self.num_token_chunks
+      if num_tokens % num_chunks != 0:
+        num_chunks = next(
+            d
+            for d in range(min(num_chunks, num_tokens), 0, -1)
+            if num_tokens % d == 0
+        )
+        # Dynamo cannot trace the set mutation or the logger call; make_fx
+        # and eager run them as Python.
+        if (
+            not torch.compiler.is_compiling()
+            and (num_tokens, num_chunks) not in self._warned_chunk_snap
+        ):
+          self._warned_chunk_snap.add((num_tokens, num_chunks))
+          logger.warning(
+              "%d tokens are not divisible by num_token_chunks=%d; using %d"
+              " chunks (fewer chunks keep more EP buffers live).",
+              num_tokens,
+              self.num_token_chunks,
+              num_chunks,
+          )
+      if num_chunks > 1:
+        return self._forward_ep_chunked(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+            num_chunks=num_chunks,
+            ep_size=ep_mesh.size(),
+        )
+
     if not self.scale_before_down_proj:
       return super().forward(
           x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E

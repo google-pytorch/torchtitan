@@ -9,3 +9,4 @@ numpy
 gcsfs
 frozendict
 triton
+ml-goodput-measurement==0.2.3

@@ -251,7 +251,10 @@ def _my_bwd(
   # Tokamax's backward API consumes its cotangent as a scalar. Whole-graph XLA
   # can fold that distinction away; an executable boundary preserves the
   # one-element shape, so normalize it explicitly before entering Tokamax.
-  dout = jax.numpy.reshape(dout, ())
+  # reduction="none" has one loss per row, so its cotangent is a (B,) vector,
+  # which Tokamax's backward (and the soft-cap copy) take as is.
+  if reduction != "none":
+    dout = jax.numpy.reshape(dout, ())
   if _has_logit_transform(soft_cap, output_multiplier):
     from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel  # pylint: disable=g-import-not-at-top
 
@@ -388,12 +391,18 @@ def _get_loss_op_names(
       mutates_args=(),
       schema="(Tensor x, Tensor labels, Tensor weights) -> (Tensor, Tensor)",
   )
-  torch_fwd_fn.register_fake(
-      lambda x, labels, weights: (
-          torch.empty(1, dtype=torch.float32, device=x.device),
-          torch.empty(x.shape[0], dtype=torch.float32, device=x.device),
-      )
-  )
+  @torch_fwd_fn.register_fake
+  def _fwd_fake(x, labels, weights):
+    # Tracing (e.g. GraphTrainer) uses these shapes instead of running the
+    # kernel, so they must match: reduction="none" gives one loss per token.
+    num_rows = x.shape[0]
+    if reduction == "none":
+      loss_shape = (num_rows,)  # one loss per token
+    else:
+      loss_shape = (1,)  # "sum" / "mean": a single loss value
+    loss = torch.empty(loss_shape, dtype=torch.float32, device=x.device)
+    lse = torch.empty((num_rows,), dtype=torch.float32, device=x.device)
+    return loss, lse
 
   torch_bwd_fn = torch.library.custom_op(
       f"pallas::{op_bwd_name}",
@@ -500,8 +509,9 @@ def linear_softmax_cross_entropy_loss(
       labels: The ground truth labels index in the dimension of (B,).
       weights: The linear projection weight matrix in the dimension of (H, V)
         where V is the dimension of the output logits aka vocabulary size.
-      reduction: The reduction method for the cross entropy loss. Can be set to
-        "sum" or "mean" explicitly.
+      reduction: The reduction method for the cross entropy loss: "sum",
+        "mean", or "none" for one loss per row (shape (B,)), whose backward
+        takes a per-row cotangent.
       implementation: By default "None" will be used to pick the best available
         backend. Can be set to "xla" or "mosaic_tpu" explicitly.
       b_block_size: Block size for batch dimension.

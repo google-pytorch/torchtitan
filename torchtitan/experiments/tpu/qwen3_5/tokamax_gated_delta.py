@@ -47,7 +47,6 @@ rounding moves those three gradients further (65% / 55% / 12%, cosine 0.85 /
 from collections.abc import Sequence
 from dataclasses import dataclass
 import functools
-import re
 from typing import Any
 
 import jax
@@ -55,6 +54,7 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from torchtitan.config.override import derive, override
+from torchtitan.experiments.tpu.kernels import pallas_vmem
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import per_row_segment_ids
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import TpuGatedDeltaKernel
 from torchtitan.tools.logging import logger
@@ -138,25 +138,9 @@ def _require_tokamax_kda():
   return kimi_delta_attention
 
 
-@functools.lru_cache(maxsize=1)
-def _tpu_generation() -> int | None:
-  """Attached TPU generation (e.g. 5 for v5e/v5p, 6 for v6e, 7 for TPU7x)."""
-  get_props = getattr(
-      getattr(torch, "tpu", None), "get_device_properties", None
-  )
-  if get_props is None:
-    return None
-  try:
-    name = get_props().name.lower()
-  except RuntimeError:
-    return None
-  match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
-  return int(match.group(1)) if match else None
-
-
 def supports_current_tpu() -> bool:
   """Whether the attached TPU meets Mosaic KDA's generation >= 6 requirement."""
-  gen = _tpu_generation()
+  gen = pallas_vmem.tpu_generation()
   return gen is not None and gen >= _MIN_TPU_GENERATION
 
 
@@ -629,7 +613,7 @@ class TokamaxGatedDeltaKernel(TpuGatedDeltaKernel):
     """Why the Mosaic kernels cannot run these inputs, or None."""
     if q_BSHK.device.type != "tpu":
       return f"device {q_BSHK.device.type}"
-    gen = _tpu_generation()
+    gen = pallas_vmem.tpu_generation()
     if gen is not None and gen < _MIN_TPU_GENERATION:
       return f"TPU v{gen} (needs >= v{_MIN_TPU_GENERATION})"
     if 0 in q_BSHK.shape or 0 in v_BSHV.shape:

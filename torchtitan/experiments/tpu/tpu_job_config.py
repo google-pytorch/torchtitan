@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 import torchtitan.config
+from torchtitan.experiments.tpu.goodput import config as goodput_config
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.distributed.cp_attention import validate_tpu_context_parallel
 import torchtitan.trainer
@@ -50,6 +51,12 @@ class TPUConfig:
   ] | None = None
   ep_scale_before_down_proj: bool | None = None
   ep_capacity_factor: float | None = None
+  ep_token_chunks: int | None = None
+  ep_max_inflight_chunks: int | None = None
+  # False sums each layer's cross-chunk expert dWeights in BF16 instead of FP32.
+  ep_chunk_dw_fp32: bool | None = None
+  # False switches paired W1+W3 Pallas grouped matmuls to unpaired under EP.
+  ep_paired_grouped_mm: bool | None = None
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]
@@ -235,6 +242,23 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
           training=self.training,
           splash_attention_kernel=self.splash_attention_kernel,
       )
+      # The Pallas fused loss tiles each rank's tokens by b_block_size, and a
+      # CP rank holds 1 / cp of the data-parallel rank's tokens.
+      cp = self.parallelism.context_parallel_degree
+      b_block_size = getattr(self.loss, "b_block_size", None)
+      tokens_per_rank = (
+          self.training.num_tokens_per_microbatch_per_dp_rank // cp
+      )
+      if (
+          b_block_size
+          and getattr(self.loss, "implementation", None) == "mosaic_tpu"
+          and tokens_per_rank % b_block_size
+      ):
+        raise ValueError(
+            f"With context_parallel_degree={cp}, each rank holds"
+            f" {tokens_per_rank} tokens, which the Pallas loss's b_block_size"
+            f" ({b_block_size}) must divide."
+        )
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed
     # that is crashing when running on TAP.
@@ -288,6 +312,10 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
       default_factory=TpuTrainerCompileConfig
   )
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
+  # Goodput recording/monitoring; only the graph trainer is instrumented.
+  goodput: goodput_config.GoodputConfig = dataclasses.field(
+      default_factory=goodput_config.GoodputConfig
+  )
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()

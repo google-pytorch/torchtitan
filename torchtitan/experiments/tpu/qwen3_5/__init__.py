@@ -16,6 +16,10 @@ Wraps upstream ``torchtitan.models.qwen3_5`` for the TPU lane
 * Swaps every full-attention layer for ``TpuQwen35Attention`` with a
   ``SlidingWindowScaledDotProductInnerAttention`` without a window, so packed
   documents are masked on SDPA and the Splash patch sees ``positions``.
+* Uses ``TpuQwen35Model``, whose context-parallel input sharding goes through
+  the CP inner attention's ``cp_shard`` (as core ``Decoder`` does). CP recipes
+  also run the GatedDeltaNet head-parallel (``cp_gated_delta``; see
+  ``config_registry._qwen35_cp``).
 * Turns off the expert-bias balancer (``load_balance_coeff=None``): HF
   checkpoints, and so ``Qwen35StateDictAdapter``, have no ``expert_bias``.
 * Gives the GatedDeltaNet's depthwise convolutions a ``param_init`` (the
@@ -34,6 +38,10 @@ from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScale
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
+
+# Registers the GatedDeltaNet CP validator and reverter
+# (validate_tpu_context_parallel / revert_tpu_context_parallel).
+from torchtitan.experiments.tpu.qwen3_5 import cp_gated_delta  # pylint: disable=unused-import
 from torchtitan.experiments.tpu.qwen3_5.gated_delta import (
     TpuGatedDeltaKernel,
     TpuGatedDeltaNet,
@@ -50,6 +58,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 __all__ = [
     "model_registry",
     "qwen3_5_configs",
+    "to_tpu_model_spec",
     "use_tpu_modules",
 ]
 
@@ -121,12 +130,29 @@ def model_registry(
         "Qwen3.5 on TPU supports only attn_backend='sdpa', got "
         f"{attn_backend!r}"
     )
-  model_spec = upstream_qwen3_5.model_registry(
-      flavor,
-      seq_len=seq_len,
-      attn_backend="sdpa",
-      converters=converters,
+  return to_tpu_model_spec(
+      upstream_qwen3_5.model_registry(
+          flavor,
+          seq_len=seq_len,
+          attn_backend="sdpa",
+          converters=converters,
+      )
   )
+
+
+def to_tpu_model_spec(model_spec: ModelSpec) -> ModelSpec:
+  """Returns ``model_spec`` with TPU modules and the TPU parallelization.
+
+  Applies to any upstream spec built on ``Qwen35Model`` (``qwen3_5`` and the
+  version-specific ``qwen3_8`` registry) with ``attn_backend="sdpa"``.
+
+  Args:
+    model_spec: An upstream Qwen3.5-architecture model spec.
+
+  Returns:
+    A text-only spec using ``use_tpu_modules`` and ``parallelize_qwen3_5``,
+    without pipelining.
+  """
   return dataclasses.replace(
       model_spec,
       model=use_tpu_modules(model_spec.model),

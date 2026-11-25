@@ -59,9 +59,58 @@ def init_device_mesh(
     )
 
 
+def register_logical_spmd_axes(mesh: DeviceMesh) -> None:
+    """Pin each ``mesh`` dimension's spmd_types ``MeshAxis`` to its logical layout.
+
+    ``spmd_types.MeshAxis.of(pg)`` infers an axis's ``(shape, stride)`` from
+    the sorted *global* ranks of the calling rank's process group. That only
+    reproduces the mesh's logical layout when ranks are laid out in order. With
+    ``enable_tpu_topo_mesh`` the world mesh is a job-dependent permutation of
+    the ranks (e.g. ``[1, 3, 2, 0, 6, 5, 7, 4]`` on one v6e-8), so an outer
+    axis such as ``dp_shard`` has groups like ``[0, 4], [1, 6], [2, 7], [3, 5]``
+    whose inferred strides differ per rank and can overlap the inner axis.
+    spmd_types then rejects the mesh at startup with ``SpmdTypeError: Mesh
+    axes ... are not orthogonal`` for any mesh with two or more non-trivial
+    axes (HSDP, FSDP+TP, FSDP+CP, FSDP+EP).
+
+    ``DeviceMesh._layout`` already holds the rank-invariant logical layout of
+    every dimension (strides in ``_rank_map`` index space), so we seed
+    spmd_types' process-group cache from it. Typechecking then sees the same
+    orthogonal axes on every rank, while collectives keep running over the
+    topology-ordered process groups. With an in-order rank map the registered
+    axes equal what spmd_types would have inferred, so this is a no-op there.
+
+    Idempotent: re-registering the same group with the same layout is fine.
+
+    TODO(b/587033846): this seeds spmd_types' private ``_pg_to_mesh_axis``
+    cache because ``ProcessGroup`` cannot carry the ``__mesh_axis__`` hook
+    (no instance ``__dict__``). Drop it once spmd_types reads the layout from
+    the ``DeviceMesh`` itself.
+    """
+    # Lazy so this module does not force the spmd_types import order.
+    from spmd_types import _mesh_axis
+
+    if not mesh.mesh_dim_names:
+        return
+    layout = getattr(mesh, "_layout", None)
+    if layout is None:
+        return
+    for dim in range(len(mesh.mesh_dim_names)):
+        pg = mesh.get_group(dim)
+        axis = _mesh_axis.MeshAxis(layout[dim])
+        # Overwrite: a stale entry can only be a rank-inferred axis for the
+        # same group, which is exactly what this replaces.
+        _mesh_axis._pg_to_mesh_axis[pg] = axis
+        # Mirror _from_pg: keep the human-readable name for error messages.
+        desc = getattr(pg, "group_desc", None)
+        if desc and desc != "undefined":
+            _mesh_axis._register_name(axis, desc)
+
+
 __all__ = [
     "MeshAxisName",
     "ParallelDims",
+    "register_logical_spmd_axes",
     "unfold_dp_axis",
     "unfold_dp_axes",
 ]
@@ -307,8 +356,29 @@ class ParallelDims:
         self._single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
 
         self._validate_meshes()
+        self.register_spmd_axes()
 
         return self._world_mesh
+
+    def register_spmd_axes(self) -> None:
+        """Register the logical spmd_types ``MeshAxis`` of every mesh axis.
+
+        Called by ``build_mesh``. Call again after ``spmd_types`` drops its
+        process-group cache (``spmd_types._mesh_axis._reset()``, e.g. between
+        tests) while this ``ParallelDims`` is still in use. See
+        ``register_logical_spmd_axes``.
+        """
+        # Submeshes share the process groups of the mesh they slice, but
+        # DeviceMesh recreates groups per unflatten, so cover every mesh that
+        # can be handed out rather than only the unflattened ones.
+        register_logical_spmd_axes(self.world_mesh)
+        for meshes in (
+            self._global_meshes,
+            self._single_axis_meshes,
+            self._multi_axis_meshes,
+        ):
+            for mesh in meshes.values():
+                register_logical_spmd_axes(mesh)
 
     def _validate_meshes(self):
         """Validate that created meshes have the expected sizes."""

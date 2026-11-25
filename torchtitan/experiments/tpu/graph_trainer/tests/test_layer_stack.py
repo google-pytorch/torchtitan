@@ -34,6 +34,7 @@ from torchtitan.experiments.tpu.graph_trainer import layer_stack
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     _segments,
     check_layers_are_stackable,
+    LayerStack,
     LayerStackHolder,
     STACK_ATTR,
     with_tpu_stacked_layers,
@@ -801,6 +802,50 @@ class TestQwen3(unittest.TestCase):
         summary = f"scan error {scan_error}, aux effect {aux_effect}"
         self.assertLess(max(scan_error), 5e-2, summary)
         self.assertGreater(min(aux_effect), 3 * max(scan_error), summary)
+
+
+class TestPrequantizedScanBody(unittest.TestCase):
+    """The opt-in FP8 scan body, and that nothing else gets it."""
+
+    def _stack(self) -> LayerStack:
+        stack = LayerStack(nn.ModuleDict(), holder=None)
+        stack.names = ["mlp.w1", "mlp.w3"]
+        return stack
+
+    def test_no_opt_in_means_no_prequantized_body(self):
+        # `run` keeps the plain scan body unless this plan is non-empty, and
+        # only modules defining `scan_prequantize_groups` can make it so.
+        template = nn.ModuleDict({"mlp": nn.Linear(4, 4)})
+        self.assertEqual(self._stack()._plan_prequantized_gathers(template, {}), [])
+
+    def test_prequantized_body_adds_fp8_weights_to_the_plain_params(self):
+        stack = self._stack()
+        seen = {}
+
+        def quantize(shard, all_gather):
+            seen["shard"] = shard
+            return shard.to(torch.float8_e4m3fn), shard.abs().amax(0, keepdim=True)
+
+        def body(carry, params):
+            seen["params"] = params
+            return carry + 1
+
+        prequant = [("mlp.fp8_w13", ["mlp.w1", "mlp.w3"], None, quantize)]
+        scan_body = stack._prequantized_scan_body(body, prequant)
+        w1, w3 = torch.randn(2, 3), torch.randn(2, 5)
+        out, y = scan_body(torch.zeros(2), {"mlp__w1": w1, "mlp__w3": w3})
+
+        torch.testing.assert_close(out, torch.ones(2))
+        self.assertEqual(y.shape, ())
+        params = seen["params"]
+        self.assertEqual(
+            set(params), {"mlp.w1", "mlp.w3", "mlp.fp8_w13_q", "mlp.fp8_w13_scale"}
+        )
+        # No FSDP plan: the plain params are the rows as they came in.
+        self.assertIs(params["mlp.w1"], w1)
+        self.assertIs(params["mlp.w3"], w3)
+        # The group's shards are quantized together, concatenated on the last axis.
+        torch.testing.assert_close(seen["shard"], torch.cat([w1, w3], dim=-1))
 
 
 if __name__ == "__main__":

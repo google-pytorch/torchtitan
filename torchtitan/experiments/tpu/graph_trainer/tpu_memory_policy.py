@@ -491,15 +491,17 @@ def _tpu_selective_and_offload_memory_policy_pass(
 ) -> torch.fx.GraphModule:
     """``tpu_selective`` saves kept in HBM, plus CPU offload of layer boundaries.
 
-    The layer boundaries are offloaded as in ``full_and_offload``. The chosen
-    save-region values stay on device: backward reads them first, and
-    offloading them too would add their bytes to the host link every layer.
+    Without scan, the layer boundaries are offloaded as in
+    ``full_and_offload``, and the chosen save-region values stay on device:
+    backward reads them first, and offloading them too would add their bytes
+    to the host link every layer. With scan, the saves named in
+    ``compile.scan_offload`` (default: the layer input) go to host from inside
+    the loops.
     """
     if config.compile.use_scan_layers:
-        # The saves live in the scan body, which `LayerStack.run` tags; the
-        # layer input goes to host from inside the loops.
+        # The saves live in the scan body, which `LayerStack.run` tags.
         _full_memory_policy_pass(gm, config=config)
-        return offload_scan_activations(gm)
+        return offload_scan_activations(gm, tuple(config.compile.scan_offload))
     last_n_layers = config.compile.save_last_n_layers
     regions = resolve_save_regions(
         config.compile.save_regions,

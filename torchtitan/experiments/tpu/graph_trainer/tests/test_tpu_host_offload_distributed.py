@@ -69,26 +69,24 @@ def _check_offload_engaged(gm):
 
   fwd_body = _body(gm, forward[0]).graph
   bwd_body = _body(gm, backward[0]).graph
-  assert _OFFLOAD in _ao_targets(fwd_body), "the forward body does not offload"
-  assert _RELOAD in _ao_targets(bwd_body), "the backward body does not reload"
-
-  # Reloading the placeholder is legal and pulls the whole stack back on every
-  # iteration -- worse than not offloading.
-  reload_node = next(n for n in bwd_body.nodes if n.target is _RELOAD)
-  assert reload_node.args[0].target is torch.ops.aten.index_select.default, (
-      f"the reload is on {reload_node.args[0].target}, not on the slice"
-  )
-
-  # Exactly one value goes to host: the saved copy of the layer input.
+  # Exactly one value goes to host and comes back: the saved layer input.
   offloads = [n for n in fwd_body.nodes if n.target is _OFFLOAD]
-  assert len(offloads) == 1, f"{len(offloads)} offloads in the forward body"
+  reloads = [n for n in bwd_body.nodes if n.target is _RELOAD]
+  assert len(offloads) == 1 and len(reloads) == 1, (
+      f"{len(offloads)} offloads and {len(reloads)} reloads in the loop bodies"
+  )
   offload_node = offloads[0]
   saved = offload_node.args[0]
   carry = fwd_body.find_nodes(op="placeholder")[0]
   assert saved.target is torch.ops.aten.clone.default and saved.args[0] is carry, (
       f"offloaded {saved.format_node()}, not the carry's clone"
   )
-  assert _ao_targets(bwd_body).count(_RELOAD) == 1, "expected one reload"
+
+  # Reloading the placeholder is legal and pulls the whole stack back on every
+  # iteration -- worse than not offloading.
+  assert reloads[0].args[0].target is torch.ops.aten.index_select.default, (
+      f"the reload is on {reloads[0].args[0].target}, not on the slice"
+  )
 
   # Around the loop rather than inside it means every row lands on device at
   # once, which costs the stack instead of saving it. The epilogue's read of the
@@ -183,31 +181,30 @@ class ScanOffloadDistributedTest(
 ):
   """Trains llama3 with offloading on, and reads the graph it produced."""
 
-  def test_scan_offload(self):
+  def _train(self, memory_policy_args, start_trainer):
     # Upstream replaced seq_len/local_batch_size with a token budget:
     # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
     self._test_train_distributed(
-        config_args=[
-            *_LLAMA3_SCAN,
-            "--compile.memory_policy=full_and_scan_offload",
-        ],
+        config_args=[*_LLAMA3_SCAN, *memory_policy_args],
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,
-        start_trainer=_start_and_expect_offload,  # pyrefly: ignore[bad-argument-type]
+        start_trainer=start_trainer,  # pyrefly: ignore[bad-argument-type]
         enable_compile=True,
     )
 
+  def test_scan_offload(self):
+    self._train(
+        ["--compile.memory_policy=full_and_scan_offload"],
+        _start_and_expect_offload,
+    )
+
   def test_scan_offload_with_attention_saved(self):
-    self._test_train_distributed(
-        config_args=[
-            *_LLAMA3_SCAN,
+    self._train(
+        [
             "--compile.memory_policy=tpu_selective_and_offload",
             "--compile.save_regions=attention.inner_attention",
         ],
-        data_parallel_shard_degree=-1,
-        tensor_parallel_degree=1,
-        start_trainer=_start_and_expect_attention_saved,  # pyrefly: ignore[bad-argument-type]
-        enable_compile=True,
+        _start_and_expect_attention_saved,
     )
 
 

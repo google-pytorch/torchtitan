@@ -447,6 +447,45 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         model.layers.save_last_n_layers, tuple(last_n_layers.items())
     )
 
+  def test_scan_offload_takes_a_saved_region(self) -> None:
+    config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3",
+        "--config=graph_trainer_qwen3_debugmodel",
+        "--compile.use-scan-layers",
+        "--compile.memory_policy=tpu_selective_and_offload",
+        "--compile.save_regions", "attention.inner_attention",
+        "--compile.scan_offload", "layer_input", "attention.inner_attention",
+    ])
+
+    self._qwen3_graph_config(config)
+    self.assertEqual(
+        config.compile.scan_offload,
+        ("layer_input", "attention.inner_attention"),
+    )
+
+  @parameterized.named_parameters(
+      ("unknown_name", True, "tpu_selective_and_offload", ("layer_inputs",),
+       "at most once"),
+      # Only tpu_selective_and_offload saves a region.
+      ("region_not_saved", True, "full_and_scan_offload",
+       ("attention.inner_attention",), "not saved"),
+      ("nothing", True, "tpu_selective_and_offload", (), "at least one"),
+      ("no_scan", False, "tpu_selective_and_offload",
+       ("attention.inner_attention",), "only applies"),
+  )
+  def test_scan_offload_rejects(
+      self, use_scan, policy, names, error
+  ) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = use_scan
+    config.compile.memory_policy = policy
+    if policy == "tpu_selective_and_offload":
+      config.compile.save_regions = ("attention.inner_attention",)
+    config.compile.scan_offload = names
+
+    with self.assertRaisesRegex(ValueError, error):
+      self._qwen3_graph_config(config)
+
   @parameterized.parameters(
       "default", "full", "eager", "sac_and_offload", "full_and_offload"
   )

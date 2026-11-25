@@ -58,6 +58,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 __all__ = [
     "model_registry",
     "qwen3_5_configs",
+    "to_tpu_model_spec",
     "use_tpu_modules",
 ]
 
@@ -129,12 +130,29 @@ def model_registry(
         "Qwen3.5 on TPU supports only attn_backend='sdpa', got "
         f"{attn_backend!r}"
     )
-  model_spec = upstream_qwen3_5.model_registry(
-      flavor,
-      seq_len=seq_len,
-      attn_backend="sdpa",
-      converters=converters,
+  return to_tpu_model_spec(
+      upstream_qwen3_5.model_registry(
+          flavor,
+          seq_len=seq_len,
+          attn_backend="sdpa",
+          converters=converters,
+      )
   )
+
+
+def to_tpu_model_spec(model_spec: ModelSpec) -> ModelSpec:
+  """Returns ``model_spec`` with TPU modules and the TPU parallelization.
+
+  Applies to any upstream spec built on ``Qwen35Model`` (``qwen3_5`` and the
+  version-specific ``qwen3_8`` registry) with ``attn_backend="sdpa"``.
+
+  Args:
+    model_spec: An upstream Qwen3.5-architecture model spec.
+
+  Returns:
+    A text-only spec using ``use_tpu_modules`` and ``parallelize_qwen3_5``,
+    without pipelining.
+  """
   return dataclasses.replace(
       model_spec,
       model=use_tpu_modules(model_spec.model),

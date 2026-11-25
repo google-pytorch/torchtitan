@@ -41,6 +41,7 @@ from torchtitan.experiments.graph_trainer.configs import (
     to_graph_trainer_config,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.experiments.tpu import goodput
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
@@ -222,10 +223,47 @@ class TpuGraphTrainer(GraphTrainer):
         self._ep_drop_stats_L2: torch.Tensor | None = None
         self._ep_drop_stats_enabled = self._configure_ep_drop_stats(config)
 
+        self._wrap_goodput_badput()
+
+    def init_distributed(self):
+        """Records process group and device setup as goodput TPU init.
+
+        Also starts goodput training preparation, which covers model build,
+        parallelization and compilation setup. It ends when checkpoint load
+        starts (load is recorded as checkpoint restore), or at the first train
+        step.
+        """
+        with goodput.maybe_record(goodput.GoodputEvent.TPU_INIT):
+            parallel_dims = super().init_distributed()
+        goodput.start_training_preparation()
+        return parallel_dims
+
+    def batch_generator(self, data_iterable):
+        """Records each blocking batch fetch as goodput data loading."""
+        return goodput.record_data_loading(super().batch_generator(data_iterable))
+
+    def _wrap_goodput_badput(self) -> None:
+        """Records checkpoint save/restore and eval badput.
+
+        Checkpoint saves and restores go to the library's native checkpoint
+        buckets; eval (validation) is custom badput.
+        """
+        if not goodput.enabled():
+            return
+        goodput.wrap_checkpointer(
+            getattr(self, "checkpointer", None), get_step=lambda: self.step
+        )
+        validator = getattr(self, "validator", None)
+        if validator is not None and hasattr(validator, "validate"):
+            validator.validate = goodput.wrap_with_custom_badput(
+                validator.validate, goodput.EVAL_BADPUT
+            )
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
         """Run the in-graph optimizer loop when that execution mode is selected."""
+        goodput.record_step_start(self.step)
         if not self._optimizer_in_graph:
             super().train_step(data_iterator)
         else:

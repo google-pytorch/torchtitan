@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu import goodput
 from torchtitan.experiments.tpu.components.grad_norm import CompiledGradNorm
 import torchtitan.experiments.tpu.profiling.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
@@ -279,6 +280,29 @@ def start_trainer(
         model_spec.model, train_config.training.max_context_length
     )
   is_graph_trainer = isinstance(train_config, TpuGraphTrainer.Config)
+  goodput_config = (
+      getattr(train_config, "goodput", None) or goodput.GoodputConfig()
+  )
+  if is_graph_trainer:
+    goodput.initialize(goodput_config)
+    goodput.record_start(goodput.GoodputEvent.JOB)
+  else:
+    # TODO: b/577216307 - instrument TPUTrainer (and FluxTrainer) too, once the
+    # ml-goodput-measurement upgrade lands; until then only TpuGraphTrainer
+    # has the goodput recording hooks.
+    if (
+        goodput_config.enable_goodput_recording
+        or goodput_config.enable_goodput_monitoring
+    ):
+      logger.warning(
+          "Goodput is only supported with TpuGraphTrainer (graph-trainer"
+          " configs); goodput is disabled."
+      )
+    goodput_config = dataclasses.replace(
+        goodput_config,
+        enable_goodput_recording=False,
+        enable_goodput_monitoring=False,
+    )
   if model_name == "flux":
     # FluxTrainer owns a separate train_step and bypasses the TPU integration.
     if train_config.compile.compile_grad_norm:
@@ -340,6 +364,19 @@ def start_trainer(
 
   try:
     with contextlib.ExitStack() as stack:
+      # Started before the trainer touches the TPU; stopped (with a final
+      # flush) last, after the recorder flush registered just below.
+      stack.enter_context(
+          goodput.maybe_monitor_goodput(
+              config=goodput_config,
+              # Default to a subfolder of TorchTitan's metrics folder:
+              # i.e. <dump_folder>/<save_tb_folder>/goodput.
+              default_tensorboard_dir=os.path.join(
+                  train_config.dump_folder, train_config.metrics.save_tb_folder
+              ),
+          )
+      )
+      stack.callback(goodput.shutdown)
       torchtitan.train._maybe_enable_min_cost_redistribute(  # pylint: disable=protected-access
           stack,
           train_config.parallelism,
@@ -384,6 +421,9 @@ def start_trainer(
         # training.max_context_length.
         with set_unflatten_seq_len(train_config.training.max_context_length):
           trainer.train()
+        # Only a run that finished training ends the goodput job; a crash or
+        # preemption leaves it open so a restart resumes the same job.
+        goodput.record_end(goodput.GoodputEvent.JOB)
   except Exception:
     if trainer:
       trainer.close()
@@ -394,6 +434,8 @@ def start_trainer(
       torch.distributed.barrier()
       torch.distributed.destroy_process_group()
     logger.info("Process group destroyed")
+  finally:
+    goodput.shutdown()
 
 
 if __name__ == "__main__":

@@ -1020,10 +1020,19 @@ class CPQwen35ConfigTest(parameterized.TestCase):
           cfg.model_spec.model, cfg.parallelism
       )
 
-  def test_rejects_expert_parallelism(self):
+  def test_allows_expert_parallelism_with_simple_fsdp(self):
     cfg = self._cp_config(gated_delta_lb=None)
     cfg.parallelism.expert_parallel_degree = 2
-    with self.assertRaisesRegex(NotImplementedError, "expert parallelism"):
+    cfg.parallelism.use_simple_fsdp = True
+    cp_gated_delta.validate_gated_delta_context_parallel(
+        cfg.model_spec.model, cfg.parallelism
+    )
+
+  def test_rejects_expert_parallelism_without_simple_fsdp(self):
+    cfg = self._cp_config(gated_delta_lb=None)
+    cfg.parallelism.expert_parallel_degree = 2
+    cfg.parallelism.use_simple_fsdp = False
+    with self.assertRaisesRegex(NotImplementedError, "SimpleFSDP"):
       cp_gated_delta.validate_gated_delta_context_parallel(
           cfg.model_spec.model, cfg.parallelism
       )

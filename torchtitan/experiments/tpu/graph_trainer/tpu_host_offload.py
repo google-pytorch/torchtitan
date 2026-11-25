@@ -46,7 +46,7 @@ from torchtitan.tools.logging import logger
 
 _SCAN_HOP = torch.ops.higher_order.scan
 # The ``compile.scan_offload`` name of the saved carry.
-LAYER_INPUT = "layer_input"
+SAVED_CARRY = "layer_input"
 
 
 def _scan_body(gm: torch.fx.GraphModule, scan_node: Node) -> torch.fx.GraphModule:
@@ -72,7 +72,7 @@ def _is_saved_carry(body: torch.fx.GraphModule, node: object) -> bool:
 
 
 def _is_named_save(body: torch.fx.GraphModule, node: object, name: str) -> bool:
-    if name == LAYER_INPUT:
+    if name == SAVED_CARRY:
         return _is_saved_carry(body, node)
     # Scan returns a saved op output as is, with the op's region label.
     return (
@@ -222,7 +222,7 @@ def _offload_one(
 
 
 def offload_scan_activations(
-    gm: torch.fx.GraphModule, names: tuple[str, ...] = (LAYER_INPUT,)
+    gm: torch.fx.GraphModule, names: tuple[str, ...] = (SAVED_CARRY,)
 ) -> torch.fx.GraphModule:
     """Move each forward scan's saves named in ``names`` to host, inside the loops.
 
@@ -239,7 +239,7 @@ def offload_scan_activations(
         outs = _outputs(body)
         for name in names:
             saved = [i for i, o in enumerate(outs) if _is_named_save(body, o, name)]
-            if name == LAYER_INPUT and len(saved) > 1:
+            if name == SAVED_CARRY and len(saved) > 1:
                 raise RuntimeError(f"scan offload: {node.name} saves its carry twice")
             for index in saved:
                 _offload_one(gm, node, index, name)
@@ -249,7 +249,7 @@ def offload_scan_activations(
             "scan offload found no forward scan; it needs "
             "--compile.use-scan-layers."
         )
-    if found.get(LAYER_INPUT) == 0:
+    if found.get(SAVED_CARRY) == 0:
         raise RuntimeError(
             f"scan offload: {forward_scans} forward scans, none saves its "
             "carry (is the layer input recomputed instead of saved?)"

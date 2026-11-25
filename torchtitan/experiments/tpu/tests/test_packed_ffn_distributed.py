@@ -106,9 +106,11 @@ def _test_simple_fsdp_checkpoint_roundtrip(
   dcp.load(load_state, checkpoint_id=fused_dir)
   restored.load_state_dict(load_state["model"])
   _assert_states_equal(restored.state_dict(), fused_state)
+  # `named_parameters()`, not attribute access: SimpleFSDP's parametrization
+  # makes `module.w13_packed.weight` the gathered plain tensor.
   torch.testing.assert_close(
-      restored.w13_packed.weight.full_tensor(),
-      packed.w13_packed.weight.full_tensor(),
+      _full_tensor(dict(restored.named_parameters())["w13_packed.weight"]),
+      _full_tensor(parameters["w13_packed.weight"]),
       rtol=0,
       atol=0,
   )

@@ -88,7 +88,9 @@ def _sequence_wise_load_balance_loss(
         cp_mesh=cp_mesh,
         tp_mesh=tp_mesh,
     )
-    num_tokens_B = counts_BE.sum(dim=1) / top_k
+    # Padding is excluded from the counts, so a sequence that is all padding
+    # has no counted tokens. Clamp so it contributes 0 instead of 0 / 0.
+    num_tokens_B = (counts_BE.sum(dim=1) / top_k).clamp(min=1)
 
     p_BE = prob_sums_BE / num_tokens_B.unsqueeze(1)
     f_BE = counts_BE * (num_experts / (top_k * num_tokens_B.unsqueeze(1)))

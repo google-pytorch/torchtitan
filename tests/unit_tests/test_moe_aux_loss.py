@@ -96,6 +96,37 @@ def test_aux_loss_injection_matches_explicit_loss(loss_fn):
     )
 
 
+def test_sequence_wise_aux_loss_ignores_all_padding_sequence():
+    """A sequence with no counted tokens contributes 0, not 0 / 0.
+
+    The router zeroes the scores and the routing map of padding tokens, so an
+    all-padding sequence reaches the loss as all zeros.
+    """
+    L, E, K = 5, 7, 2
+    coeff = 0.125
+    torch.manual_seed(0)
+
+    valid_scores_LE = torch.rand(L, E, dtype=torch.double)
+    scores_BLE = torch.stack([valid_scores_LE, torch.zeros_like(valid_scores_LE)])
+    scores_BLE.requires_grad_(True)
+    valid_map_LE = _routing_map(torch.topk(valid_scores_LE, k=K, dim=-1).indices, E)
+    routing_map_BLE = torch.stack([valid_map_LE, torch.zeros_like(valid_map_LE)])
+
+    loss = _sequence_wise_load_balance_loss(scores_BLE, routing_map_BLE, K, coeff)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(scores_BLE.grad).all()
+    assert scores_BLE.grad[0].abs().sum() > 0
+    torch.testing.assert_close(scores_BLE.grad[1], torch.zeros(L, E).double())
+
+    # The mean is still over both sequences; the padded one adds 0.
+    valid_only = _sequence_wise_load_balance_loss(
+        valid_scores_LE.unsqueeze(0), valid_map_LE.unsqueeze(0), K, coeff
+    )
+    torch.testing.assert_close(loss.detach(), valid_only / 2)
+
+
 def test_batch_wise_aux_loss_matches_qwen_definition():
     scores_BLE = torch.tensor(
         [

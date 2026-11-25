@@ -20,7 +20,9 @@ from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExpertsConverter
+from torchtitan.experiments.tpu.components.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
 from torchtitan.experiments.tpu.qwen3_5 import use_tpu_modules
 import torchtitan.experiments.tpu.qwen3_8 as qwen3_8_tpu
@@ -408,6 +410,43 @@ class Qwen38Test(base_device_test.BaseAcceleratorDeviceTest):
       # Upstream's expert-bias balancer, not a router aux loss.
       self.assertEqual(moe.load_balance_coeff, 1e-3)
       self.assertIsNone(moe.router.aux_loss)
+
+  def test_ep_recipe_pins_ragged_transport(self):
+    """The EP recipe stays on the ragged transport at any EP degree.
+
+    Left unset, the transport becomes upstream's "auto", which picks
+    Ring-of-Experts at EP <= top_k when it can run (TPU). At EP = 2 and the
+    debug model's top_k = 2 that would switch the recipe off the transport its
+    EP parity was measured on.
+    """
+    cfg = ConfigManager().parse_args([
+        "--module",
+        "torchtitan.experiments.tpu.qwen3_8",
+        "--config",
+        "qwen38_moe_debugmodel_ep8",
+        "--parallelism.expert_parallel_degree",
+        "2",
+    ])
+    model_config = cfg.model_spec.model
+    # What `TpuQwen35Model.Config.update_from_config` does with the EP degree.
+    use_expert_parallel(
+        model_config, ep_degree=cfg.parallelism.expert_parallel_degree
+    )
+    dispatchers = [
+        d
+        for _, d, _, _ in model_config.traverse(
+            TpuAllToAllTokenDispatcher.Config
+        )
+    ]
+    self.assertLen(dispatchers, len(list(model_config.traverse(MoE.Config))))
+    x_TD = torch.zeros(4, model_config.dim, device=self.accelerator_device)
+    for dispatcher_config in dispatchers:
+      self.assertLessEqual(2, dispatcher_config.top_k)
+      self.assertEqual(dispatcher_config.ep_transport, "ragged_all_to_all")
+      dispatcher = dispatcher_config.build()
+      # pylint: disable-next=protected-access
+      resolved = dispatcher._resolve_ep_transport(2, x_TD)
+      self.assertEqual(resolved, "ragged_all_to_all")
 
 
 if __name__ == "__main__":

@@ -12,12 +12,15 @@ from torch.distributed.algorithms._checkpoint import checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from torchtitan.components.checkpointer.utils import canonical_fqn
+
 if TYPE_CHECKING:
     from torchtitan.components.optimizer import OptimizersContainer
     from torchtitan.distributed import ParallelDims
 
 
 __all__ = [
+    "merge_into_fused_parameters",
     "ptd_checkpoint_wrapper_with_early_stop",
     "split_optimizers_by_mesh",
     "with_split_optimizers_by_mesh",
@@ -177,3 +180,36 @@ def with_split_optimizers_by_mesh(
         split_optimizers_by_mesh(optimizers)
 
     return post_optimizer_build_and_split_by_mesh
+
+
+# ``load_state_dict`` pre-hooks of the modules that keep several logical
+# parameters in one physical parameter: wq/wk/wv in wqkv, w1/w3 in w13.
+_FUSED_MERGE_HOOKS = ("_merge_qkv_on_load", "_merge_w13_on_load")
+
+
+def merge_into_fused_parameters(
+    model: torch.nn.Module, state_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """Return ``state_dict`` re-keyed to ``model``'s physical parameter names.
+
+    A module that fuses parameters exposes the logical names (``wq``/``wk``/
+    ``wv``, ``w1``/``w3``) in ``state_dict()``, where a save hook builds them
+    from the fused parameter, and merges them back in a ``load_state_dict``
+    pre-hook. Code that copies checkpoint tensors into the model itself,
+    instead of calling ``load_state_dict``, cannot write into the
+    ``state_dict()`` entries: those are not the parameter, so the fused
+    parameter would keep its initial value with no error. Run the same merges
+    here and copy the result into ``named_parameters()`` (keyed by
+    ``canonical_fqn``).
+
+    ``state_dict`` is not modified.
+    """
+    merged = dict(state_dict)
+    for name, module in model.named_modules():
+        prefix = canonical_fqn(name)
+        prefix = f"{prefix}." if prefix else ""
+        for hook in _FUSED_MERGE_HOOKS:
+            merge = getattr(module, hook, None)
+            if merge is not None:
+                merge(module, merged, prefix)
+    return merged

@@ -751,6 +751,7 @@ class GraphSplitTest(absltest.TestCase):
             cpu_offload_prefetch_executables=0,
             donate_internal_buffers=False,
             expert_all_gathers_under_splash=False,
+            async_compile_workers=0,
         ),
         n_layers=3,
     )

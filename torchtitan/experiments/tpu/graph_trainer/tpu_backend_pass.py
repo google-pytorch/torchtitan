@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 from collections import Counter
+import concurrent.futures
 import functools
+import inspect
 import logging
 import operator
 import time
@@ -54,6 +56,27 @@ def _import_static_compiler():
     """Lazy import so this module is safe to import across environments."""
     from torch_tpu._internal.compile.compiler import StaticCompiler  # pytype: disable=import-error # noqa: F401
     return StaticCompiler
+
+
+def set_async_compile_workers(workers: int) -> None:
+    """Size the thread pool that ``StaticCompiler(async_compile=True)`` uses.
+
+    TorchTPU keeps the pool as a class attribute with a fixed width; replace it
+    when the configured width differs. Call before any async compile starts.
+    """
+    StaticCompiler = _import_static_compiler()
+    if "async_compile" not in inspect.signature(StaticCompiler.__init__).parameters:
+        raise RuntimeError(
+            "graph_split.async_compile_workers requires a TorchTPU build whose "
+            "StaticCompiler accepts async_compile"
+        )
+    executor = getattr(StaticCompiler, "_async_compile_executor", None)
+    if getattr(executor, "_max_workers", None) != workers:
+        StaticCompiler._async_compile_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="tpu_async_compile"
+            )
+        )
 
 
 def _optimization_barrier_fake(
@@ -301,12 +324,15 @@ def tpu_backend_compile_pass(
     *,
     is_fwd: bool = True,
     donated_input_positions: tuple[int, ...] = (),
+    async_compile: bool = False,
 ) -> torch.fx.GraphModule:
     """Terminal pass in the TPU graph pipeline: lowers gm into a static XLA binary.
 
     This pass inspects the traced GraphModule (`gm`), logs op and collective statistics
     when debug logging is enabled, filters out non-Tensor slots if necessary, and
-    compiles the graph using `StaticCompiler` (`lazy PJRT/XLA lowering`). The forward
+    compiles the graph using `StaticCompiler`. With ``async_compile`` the compile
+    runs on StaticCompiler's thread pool and the returned executable blocks on
+    it at its first call. The forward
     method of the module is then rebound to execute the compiled XLA executable directly,
     eliminating per-node host dispatch overhead during training steps.
     """
@@ -374,11 +400,12 @@ def tpu_backend_compile_pass(
         # Added in TorchTPU PR #2800. Keep this keyword conditional so the
         # default no-donation path also works with older TorchTPU builds.
         compiler_kwargs["donated_inputs"] = donated_inputs
-    executable = StaticCompiler()(gm, list(example_inputs), **compiler_kwargs)
+    compiler = StaticCompiler(async_compile=True) if async_compile else StaticCompiler()
+    executable = compiler(gm, list(example_inputs), **compiler_kwargs)
     elapsed = time.time() - t0
     logger.info(
-        f"[tpu_backend_pass] StaticCompiler ready in {elapsed:.1f}s "
-        "(PJRT compile finishes lazily on first execute)"
+        f"[tpu_backend_pass] StaticCompiler "
+        f"{'submitted' if async_compile else 'ready'} in {elapsed:.1f}s"
     )
 
     gm._tpu_executable = executable
@@ -465,6 +492,7 @@ def tpu_backend_compile_partitioned_pass(
     *,
     is_fwd: bool = True,
     donate_internal_buffers: bool = False,
+    async_compile: bool = False,
 ) -> torch.fx.GraphModule:
     """Discover child inputs and compile each split GraphModule independently."""
     # TorchTPU is an optional dependency, so importing its private split helper
@@ -497,6 +525,7 @@ def tpu_backend_compile_partitioned_pass(
             donated_input_positions=tuple(
                 submodule.meta.get("tpu_donated_input_positions", ())
             ),
+            async_compile=async_compile,
         )
 
     compiler = _SubmodCompiler(gm, compile_submodule, fake_mode)
@@ -671,6 +700,7 @@ def register() -> None:
 
 
 __all__ = [
+    "set_async_compile_workers",
     "tpu_backend_compile_pass",
     "tpu_backend_compile_partitioned_pass",
     "construct_tpu_transform_passes",

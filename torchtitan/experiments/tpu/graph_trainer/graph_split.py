@@ -67,6 +67,7 @@ from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
   thread_host_offload_donors,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
+    set_async_compile_workers,
     tpu_backend_compile_partitioned_pass,
     tpu_backend_compile_pass,
 )
@@ -297,6 +298,11 @@ class GraphSplitter:
       raise ValueError(
           "cpu_offload_prefetch_executables must be nonnegative"
       )
+    if split_config.async_compile_workers < 0:
+      raise ValueError(
+          "graph_split.async_compile_workers must be >= 0, got "
+          f"{split_config.async_compile_workers}"
+      )
     if split_config.cpu_offload_prefetch_executables and (
         not enabled or split_config.backward_partition_mode == "none"
     ):
@@ -334,6 +340,9 @@ class GraphSplitter:
     if not self.enabled:
       raise RuntimeError("GraphSplitter is disabled")
 
+    async_compile = self.config.async_compile_workers > 0
+    if async_compile:
+      set_async_compile_workers(self.config.async_compile_workers)
     if self.config.expert_all_gathers_under_splash:
       apply_expert_all_gathers_under_splash(traced.gm)
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
@@ -362,12 +371,14 @@ class GraphSplitter:
           forward.module,
           forward_example_inputs,
           donate_internal_buffers=self.config.donate_internal_buffers,
+          async_compile=async_compile,
       )
     else:
       tpu_backend_compile_pass(
           split.forward_graph,
           forward_example_inputs,
           donated_input_positions=donor_input_positions,
+          async_compile=async_compile,
       )
 
     mode = self.config.backward_partition_mode
@@ -389,12 +400,14 @@ class GraphSplitter:
           split.backward_example_inputs,
           is_fwd=False,
           donate_internal_buffers=self.config.donate_internal_buffers,
+          async_compile=async_compile,
       )
     else:
       tpu_backend_compile_pass(
           split.backward_graph,
           split.backward_example_inputs,
           is_fwd=False,
+          async_compile=async_compile,
       )
     return split.module
 

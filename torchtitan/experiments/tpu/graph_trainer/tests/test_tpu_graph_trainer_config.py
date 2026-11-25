@@ -7,6 +7,9 @@
 """Tests for TPU GraphTrainer config conversion."""
 
 import dataclasses
+import importlib
+import inspect
+import pathlib
 import typing
 from types import SimpleNamespace
 from unittest import mock
@@ -16,19 +19,23 @@ from absl.testing import parameterized
 import torch
 from torch import nn
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.config import CompileConfig, apply_overrides
+from torchtitan.config import CompileConfig, TORCH_DTYPE_MAP, apply_overrides
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.jax.jax_job_config import JaxJobConfig
 from torchtitan.experiments.graph_trainer import llama3 as llama3_gt
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+import torchtitan.experiments.tpu as tpu_package
 from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
     apply_tpu_graph_trainer_model_transforms,
 )
 from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
+from torchtitan.experiments.tpu.graph_trainer.passes.reduce_scatter_allreduce import (
+    matching_parameter_patterns,
+)
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_pass_pipeline,
 )
@@ -93,7 +100,6 @@ from torchtitan.experiments.tpu.overrides.real_rope import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
-from torchtitan.experiments.tpu.components.ffn import TpuPackedFeedForward
 from torchtitan.experiments.tpu.components.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.components.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3 import config_registry as qwen3_config_registry
@@ -132,6 +138,57 @@ from torchtitan.models.common.moe import MoE, MoELoadBalanceAuxLoss
 from torchtitan.models.llama3.config_registry import (
     model_registry as llama3_model_registry,
 )
+
+
+def _tpu_graph_recipes():
+  """Yields ``(name, recipe)`` for every TPU GraphTrainer registry recipe.
+
+  Scans every ``config_registry.py`` under ``torchtitan/experiments/tpu`` whose
+  source names ``TpuGraphTrainer``: only its config has the TPU graph compile
+  options, and the other registries are not imported. A recipe is a public
+  function defined in the registry that can be called without arguments, which
+  is how ``ConfigManager`` calls it.
+  """
+  root = pathlib.Path(tpu_package.__file__).parent
+  for path in sorted(root.rglob("config_registry.py")):
+    if "TpuGraphTrainer" not in path.read_text():
+      continue
+    module_name = ".".join(
+        (tpu_package.__name__, *path.relative_to(root).with_suffix("").parts)
+    )
+    module = importlib.import_module(module_name)
+    for name, fn in inspect.getmembers(module, inspect.isfunction):
+      if name.startswith("_") or fn.__module__ != module_name:
+        continue
+      if any(
+          parameter.default is parameter.empty
+          and parameter.kind
+          not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+          for parameter in inspect.signature(fn).parameters.values()
+      ):
+        continue
+      yield f"{module_name}.{name}", fn
+
+
+def _full_world_fsdp_size(config) -> int:
+  """The world size a full-world FSDP recipe's token budgets are written for.
+
+  The all-reduce rewrite requires full-world FSDP, so every device is one
+  data-parallel rank. The recipes that use it set the global token budget to
+  one microbatch per rank, with no gradient accumulation.
+  """
+  training = config.training
+  world_size, remainder = divmod(
+      training.num_tokens_per_train_step,
+      training.num_tokens_per_microbatch_per_dp_rank,
+  )
+  if remainder or world_size < 2:
+    raise ValueError(
+        "Cannot tell the recipe's world size from its token budgets: "
+        f"{training.num_tokens_per_train_step} per step, "
+        f"{training.num_tokens_per_microbatch_per_dp_rank} per rank"
+    )
+  return world_size
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -829,20 +886,93 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ),
     )
     self.assertEqual(config.libtpu_init_flags, base.libtpu_init_flags)
-    graph_config = self._qwen3_graph_config(config)
+    self.assertEqual(_full_world_fsdp_size(config), 512)
+    self._qwen3_graph_config(config)
 
-    # The limit must fit the FP32 gradient of every parameter the pattern
-    # selects, or the all-reduce pass raises at compile time.
-    assert graph_config.model_spec is not None
-    ffns = list(
-        graph_config.model_spec.model.traverse(TpuPackedFeedForward.Config)
+  def _check_allreduce_slice_patterns(self, config) -> None:
+    """Checks a recipe's all-reduce patterns as the pass does at compile time.
+
+    ``apply_selected_reduce_scatter_allreduce_pass`` raises if a pattern
+    selects no parameter gradient, if a selected gradient exceeds the byte
+    limit in the reduction dtype, or if its dimension zero is not sharded over
+    the world. This checks the same three things on the parameters of the model
+    the recipe builds, without a device.
+    """
+    self.assertIsInstance(config, TpuGraphTrainer.Config)
+    patterns = config.compile.fsdp_allreduce_slice_parameter_patterns
+    max_input_bytes = config.compile.fsdp_allreduce_slice_max_input_bytes
+    world_size = _full_world_fsdp_size(config)
+
+    # The model config TpuGraphTrainer builds: its model transforms, then the
+    # recipe's overrides. Modules patched in after the build
+    # (`workarounds.apply_patches`) are not reproduced here.
+    apply_tpu_graph_trainer_model_transforms(config)
+    if config.override.imports:
+      apply_overrides(config.override, config)
+    assert config.model_spec is not None
+    with torch.device("meta"):
+      model = config.model_spec.model.build()
+    # The trainer names each gradient after its trainable parameter.
+    parameters = {
+        name: parameter
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+        if parameter.requires_grad
+    }
+    patterns_by_name = {
+        name: matching_parameter_patterns(name, patterns) for name in parameters
+    }
+    matched = {
+        pattern for matches in patterns_by_name.values() for pattern in matches
+    }
+    self.assertEqual(
+        [pattern for pattern in patterns if pattern not in matched],
+        [],
+        "patterns that select no parameter of the built model",
     )
-    self.assertLen(ffns, 64)
-    for _, ffn, _, _ in ffns:
-      self.assertLessEqual(
-          ffn.w13.out_features * ffn.w13.in_features * 4,
-          config.compile.fsdp_allreduce_slice_max_input_bytes,
-      )
+
+    reduce_dtype = TORCH_DTYPE_MAP[config.training.mixed_precision_reduce]
+    element_size = torch.finfo(reduce_dtype).bits // 8
+    input_bytes = {
+        name: parameters[name].numel() * element_size
+        for name, matches in patterns_by_name.items()
+        if matches
+    }
+    self.assertEqual(
+        {
+            name: size
+            for name, size in input_bytes.items()
+            if size > max_input_bytes
+        },
+        {},
+        f"selected gradients larger than the {max_input_bytes}-byte limit",
+    )
+    self.assertEqual(
+        {
+            name: tuple(parameters[name].shape)
+            for name in input_bytes
+            if parameters[name].shape[0] % world_size
+        },
+        {},
+        f"selected gradients whose dimension zero does not divide {world_size}",
+    )
+
+  def test_allreduce_slice_patterns_select_reducible_parameters(self) -> None:
+    """Every recipe that sets all-reduce patterns passes the pass's checks."""
+    checked = []
+    for name, recipe in _tpu_graph_recipes():
+      with self.subTest(recipe=name):
+        config = recipe()
+        compile_config = getattr(config, "compile", None)
+        if not getattr(
+            compile_config, "fsdp_allreduce_slice_parameter_patterns", ()
+        ):
+          continue
+        checked.append(name)
+        self._check_allreduce_slice_patterns(config)
+    # The scan found the recipes, including the one pinned above.
+    self.assertIn(
+        f"{qwen3_config_registry.__name__}.{qwen3_32b_4x8x8.__name__}", checked
+    )
 
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()

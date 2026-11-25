@@ -377,5 +377,56 @@ class PartitionDonationTest(absltest.TestCase):
 
     self.assertIs(gm._tpu_executable, executable)
 
+  def test_async_compile_uses_async_static_compiler(self):
+    gm = make_fx(lambda x: (x.sin(),))(torch.randn(2, 3))
+    executable = mock.Mock(return_value=(torch.randn(2, 3),))
+
+    class AsyncStaticCompiler:
+      _async_compile_executor = None
+      constructed_with = []
+
+      def __init__(self, *args, async_compile=False, **kwargs):
+        del args, kwargs
+        AsyncStaticCompiler.constructed_with.append(async_compile)
+
+      def __call__(self, gm, inputs, is_fwd=True):
+        del gm, inputs, is_fwd
+        return executable
+
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=AsyncStaticCompiler,
+    ):
+      tpu_backend_pass.set_async_compile_workers(4)
+      try:
+        self.assertEqual(
+            AsyncStaticCompiler._async_compile_executor._max_workers, 4
+        )
+        tpu_backend_pass.tpu_backend_compile_pass(
+            gm, (torch.randn(2, 3),), async_compile=True
+        )
+        tpu_backend_pass.tpu_backend_compile_pass(gm, (torch.randn(2, 3),))
+      finally:
+        AsyncStaticCompiler._async_compile_executor.shutdown()
+
+    self.assertEqual(AsyncStaticCompiler.constructed_with, [True, False])
+    self.assertIs(gm._tpu_executable, executable)
+
+  def test_async_compile_rejects_legacy_static_compiler(self):
+
+    class LegacyStaticCompiler:
+
+      def __call__(self, gm, inputs, is_fwd=True):
+        raise AssertionError("not called")
+
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=LegacyStaticCompiler,
+    ):
+      with self.assertRaisesRegex(RuntimeError, "async_compile"):
+        tpu_backend_pass.set_async_compile_workers(2)
+
 if __name__ == "__main__":
   absltest.main()

@@ -467,6 +467,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         pass_names.index("selective_activation_remat_pass"),
     )
 
+  def test_async_compile_workers_must_be_non_negative(self) -> None:
+    config = qwen3_8b()
+    config.compile.graph_split.async_compile_workers = -1
+
+    with self.assertRaisesRegex(ValueError, "async_compile_workers"):
+      GraphSplitter.from_trainer_config(
+          config,
+          optimizer_in_graph=False,
+      )
+
   def test_cpu_offload_prefetch_requires_backward_split(self) -> None:
     config = qwen3_8b()
     config.compile.graph_split.cpu_offload_prefetch_executables = 1

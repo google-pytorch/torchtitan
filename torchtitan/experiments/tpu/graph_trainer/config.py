@@ -117,6 +117,12 @@ class GraphSplitterConfig:
   # ("rs"). The rest stay with their layer, as in ``by_layer``. ``None``
   # moves both. Rejected with any other mode, and when empty.
   pipeline_kinds: tuple[PipelinedCollective, ...] | None = None
+  # Compile up to this many child executables concurrently on each rank
+  # (StaticCompiler's async compile; each executable waits for its compile at
+  # its first call). 0 compiles them one after another. Each XLA compile
+  # already uses several host cores, so the useful width is about host cores
+  # divided by ranks per host.
+  async_compile_workers: int = 0
 
 
 @dataclass(kw_only=True, slots=True)

@@ -81,7 +81,7 @@ def _config(registry=model_registry):
     so that stacking is the only difference between them: a stock ``Decoder``
     loops over its layers directly and would ignore the stacks entirely.
     """
-    config = registry("debugmodel", attn_backend="sdpa").model
+    config = registry("debugmodel", attn_backend="sdpa")
     for layer in config.layers:
         layer.attention.rope = dataclasses.replace(
             layer.attention.rope, max_context_length=TOKENS
@@ -586,7 +586,7 @@ class TestStackable(unittest.TestCase):
             )
 
     def _moe_model(self, load_balance_coeff: float | None):
-        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa").model
+        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa")
         for layer in config.layers:
             layer.moe.load_balance_coeff = load_balance_coeff
         with torch.device("meta"):
@@ -683,7 +683,7 @@ class TestQwen3(unittest.TestCase):
         )
 
     def _moe_config_with_global_batch_aux_loss(self, coeff):
-        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa").model
+        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa")
         config = dataclasses.replace(config, enable_weight_tying=False)
         for layer in config.layers:
             layer.attention.rope = dataclasses.replace(

@@ -45,7 +45,6 @@ from torchtitan.experiments.graph_trainer.trainer import (
     GraphTrainer,
     GraphTrainingEngine,
 )
-from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
@@ -65,8 +64,9 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     register as register_tpu_pipeline,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
-from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.experiments.tpu.parallelize import install_tpu_parallelize
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
+from torchtitan.protocols.model import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -132,16 +132,22 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
         self._ep_drop_stats_L2: torch.Tensor | None = None
         self._ep_drop_stats_enabled = False
 
+    def _build_model(self) -> BaseModel:
+        model = super()._build_model()
+        # TPU model patches, right before the model parallelizes itself.
+        install_tpu_parallelize(model, self.config)
+        return model
+
     def _initialize_model(
         self,
-        model_spec: ModelSpec,
         *,
         compile_config: Any,
+        hf_assets_path: str,
         create_seed_checkpoint: bool = False,
     ) -> None:
         super()._initialize_model(
-            model_spec,
             compile_config=compile_config,
+            hf_assets_path=hf_assets_path,
             create_seed_checkpoint=create_seed_checkpoint,
         )
         # Only dump weight/buffer statistics when debug logging is explicitly
@@ -150,8 +156,14 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             _dump_weight_stats(self.model_parts)
         self._ep_drop_stats_enabled = self._configure_ep_drop_stats()
 
-    def _initialize_optimizer(self, model_spec: ModelSpec) -> None:
-        super()._initialize_optimizer(model_spec)
+    def _register_optimizer_hooks(self) -> None:
+        super()._register_optimizer_hooks()
+        # Under EP, split optimizer param groups by device mesh, before the
+        # engine builds the LR schedulers and the checkpointer.
+        split_optimizers_by_mesh(self.optimizers)
+
+    def _initialize_optimizer(self) -> None:
+        super()._initialize_optimizer()
         if self._optimizer_in_graph:
             for opt in self.optimizers.optimizers:
                 for group in opt.param_groups:
@@ -406,11 +418,12 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
                 if self._ep_drop_stats_enabled:
                     fwd_bwd_fn = _with_ep_drop_stat_outputs(fwd_bwd_fn, model)
                 maybe_register_blockmask_pytree_node()
-                trace_context = dist_utils.get_spmd_context(
+                # Unlike upstream's GraphTrainingEngine, tracing honors
+                # `debug.spmd_typechecking`, like the traced run below.
+                with dist_utils.get_spmd_context(
                     parallel_dims=self.parallel_dims,
-                    spmd_typechecking=False,
-                )
-                with self.train_context(), trace_context():
+                    spmd_typechecking=self.config.debug.spmd_typechecking,
+                ):
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
@@ -449,7 +462,10 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
                 self._traced_step.gm = self._graph_splitter.split_and_compile(
                     self._traced_step
                 )
-        with self.train_context():
+        with dist_utils.get_spmd_context(
+            parallel_dims=self.parallel_dims,
+            spmd_typechecking=self.config.debug.spmd_typechecking,
+        ):
             outputs = run_traced(self._traced_step, module=model)(
                 inputs,
                 labels,
@@ -533,11 +549,10 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
             if self._ep_drop_stats_enabled:
                 fwd_bwd_adamw = _with_ep_drop_stat_outputs(fwd_bwd_adamw, model)
 
-            trace_context = dist_utils.get_spmd_context(
+            with dist_utils.get_spmd_context(
                 parallel_dims=self.parallel_dims,
-                spmd_typechecking=False,
-            )
-            with self.train_context(), trace_context():
+                spmd_typechecking=self.config.debug.spmd_typechecking,
+            ):
                 self._traced_step = minimal_fx_tracer(
                     fwd_bwd_adamw,
                     module=model,
@@ -558,7 +573,10 @@ class TpuGraphTrainingEngine(GraphTrainingEngine):
                 compile_config=self.config.compile,
             )
 
-        with self.train_context():
+        with dist_utils.get_spmd_context(
+            parallel_dims=self.parallel_dims,
+            spmd_typechecking=self.config.debug.spmd_typechecking,
+        ):
             outputs = run_traced(self._traced_step, module=model)(
                 inputs,
                 labels,
@@ -706,19 +724,25 @@ class TpuGraphTrainer(GraphTrainer):
         def from_tpu_trainer_config(
             cls,
             base_config: TPUTrainerConfig,
-            model_registry: Callable[[str], ModelSpec],
+            model_source: type[BaseModel.Config] | Callable[[str], BaseModel.Config],
         ) -> TpuGraphTrainer.Config:
             """Convert a TPU recipe to the final GraphTrainer config type.
 
             The upstream converter copies shared job fields, replaces the model
-            spec, and deliberately drops the regular Trainer compile config so
+            config, and deliberately drops the regular Trainer compile config so
             this class supplies its GraphTrainer-specific default.
             """
+            if isinstance(model_source, type):
+                model_config_cls = model_source
+            elif hasattr(model_source, "_model_config_cls"):
+                model_config_cls = getattr(model_source, "_model_config_cls")
+            else:
+                model_config_cls = type(model_source("debugmodel"))
             config = cast(
                 TpuGraphTrainer.Config,
                 to_graph_trainer_config(
                     base_config,
-                    model_registry,
+                    model_config_cls,
                     target_cls=cls,
                 ),
             )
@@ -737,31 +761,14 @@ class TpuGraphTrainer(GraphTrainer):
                 "CrossEntropyLoss or PallasCrossEntropyLoss"
             )
         apply_tpu_graph_trainer_model_transforms(config)
-        assert config.model_spec is not None
-        parallelize_fn = config.model_spec.parallelize_fn
-        assert parallelize_fn is not None
-
-        def tpu_graph_parallelize(model, *args, **kwargs):
-            workarounds.apply_patches(model, config)
-            kwargs.pop("tpu_compile_mode", None)
-            return parallelize_fn(model, *args, **kwargs)
-
-        # Under EP, split optimizer param groups by device mesh; the engine
-        # runs this hook before it builds the LR schedulers.
-        config.model_spec = dataclasses.replace(
-            config.model_spec,
-            parallelize_fn=tpu_graph_parallelize,
-            post_optimizer_build_fn=with_split_optimizers_by_mesh(
-                config.model_spec.post_optimizer_build_fn
-            ),
-        )
+        assert config.model is not None
 
         # The engine builds `loss_fn` from `config.loss`; fill
         # `global_vocab_size` (spmd_types loss-parallel CE under TP) from the
         # final model config first, as TPUTrainer.__init__ does.
         from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
 
-        set_global_vocab_size(config.loss, config.model_spec.model)
+        set_global_vocab_size(config.loss, config.model)
 
         super().__init__(config)
 

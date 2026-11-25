@@ -299,7 +299,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
     self.training.disable_cuda_graphs = True
     if (
-        self.model_spec is not None
+        self.model is not None
         and self.parallelism.context_parallel_degree > 1
     ):
       # CP recipes apply core ContextParallelTransform with a TPU CP inner
@@ -307,7 +307,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
       # Runs before ``super()`` so the strategy-specific sequence-length error
       # surfaces instead of upstream's generic ring-CP (``2 * cp``) token check.
       validate_tpu_context_parallel(
-          self.model_spec.model,
+          self.model,
           self.parallelism,
           training=self.training,
           splash_attention_kernel=self.splash_attention_kernel,
@@ -323,7 +323,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # here: the model vocab can still change after construction
     # (``train_minimal`` widens it to the tokenizer's).
     if (
-        self.model_spec is not None
+        self.model is not None
         and self.parallelism.context_parallel_degree > 1
     ):
       # The Pallas fused loss tiles each rank's tokens by b_block_size, and a
@@ -358,7 +358,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     ``TPUTrainerConfig`` onto ``JaxJobConfig`` / ``TorchaxJobConfig``. Fields
     that exist only on the source (e.g. ``tpu_config``) are silently dropped;
     fields that exist only on the destination (``jax_config`` etc.) get their
-    default unless supplied via ``overrides``. The model_spec.flavor and most
+    default unless supplied via ``overrides``. The model config and most
     other state flow through unchanged — call sites typically only need to
     mutate the lane-specific bits after construction.
     """

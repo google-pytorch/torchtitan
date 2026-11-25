@@ -121,7 +121,11 @@ def _traced_trainer(model: nn.Module, batch_size: int, device):
   trainer._traced_step = make_fx_tracer.minimal_fx_tracer(
       fwd_bwd, module=model
   )(inputs, labels, torch.tensor(1.0, device=device), {})
-  trainer.train_context = contextlib.nullcontext
+  # The traced run enters `get_spmd_context`; no mesh, no typechecking here.
+  trainer.parallel_dims = None
+  trainer.config = SimpleNamespace(
+      debug=SimpleNamespace(spmd_typechecking=False)
+  )
   trainer._collect_moe_routing_metrics = False
   trainer._ep_drop_stats_enabled = False
   return trainer
@@ -224,9 +228,9 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         tpu_graph_trainer.TpuGraphTrainer.Config,
         "from_tpu_trainer_config must produce TpuGraphTrainer.Config.",
     )
-    assert self.config.model_spec is not None
-    assert gt_cfg.model_spec is not None
-    self.assertEqual(gt_cfg.model_spec.name, self.config.model_spec.name)
+    assert self.config.model is not None
+    assert gt_cfg.model is not None
+    self.assertEqual(gt_cfg.model.dim, self.config.model.dim)
 
   def test_pallas_ce_loss_override(self) -> None:
     """Verifies build_cross_entropy_loss returns PallasCrossEntropyLoss when use_loss_kernel=True."""

@@ -188,9 +188,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     """GraphTrainer FLOPs/token at sequence length 2048."""
     graph_config = self._qwen3_graph_config(config)
     with torch.device("meta"):
-      model = graph_config.model_spec.model.build()
+      model = graph_config.model.build()
     self.assertIsInstance(model, GraphTrainerQwen3Model)
-    return graph_config.model_spec.model.get_nparams_and_flops(
+    return graph_config.model.get_nparams_and_flops(
         model, seq_len=2048
     )[1]
 
@@ -215,10 +215,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     """The scan rewrite keeps the MaxText class picked before it."""
     graph_config = self._qwen3_graph_config(qwen3_moe_235b_scan_maxtext())
     self.assertIsInstance(
-        graph_config.model_spec.model,
+        graph_config.model,
         MaxTextTpuGraphTrainerQwen3Model.Config,
     )
-    self.assertTrue(builds_layer_loop(graph_config.model_spec.model))
+    self.assertTrue(builds_layer_loop(graph_config.model))
 
   @parameterized.named_parameters(
       ("torchtitan_flops", qwen3_moe_235b_scan_proxy),
@@ -231,8 +231,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     parameter count would then miss the top-k discount and count every expert.
     """
     config = recipe()
-    unstacked = config.model_spec.model
-    scanned = self._qwen3_graph_config(config).model_spec.model
+    unstacked = config.model
+    scanned = self._qwen3_graph_config(config).model
     self.assertTrue(builds_layer_loop(scanned))
     with torch.device("meta"):
       unstacked_model, scanned_model = unstacked.build(), scanned.build()
@@ -254,15 +254,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config.compile.use_scan_layers = scanned
     graph_config = self._qwen3_graph_config(config)
 
-    plain = qwen3_8b().model_spec.model
+    plain = qwen3_8b().model
     with torch.device("meta"):
-      model = graph_config.model_spec.model.build()
+      model = graph_config.model.build()
       plain_model = plain.build()
 
     self.assertEqual(runs_layer_loop(model), scanned)
     # The MaxText FLOP accounting the registry installed must survive it.
     self.assertEqual(
-        graph_config.model_spec.model.get_nparams_and_flops(model, seq_len=2048),
+        graph_config.model.get_nparams_and_flops(model, seq_len=2048),
         plain.get_nparams_and_flops(plain_model, seq_len=2048),
     )
 
@@ -283,7 +283,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config.parallelism.expert_parallel_degree = 1
 
     with torch.device("meta"):
-      self._qwen3_graph_config(config).model_spec.model.build()
+      self._qwen3_graph_config(config).model.build()
 
   def test_scanning_refuses_expert_parallelism(self) -> None:
     config = qwen3_8b()
@@ -322,7 +322,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
   def test_sibling_lane_derivation_restores_generic_compile_type(self) -> None:
     source = TPUTrainerConfig(
-        model_spec=llama3_model_registry("debugmodel", attn_backend="sdpa"),
+        model=llama3_model_registry("debugmodel", attn_backend="sdpa"),
         compile=TpuTrainerCompileConfig(
             enable=True,
             components=["model"],
@@ -362,7 +362,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       self, compile_config
   ) -> None:
     config = TpuGraphTrainer.Config(
-        model_spec=tpu_qwen3_graph_registry("debugmodel"),
+        model=tpu_qwen3_graph_registry("debugmodel"),
         compile=compile_config,
     )
 
@@ -817,8 +817,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     graph_config = self._qwen3_graph_config(config)
     apply_overrides(graph_config.override, graph_config)
-    assert graph_config.model_spec is not None
-    ropes = [layer.attention.rope for layer in graph_config.model_spec.model.layers]
+    assert graph_config.model is not None
+    ropes = [layer.attention.rope for layer in graph_config.model.layers]
     self.assertTrue(ropes)
     self.assertTrue(
         all(
@@ -837,12 +837,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = recipe()
     zero3 = qwen3_8b_zero3()
 
-    assert config.model_spec is not None
-    self.assertEqual(config.model_spec.flavor, "32B")
-    self.assertFalse(config.model_spec.model.enable_weight_tying)
-    self.assertLen(config.model_spec.model.layers, 64)
+    assert config.model is not None
+    self.assertFalse(config.model.enable_weight_tying)
+    self.assertLen(config.model.layers, 64)
     self.assertLen(
-        list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config)), 64
+        list(config.model.traverse(TpuPackedQKVLinear.Config)), 64
     )
     self.assertEqual(config.training.max_context_length, 4096)
     self.assertEqual(
@@ -875,11 +874,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.libtpu_init_flags["xla_tpu_dvfs_p_state"], "7")
 
     graph_config = self._qwen3_graph_config(config)
-    assert graph_config.model_spec is not None
-    self.assertFalse(graph_config.model_spec.model.enable_weight_tying)
+    assert graph_config.model is not None
+    self.assertFalse(graph_config.model.enable_weight_tying)
     self.assertLen(
         list(
-            graph_config.model_spec.model.traverse(TpuPackedQKVLinear.Config)
+            graph_config.model.traverse(TpuPackedQKVLinear.Config)
         ),
         64,
     )
@@ -934,9 +933,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.splash_attention_kernel.sa_block_q_dkv, 2048)
     self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv, 2048)
     self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv_compute, 1024)
-    assert config.model_spec is not None
+    assert config.model is not None
     dispatchers = list(
-        config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+        config.model.traverse(TpuAllToAllTokenDispatcher.Config)
     )
     self.assertTrue(dispatchers)
     self.assertTrue(
@@ -945,7 +944,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for _, dispatcher, _, _ in dispatchers
         )
     )
-    routed = list(config.model_spec.model.traverse(TpuRoutedExperts.Config))
+    routed = list(config.model.traverse(TpuRoutedExperts.Config))
     self.assertTrue(routed)
     self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
 
@@ -1037,17 +1036,17 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ".tpu_activation_dtype_cossin_rope",
         graph_config.override.imports,
     )
-    assert graph_config.model_spec is not None
+    assert graph_config.model is not None
     routed = list(
-        graph_config.model_spec.model.traverse(TpuRoutedExperts.Config)
+        graph_config.model.traverse(TpuRoutedExperts.Config)
     )
     self.assertTrue(routed)
     self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
 
     apply_overrides(graph_config.override, graph_config)
-    assert graph_config.model_spec is not None
+    assert graph_config.model is not None
     rope_configs = [
-        layer.attention.rope for layer in graph_config.model_spec.model.layers
+        layer.attention.rope for layer in graph_config.model.layers
     ]
     self.assertTrue(rope_configs)
     self.assertTrue(
@@ -1060,11 +1059,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_235b_recipe_stays_stackable_under_scan(self) -> None:
     config = qwen3_moe_235b_scan()
 
-    assert config.model_spec is not None
-    self.assertEqual(config.model_spec.flavor, "235B-A22B")
+    assert config.model is not None
+    self.assertLen(config.model.layers, 94)
     # Bias-based load balancing (#22) and the routing metrics (#28) both keep
     # per-layer state a scan body cannot hold.
-    moes = list(config.model_spec.model.traverse(MoE.Config))
+    moes = list(config.model.traverse(MoE.Config))
     self.assertLen(moes, 94)
     self.assertTrue(all(moe.load_balance_coeff is None for _, moe, _, _ in moes))
     self.assertTrue(
@@ -1077,15 +1076,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertTrue(
         all(
             isinstance(moe, TpuDiscardedTokenCounterMoE.Config)
-            for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config)
+            for _, moe, _, _ in config.model.traverse(MoE.Config)
         )
     )
 
   def test_235b_splitter_uses_global_aux_loss(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
 
-    assert config.model_spec is not None
-    moes = list(config.model_spec.model.traverse(MoE.Config))
+    assert config.model is not None
+    moes = list(config.model.traverse(MoE.Config))
     self.assertLen(moes, 94)
     for _, moe, _, _ in moes:
       self.assertIsNone(moe.load_balance_coeff)
@@ -1101,10 +1100,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     # the fork's global-batch loss, not upstream's microbatch-wise one.
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
-    assert config.model_spec is not None
-    self.assertEqual(config.model_spec.flavor, "30B-A3B-global-aux")
+    assert config.model is not None
     self.assertTrue(config.metrics.enable_moe_routing)
-    moes = list(config.model_spec.model.traverse(MoE.Config))
+    moes = list(config.model.traverse(MoE.Config))
     self.assertLen(moes, 48)
     for _, moe, _, _ in moes:
       self.assertIsNone(moe.load_balance_coeff)
@@ -1166,25 +1164,22 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   )
   def test_235b_recipes_keep_graph_trainer_model_spec(self, recipe) -> None:
     config = recipe()
-    assert config.model_spec is not None
+    assert config.model is not None
     self.assertIsInstance(
-        config.model_spec.model, GraphTrainerQwen3Model.Config
-    )
-    self.assertIs(
-        config.model_spec.parallelize_fn, tpu_graph_parallelize_qwen3
+        config.model, GraphTrainerQwen3Model.Config
     )
 
   def test_235b_scan_recipe_packs_qkv(self) -> None:
     config = qwen3_moe_235b_scan()
 
-    assert config.model_spec is not None
+    assert config.model is not None
     self.assertLen(
-        list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config)), 94
+        list(config.model.traverse(TpuPackedQKVLinear.Config)), 94
     )
     # The scanned graph-trainer model keeps the packed projection.
     graph_config = self._qwen3_graph_config(config)
     self.assertLen(
-        list(graph_config.model_spec.model.traverse(TpuPackedQKVLinear.Config)),
+        list(graph_config.model.traverse(TpuPackedQKVLinear.Config)),
         94,
     )
 
@@ -1193,8 +1188,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     # so the recipe multiplies them after the experts instead.
     config = qwen3_moe_235b_scan_fp8()
 
-    assert config.model_spec is not None
-    model = config.model_spec.model
+    assert config.model is not None
+    model = config.model
     experts = list(model.traverse(TpuGroupedExperts.Config))
     self.assertLen(experts, 94)
     self.assertTrue(all(e.use_fp8_grouped_mm for _, e, _, _ in experts))
@@ -1261,8 +1256,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:
     proxy = qwen3_moe_235b_scan_proxy()
 
-    assert proxy.model_spec is not None
-    self.assertLen(proxy.model_spec.model.layers, 12)
+    assert proxy.model is not None
+    self.assertLen(proxy.model.layers, 12)
     # The 32x global-to-local ratio, now in token counts: both sides scale by
     # the same max_context_length, so the ratio carries over unchanged.
     self.assertEqual(
@@ -1283,17 +1278,17 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             ".tpu_activation_dtype_cossin_rope"
         },
     )
-    assert base.model_spec is not None and maxtext.model_spec is not None
+    assert base.model is not None and maxtext.model is not None
     # Scaling routes before W2 is not a numerics knob: both scan recipes and
     # the splitter use it.
     splitter = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
     for config in (base, maxtext, splitter):
-      assert config.model_spec is not None
-      routed = list(config.model_spec.model.traverse(TpuRoutedExperts.Config))
+      assert config.model is not None
+      routed = list(config.model.traverse(TpuRoutedExperts.Config))
       self.assertLen(routed, 94)
       self.assertTrue(all(r.scale_before_down_proj for _, r, _, _ in routed))
     # Everything the base recipe works around is inherited, not re-derived.
-    self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
+    self.assertEqual(len(maxtext.model.layers), len(base.model.layers))
     self.assertEqual(
         maxtext.training.num_tokens_per_microbatch_per_dp_rank
         // maxtext.training.max_context_length,
@@ -1506,9 +1501,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)
-    assert graph_config.model_spec is not None
+    assert graph_config.model is not None
     with torch.device("meta"):
-      model = graph_config.model_spec.model.build()
+      model = graph_config.model.build()
     ropes = [m for m in model.modules() if isinstance(m, ComplexRoPE)]
     self.assertNotEmpty(ropes)
     for rope in ropes:
@@ -1542,12 +1537,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)
-    assert graph_config.model_spec is not None
-    lm_head_config = graph_config.model_spec.model.lm_head
+    assert graph_config.model is not None
+    lm_head_config = graph_config.model.lm_head
     self.assertIsInstance(lm_head_config, FusedLossLinearWrapper.Config)
 
     with torch.device("meta"):
-      model = graph_config.model_spec.model.build()
+      model = graph_config.model.build()
     self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
     self.assertEqual(
         [name for name in model.state_dict() if name.endswith("lm_head.weight")],
@@ -1695,18 +1690,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       apply_tpu_graph_trainer_model_transforms(graph_config)
 
   def test_scan_transform_configures_simple_fsdp_shard_dims(self) -> None:
+    from unittest import mock
+
     config = llama3_8b_scan()
     config.parallelism.data_parallel_shard_degree = 512
     called_with: list[nn.Module] = []
-    config.model_spec = dataclasses.replace(
-        config.model_spec,
-        parallelize_fn=lambda model, **kwargs: (
-            called_with.append(model) or model
-        ),
-    )
 
     apply_tpu_graph_trainer_model_transforms(config)
-    wrapped_fn = config.model_spec.parallelize_fn
+    scanned_cls = config.model._owner
+    base_cls = scanned_cls.__bases__[0]
 
     class DummyHolder(nn.Module):
       def __init__(self):
@@ -1733,7 +1725,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     m = DummyModel()
     pdims = SimpleNamespace(dp_shard=512, cp=1)
-    out = wrapped_fn(m, parallel_dims=pdims)
+    with mock.patch.object(
+        base_cls,
+        "parallelize",
+        side_effect=lambda model, **kwargs: (called_with.append(model) or model),
+    ):
+      out = scanned_cls.parallelize(m, parallel_dims=pdims)
     self.assertIs(out, m)
     self.assertEqual(called_with, [m])
     self.assertEqual(getattr(m.tok_embeddings, "_fsdp_shard_dim", None), 1)
@@ -1747,32 +1744,15 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   """Config-level checks for the Gemma 4 GraphTrainer wrapper."""
 
   @parameterized.parameters(
-      gemma4_debugmodel,
-      gemma4_moe_debug,
-      gemma4_moe_testmodel,
-      graph_trainer_gemma4_debugmodel,
-      graph_trainer_gemma4_moe_debug,
-      gemma4_31b,
-      gemma4_31b_graph_trainer,
-      gemma4_31b_graph_split,
-      gemma4_31b_graph_split_offload,
-      gemma4_26b_a4b,
-      gemma4_26b_a4b_graph_trainer,
-      gemma4_26b_a4b_graph_split,
-      gemma4_26b_a4b_graph_split_offload,
+      "debugmodel",
+      "debugmodel_moe",
+      "testmodel_moe",
+      "31B",
+      "26B-A4B",
   )
-  def test_recipe_flavor_resolves_through_the_graph_trainer(self, recipe):
-    # The graph trainer discards the recipe's ModelSpec and re-resolves the
-    # flavor string against the wrapper's registry; a flavor the wrapper does
-    # not know dies there on a KeyError, after every other test passes.
-    config = recipe()
-    assert config.model_spec is not None
-
-    spec = tpu_gemma4_graph_registry(config.model_spec.flavor)
-
-    self.assertIs(type(spec.model), Gemma4Model.Config)
-    self.assertIs(spec.parallelize_fn, graph_trainer_parallelize_gemma4)
-    self.assertIsNone(spec.pipelining_fn)
+  def test_recipe_flavor_resolves_through_the_graph_trainer(self, flavor):
+    model_cfg = tpu_gemma4_graph_registry(flavor)
+    self.assertIsInstance(model_cfg, Gemma4Model.Config)
 
   @parameterized.parameters(gemma4_debugmodel, gemma4_moe_debug)
   def test_graph_config_keeps_the_recipe_model(self, recipe) -> None:
@@ -1783,29 +1763,25 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     accounting the MFU benchmark reads.
     """
     config = recipe()
-    assert config.model_spec is not None
-    recipe_model_config = config.model_spec.model
+    assert config.model is not None
+    recipe_model_config = config.model
 
     graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
         config, tpu_gemma4_graph_registry
     )
 
-    assert graph_config.model_spec is not None
-    graph_model_config = graph_config.model_spec.model
-    self.assertIs(type(graph_model_config), Gemma4Model.Config)
+    assert graph_config.model is not None
+    graph_model_config = graph_config.model
+    self.assertIsInstance(graph_model_config, Gemma4Model.Config)
     self.assertFalse(graph_model_config.enable_weight_tying)
-    self.assertEqual(
-        graph_config.model_spec.parallelize_fn, graph_trainer_parallelize_gemma4
-    )
-    self.assertIsNone(graph_config.model_spec.pipelining_fn)
-    # Checkpoint adapter and the MoE load-balancing hook come from the recipe.
+    # Checkpoint adapter and the MoE load-balancing hook come from the model class.
     self.assertIs(
-        graph_config.model_spec.state_dict_adapter,
-        config.model_spec.state_dict_adapter,
+        graph_model_config._owner.state_dict_adapter_cls,
+        recipe_model_config._owner.state_dict_adapter_cls,
     )
     self.assertIs(
-        graph_config.model_spec.post_optimizer_build_fn,
-        config.model_spec.post_optimizer_build_fn,
+        graph_model_config._owner._register_optimizer_hooks.__func__,
+        recipe_model_config._owner._register_optimizer_hooks.__func__,
     )
     for field in dataclasses.fields(recipe_model_config):
       self.assertIs(
@@ -1831,9 +1807,9 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   )
   def test_parallelize_rejects_unsupported_parallelism(self, enabled) -> None:
     graph_config = graph_trainer_gemma4_debugmodel()
-    assert graph_config.model_spec is not None
+    assert graph_config.model is not None
     with torch.device("meta"):
-      model = graph_config.model_spec.model.build()
+      model = graph_config.model.build()
     flags = dict(
         tp_enabled=False, cp_enabled=False, pp_enabled=False, ep_enabled=False
     )
@@ -1855,7 +1831,7 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     """SimpleFSDP's read-only ``weight`` cannot be re-tied by ``init_states``."""
     tied = tpu_gemma4.model_registry("testmodel", enable_weight_tying=True)
     with torch.device("meta"):
-      model = tied.model.build()
+      model = tied.build()
     parallel_dims = SimpleNamespace(
         tp_enabled=False,
         cp_enabled=False,
@@ -1887,14 +1863,14 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     graph_config.compile.use_scan_layers = True
     apply_tpu_graph_trainer_model_transforms(graph_config)
 
-    assert graph_config.model_spec is not None
+    assert graph_config.model is not None
     with (
         torch.device("meta"),
         self.assertRaisesRegex(
             ValueError, "layer 5 does not match layer 0, so their weights cannot"
         ),
     ):
-      graph_config.model_spec.model.build()
+      graph_config.model.build()
 
   @parameterized.parameters(
       (graph_trainer_gemma4_debugmodel, 6, 1),
@@ -1913,10 +1889,10 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
   ) -> None:
     """Production and GraphTrainer Gemma 4 recipes convert all layers (sliding and global K=V) to TpuPackedQKVLinear."""
     config = recipe()
-    assert config.model_spec is not None
+    assert config.model is not None
     packed_cfgs = [
         cfg
-        for _, cfg, _, _ in config.model_spec.model.traverse(
+        for _, cfg, _, _ in config.model.traverse(
             TpuPackedQKVLinear.Config
         )
     ]
@@ -2063,7 +2039,7 @@ class TpuGraphTrainerGemma4ConfigTest(parameterized.TestCase):
     self.assertTrue(splitter.enabled)
     self.assertEqual(
         splitter.n_layers,
-        len(config.model_spec.model.layers),
+        len(config.model.layers),
     )
     self.assertEqual(
         splitter.config.cpu_offload_prefetch_executables, 1 if offload else 0

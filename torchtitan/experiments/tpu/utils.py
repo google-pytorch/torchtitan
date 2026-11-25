@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -20,7 +19,6 @@ if TYPE_CHECKING:
 __all__ = [
     "ptd_checkpoint_wrapper_with_early_stop",
     "split_optimizers_by_mesh",
-    "with_split_optimizers_by_mesh",
 ]
 
 
@@ -147,33 +145,3 @@ def split_optimizers_by_mesh(
         for group in new_groups:
             optimizer.add_param_group(group)
     return bool(regrouped)
-
-
-def with_split_optimizers_by_mesh(
-    post_optimizer_build_fn: Callable[..., None] | None,
-) -> Callable[..., None]:
-    """Chains ``split_optimizers_by_mesh`` after ``post_optimizer_build_fn``.
-
-    Both TPU trainers install the result as the model spec's
-    ``post_optimizer_build_fn``. The upstream ``Trainer`` calls that hook right
-    after it builds the optimizers and before it builds the LR schedulers and
-    the checkpointer, so both see the split param groups.
-
-    Args:
-        post_optimizer_build_fn: The model's own hook, or ``None``.
-
-    Returns:
-        A hook that calls ``post_optimizer_build_fn`` (if set) and then
-        ``split_optimizers_by_mesh``.
-    """
-
-    def post_optimizer_build_and_split_by_mesh(
-        optimizers: "OptimizersContainer",
-        model_parts: list[torch.nn.Module],
-        parallel_dims: "ParallelDims",
-    ) -> None:
-        if post_optimizer_build_fn is not None:
-            post_optimizer_build_fn(optimizers, model_parts, parallel_dims)
-        split_optimizers_by_mesh(optimizers)
-
-    return post_optimizer_build_and_split_by_mesh

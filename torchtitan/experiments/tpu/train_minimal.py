@@ -160,8 +160,7 @@ class TrainerMinimal:
       #     distinct_seed_mesh_dims=["pp"],
       # )
 
-    assert job_config.model_spec is not None
-    self.model_spec = job_config.model_spec
+    assert job_config.model is not None
 
     self.tokenizer = typing.cast(
         torchtitan.components.tokenizer.HuggingFaceTokenizer,
@@ -182,7 +181,7 @@ class TrainerMinimal:
             job_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
 
-    model_config = self.model_spec.model
+    model_config = job_config.model
     # MoELoadBalanceAuxLoss needs sample-counted batch sizes, and
     # Qwen3Model.update_from_config raises without them. Same formula as
     # Trainer, with the batch mesh's degree as the data-parallel degree.
@@ -220,7 +219,7 @@ class TrainerMinimal:
       self.model_config.vocab_size = self.tokenizer.vocab_size  # pyrefly: ignore[missing-attribute]
 
     logger.info(
-        f"Building {self.model_spec.name} {self.model_spec.flavor}"
+        f"Building {type(self.model_config).__qualname__}"
         f" with {self.model_config}"
     )
 
@@ -240,7 +239,7 @@ class TrainerMinimal:
     )
 
     logger.info(
-        f"Model {self.model_spec.name} {self.model_spec.flavor} "
+        f"Model {type(model).__name__} "
         f"size: {model_param_count:,} total parameters"
     )
 
@@ -256,7 +255,13 @@ class TrainerMinimal:
     workarounds.raise_dynamo_recompile_limits(model_config)
 
     if self.world_size > 1:
-      self.model_spec.parallelize_fn(
+      from torchtitan.experiments.tpu.parallelize import tpu_parallelize_fn  # pylint: disable=g-import-not-at-top
+
+      # The TPU wrapper of the model's family, as the regular TPUTrainer
+      # uses; other models parallelize themselves. All of them parallelize the
+      # model in place.
+      parallelize = tpu_parallelize_fn(model) or type(model).parallelize
+      parallelize(
           model,
           parallel_dims=self.parallel_dims,
           training=job_config.training,
@@ -267,8 +272,7 @@ class TrainerMinimal:
       )
 
     logger.info(
-        f"Moving model {self.model_spec.name}"
-        f" {self.model_spec.flavor} to device {self.device}"
+        f"Moving model {type(model).__name__} to device {self.device}"
     )
     self.model = model.to_empty(device=self.device)
     with torch.no_grad():
@@ -290,7 +294,7 @@ class TrainerMinimal:
     # get_spmd_context sets the process-wide SPMD mesh the spmd_types
     # collectives read, so components such as ChunkedLossWrapper support loss
     # parallelism without the training loop handling it explicitly.
-    self.train_context = dist_utils.get_spmd_context(
+    self.train_context = lambda: dist_utils.get_spmd_context(
         parallel_dims=self.parallel_dims,
     )
     self.step_callback = step_callback

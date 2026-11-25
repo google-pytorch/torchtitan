@@ -33,9 +33,11 @@ import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
-from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
+from torchtitan.distributed import utils as dist_utils
+from torchtitan.experiments.tpu.parallelize import install_tpu_parallelize
+from torchtitan.experiments.tpu.utils import split_optimizers_by_mesh
 from torchtitan.observability.logging import init_logger
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.protocols.model import BaseModel
 import torchtitan.train
 import torchtitan.trainer
 from torchtitan.training_engine import TrainingEngine
@@ -95,16 +97,27 @@ class TpuTrainingEngine(TrainingEngine):
           and not self.parallel_dims.pp_enabled
       )
 
+  def _build_model(self) -> BaseModel:
+    model = super()._build_model()
+    install_tpu_parallelize(
+        model,
+        self.config,
+        tpu_compile_mode=(
+            self.config.compile.mode if self._is_tpu_config else None
+        ),
+    )
+    return model
+
   def _initialize_model(
       self,
-      model_spec: ModelSpec,
       *,
       compile_config: Any,
+      hf_assets_path: str,
       create_seed_checkpoint: bool = False,
   ) -> None:
     super()._initialize_model(
-        model_spec,
         compile_config=compile_config,
+        hf_assets_path=hf_assets_path,
         create_seed_checkpoint=create_seed_checkpoint,
     )
     if self._is_tpu_config:
@@ -115,8 +128,14 @@ class TpuTrainingEngine(TrainingEngine):
 
       self.loss_fn = build_cross_entropy_loss(self.config)
 
-  def _initialize_optimizer(self, model_spec: ModelSpec) -> None:
-    super()._initialize_optimizer(model_spec)
+  def _register_optimizer_hooks(self) -> None:
+    super()._register_optimizer_hooks()
+    # Under EP, split optimizer param groups by device mesh, before the
+    # engine builds the LR schedulers and the checkpointer.
+    split_optimizers_by_mesh(self.optimizers)
+
+  def _initialize_optimizer(self) -> None:
+    super()._initialize_optimizer()
     if (
         self._is_tpu_config
         and self.config.compile.optimizer_compile == "separate_graph"
@@ -173,7 +192,10 @@ class TpuTrainingEngine(TrainingEngine):
     from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
 
     assert len(self.model_parts) == 1
-    with self.train_context():
+    with dist_utils.get_spmd_context(
+        parallel_dims=self.parallel_dims,
+        spmd_typechecking=self.config.debug.spmd_typechecking,
+    ):
       pred = self.model_parts[0](inputs, **model_kwargs)
       loss, self.loss_metrics = self.loss_fn(
           pred,
@@ -210,12 +232,10 @@ class TPUTrainer(torchtitan.trainer.Trainer):
       # `global_vocab_size` from the final model config first.
       from torchtitan.experiments.tpu.components.loss import set_global_vocab_size  # pylint: disable=g-import-not-at-top
 
-      if job_config.model_spec is not None:
-        set_global_vocab_size(job_config.loss, job_config.model_spec.model)
-    # Under EP, split optimizer param groups by device mesh; the engine runs
-    # this hook before it builds the LR schedulers.
-    model_spec = getattr(job_config, "model_spec", None)
-    if model_spec is not None:
+      if job_config.model is not None:
+        set_global_vocab_size(job_config.loss, job_config.model)
+    model_config = getattr(job_config, "model", None)
+    if model_config is not None:
       # The eager (non-scan) step runs the SwiGLU gate/up projections as two
       # GEMMs, over a [2F, D] w13 that FSDP shards on dim 0 unless tensor
       # parallelism needs upstream's stacked [2, F, D]; see
@@ -226,16 +246,33 @@ class TPUTrainer(torchtitan.trainer.Trainer):
       tp_degree = (
           parallelism.tensor_parallel_degree if parallelism is not None else 1
       )
-      job_config.model_spec = dataclasses.replace(
-          model_spec,
-          model=TpuTwoProjFeedForwardConverter.Config(packed=tp_degree <= 1)
+      job_config.model = (
+          TpuTwoProjFeedForwardConverter.Config(packed=tp_degree <= 1)
           .build()
-          .convert(model_spec.model),
-          post_optimizer_build_fn=with_split_optimizers_by_mesh(
-              model_spec.post_optimizer_build_fn
-          ),
+          .convert(model_config)
       )
     super().__init__(job_config)
+
+
+def _with_tpu_model_patches(
+    trainer_cls: type[torchtitan.trainer.Trainer],
+) -> type[torchtitan.trainer.Trainer]:
+  """Returns ``trainer_cls`` with the TPU model patches applied before parallelize.
+
+  For trainers that keep their own engine (FluxTrainer): the engine is
+  subclassed to install ``workarounds.apply_patches`` on the built model, as
+  ``TpuTrainingEngine`` does, and nothing else changes.
+  """
+
+  class _PatchedEngine(trainer_cls.engine_cls):
+
+    def _build_model(self) -> BaseModel:
+      model = super()._build_model()
+      install_tpu_parallelize(model, self.config)
+      return model
+
+  _PatchedEngine.__name__ = f"Tpu{trainer_cls.engine_cls.__name__}"
+  return type(trainer_cls.__name__, (trainer_cls,), {"engine_cls": _PatchedEngine})
 
 
 def _apply_flux_img_size(
@@ -316,7 +353,7 @@ def start_trainer(
   from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
 
   tpu_job_config_module.validate_compile_components(train_config.compile)
-  workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
+  workarounds.raise_dynamo_recompile_limits(train_config.model)
   profiler_workaround.init(train_config)
 
   # Reject a replicate degree that would straddle DCN, before ParallelDims is
@@ -329,21 +366,23 @@ def start_trainer(
     workarounds.disable_pinned_host_memory()
 
   trainer: torchtitan.trainer.Trainer | None = None
-  model_spec = train_config.model_spec
-  assert model_spec is not None
-  model_name = model_spec.name
-  if model_name != "flux":
+  model_cfg = train_config.model
+  assert model_cfg is not None
+  from torchtitan.models.flux import FluxModel  # pylint: disable=g-import-not-at-top
+
+  is_flux = isinstance(model_cfg, FluxModel.Config)
+  if not is_flux:
     _fit_rope_to_context(
-        model_spec.model, train_config.training.max_context_length
+        model_cfg, train_config.training.max_context_length
     )
   is_graph_trainer = isinstance(train_config, TpuGraphTrainer.Config)
-  if model_name == "flux":
+  if is_flux:
     # FluxTrainer owns a separate train_step and bypasses the TPU integration.
     if train_config.compile.compile_grad_norm:
       raise ValueError("compile.compile_grad_norm does not support FluxTrainer")
     from torchtitan.models.flux.trainer import FluxTrainer
     _apply_flux_img_size(train_config)
-    trainer_cls = FluxTrainer
+    trainer_cls = _with_tpu_model_patches(FluxTrainer)
   elif is_graph_trainer:
     trainer_cls = TpuGraphTrainer
   else:
@@ -374,28 +413,6 @@ def start_trainer(
         f"Setting default seed {train_config.debug.seed} to avoid hang on TPU"
     )
 
-  # Apply TPU-specific workarounds before model parallelization
-  # Moved from deprecated args.py files
-  orig_parallelize = model_spec.parallelize_fn
-
-  def patched_parallelize(model, *args, **kwargs):
-    from torchtitan.experiments.tpu import workarounds
-
-    workarounds.apply_patches(model, train_config)
-    if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if model_spec.name in (
-          "llama3",
-          "muse_glimmer",
-          "qwen3",
-          "qwen3_5",
-          "gemma4",
-      ):
-        kwargs["tpu_compile_mode"] = train_config.compile.mode
-    return orig_parallelize(model, *args, **kwargs)
-
-  if not is_graph_trainer:
-    model_spec.parallelize_fn = patched_parallelize
-
   try:
     with contextlib.ExitStack() as stack:
       torchtitan.train._maybe_enable_min_cost_redistribute(  # pylint: disable=protected-access
@@ -406,9 +423,9 @@ def start_trainer(
       # variants can use the upstream-native ``config.build()`` construction
       # path.
       trainer = trainer_cls(train_config)
-      # Asked of the built model rather than wrapped around `parallelize_fn`:
-      # graph-trainer recipes already carry their graph-specific model spec and
-      # parallelize_fn, so the regular trainer wrapper above is not installed.
+      # Asked of the built model rather than checked inside `parallelize`:
+      # graph-trainer models own their graph-specific `parallelize`, which the
+      # regular trainer's family wrappers do not run.
       for part in trainer.engine.model_parts:
         check_scan_was_applied(
             part,

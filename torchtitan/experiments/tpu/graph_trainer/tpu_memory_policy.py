@@ -212,7 +212,7 @@ def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     Matched by op rather than by module FQN, so the match does not depend on
     whether the Splash patch replaced ``inner_attention`` before or after
     ``annotate_module_fqns`` ran. ``TpuGraphTrainer`` applies the patches
-    before ``parallelize_fn``, so the replacement module is annotated with
+    before ``model.parallelize``, so the replacement module is annotated with
     ``layers.N.attention.inner_attention``. Raises if a Splash op does not
     return the expected pair, so a kernel change fails loudly instead of
     silently saving the wrong thing.

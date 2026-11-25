@@ -853,6 +853,20 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
         base.__init__(self, *args, **kwargs)
         _apply_stacked_layers(self, use_scan=use_scan)
 
+    def parallelize(self, **kwargs):
+        if use_scan:
+            from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (  # pylint: disable=g-import-not-at-top
+                configure_simple_fsdp_shard_dims,
+            )
+
+            configure_simple_fsdp_shard_dims(self, kwargs.get("parallel_dims"))
+        model = base.parallelize(self, **kwargs)
+        if use_scan:
+            for holder in model.modules():
+                if hasattr(holder, "build_split_meshes"):
+                    holder.build_split_meshes()
+        return model
+
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
     ) -> tuple[int, int]:
@@ -879,6 +893,7 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
         name,
         config_body={"get_nparams_and_flops": get_nparams_and_flops},
         __init__=__init__,
+        parallelize=parallelize,
     )
 
 

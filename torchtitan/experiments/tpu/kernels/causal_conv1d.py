@@ -13,8 +13,6 @@ Only whole rows are supported (no packed-document resets); see
 ``qwen3_5.gated_delta.causal_conv_silu`` for the dispatch.
 """
 
-import re
-
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -22,6 +20,7 @@ import jax.numpy as jnp
 import torch
 from torch.distributed.tensor import DTensor
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.kernels import pallas_vmem
 
 # Channels per kernel block (one lane tile). At S=8192 on TPU7x, one [8192, 128]
 # fp32 strip is 4 MiB, so keeping S bounded by TPU generation and dtype keeps
@@ -29,29 +28,6 @@ from torch_tpu._internal import pallas
 _BLOCK_C = 128
 _MAX_WIDTH = 8
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
-
-
-_tpu_gen_cache: list[int | None] = []
-
-
-@torch._dynamo.assume_constant_result
-def _tpu_generation() -> int | None:
-  """Attached TPU generation (e.g. 5 for v5e/v5p, 6 for v6e, 7 for TPU7x)."""
-  if _tpu_gen_cache:
-    return _tpu_gen_cache[0]
-  gen: int | None = None
-  get_props = getattr(
-      getattr(torch, "tpu", None), "get_device_properties", None
-  )
-  if get_props is not None:
-    try:
-      name = get_props().name.lower()
-      match = re.search(r"(?:v|tpu[- ]?)(\d+)", name)
-      gen = int(match.group(1)) if match else None
-    except RuntimeError:
-      gen = None
-  _tpu_gen_cache.append(gen)
-  return gen
 
 
 def _vmem_limit_bytes() -> int | None:
@@ -75,7 +51,7 @@ def _max_supported_seq_len(dtype: torch.dtype, width: int = 4) -> int:
   >= 32 MiB on TPU7x); the kernels request ``_vmem_limit_bytes()``, which is
   larger, so the bounds keep headroom.
   """
-  gen = _tpu_generation()
+  gen = pallas_vmem.tpu_generation()
   if gen is not None and gen >= 7:
     # TPU7x has >= 32 MiB default scoped VMEM (63.94 MiB in 35B recipes);
     # wider kernels (> 4 taps) keep more rolled strips live in backward.

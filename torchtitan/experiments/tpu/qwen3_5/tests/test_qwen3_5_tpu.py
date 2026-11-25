@@ -615,15 +615,18 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
       ):
         out_pallas = gated_delta.causal_conv_silu(x, weight, None)
         self.assertEqual(pallas_spy.call_count, 1)
-        _ = gated_delta.causal_conv_silu(x, weight, seg)
+        out_pallas_seg = gated_delta.causal_conv_silu(x, weight, seg)
+        self.assertEqual(pallas_spy.call_count, 2)
         self.assertEqual(log_info_spy.call_count, 0)
         _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
         _ = gated_delta.causal_conv_silu(x[:, :7, :], weight, None)
-        self.assertEqual(pallas_spy.call_count, 1)
+        self.assertEqual(pallas_spy.call_count, 2)
         self.assertEqual(log_info_spy.call_count, 1)
         self.assertIn("seq_len=7", log_info_spy.call_args.args[1])
       out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access
       self.assertLess(_relative_l2_error(out_pallas, out_slice), 5e-3)
+      out_slice_seg = gated_delta._CausalConvSilu.apply(x, weight, seg)  # pylint: disable=protected-access
+      self.assertLess(_relative_l2_error(out_pallas_seg, out_slice_seg), 5e-3)
     else:
       out_fallback = gated_delta.causal_conv_silu(x, weight, None)
       out_slice = gated_delta._CausalConvSilu.apply(x, weight, None)  # pylint: disable=protected-access

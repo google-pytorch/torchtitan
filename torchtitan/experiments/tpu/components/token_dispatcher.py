@@ -597,8 +597,10 @@ class _LocalReorder(torch.autograd.Function):
   """
 
   @staticmethod
-  def forward(ctx, x_TD, scores_TK, permutation_N, inverse_N, top_k):
+  def forward(ctx, x_TD, scores_TK, permutation_N, top_k, inverse_N=None):
     ctx.set_materialize_grads(False)
+    if inverse_N is None:
+      inverse_N = torch.argsort(permutation_N)
     token_indices_N = permutation_N // top_k
     ctx.save_for_backward(inverse_N)
     ctx.input_shape = x_TD.shape
@@ -652,7 +654,7 @@ def local_reorder(
   with annotate_region(MOE_ROUTING):
     permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
     inverse_N = torch.argsort(permutation_N)
-  out = _LocalReorder.apply(x_TD, scores_TK, permutation_N, inverse_N, top_k)
+  out = _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k, inverse_N)
   if return_inverse:
     return (*out, inverse_N)
   return out

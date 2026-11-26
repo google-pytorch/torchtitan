@@ -597,7 +597,7 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
       # GraphTrainer does not apply this eager AC config; its graph
       # rematerialization policy is selected on the final compile config below.
       activation_checkpoint=SelectiveAC.Config(),
-      tpu_config=TPUConfig(),
+      tpu_config=TPUConfig(fused_qk_norm_rope=True),
       # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
       # libtpu 0.0.48; see cl/979992733), which segfaults in
       # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
@@ -666,6 +666,7 @@ def qwen3_8b_maxtext_parity() -> TpuGraphTrainer.Config:
   cfg = qwen3_8b_zero3()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  cfg.tpu_config.fused_qk_norm_rope = False
   _use_maxtext_flops(cfg)
   return cfg
 
@@ -728,6 +729,7 @@ def qwen3_32b_maxtext_parity() -> TpuGraphTrainer.Config:
   cfg = qwen3_32b()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  cfg.tpu_config.fused_qk_norm_rope = False
   _use_maxtext_flops(cfg)
   return cfg
 
@@ -1025,6 +1027,7 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   cfg.compile.optimizer_compile = "eager"
   cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
   cfg.metrics.log_freq = 1
+  cfg.tpu_config.fused_qk_norm_rope = True
   return cfg
 
 
@@ -1075,6 +1078,7 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TpuGraphTrainer.Config:
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  cfg.tpu_config.fused_qk_norm_rope = False
   _use_maxtext_flops(cfg)
   return cfg
 

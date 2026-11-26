@@ -236,6 +236,22 @@ class TestRefusals(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "all_to_all"):
             check_scan_expert_parallel(_config(ep_transport="all_to_all"))
 
+    def test_ragged_transport(self):
+        with self.assertRaisesRegex(ValueError, "ragged"):
+            check_scan_expert_parallel(_config(ep_transport="ragged_all_to_all"))
+
+    def test_auto_past_top_k_picks_ragged(self):
+        cfg = _config(ep=8)
+        dispatcher = types.SimpleNamespace(top_k=4, ep_transport=None)
+        cfg.model_spec.model.traverse = lambda cls: (
+            [(None, dispatcher, None, None)] if cls.__name__ == "Config"
+            and cls.__qualname__.startswith("LocalTokenDispatcher") else []
+        )
+        with self.assertRaisesRegex(ValueError, "ragged"):
+            check_scan_expert_parallel(cfg)
+        dispatcher.top_k = 8
+        check_scan_expert_parallel(cfg)
+
     def test_grow_buffer(self):
         with self.assertRaisesRegex(ValueError, "grow"):
             check_scan_expert_parallel(_config(ep_capacity_overflow="grow"))

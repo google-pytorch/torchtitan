@@ -465,9 +465,10 @@ def _debugmodel_moe_8l16e(cfg: TPUTrainerConfig) -> None:
 def graph_trainer_qwen35_moe_debugmodel_ep() -> TpuGraphTrainer.Config:
   """Split (one layer per executable) debug MoE, 8 layers, 16 experts, EP = 2.
 
-  The scan + EP proxy's reference lane. `auto` transport: Ring-of-Experts while
-  EP <= top_k = 4, ragged all-to-all at EP = 8. Two token chunks, the most a
-  scan body allows (`check_scan_expert_parallel`).
+  The scan + EP proxy's reference lane. Ring-of-Experts at every EP (the
+  ragged all-to-all that `auto` picks past top_k = 4 does not trace in a scan
+  body yet). Two token chunks, the most a scan body allows
+  (`check_scan_expert_parallel`).
   """
   base = qwen35_moe_debugmodel()
   _debugmodel_moe_8l16e(base)
@@ -480,6 +481,7 @@ def graph_trainer_qwen35_moe_debugmodel_ep() -> TpuGraphTrainer.Config:
       save_regions=("moe.routing",),
   )
   _use_expert_parallel(cfg, ep_degree=2, num_token_chunks=2)
+  cfg.tpu_config.ep_transport = "ring_of_experts"
   return cfg
 
 

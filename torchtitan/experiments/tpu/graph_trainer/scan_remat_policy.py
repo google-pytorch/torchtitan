@@ -14,6 +14,7 @@ op's ``remat_region`` (see ``remat_regions.py``):
 import functools
 from collections.abc import Callable, Set
 
+import torch
 from torch import fx
 from torch._higher_order_ops.scan import scan
 from torch.utils.checkpoint import (
@@ -55,6 +56,20 @@ def scan_body_policy(
     return policy
 
 
+def _torch_has_scan_sac_fixes() -> bool:
+    """Whether PyTorch has pytorch/pytorch#203334 and #203534.
+
+    `_tag_recompute_for_partitioner` is #203534's switch. #203334's fix (re-running the
+    body through an interpreter so node meta survives) adds no new name;
+    `HopJointGraph._mark_rng_ops_as_must_save` was added in the same commit.
+    """
+    from torch._higher_order_ops import partitioner
+    from torch.utils import checkpoint
+    return hasattr(checkpoint, "_tag_recompute_for_partitioner") and hasattr(
+        partitioner.HopJointGraph, "_mark_rng_ops_as_must_save"
+    )
+
+
 def scan_with_remat_policy(
     body: Callable, init, xs, save_regions: Set[str] = frozenset()
 ):
@@ -63,9 +78,19 @@ def scan_with_remat_policy(
     Raises if a requested save region matches no op in the body, e.g.
     ``attention.inner_attention`` with SDPA instead of Splash.
     """
+    if not _torch_has_scan_sac_fixes():
+        raise RuntimeError(
+            "--compile.use-scan-layers needs PyTorch with pytorch/pytorch#203334 "
+            "and #203534 (nightly >= 2.16.0.dev20261120); on older PyTorch the "
+            "scan body would keep every layer's gathered weights."
+        )
     unknown = set(save_regions) - SCAN_SAVE_REGIONS
     if unknown:
         raise ValueError(f"a scan body cannot save regions {sorted(unknown)}")
+    if not torch.is_grad_enabled():
+        # No backward (validation, inference): checkpoint would not run the policy
+        # (it yields early without grad), so run plain scan and skip the region check.
+        return scan(body, init, xs)
     # Mutation allowed: the MoE aux loss all-reduces its saved counts in place,
     # once per mesh axis. This turns off SAC's mutation check for the whole
     # body. Safe: scan traces and functionalizes the body to build its backward,

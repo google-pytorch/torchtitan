@@ -523,6 +523,7 @@ def _selective_config(
         compile=SimpleNamespace(
             save_regions=save_regions,
             save_last_n_layers=last_n_layers or {},
+            use_scan_layers=False,
         ),
         parallelism=_parallelism("always"),
     )
@@ -665,6 +666,19 @@ class TestTpuSelectivePolicy(unittest.TestCase):
                 actual_output, expected_output, rtol=0, atol=0
             )
         return chosen
+
+    def test_scan_layers_tag_the_outer_graph_like_full(self) -> None:
+        # The regions live in the scan body, so the outer graph gets `full`,
+        # even for a region it does not contain.
+        config = _selective_config(("attention.inner_attention",))
+        config.compile.use_scan_layers = True
+        config.compile.full_recompute_save_ops = ""
+        graphs = [_trace_toy(_DenseToy())[0].gm for _ in range(2)]
+        MEMORY_POLICY_REGISTRY["tpu_selective"](graphs[0], config=config)
+        MEMORY_POLICY_REGISTRY["full"](graphs[1], config=config)
+        tags = [[n.meta.get("recompute") for n in gm.graph.nodes] for gm in graphs]
+        self.assertIn(CheckpointPolicy.MUST_RECOMPUTE, tags[0])
+        self.assertEqual(tags[0], tags[1])
 
     def test_saves_routing_in_every_layer(self) -> None:
         torch.manual_seed(0)

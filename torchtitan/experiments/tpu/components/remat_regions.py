@@ -37,6 +37,10 @@ MOE_EP_DISPATCH = "moe.ep_dispatch"
 # Each layer's FFN down-projection output (the w2 matmul), which the post-FFN
 # norm backward reads; saving it avoids recomputing that matmul.
 FEED_FORWARD_W2 = "feed_forward.w2"
+# The MoE aux loss's all-reduced expert counts. The scan body always saves
+# them: redoing the all-reduce in backward is an exposed round trip per layer.
+# Set on `_all_reduce_expert_counts` in `models/common/moe.py`; keep in sync.
+MOE_EXPERT_COUNTS = "moe.expert_counts"
 
 
 def annotate_region(name: str) -> AbstractContextManager[None]:

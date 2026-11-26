@@ -1,9 +1,8 @@
-"""The scan body saves its expert counts, and nothing else changes.
+"""The scan body saves its policy's regions, and nothing else changes.
 
-The counts are the one thing the body's full remat no longer redoes in
-backward. Everything here is checked against the plain budget-0.0 partition
-it replaces: the gradients bit for bit, and the backward graph for what it
-stopped (and did not stop) recomputing.
+Checked against a plain budget-0.0 partition (recompute everything): the
+gradients bit for bit, and the backward graph for what it stopped (and did
+not stop) recomputing.
 """
 
 import unittest
@@ -14,7 +13,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch._functorch import config as functorch_config, partitioners
+from torch._guards import tracing, TracingContext
 from torch._higher_order_ops.scan import scan
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 # Imported for the same reason as in `test_layer_stack`: production scans run
@@ -22,8 +23,12 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
 from torchtitan.experiments.tpu.graph_trainer import scan_remat_policy
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
-    count_collectives,
-    scan_body_remat_window,
+    scan_with_remat_policy,
+)
+from torchtitan.experiments.tpu.components.remat_regions import (
+    annotate_region,
+    ATTENTION_INNER_ATTENTION,
+    MOE_EXPERT_COUNTS,
 )
 from torchtitan.models.common.moe import _batch_wise_load_balance_loss
 
@@ -51,7 +56,8 @@ def _counts(scores: torch.Tensor) -> torch.Tensor:
     counts = torch.histc(
         ids.reshape(-1).float(), bins=EXPERTS, min=0, max=EXPERTS
     ).to(scores.dtype)
-    return funcol.all_reduce(counts, "sum", dist.group.WORLD)
+    with annotate_region(MOE_EXPERT_COUNTS):
+        return funcol.wait_tensor(funcol.all_reduce(counts, "sum", dist.group.WORLD))
 
 
 def _aux_term(scores: torch.Tensor) -> torch.Tensor:
@@ -73,11 +79,6 @@ def _routing_counts(scores: torch.Tensor) -> torch.Tensor:
     return funcol.all_to_all_single(
         counts.view(1, -1), None, None, dist.group.WORLD
     )
-
-
-def _routing_term(scores: torch.Tensor) -> torch.Tensor:
-    """Keeps the routing count exchange live without a gradient through it."""
-    return _routing_counts(scores).sum().to(scores.dtype) * 0.0
 
 
 class _Mesh:
@@ -114,6 +115,12 @@ def _real_aux_term(dp_group, cp_group):
     return term
 
 
+def _attention_term(scores: torch.Tensor) -> torch.Tensor:
+    """Stands in for splash: a region whose output its backward reads."""
+    with annotate_region(ATTENTION_INNER_ATTENTION):
+        return torch.sigmoid(scores).sum(dim=-1, keepdim=True)
+
+
 def _body(h: torch.Tensor, w: torch.Tensor, *, extra):
     """A router, plus `extra(scores)` if given."""
     scores = torch.softmax(h @ w, dim=-1)
@@ -123,13 +130,15 @@ def _body(h: torch.Tensor, w: torch.Tensor, *, extra):
     return out, out.new_zeros(())
 
 
-def _run(window, *, extra=_aux_term):
-    """Forward and backward one scan; returns grads and the body's partitions."""
-    torch._dynamo.reset()
+def _inputs():
     torch.manual_seed(SEED)
     h = torch.randn(TOKENS, DIM, requires_grad=True)
     w = torch.randn(N_LAYERS, DIM, EXPERTS, requires_grad=True)
+    return h, w
 
+
+def _capturing():
+    """Patch min-cut to record (budget, backward graph) of each partition."""
     captured = []
     partition = partitioners.min_cut_rematerialization_partition
 
@@ -138,25 +147,64 @@ def _run(window, *, extra=_aux_term):
         captured.append((functorch_config.activation_memory_budget, backward))
         return forward, backward
 
+    patch = mock.patch.object(
+        partitioners, "min_cut_rematerialization_partition", capture
+    )
+    return patch, captured
+
+
+def _run(run_scan, *, extra=_aux_term):
+    """Forward and backward one scan; returns grads and the body's partitions.
+
+    ``run_scan(body, init, xs)`` runs the scan.
+    """
+    torch._dynamo.reset()
+    h, w = _inputs()
+
     def body(carry, x):
         return _body(carry, x, extra=extra)
 
-    with mock.patch.object(
-        partitioners, "min_cut_rematerialization_partition", capture
-    ):
-        with window():
-            carry, _ = scan(body, h, w)
+    patch, captured = _capturing()
+    with patch:
+        carry, _ = run_scan(body, h, w)
     carry.square().sum().backward()
     return (carry.detach(), h.grad, w.grad), captured
 
 
-def _legacy_window():
-    return functorch_config.patch(activation_memory_budget=0.0)
+def _run_non_strict(run_scan, *, extra=_aux_term):
+    """``_run``, traced as the graph trainer does: non-strict ``make_fx``."""
+    torch._dynamo.reset()
+    h, w = _inputs()
+
+    def body(carry, x):
+        return _body(carry, x, extra=extra)
+
+    def step(h, w):
+        carry, _ = run_scan(body, h, w)
+        return (carry, *torch.autograd.grad(carry.square().sum(), (h, w)))
+
+    fake = FakeTensorMode(allow_non_fake_inputs=True)
+    patch, captured = _capturing()
+    with (
+        patch,
+        fake,
+        tracing(TracingContext(fake)),
+        torch.compiler._non_strict_tracing_context(),
+        torch.compiler._patch_autograd_grad(),
+    ):
+        gm = make_fx(step)(fake.from_tensor(h), fake.from_tensor(w))
+    with torch.no_grad():
+        return tuple(gm(h.detach(), w.detach())), captured
 
 
-def _has_count_source(graph_module) -> bool:
-    return any(
-        scan_remat_policy._is_count_source(n) for n in graph_module.graph.nodes
+def _legacy(body, init, xs):
+    with functorch_config.patch(activation_memory_budget=0.0):
+        return scan(body, init, xs)
+
+
+def _saving(*regions):
+    return lambda body, init, xs: scan_with_remat_policy(
+        body, init, xs, frozenset(regions)
     )
 
 
@@ -164,67 +212,11 @@ def _ops(graph_module) -> list[str]:
     return [str(n.target) for n in graph_module.graph.nodes if n.op == "call_function"]
 
 
-class TestCountCollectives(unittest.TestCase):
-    """Only an all-reduce whose operand *is* a count is picked up."""
-
-    def setUp(self):
-        _init_single_rank_gloo(12391)
-
-    def tearDown(self):
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-    def test_finds_the_count_all_reduce_and_not_the_others(self):
-        def f(scores, weight):
-            counts = funcol.wait_tensor(_counts(scores))
-            # Collectives on values that are not counts: a weight, and a count
-            # once it has been mixed with something else.
-            gathered = funcol.wait_tensor(
-                funcol.all_reduce(weight, "sum", dist.group.WORLD)
-            )
-            mixed = funcol.wait_tensor(
-                funcol.all_reduce(counts * weight.sum(), "sum", dist.group.WORLD)
-            )
-            return counts, gathered, mixed
-
-        graph = make_fx(f)(
-            torch.randn(TOKENS, EXPERTS).softmax(-1), torch.randn(EXPERTS)
-        ).graph
-        found = count_collectives(graph)
-
-        self.assertTrue(found, "the count all-reduce was not found")
-        # The count's own all_reduce and its wait(s) -- tracing may emit more
-        # than one wait for it -- and nothing for the weight or the mix.
-        self.assertEqual(
-            {str(n.target) for n in found},
-            {"_c10d_functional.all_reduce.default", "_c10d_functional.wait_tensor.default"},
-        )
-        all_reduces = [
-            n for n in found if n.target is torch.ops._c10d_functional.all_reduce.default
-        ]
-        self.assertEqual(len(all_reduces), 1, found)
-        (all_reduce,) = all_reduces
-        self.assertIn(
-            all_reduce.args[0].target,
-            (torch.ops.aten._to_copy.default, torch.ops.aten.histc.default),
-        )
-
-    def test_ignores_the_expert_parallel_routing_count_exchange(self):
-        """Also born at a `histc`, but all-to-all'd: not the aux loss's counts."""
-
-        def f(scores):
-            return funcol.wait_tensor(_routing_counts(scores))
-
-        graph = make_fx(f)(torch.randn(TOKENS, EXPERTS).softmax(-1)).graph
-        self.assertIn(
-            "_c10d_functional.all_to_all_single.default",
-            [str(n.target) for n in graph.nodes],
-            "the exchange was not traced -- test is vacuous",
-        )
-        self.assertEqual(count_collectives(graph), [])
+def _both(*terms):
+    return lambda scores: sum(t(scores) for t in terms)
 
 
-class TestScanBodyRematWindow(unittest.TestCase):
+class TestScanRematPolicy(unittest.TestCase):
 
     def setUp(self):
         _init_single_rank_gloo(12392)
@@ -233,17 +225,15 @@ class TestScanBodyRematWindow(unittest.TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def test_gradients_are_bitwise_identical(self):
-        """The whole point: the counts move, the math does not."""
-        want, _ = _run(_legacy_window)
-        got, _ = _run(scan_body_remat_window)
+    def _check_same_grads(self, got, want):
         for name, g, w in zip(("out", "h.grad", "w.grad"), got, want):
             torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)
 
-    def test_backward_no_longer_recomputes_the_counts(self):
-        _, legacy = _run(_legacy_window)
-        _, captured = _run(scan_body_remat_window)
+    def test_saves_the_counts_and_recomputes_the_rest(self):
+        want, legacy = _run(_legacy)
+        got, captured = _run(_saving())
         self.assertTrue(captured, "the scan body was never partitioned")
+        self._check_same_grads(got, want)
 
         # Sanity: before, backward redid the histogram and its all-reduce.
         legacy_ops = _ops(legacy[0][1])
@@ -253,67 +243,107 @@ class TestScanBodyRematWindow(unittest.TestCase):
         budget, backward = captured[0]
         self.assertEqual(budget, 1.0)
         ops = _ops(backward)
-        self.assertNotIn("aten.histc.default", ops)
         self.assertNotIn("_c10d_functional.all_reduce.default", ops)
         # ... while the rest of the body is still recomputed.
         self.assertIn("aten.mm.default", ops)
         self.assertIn("aten.tanh.default", ops)
 
     def test_the_real_aux_loss_over_two_groups(self):
-        """`_batch_wise_load_balance_loss` itself, not a stand-in.
-
-        Its counts go through an in-place `dist.all_reduce` per mesh axis --
-        here DP and CP, two distinct groups -- which Dynamo and
-        functionalization turn into a chain of functional all-reduces with
-        copies between them. All of it has to be found and saved.
-        """
+        """The real MoE aux loss (`_batch_wise_load_balance_loss`), whose count all-reduces run in place, over two groups."""
         extra = _real_aux_term(dist.new_group([0]), dist.new_group([0]))
-        want, legacy = _run(_legacy_window, extra=extra)
-        got, captured = _run(scan_body_remat_window, extra=extra)
-
-        legacy_ops = _ops(legacy[0][1])
+        want, legacy = _run(_legacy, extra=extra)
+        got, captured = _run(_saving(), extra=extra)
         self.assertEqual(
-            legacy_ops.count("_c10d_functional.all_reduce.default"),
+            _ops(legacy[0][1]).count("_c10d_functional.all_reduce.default"),
             2,
             "expected one count all-reduce per group -- test is vacuous",
         )
-        # The real loss counts by summing the routing map, not with `histc`.
-        self.assertTrue(
-            _has_count_source(legacy[0][1]),
-            "expected budget 0.0 to recompute the counts -- test is vacuous",
+        self.assertNotIn(
+            "_c10d_functional.all_reduce.default", _ops(captured[0][1])
         )
-        budget, backward = captured[0]
-        self.assertEqual(budget, 1.0)
-        ops = _ops(backward)
-        self.assertFalse(_has_count_source(backward))
+        self._check_same_grads(got, want)
+
+    def test_a_body_without_regions_recomputes_everything(self):
+        want, legacy = _run(_legacy, extra=None)
+        got, captured = _run(_saving(), extra=None)
+        self.assertEqual(_ops(captured[0][1]), _ops(legacy[0][1]))
+        self._check_same_grads(got, want)
+
+    def test_the_expert_parallel_count_exchange_is_recomputed(self):
+        """Only the aux loss's counts are saved, not EP's `all_to_all`."""
+        def routing_scaled(scores):
+            # Backward reads the exchanged counts, so it must get them somehow.
+            return (_routing_counts(scores).sum().to(scores.dtype) * scores).sum()
+
+        extra = _both(_aux_term, routing_scaled)
+        want, _ = _run(_legacy, extra=extra)
+        got, captured = _run(_saving(), extra=extra)
+        ops = _ops(captured[0][1])
+        self.assertIn("_c10d_functional.all_to_all_single.default", ops)
         self.assertNotIn("_c10d_functional.all_reduce.default", ops)
-        for name, g, w in zip(("out", "h.grad", "w.grad"), got, want):
-            torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)
+        self._check_same_grads(got, want)
 
-    def test_a_body_without_counts_is_partitioned_as_before(self):
-        """No counts, no tags: the old budget-0.0 path, untouched."""
-        want, legacy = _run(_legacy_window, extra=None)
-        got, captured = _run(scan_body_remat_window, extra=None)
-        self.assertEqual(captured[0][0], 0.0)
-        self.assertEqual(_ops(captured[0][1]), _ops(legacy[0][1]))
-        for name, g, w in zip(("out", "h.grad", "w.grad"), got, want):
-            torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)
+    def test_a_selected_region_is_saved(self):
+        """A region in `save_regions` is saved, at PyTorch's default memory budget."""
+        self.assertEqual(functorch_config.activation_memory_budget, 1.0)
+        want, _ = _run(_legacy, extra=_attention_term)
+        _, unselected = _run(_saving(), extra=_attention_term)
+        got, selected = _run(
+            _saving(ATTENTION_INNER_ATTENTION), extra=_attention_term
+        )
+        self.assertIn("aten.sigmoid.default", _ops(unselected[0][1]))
+        self.assertEqual({budget for budget, _ in selected}, {1.0})
+        self.assertNotIn("aten.sigmoid.default", _ops(selected[0][1]))
+        self._check_same_grads(got, want)
 
-    def test_an_expert_parallel_body_without_aux_loss_is_as_before(self):
-        """EP's routing count exchange alone does not leave the 0.0 path."""
-        want, legacy = _run(_legacy_window, extra=_routing_term)
-        got, captured = _run(scan_body_remat_window, extra=_routing_term)
-        self.assertEqual(captured[0][0], 0.0)
-        self.assertEqual(_ops(captured[0][1]), _ops(legacy[0][1]))
-        for name, g, w in zip(("out", "h.grad", "w.grad"), got, want):
-            torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)
+    def test_the_policy_holds_under_non_strict_tracing(self):
+        """Under the graph trainer's non-strict tracing, the policy's tags still reach the scan body."""
+        extra = _both(_aux_term, _attention_term)
+        want, legacy = _run(_legacy, extra=extra)
+        got, captured = _run_non_strict(
+            _saving(ATTENTION_INNER_ATTENTION), extra=extra
+        )
+        self.assertIn("_c10d_functional.all_reduce.default", _ops(legacy[0][1]))
+        ops = _ops(captured[0][1])
+        self.assertNotIn("_c10d_functional.all_reduce.default", ops)
+        self.assertNotIn("aten.sigmoid.default", ops)
+        self.assertIn("aten.mm.default", ops)
+        self._check_same_grads(got, want)
 
-    def test_the_window_closes(self):
-        default_budget = functorch_config.activation_memory_budget
-        partition = partitioners.min_cut_rematerialization_partition
-        _run(scan_body_remat_window)
-        self.assertEqual(functorch_config.activation_memory_budget, default_budget)
-        self.assertIs(partitioners.min_cut_rematerialization_partition, partition)
+    def test_raises_when_a_save_region_matches_nothing(self):
+        # E.g. SDPA instead of Splash: the body has regions, but not this one.
+        with self.assertRaisesRegex(ValueError, "attention.inner_attention"):
+            _run(_saving(ATTENTION_INNER_ATTENTION))
+        # ... or no region at all (no MoE, no FSDP).
+        with self.assertRaisesRegex(ValueError, "matched no op"):
+            _run(_saving(ATTENTION_INNER_ATTENTION), extra=None)
+
+    def test_refuses_an_unknown_save_region(self):
+        with self.assertRaisesRegex(ValueError, "cannot save regions"):
+            _run(_saving("moe.routing"))
+
+    def test_without_grad_runs_plain_scan(self):
+        """Validation runs the scan under no_grad: same result, and no region check."""
+        torch._dynamo.reset()
+        h, w = _inputs()
+
+        def body(carry, x):
+            return _body(carry, x, extra=_attention_term)
+
+        with torch.no_grad():
+            want, _ = scan(body, h, w)
+            got, _ = scan_with_remat_policy(
+                body, h, w, frozenset({ATTENTION_INNER_ATTENTION})
+            )
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_needs_the_pytorch_fixes(self):
+        self.assertTrue(scan_remat_policy._torch_has_scan_sac_fixes())
+        with mock.patch.object(
+            scan_remat_policy, "_torch_has_scan_sac_fixes", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "203534"):
+                _run(_saving())
 
 
 if __name__ == "__main__":

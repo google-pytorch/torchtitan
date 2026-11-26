@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch import nn
-from torch._functorch import config as functorch_config, partitioners
+from torch._functorch import partitioners
 from torch._higher_order_ops.scan import ScanAutogradImpl
 from torch.distributed.tensor import DTensor, Shard
 
@@ -323,39 +323,31 @@ class TestLayerStack(unittest.TestCase):
             _build(stacked=True)
 
     def test_the_body_recomputes_its_gather_in_backward(self):
-        """The in-body gather is worth nothing unless backward redoes it.
+        """Backward must redo each layer's weight all-gather.
 
-        At the default budget the partitioner saves the gathered per-layer
-        weight across the cut: the gather runs inside the loop, but its result
-        is carried out of it. ``run`` opens an ``activation_memory_budget=0.0``
-        window to stop that. Two things are checked here -- that the window
-        reaches the body's partition, and that it closes again afterwards,
-        since the config is process-global.
+        If it saved the gathered weight instead, every layer's full weight
+        would stay in memory and scan would save nothing.
         """
         captured = []
         partition = partitioners.min_cut_rematerialization_partition
 
         def capture(joint, inputs, **kwargs):
             forward, backward = partition(joint, inputs, **kwargs)
-            captured.append((functorch_config.activation_memory_budget, backward))
+            captured.append(backward)
             return forward, backward
 
         model = _build(stacked=True, scan=True)
         tokens = torch.randint(0, model.config.vocab_size, (TOKENS,))
-        default = functorch_config.activation_memory_budget
         with patch.object(
             partitioners, "min_cut_rematerialization_partition", capture
         ):
             model(tokens).sum().backward()
 
         self.assertTrue(captured, "the scan body was never partitioned")
-        budget, backward = captured[0]
-        self.assertEqual(budget, 0.0)
         self.assertTrue(
-            any("all_gather" in str(n.target) for n in backward.graph.nodes),
+            any("all_gather" in str(n.target) for n in captured[0].graph.nodes),
             "the body's backward reuses a saved gather instead of redoing it",
         )
-        self.assertEqual(functorch_config.activation_memory_budget, default)
 
     def test_scan_gradients_match_the_loop(self):
         """Per layer, because a severed carry chain keeps the loss exact.

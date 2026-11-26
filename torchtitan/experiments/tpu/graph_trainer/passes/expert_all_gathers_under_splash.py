@@ -96,6 +96,20 @@ def _layer_copy(node: torch.fx.Node) -> tuple[int, bool, bool]:
     )
 
 
+def _reads(node: torch.fx.Node, anchor: torch.fx.Node, order: dict) -> bool:
+    """Whether ``node`` depends on ``anchor`` (searching nodes after it)."""
+    stack, seen = [node], set()
+    while stack:
+        current = stack.pop()
+        if current is anchor:
+            return True
+        if current in seen or order.get(current, -1) <= order[anchor]:
+            continue
+        seen.add(current)
+        stack.extend(current.all_input_nodes)
+    return False
+
+
 def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     gathered: dict[tuple, list[torch.fx.Node]] = defaultdict(list)
     splash: dict[tuple, torch.fx.Node] = {}
@@ -112,6 +126,11 @@ def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.
     for layer_copy, weights in gathered.items():
         anchor = splash.get(layer_copy)
         if anchor is None:
+            continue
+        # A gather computed from the Splash output (e.g. the MoE token
+        # dispatch gather) cannot be joined with it: that would be a cycle.
+        weights = [w for w in weights if not _reads(w, anchor, order)]
+        if not weights:
             continue
         values = [anchor, *weights]
         users = {value: list(value.users) for value in values}
@@ -144,6 +163,7 @@ def apply_expert_all_gathers_under_splash(gm: torch.fx.GraphModule) -> torch.fx.
                 if (
                     _layer_copy(user) == layer_copy
                     and order.get(user, len(order)) > order[anchor]
+                    and user not in hoisted
                 ):
                     user.replace_input_with(value, output)
         barriers += 1

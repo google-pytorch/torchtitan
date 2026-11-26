@@ -1,4 +1,5 @@
 import itertools
+import operator
 from types import SimpleNamespace
 from unittest import mock
 
@@ -838,6 +839,132 @@ class GraphSplitTest(absltest.TestCase):
     # A model without MoE layers or Splash has nothing to join.
     with self.assertRaisesRegex(ValueError, "no layer with both"):
       self._trace_simple_fsdp(n_layers=2, before_split=apply_deadline)
+
+  def _attention_moe_graph(
+      self, ep_token_gather: bool
+  ) -> tuple[torch.fx.GraphModule, dict[str, torch.fx.Node]]:
+    """One forward layer: attention into Splash, then the routed experts.
+
+    With ``ep_token_gather``, the routed experts all-gather their tokens over
+    the EP group first, like Ring-of-Experts dispatch. ``dispatch`` is called
+    directly, not through the dispatcher's ``forward``, so the gather carries
+    the routed experts' FQN. It is a float gather under ``.moe.``, but it
+    reads the layer's Splash output through ``wo`` and the residual.
+    """
+    tokens, dim, ffn = 8, 16, 4
+    graph = torch.fx.Graph()
+    nodes = {}
+
+    def add(name, target, args, fqn, val):
+      node = graph.call_function(target, args)
+      node.meta["custom"] = {"module_fqn": fqn}
+      node.meta["val"] = val
+      nodes[name] = node
+      return node
+
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(tokens, dim)
+    wq = graph.placeholder("wq")
+    wq.meta["val"] = torch.empty(dim, dim)
+    w_shard = graph.placeholder("w_shard")
+    w_shard.meta["val"] = torch.empty(dim, ffn // 2)
+    attention = "layers.0.attention"
+    experts = "layers.0.moe.routed_experts"
+    act = torch.empty(tokens, dim)
+    q = add("q", torch.ops.aten.mm.default, (x, wq), attention, act)
+    splash = add(
+        "splash",
+        _STOCK_STYLE_SPLASH._opoverload,
+        (q, q, q),
+        f"{attention}.inner_attention",
+        (act, torch.empty(tokens)),
+    )
+    anchor = add(
+        "anchor",
+        operator.getitem,
+        (splash, 0),
+        f"{attention}.inner_attention",
+        act,
+    )
+    view = add(
+        "view",
+        torch.ops.aten.view.default,
+        (anchor, [tokens, dim]),
+        attention,
+        act,
+    )
+    out = add("wo", torch.ops.aten.mm.default, (view, wq), attention, act)
+    hidden = add("h", torch.ops.aten.add.Tensor, (x, out), "layers.0", act)
+    routed = hidden
+    if ep_token_gather:
+      routed = add(
+          "token_gather",
+          torch.ops.tpu._all_gather_dim.default,
+          (hidden, 0, 2, "ep_pg"),
+          experts,
+          torch.empty(2 * tokens, dim),
+      )
+    weight = add(
+        "weight_gather",
+        torch.ops.tpu._all_gather_dim.default,
+        (w_shard, 1, 2, "fsdp_pg"),
+        f"{experts}.inner_experts",
+        torch.empty(dim, ffn),
+    )
+    moe = add(
+        "moe",
+        torch.ops.aten.mm.default,
+        (routed, weight),
+        experts,
+        torch.empty(routed.meta["val"].shape[0], ffn),
+    )
+    residual = add(
+        "residual",
+        torch.ops.aten.sum.default,
+        (hidden,),
+        "layers.0",
+        torch.empty(()),
+    )
+    graph.output((moe, residual))
+    return torch.fx.GraphModule(torch.nn.Module(), graph), nodes
+
+  def _assert_weight_joined_with_splash(
+      self, gm: torch.fx.GraphModule, nodes: dict[str, torch.fx.Node]
+  ) -> None:
+    (barrier,) = [
+        node for node in gm.graph.nodes if node.target is _optimization_barrier
+    ]
+    anchor, weight = nodes["anchor"], nodes["weight_gather"]
+    self.assertEqual(barrier.args, (anchor, weight))
+    self.assertEqual(list(anchor.users), [barrier])
+    self.assertEqual(list(weight.users), [barrier])
+    outputs = {node.args[1]: node for node in barrier.users}
+    self.assertEqual(nodes["view"].args[0], outputs[0])
+    self.assertEqual(nodes["moe"].args[1], outputs[1])
+    order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    self.assertLess(order[weight], order[barrier])
+    self.assertLess(order[barrier], order[nodes["view"]])
+
+  def test_expert_all_gathers_under_splash_skips_ep_token_gather(self):
+    """The EP token gather reads the Splash output, so it is not joined.
+
+    Joining it hoisted the Splash output's reader ahead of the barrier and then
+    rewired that reader to the barrier's output: a cycle that failed lint with
+    "used before it has been defined".
+    """
+    gm, nodes = self._attention_moe_graph(ep_token_gather=True)
+    token_gather = nodes["token_gather"]
+    # The token gather matches the weight pattern; only its inputs set it apart.
+    self.assertTrue(under_splash_lib._is_gathered_expert_weight(token_gather))
+    under_splash_lib.apply_expert_all_gathers_under_splash(gm)  # Lints.
+    self._assert_weight_joined_with_splash(gm, nodes)
+    self.assertEqual(token_gather.args[0], nodes["h"])
+    self.assertEqual(list(token_gather.users), [nodes["moe"]])
+
+  def test_expert_all_gathers_under_splash_without_ep(self):
+    gm, nodes = self._attention_moe_graph(ep_token_gather=False)
+    under_splash_lib.apply_expert_all_gathers_under_splash(gm)
+    self._assert_weight_joined_with_splash(gm, nodes)
 
   def test_ep_collectives_are_not_classified_as_expert_weights_or_fsdp_ag(self):
     graph = torch.fx.Graph()

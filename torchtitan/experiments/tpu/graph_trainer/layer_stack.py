@@ -199,6 +199,39 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     return max(range(1, param.ndim), key=lambda d: param.shape[d])
 
 
+@contextlib.contextmanager
+def _no_sparse_mesh_push():
+    """Hides the registered EP sparse mesh while the scan body is captured.
+
+    Under EP, the MoE code enters ``maybe_set_sparse_mesh()``, which appends to
+    a thread-local mesh stack. Inside ``scan`` that is a mutation of state from
+    outside the body, which Dynamo refuses (``UncapturedHigherOrderOpError``).
+    The pushed mesh only feeds spmd_types type checking, which TPU GraphTrainer
+    runs with off; with no sparse mesh registered the context is a no-op, as it
+    is at EP = 1. The backward body is derived from the captured graph, so the
+    window only has to cover the ``scan`` call.
+    """
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.distributed import spmd_types as tt_spmd
+
+    tls = tt_spmd._MESH_TLS  # pylint: disable=protected-access
+    saved = getattr(tls, "sparse_mesh", None)
+    if saved is None:
+        yield
+        return
+    import spmd_types as spmd  # pylint: disable=g-import-not-at-top
+
+    if spmd.is_type_checking():
+        raise NotImplementedError(
+            "scan with expert parallelism needs spmd type checking off"
+        )
+    tls.sparse_mesh = None
+    try:
+        yield
+    finally:
+        tls.sparse_mesh = saved
+
+
 class LayerStackHolder(Module):
     """``model.layer_stacks``: the stacks, and nothing else.
 
@@ -1041,7 +1074,7 @@ class LayerStack:
             #
             # The patch is process-global, so it has to be a window; it closes
             # when this call returns. `test_layer_stack.py` checks both halves.
-            with scan_body_remat_window():
+            with scan_body_remat_window(), _no_sparse_mesh_push():
                 h, _ = scan(scan_body, h, xs)
         else:
             if self.holder.ep_dims:

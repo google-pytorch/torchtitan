@@ -67,7 +67,9 @@ def scan_with_remat_policy(
     if unknown:
         raise ValueError(f"a scan body cannot save regions {sorted(unknown)}")
     # Mutation allowed: the MoE aux loss all-reduces its saved counts in place,
-    # once per mesh axis.
+    # once per mesh axis. This turns off SAC's mutation check for the whole
+    # body. Safe: scan traces and functionalizes the body to build its backward,
+    # so backward reads each saved value as it was when saved.
     saved: set[str] = set()
     context_fn = functools.partial(
         create_selective_checkpoint_contexts,

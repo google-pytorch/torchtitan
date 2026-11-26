@@ -629,7 +629,7 @@ class LayerStack:
             logger.info(
                 "Decoder layers run as a scan: the body recomputes everything "
                 "but %ssave regions %s",
-                "its MoE expert counts and " if has_moe else "",
+                "its MoE expert counts (if all-reduced) and " if has_moe else "",
                 list(save_regions),
             )
         # The container holds the same layer modules, so `self.layers` keeps

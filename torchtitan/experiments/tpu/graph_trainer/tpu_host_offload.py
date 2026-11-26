@@ -250,10 +250,18 @@ def offload_scan_activations(
         num_forward_scans += 1
         body = _scan_body(gm, node)
         outs = _outputs(body)
-        for name in names:
-            saved = [i for i, o in enumerate(outs) if _is_named_save(body, o, name)]
-            if name == SAVED_CARRY and len(saved) > 1:
-                raise RuntimeError(f"scan offload: {node.name} saves its carry twice")
+        saves = {
+            name: [i for i, o in enumerate(outs) if _is_named_save(body, o, name)]
+            for name in names
+        }
+        # Per scan: with last-N there is one forward scan per segment.
+        if SAVED_CARRY in saves and len(saves[SAVED_CARRY]) != 1:
+            raise RuntimeError(
+                f"scan offload: forward scan {node.name} saves its carry "
+                f"{len(saves[SAVED_CARRY])} times, not once (is the layer input "
+                "recomputed instead of saved?)"
+            )
+        for name, saved in saves.items():
             for index in saved:
                 _offload_one(gm, node, index, name)
                 found[name] += 1
@@ -261,11 +269,6 @@ def offload_scan_activations(
         raise RuntimeError(
             "scan offload found no forward scan; it needs "
             "--compile.use-scan-layers."
-        )
-    if found.get(SAVED_CARRY) == 0:
-        raise RuntimeError(
-            f"scan offload: {num_forward_scans} forward scans, none saves its "
-            "carry (is the layer input recomputed instead of saved?)"
         )
     missing = [name for name, count in found.items() if not count]
     if missing:

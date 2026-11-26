@@ -30,7 +30,9 @@ from torchtitan.config import apply_overrides, derive, OverrideConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
+from torchtitan.experiments.tpu.graph_trainer import layer_stack
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
+    _segments,
     check_layers_are_stackable,
     LayerStack,
     LayerStackHolder,
@@ -131,6 +133,7 @@ def _build(
     device: str | torch.device = "cpu",
     world_size: int = 1,
     flatten: bool = False,
+    stack_kwargs: dict | None = None,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
@@ -159,7 +162,9 @@ def _build(
         mixed_precision_param=param_dtype, mixed_precision_reduce="float32"
     )
     if stacked or scan:
-        convert = functools.partial(with_tpu_stacked_layers, use_scan=scan)
+        convert = functools.partial(
+            with_tpu_stacked_layers, use_scan=scan, **(stack_kwargs or {})
+        )
     else:
         convert = _layer_loop
     with torch.device("meta"):
@@ -355,27 +360,49 @@ class TestLayerStack(unittest.TestCase):
         If the scan's init carry does not carry a gradient, the inter-layer
         chain is cut: the loss is unchanged, no error is raised, and only the
         layer at one end of the stack is visibly wrong.
+
+        Also with ``save_last_n_layers``: the last N layers get their own scan
+        and policy, over a slice of the same stacks. CPU has no Splash, so each
+        scan is asked to save no regions; the spy records what it was asked for.
         """
         plain = _build(stacked=False)
-        scanned = _build(stacked=True, scan=True)
+        n_layers = len(plain.layers)
         tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
-
-        for model in (plain, scanned):
-            model(tokens).sum().backward()
-
-        # `_parameters`, not `get_parameter`: after SimpleFSDP the attribute
-        # returns the gathered tensor, which has no `.grad`.
-        stacks = getattr(scanned, STACK_ATTR)._parameters
-        for i, layer in enumerate(plain.layers.values()):
-            for name, param in layer.named_parameters():
-                stack = stacks[name.replace(".", "__")]
-                torch.testing.assert_close(
-                    stack.grad[i].to_local(),
-                    param.grad.to_local(),
-                    rtol=1e-5,
-                    atol=5e-5,
-                    msg=f"layers.{i}.{name}",
+        plain(tokens).sum().backward()
+        attention = "attention.inner_attention"
+        for last_n, want_scans in (
+            ((), [(n_layers, [])]),
+            (((attention, 1),), [(n_layers - 1, []), (1, [attention])]),
+        ):
+            with self.subTest(save_last_n_layers=last_n):
+                scanned = _build(
+                    stacked=True,
+                    scan=True,
+                    stack_kwargs={"save_last_n_layers": last_n},
                 )
+                scans = []
+                scan = layer_stack.scan_with_remat_policy
+
+                def spy_scan(body, init, xs, regions):
+                    scans.append((next(iter(xs.values())).shape[0], sorted(regions)))
+                    return scan(body, init, xs, frozenset())
+
+                with patch.object(layer_stack, "scan_with_remat_policy", spy_scan):
+                    scanned(tokens).sum().backward()
+                self.assertEqual(scans, want_scans)
+
+                # `_parameters`, not `get_parameter`: after SimpleFSDP the
+                # attribute returns the gathered tensor, which has no `.grad`.
+                stacks = getattr(scanned, STACK_ATTR)._parameters
+                for i, layer in enumerate(plain.layers.values()):
+                    for name, param in layer.named_parameters():
+                        torch.testing.assert_close(
+                            stacks[name.replace(".", "__")].grad[i].to_local(),
+                            param.grad.to_local(),
+                            rtol=1e-5,
+                            atol=5e-5,
+                            msg=f"layers.{i}.{name}",
+                        )
 
     def test_the_body_gathers_in_the_compute_dtype(self):
         """The gather is also the cast, exactly as SimpleFSDP's is.
@@ -509,6 +536,23 @@ def _toy_layer(dim=4, extra=None, out=None, cache=None, frozen=False):
 
 def _toy_layers(*mods):
     return nn.ModuleDict({str(i): m for i, m in enumerate(mods)})
+
+
+class TestSegments(unittest.TestCase):
+    def test_segments(self):
+        for args, want in (
+            # No last-N: one segment, saving the plain save_regions.
+            ((94, ("a",), ()), [(0, 94, frozenset({"a"}))]),
+            (
+                (94, (), (("a", 36),)),
+                [(0, 58, frozenset()), (58, 94, frozenset({"a"}))],
+            ),
+            # N of at least all layers: one segment.
+            ((4, (), (("a", 4),)), [(0, 4, frozenset({"a"}))]),
+            ((4, (), (("a", 9),)), [(0, 4, frozenset({"a"}))]),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(_segments(*args), want)
 
 
 class TestStackable(unittest.TestCase):

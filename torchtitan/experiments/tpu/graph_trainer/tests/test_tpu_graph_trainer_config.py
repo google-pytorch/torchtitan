@@ -430,18 +430,26 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "full_and_scan_offload"):
       self._qwen3_graph_config(config)
 
-  @parameterized.parameters("tpu_selective", "tpu_selective_and_offload")
+  @parameterized.parameters(
+      ("tpu_selective", ("attention.inner_attention",), {}),
+      ("tpu_selective_and_offload", ("attention.inner_attention",), {}),
+      ("tpu_selective_and_offload", (), {"attention.inner_attention": 4}),
+  )
   def test_scanning_passes_save_regions_to_the_scan_body(
-      self, memory_policy: str
+      self, memory_policy: str, save_regions: tuple, last_n_layers: dict
   ) -> None:
     config = qwen3_8b()
     config.compile.use_scan_layers = True
     config.compile.memory_policy = memory_policy
-    config.compile.save_regions = ("attention.inner_attention",)
+    config.compile.save_regions = save_regions
+    config.compile.save_last_n_layers = last_n_layers
 
     with torch.device("meta"):
       model = self._qwen3_graph_config(config).model_spec.model.build()
-    self.assertEqual(model.layers.save_regions, ("attention.inner_attention",))
+    self.assertEqual(model.layers.save_regions, save_regions)
+    self.assertEqual(
+        model.layers.save_last_n_layers, tuple(last_n_layers.items())
+    )
 
   def test_scan_offload_takes_a_saved_region(self) -> None:
     config = ConfigManager().parse_args([
@@ -480,6 +488,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config.compile.scan_offload = names
 
     with self.assertRaisesRegex(ValueError, error):
+      self._qwen3_graph_config(config)
+
+  def test_scan_offload_rejects_a_last_n_only_region(self) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "tpu_selective_and_offload"
+    config.compile.save_last_n_layers = {"attention.inner_attention": 4}
+    config.compile.scan_offload = ("layer_input", "attention.inner_attention")
+
+    with self.assertRaisesRegex(ValueError, "save_last_n_layers region"):
+      self._qwen3_graph_config(config)
+
+  def test_scan_last_n_rejects_graph_split(self) -> None:
+    # The layers run as several scans, and the fence pass skips split graphs.
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "tpu_selective"
+    config.compile.save_last_n_layers = {"attention.inner_attention": 4}
+    config.compile.graph_split.enabled = True
+
+    with self.assertRaisesRegex(ValueError, "fence_scan_segments"):
       self._qwen3_graph_config(config)
 
   def test_scan_offload_warns_that_the_budget_is_ignored(self) -> None:
@@ -610,20 +639,20 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           "use-scan-layers",
       ),
       (
+          "scan_last_n",
+          "tpu_selective",
+          (),
+          {"moe.routing": 2},
+          True,
+          "use-scan-layers",
+      ),
+      (
           "scan_unknown_region",
           "tpu_selective",
           ("moe.nope",),
           {},
           True,
           "use-scan-layers",
-      ),
-      (
-          "scan_last_n_layers",
-          "tpu_selective",
-          (),
-          {"attention.inner_attention": 2},
-          True,
-          "no compile.save_last_n_layers",
       ),
       (
           "regions_without_policy",

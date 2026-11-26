@@ -204,7 +204,7 @@ class ScanOffloadTest(parameterized.TestCase):
         # Reloading the whole stack every iteration is worse than no offload.
         ("a_whole_stack_read", {"reads": "whole"}, lambda g, s: [], None, "whole"),
         ("no_saved_carry", {"saves_carry": False}, lambda g, s: [], None,
-         "none saves"),
+         "saves its carry 0 times"),
         ("a_region_no_scan_saves", {}, lambda g, s: [], ("feed_forward.w2",),
          "saves region"),
     )
@@ -219,6 +219,17 @@ class ScanOffloadTest(parameterized.TestCase):
             _offload(gm, names)
         self.assertEqual(_ao_targets(_body_of(gm, fwd).graph), [])
         self.assertEqual(_ao_targets(_body_of(gm, bwd).graph), [])
+
+    def test_carry_check_is_per_forward_scan(self):
+        # With last-N, one forward scan per segment; each must save its carry.
+        _, _, bwd_a = self._pair()
+        fwd_b, _, bwd_b = self._pair(saves_carry=False)
+        self.graph.output((bwd_a, bwd_b))
+
+        with self.assertRaisesRegex(
+            RuntimeError, f"forward scan {fwd_b.name} saves its carry 0 times"
+        ):
+            offload_scan_activations(self._gm())
 
     def test_a_graph_with_no_scan_raises(self):
         big = _mm(self.graph, self.x, (4096, 2048), name="log_softmax")

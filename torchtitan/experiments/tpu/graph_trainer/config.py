@@ -27,6 +27,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
+from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import SAVED_CARRY
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     resolve_save_regions,
 )
@@ -151,7 +152,7 @@ class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   # the scan saves to keep on host, by name. "layer_input" is the saved layer
   # input; a save region (also listed in save_regions) is its saved values.
   # Example: --compile.scan-offload layer_input attention.inner_attention
-  scan_offload: tuple[str, ...] = ("layer_input",)
+  scan_offload: tuple[str, ...] = (SAVED_CARRY,)
   # Execute optimizer.step eagerly, in a separate compiled FX graph, or inside
   # the joint forward/loss/backward graph.
   optimizer_compile: TpuGraphTrainerOptimizerCompileMode = "eager"
@@ -289,14 +290,14 @@ def _validate_scan_offload(config: "TpuGraphTrainer.Config") -> None:
       and compile_config.memory_policy
       in ("full_and_scan_offload", "tpu_selective_and_offload")
   ):
-    if names != ("layer_input",):
+    if names != (SAVED_CARRY,):
       raise ValueError(
           "compile.scan_offload only applies with --compile.use-scan-layers "
           "and compile.memory_policy='full_and_scan_offload' or "
           "'tpu_selective_and_offload'"
       )
     return
-  known = {"layer_input", *SCAN_SAVE_REGIONS}
+  known = {SAVED_CARRY, *SCAN_SAVE_REGIONS}
   unknown = [name for name in names if name not in known]
   if unknown or not names or len(set(names)) != len(names):
     raise ValueError(
@@ -312,7 +313,7 @@ def _validate_scan_offload(config: "TpuGraphTrainer.Config") -> None:
         "compile.save_last_n_layers; offloading a save_last_n_layers region "
         "is not supported"
     )
-  not_saved = [n for n in names if n != "layer_input" and n not in saved]
+  not_saved = [n for n in names if n != SAVED_CARRY and n not in saved]
   if not_saved:
     raise ValueError(
         f"compile.scan_offload names {not_saved}, which are not saved; add "

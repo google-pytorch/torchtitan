@@ -636,7 +636,7 @@ class LayerStack:
             logger.info(
                 "Decoder layers run as a scan: the body recomputes everything "
                 "but %ssave regions %s%s",
-                "its MoE expert counts and " if has_moe else "",
+                "its MoE expert counts (if all-reduced) and " if has_moe else "",
                 list(save_regions),
                 f" (in the last N layers: {dict(save_last_n_layers)})"
                 if save_last_n_layers

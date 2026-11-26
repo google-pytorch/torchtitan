@@ -24,6 +24,7 @@ and backward.
 from __future__ import annotations
 
 from collections import defaultdict
+import logging
 import operator
 from typing import Any
 
@@ -38,7 +39,8 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _optimization_barrier,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 _CHUNK_IDX_KEY = "ep_chunk_idx"

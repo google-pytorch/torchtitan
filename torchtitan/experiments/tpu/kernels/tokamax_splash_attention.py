@@ -5,6 +5,7 @@ Uses torch_tpu._internal.pallas.pallas.jax_op to bridge JAX -> PyTorch.
 """
 
 import functools
+import logging
 import math
 from typing import Optional
 
@@ -21,7 +22,8 @@ from torchtitan.experiments.tpu.distributed.headtail import (
     slice_cp_mask_info,
 )
 from torchtitan.experiments.tpu.kernels import splash_tbwd
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 try:
   from tokamax._src.ops.splash_attention import splash_attention_kernel  # pylint: disable=g-import-not-at-top

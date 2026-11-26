@@ -1,14 +1,14 @@
+import logging
 import os as os
 import torch
-import torchtitan.tools.logging as torchtitan_logging
-import torchtitan.tools.profiler as profiler_tool
+import torchtitan.observability.profiler as profiler_tool
 
 try:
   import jax
 except ImportError:
   jax = None
 
-logger = torchtitan_logging.logger
+logger = logging.getLogger(__name__)
 
 
 class JaxProfiler:

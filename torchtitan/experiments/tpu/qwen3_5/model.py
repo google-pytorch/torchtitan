@@ -114,6 +114,7 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
       attention_masks: Qwen35AttentionMaskDict | None,
       positions: torch.Tensor | None = None,
       *,
+      padding_mask: torch.Tensor | None = None,
       full_positions: torch.Tensor | None = None,
       full_segment_ids: torch.Tensor | None = None,
   ) -> torch.Tensor:
@@ -139,7 +140,7 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
 
     h_TD = self.ffn_norm(x_TD)
     if self.moe_enabled:
-      x_TD = x_TD + self.moe(h_TD)
+      x_TD = x_TD + self.moe(h_TD, padding_mask_T=padding_mask)
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
@@ -189,6 +190,7 @@ class TpuQwen35Model(Qwen35Model):
       *,
       attention_masks: Any = None,
       positions: torch.Tensor | None = None,
+      padding_mask: torch.Tensor | None = None,
       cp_full_positions: torch.Tensor | None = None,
       cp_full_segment_ids: torch.Tensor | None = None,
       **kwargs,
@@ -217,6 +219,7 @@ class TpuQwen35Model(Qwen35Model):
           tokens,
           attention_masks=attention_masks,
           positions=positions,
+          padding_mask=padding_mask,
           **kwargs,
       )
     unsupported = sorted(
@@ -245,6 +248,7 @@ class TpuQwen35Model(Qwen35Model):
           x,
           attention_masks,
           positions,
+          padding_mask=padding_mask,
           full_positions=cp_full_positions,
           full_segment_ids=cp_full_segment_ids,
       )
@@ -271,7 +275,10 @@ class TpuQwen35Model(Qwen35Model):
           max_context_length=max_context_length,
       )
     batch: dict[str, Any] = dict(input_dict)
-    padding_mask = batch.pop("padding_mask", None)
+    # Kept in the batch, as upstream does: `decoder_input_sharding()` has an
+    # entry for it, so it is CP-sharded with the tokens and reaches `forward`,
+    # where the MoE router excludes padding from its counts.
+    padding_mask = batch.get("padding_mask")
     if batch.pop("mrope_positions", None) is not None:
       # TPU: CP shards text tokens only; vision tokens would need scattering
       # into the sequence before sharding.

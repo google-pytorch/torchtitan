@@ -1,7 +1,9 @@
 """SPMD utilities for TPU."""
 
+import logging
 import torch
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 try:
   spmd_safe = torch.tpu.distributed.spmd_safe

@@ -1,6 +1,7 @@
 """Parallelization for Qwen3.5 models on TPU."""
 
 import dataclasses
+import logging
 
 import torch
 from torch import nn
@@ -13,7 +14,7 @@ from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.tpu.components.activation_checkpoint import tpu_selective_ac_config
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 from torchtitan.tools.utils import device_type
 
 # Before `torchtitan.models.qwen3_5`, which imports the CUDA-only `attn_gym`.
@@ -160,7 +161,7 @@ def _parallelize_text_qwen3_5_with_cp(
       edp_mesh=edp_mesh,
       dp_mesh_dims=dp_mesh_dims,
       edp_mesh_dims=edp_mesh_dims,
-      enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+      symm_mem_scope=parallelism.fsdp_symm_mem_scope,
   )
   return model
 

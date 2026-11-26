@@ -24,6 +24,7 @@ partition metadata used to validate that layers and collective chains remain
 indivisible.
 """
 
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import chain
@@ -70,7 +71,8 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_partitioned_pass,
     tpu_backend_compile_pass,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult

@@ -8,13 +8,15 @@ that may do nothing (goodput off).
 import contextlib
 import datetime
 import enum
+import logging
 import os
 import time
 from typing import Any, Callable, Iterator, Optional
 
 import torch.distributed as dist
 from torchtitan.experiments.tpu.goodput.config import GoodputConfig
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class GoodputEvent(enum.Enum):

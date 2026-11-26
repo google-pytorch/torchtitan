@@ -1215,6 +1215,49 @@ class CPQwen35ConfigTest(parameterized.TestCase):
     # cp_shard's segment_ids as an explicit input, for the attention layers.
     self.assertIs(extra["cp_full_segment_ids"], full_seg)
 
+  def test_tpu_model_cp_keeps_padding_mask(self):
+    """Under CP the padding mask is CP-sharded and reaches the forward kwargs."""
+    cfg = _small_vocab(config_registry.qwen35_debugmodel_allgather_cp2())
+    with torch.device("cpu"):
+      model = cfg.model_spec.model.build()
+    owner = cfg.model_spec.model.first_full_attention_backend._owner
+    tokens = torch.arange(2 * _SEQ_LEN)
+    # The tail of the second sequence is padding.
+    padding_mask = tokens >= 2 * _SEQ_LEN - 3
+    batch = {
+        "input": tokens,
+        "labels": tokens,
+        "positions": tokens % _SEQ_LEN,
+        "padding_mask": padding_mask,
+    }
+
+    def shard(input_dict, input_shardings, *unused_args):
+      # cp_shard shards the tensors that have an input sharding.
+      self.assertIn("padding_mask", input_shardings)
+      self.assertIs(input_dict["padding_mask"], padding_mask)
+      return {
+          k: v.chunk(2)[1] if isinstance(v, torch.Tensor) else v
+          for k, v in input_dict.items()
+      }
+
+    with mock.patch.object(
+        owner, "cp_shard", side_effect=shard
+    ) as cp_shard, mock.patch(
+        "torchtitan.experiments.tpu.qwen3_5.model.annotate_input_spmd_types",
+        side_effect=lambda dims, b, s: b,
+    ):
+      _, _, extra = model.preprocess_inputs(
+          batch,
+          parallel_dims=mock.Mock(cp_enabled=True),
+          parallelism=cfg.parallelism,
+      )
+    cp_shard.assert_called_once()
+    # `forward(..., padding_mask=...)` gets this rank's shard of the mask.
+    self.assertTrue(torch.equal(extra["padding_mask"], padding_mask.chunk(2)[1]))
+    self.assertTrue(extra["padding_mask"].any())
+    # The caller's batch is left as it was.
+    self.assertIs(batch["padding_mask"], padding_mask)
+
   @parameterized.named_parameters(
       ("without_positions", "positions", None, ValueError, "RoPE positions"),
       (

@@ -10,7 +10,7 @@ from typing import Literal, cast
 from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
@@ -65,7 +65,7 @@ from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 
 
 # Upstream d771abb0 identifies an override by the import path of its decorated
@@ -704,9 +704,10 @@ def qwen3_32b() -> TpuGraphTrainer.Config:
 def qwen3_32b_4x8x8() -> TpuGraphTrainer.Config:
   """Qwen3 32B recipe for a tpu7x-4x8x8 slice (512 devices).
 
-  At world 512 the w1/w3 gradient shards are 25600 / 512 = 50 rows. That is
-  not a multiple of 8, so their reduce-scatters run on the TensorCore instead
-  of SparseCore (~2.5 s/step). All-reduce plus a local slice keeps them on
+  At world 512 the gradient shard of the packed w1/w3 parameter
+  (``w13_packed``, [51200, 5120]) is 51200 / 512 = 100 rows. That is not a
+  multiple of 8, so its reduce-scatter runs on the TensorCore instead of
+  SparseCore (~2.5 s/step). All-reduce plus a local slice keeps it on
   SparseCore: 14.33 -> 12.34 s, for +49 GiB peak HBM.
   """
   cfg = qwen3_32b()
@@ -716,10 +717,10 @@ def qwen3_32b_4x8x8() -> TpuGraphTrainer.Config:
   # and 56 GiB peak HBM.
   cfg.compile.fsdp_barrier_policy = "interleave"
   cfg.compile.fsdp_allreduce_slice_parameter_patterns = (
-      "layers.*.feed_forward.w1.weight",
-      "layers.*.feed_forward.w3.weight",
+      "layers.*.feed_forward.w13_packed.weight",
   )
-  cfg.compile.fsdp_allreduce_slice_max_input_bytes = 25600 * 5120 * 4
+  # One FP32 w13_packed gradient: [2 * 25600, 5120].
+  cfg.compile.fsdp_allreduce_slice_max_input_bytes = 51200 * 5120 * 4
   return cfg
 
 

@@ -20,6 +20,7 @@ validate the resulting numerical trajectory.
 from __future__ import annotations
 
 import fnmatch
+import logging
 
 import torch
 import torch.distributed as dist
@@ -27,12 +28,28 @@ import torch.distributed as dist
 from torchtitan.experiments.graph_trainer.common_utils import (
     PARAMETER_GRADIENT_FQNS_META,
 )
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 _ALL_REDUCE = torch.ops._c10d_functional.all_reduce.default
 _REDUCE_SCATTER = torch.ops._c10d_functional.reduce_scatter_tensor.default
 _WAIT_TENSOR = torch.ops._c10d_functional.wait_tensor.default
+
+
+def matching_parameter_patterns(
+    parameter_fqn: str, parameter_patterns: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return the patterns that select ``parameter_fqn``.
+
+    A pattern is a case-sensitive ``fnmatch`` glob over the whole parameter
+    FQN, as ``named_parameters()`` reports it. Recipe tests use this to check
+    their patterns against a model's parameters with the pass's own rule.
+    """
+    return tuple(
+        pattern
+        for pattern in parameter_patterns
+        if fnmatch.fnmatchcase(parameter_fqn, pattern)
+    )
 
 
 def _find_reduce_scatter(
@@ -85,17 +102,15 @@ def apply_selected_reduce_scatter_allreduce_pass(
                 f"Invalid {PARAMETER_GRADIENT_FQNS_META} metadata on "
                 f"{gradient.name}: {fqns!r}"
             )
-        matching_fqns = tuple(
-            fqn
+        patterns_by_fqn = tuple(
+            (fqn, matching_parameter_patterns(fqn, parameter_patterns))
             for fqn in fqns
-            if any(fnmatch.fnmatchcase(fqn, pattern) for pattern in parameter_patterns)
         )
+        matching_fqns = tuple(fqn for fqn, patterns in patterns_by_fqn if patterns)
         if not matching_fqns:
             continue
         matched_patterns.update(
-            pattern
-            for pattern in parameter_patterns
-            if any(fnmatch.fnmatchcase(fqn, pattern) for fqn in fqns)
+            pattern for _, patterns in patterns_by_fqn for pattern in patterns
         )
         found = _find_reduce_scatter(gradient)
         if found is None:
@@ -218,4 +233,7 @@ def apply_selected_reduce_scatter_allreduce_pass(
     return gm
 
 
-__all__ = ["apply_selected_reduce_scatter_allreduce_pass"]
+__all__ = [
+    "apply_selected_reduce_scatter_allreduce_pass",
+    "matching_parameter_patterns",
+]

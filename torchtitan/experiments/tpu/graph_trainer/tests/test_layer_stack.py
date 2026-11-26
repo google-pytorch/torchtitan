@@ -103,7 +103,6 @@ def _moe_config(num_experts: int):
         _config(qwen3_registry), enable_weight_tying=False
     )
     config.layers = qwen3_models._build_qwen3_moe_layers(  # pylint: disable=protected-access
-        fuse_qkv=True,
         n_layers=2,
         dim=config.dim,
         n_heads=16,

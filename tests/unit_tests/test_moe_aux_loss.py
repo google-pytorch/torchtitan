@@ -13,7 +13,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from torch import nn
 from torch.nn import functional as F
 
-from torchtitan.components.metrics import TensorBoardLogger
+from torchtitan.observability.metrics import TensorBoardLogger
 from torchtitan.components.optimizer.optimizer import (
     collect_moe_routing_metric_tensors,
     configure_moe_routing_metrics,
@@ -31,6 +31,7 @@ from torchtitan.models.common.config_utils import (
     make_aux_loss_config,
     update_moe_aux_loss_configs,
 )
+from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
     _batch_wise_load_balance_loss,
@@ -93,6 +94,37 @@ def test_aux_loss_injection_matches_explicit_loss(loss_fn):
         rtol=1e-12,
         atol=1e-12,
     )
+
+
+def test_sequence_wise_aux_loss_ignores_all_padding_sequence():
+    """A sequence with no counted tokens contributes 0, not 0 / 0.
+
+    The router zeroes the scores and the routing map of padding tokens, so an
+    all-padding sequence reaches the loss as all zeros.
+    """
+    L, E, K = 5, 7, 2
+    coeff = 0.125
+    torch.manual_seed(0)
+
+    valid_scores_LE = torch.rand(L, E, dtype=torch.double)
+    scores_BLE = torch.stack([valid_scores_LE, torch.zeros_like(valid_scores_LE)])
+    scores_BLE.requires_grad_(True)
+    valid_map_LE = _routing_map(torch.topk(valid_scores_LE, k=K, dim=-1).indices, E)
+    routing_map_BLE = torch.stack([valid_map_LE, torch.zeros_like(valid_map_LE)])
+
+    loss = _sequence_wise_load_balance_loss(scores_BLE, routing_map_BLE, K, coeff)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(scores_BLE.grad).all()
+    assert scores_BLE.grad[0].abs().sum() > 0
+    torch.testing.assert_close(scores_BLE.grad[1], torch.zeros(L, E).double())
+
+    # The mean is still over both sequences; the padded one adds 0.
+    valid_only = _sequence_wise_load_balance_loss(
+        valid_scores_LE.unsqueeze(0), valid_map_LE.unsqueeze(0), K, coeff
+    )
+    torch.testing.assert_close(loss.detach(), valid_only / 2)
 
 
 def test_batch_wise_aux_loss_matches_qwen_definition():
@@ -497,7 +529,7 @@ def _router_config(aux_loss=None):
     return TokenChoiceTopKRouter.Config(
         num_experts=_E,
         top_k=_K,
-        score_func="softmax",
+        score_func=Softmax.Config(),
         route_norm=True,
         gate=Linear.Config(in_features=_D, out_features=_E, bias=False),
         aux_loss=aux_loss,
@@ -646,7 +678,7 @@ def test_moe_forward_produces_routing_metrics():
 
     metrics = get_moe_load_balancing_metrics([model_part])
 
-    counts_E = moe.tokens_per_expert_E
+    counts_E = moe.router.tokens_per_expert_E
     assert json.loads(metrics["moe/route_counts_json"]) == [
         counts_E.to(torch.int64).tolist()
     ]

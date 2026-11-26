@@ -32,6 +32,7 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import apply_overrides
 from torchtitan.config.override import OverrideConfig
 from torchtitan.experiments.tpu.distributed import accelerator_device_type as device_type
+from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.experiments.tpu.testing import base_device_test
 from torchtitan.experiments.tpu.testing import test_utils
 from torchtitan.experiments.tpu import tpu_flags
@@ -343,6 +344,11 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         if param.grad is not None
     }
     expected_tt_grads = adapter.from_hf(hf_grads)
+    # HF has separate gate/up grads; fold them into the fused w13 layout with
+    # the same merge the load hook applies to weights (upstream 150c4f73).
+    for name, module in tt_model.named_modules():
+      if isinstance(module, FeedForward):
+        module._merge_w13_on_load(module, expected_tt_grads, f"{name}.")
     if tt_config.enable_weight_tying:
       expected_tt_grads.pop("lm_head.weight", None)
 

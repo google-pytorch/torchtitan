@@ -6,6 +6,8 @@
 
 from typing import cast
 
+from renderers import Message
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -15,23 +17,26 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
-from torchtitan.components.quantization import (
+from torchtitan.components.validate import Validator
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.transform import (
+    apply_transforms,
     Float8LinearConverter,
+    LinearLoRAHandler,
+    LoRATransform,
     MXFP8LinearConverter,
     NVFP4LinearConverter,
 )
-from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
-from torchtitan.components.validate import Validator
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
 from torchtitan.models.common.config_utils import (
     decoder_vocab_size,
     DEFAULT_DEBUG_MODEL_SEQ_LEN,
 )
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.observability.profiler import Profiler
+from torchtitan.quantization.nvfp4 import nvfp4_bf16_tail_fqns
 from torchtitan.trainer import Trainer
 
 from . import model_registry
@@ -159,7 +164,7 @@ def llama3_debugmodel_mxfp8(
     config = llama3_debugmodel(seq_len=seq_len)
     config.compile = CompileConfig(enable=True, components=["model"])
     config.model_spec = model_registry(
-        "debugmodel",
+        "debugmodel_mxfp8",
         seq_len=seq_len,
         converters=[
             llama3_mxfp8_linear_converter_config(model_compile_enabled=True),
@@ -220,8 +225,6 @@ def llama3_debugmodel_first_85_pct_layers_nvfp4(
 def llama3_debugmodel_float8_emulate_lora(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
-    from torchtitan.components.lora import LoRAConverter
-
     config = llama3_debugmodel(seq_len=seq_len)
     config.model_spec = model_registry(
         "debugmodel",
@@ -231,10 +234,19 @@ def llama3_debugmodel_float8_emulate_lora(
                 emulate=True,
                 model_compile_enabled=False,
             ),
-            LoRAConverter.Config(rank=8, alpha=16.0, target_modules=["wqkv", "wo"]),
         ],
     )
-    return config
+    return apply_transforms(
+        config,
+        [
+            LoRATransform(
+                handlers=(LinearLoRAHandler(),),
+                rank=8,
+                alpha=16.0,
+                target_modules=["wqkv", "wo"],
+            )
+        ],
+    )
 
 
 def llama3_debugmodel_ce_loss(
@@ -421,7 +433,7 @@ def sft_debugmodel(
 ) -> Trainer.Config:
     """SFT debug config with Llama3 debugmodel and local test data."""
 
-    def process_sample(sample):
+    def process_sample(sample) -> list[Message]:
         return [
             {"role": "user", "content": sample["question"]},
             {"role": "assistant", "content": sample["answer"]},

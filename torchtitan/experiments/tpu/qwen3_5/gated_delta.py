@@ -23,6 +23,7 @@ axis as one stream. This module provides the TPU replacements:
    pretraining runs over each ``[B, S]`` row as one stream.
 """
 
+import logging
 from dataclasses import dataclass, field, replace
 
 import torch
@@ -36,7 +37,8 @@ from torchtitan.experiments.tpu.components import unflatten_shim
 from torchtitan.experiments.tpu.qwen3_5 import attn_gym_stub  # pylint: disable=unused-import
 from torchtitan.models.common.attention import VarlenMetadata, segment_ids_from_positions
 from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 try:
   from torchtitan.experiments.tpu.kernels import causal_conv1d

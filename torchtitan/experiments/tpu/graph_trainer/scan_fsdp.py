@@ -19,6 +19,7 @@ graph.
 """
 
 import dataclasses
+import logging
 import math
 from typing import Any
 
@@ -33,8 +34,7 @@ import torch.distributed.distributed_c10d as c10d
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from torchtitan.tools.logging import logger
-
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ScanFSDPSpec",

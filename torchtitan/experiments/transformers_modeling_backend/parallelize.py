@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ from torch.distributed.tensor import Shard
 
 from torchtitan.config import (
     CompileConfig,
+    FSDPSymmMemScope,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
@@ -33,7 +35,9 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
@@ -208,7 +212,7 @@ def parallelize_hf_transformers(
         pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
         ep_degree=parallel_dims.ep,
         dp_mod_ep_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
@@ -243,7 +247,7 @@ def apply_fsdp(
     dp_mesh_dims: DataParallelMeshDims | None = None,
     edp_mesh_dims: DataParallelMeshDims | None = None,
     gradient_divide_factor: int | None = None,
-    enable_symm_mem: bool = False,
+    symm_mem_scope: FSDPSymmMemScope = None,
 ):
     """Apply data parallelism (via FSDP2) to the model.
 
@@ -367,8 +371,7 @@ def apply_fsdp(
 
     fully_shard(model, **fsdp_config)
 
-    if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+    enable_fsdp_symm_mem(model, symm_mem_scope)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

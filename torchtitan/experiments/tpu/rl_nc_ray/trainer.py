@@ -21,10 +21,11 @@ from torchtitan.experiments.tpu.rl_nc_ray.padding_packing_utils import (
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools import utils
+from torchtitan.components.checkpointer.utils import canonical_fqn
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,17 @@ def load_initial_hf_weights_on_cpu(model, torchtitan_state_dict: dict) -> None:
     """
     Manually copies initial HF state dict tensors into model's DTensors on CPU.
     """
-    model_sd = model.state_dict()
+    # state_dict() exposes the logical slices of fused parameters (wq/wk/wv,
+    # w1/w3) as tensors built by a save hook, so writing into those would not
+    # load the fused parameter. Merge the checkpoint into the fused layout and
+    # copy into the parameters instead; state_dict() still supplies buffers.
+    torchtitan_state_dict = tpu_utils.merge_into_fused_parameters(
+        model, torchtitan_state_dict
+    )
+    model_sd = {
+        **model.state_dict(),
+        **{canonical_fqn(name): p for name, p in model.named_parameters()},
+    }
     with torch.no_grad():
         for k, v in torchtitan_state_dict.items():
             if k in model_sd:

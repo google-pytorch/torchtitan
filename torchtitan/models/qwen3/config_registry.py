@@ -6,6 +6,8 @@
 
 from typing import cast
 
+from renderers import Message
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -15,22 +17,22 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import (
     default_adamw,
     LRSchedulersContainer,
     OptimizersContainer,
     ParamGroupConfig,
 )
-from torchtitan.components.quantization import NVFP4LinearConverter
-from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.transform import NVFP4LinearConverter
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
 from torchtitan.models.common.config_utils import (
     decoder_vocab_size,
     DEFAULT_DEBUG_MODEL_SEQ_LEN,
 )
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.quantization.nvfp4 import nvfp4_bf16_tail_fqns
 from torchtitan.trainer import Trainer
 
 from . import model_registry
@@ -499,7 +501,7 @@ def qwen3_moe_deepep(
 def sft_qwen3_8b_math(seq_len: int | None = None) -> Trainer.Config:
     """Qwen3-8B SFT on GSM8K math dataset."""
 
-    def process_sample(sample):
+    def process_sample(sample) -> list[Message]:
         answer = sample["answer"]
         reasoning, final_answer = answer.rsplit("####", 1)
         return [

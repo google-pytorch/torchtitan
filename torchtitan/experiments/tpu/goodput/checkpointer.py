@@ -6,10 +6,12 @@ Use `wrap_checkpointer()`; `GoodputCheckpointer` is an implementation detail.
 """
 
 import datetime
+import logging
 from typing import Any, Callable, NamedTuple, Optional
 
 from torchtitan.experiments.tpu.goodput import goodput
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 # The checkpointer methods wrapped in place, and the attributes read.
 # test_goodput checks them against TorchTitan's `CheckpointManager`, so an

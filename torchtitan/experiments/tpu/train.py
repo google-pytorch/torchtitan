@@ -9,6 +9,7 @@
 import contextlib
 import dataclasses
 import json
+import logging
 from typing import Any, cast
 
 import os
@@ -32,8 +33,10 @@ import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.experiments.tpu.utils import with_split_optimizers_by_mesh
-from torchtitan.tools.logging import init_logger, logger
+from torchtitan.observability.logging import init_logger
 import torchtitan.train
+
+logger = logging.getLogger(__name__)
 
 
 class TPUTrainer(torchtitan.train.Trainer):
@@ -68,8 +71,26 @@ class TPUTrainer(torchtitan.train.Trainer):
     # runs this hook before it builds the LR schedulers.
     model_spec = getattr(job_config, "model_spec", None)
     if model_spec is not None:
+      # TODO(#195): remove TpuPackedFeedForward and this converter call.
+      # Upstream pytorch/torchtitan#4808 stores w13 stacked as [2, F, D] with
+      # contiguous gate/up halves, which lands with PR #195; re-check dense
+      # step time there before deleting.
+      from torchtitan.experiments.tpu.components.ffn import TpuPackedFeedForwardConverter  # pylint: disable=g-import-not-at-top
+
+      parallelism = getattr(job_config, "parallelism", None)
+      tp_degree = (
+          max(1, parallelism.tensor_parallel_degree)
+          if parallelism is not None
+          else 1
+      )
+      model = (
+          TpuPackedFeedForwardConverter.Config(tp_degree=tp_degree)
+          .build()
+          .convert(model_spec.model)
+      )
       job_config.model_spec = dataclasses.replace(
           model_spec,
+          model=model,
           post_optimizer_build_fn=with_split_optimizers_by_mesh(
               model_spec.post_optimizer_build_fn
           ),

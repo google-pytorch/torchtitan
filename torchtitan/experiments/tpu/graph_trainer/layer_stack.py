@@ -45,6 +45,7 @@ which is always before FSDP shards anything.
 
 import contextlib
 import functools
+import logging
 from collections.abc import Iterator
 
 import torch
@@ -73,8 +74,8 @@ from torchtitan.experiments.tpu.components.layer_loop import (
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.protocols.module import Module
-from torchtitan.tools.logging import logger
 
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "check_layers_are_stackable",
@@ -387,8 +388,8 @@ class StackedLayers(TpuLayerLoop):
         self.stack = stack
         self.use_scan = use_scan
 
-    def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
-        return self.stack.run(h, *args, use_scan=self.use_scan)
+    def forward(self, h: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        return self.stack.run(h, *args, use_scan=self.use_scan, **kwargs)
 
 
 class LayerStack:
@@ -697,7 +698,7 @@ class LayerStack:
 
         return scan_body
 
-    def run(self, h: torch.Tensor, *args, use_scan: bool):
+    def run(self, h: torch.Tensor, *args, use_scan: bool, **kwargs):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
         Both paths run the same ``body``. Layer 0 acts as the template:
@@ -748,7 +749,7 @@ class LayerStack:
                 n: t.view(layer_shapes[n]) if n in layer_shapes else t
                 for n, t in params.items()
             }
-            return functional_call(template, params, (carry, *args))
+            return functional_call(template, params, (carry, *args), kwargs)
 
         # One [n_layers, *shape] stack per parameter, keyed by its mangled
         # name. For llama3-70B, unsharded, that is

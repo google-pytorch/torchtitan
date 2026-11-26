@@ -14,13 +14,15 @@ with complete reverse-mode autograd integration.
 
 # pylint: disable=broad-exception-caught,unused-variable
 
+import logging
 from typing import Optional
 import jax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
-from torchtitan.tools import logging as torchtitan_logging
+
+logger = logging.getLogger(__name__)
 
 
 def ssd_fused_chunk_kernel(
@@ -240,7 +242,7 @@ try:
   _pallas_ssd_fwd.register_autograd(_backward, setup_context=_setup_context)
   _pallas_ssd_op = _pallas_ssd_fwd
 except Exception as exc:
-  torchtitan_logging.logger.warning(
+  logger.warning(
       f"Failed to register Mamba2 SSD JAX ops with autograd: {exc}"
   )
   _pallas_ssd_fwd = None
@@ -313,7 +315,7 @@ def ssd_chunk_scan_pallas(
       a_log_2d = a_log.view(nheads, 1, 1)
       y_chunks = _pallas_ssd_fwd(x_hf, dt_2d, a_log_2d, b_hf, c_hf)
     except Exception as err:
-      torchtitan_logging.logger.warning(
+      logger.warning(
           f"Pallas SSD scan kernel failed with error: {err}. "
           "Falling back to vectorized XLA scan."
       )

@@ -6,6 +6,7 @@
 
 """TPU-only GraphTrainer memory policies."""
 
+import logging
 import operator
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -38,7 +39,8 @@ from torchtitan.experiments.tpu.components.remat_regions import (
     MOE_ROUTING,
     REMAT_REGION,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

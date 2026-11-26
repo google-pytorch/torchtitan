@@ -491,9 +491,8 @@ def _tpu_selective_and_offload_memory_policy_pass(
 ) -> torch.fx.GraphModule:
     """``tpu_selective`` saves kept in HBM, plus CPU offload of each layer's input.
 
-    By default the save-region values stay on device: backward reads them
-    first, so offloading them would add their bytes to the host link every
-    layer.
+    Without scan, the save-region values always stay on device. With scan,
+    ``compile.scan_offload`` can also send them to host.
     """
     if config.compile.use_scan_layers:
         # With scan, the saves live in the scan body (tagged by

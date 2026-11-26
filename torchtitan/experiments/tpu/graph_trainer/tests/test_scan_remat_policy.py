@@ -21,6 +21,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 # Imported for the same reason as in `test_layer_stack`: production scans run
 # with it installed, so these do too.
 from torchtitan.experiments.tpu.components import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
+from torchtitan.experiments.tpu.graph_trainer import scan_remat_policy
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     scan_with_remat_policy,
 )
@@ -320,6 +321,29 @@ class TestScanRematPolicy(unittest.TestCase):
     def test_refuses_an_unknown_save_region(self):
         with self.assertRaisesRegex(ValueError, "cannot save regions"):
             _run(_saving("moe.routing"))
+
+    def test_without_grad_runs_plain_scan(self):
+        """Validation runs the scan under no_grad: same result, and no region check."""
+        torch._dynamo.reset()
+        h, w = _inputs()
+
+        def body(carry, x):
+            return _body(carry, x, extra=_attention_term)
+
+        with torch.no_grad():
+            want, _ = scan(body, h, w)
+            got, _ = scan_with_remat_policy(
+                body, h, w, frozenset({ATTENTION_INNER_ATTENTION})
+            )
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_needs_the_pytorch_fixes(self):
+        self.assertTrue(scan_remat_policy._torch_has_scan_sac_fixes())
+        with mock.patch.object(
+            scan_remat_policy, "_torch_has_scan_sac_fixes", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "203534"):
+                _run(_saving())
 
 
 if __name__ == "__main__":

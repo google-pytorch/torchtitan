@@ -471,6 +471,8 @@ def graph_trainer_qwen35_moe_debugmodel_ep() -> TpuGraphTrainer.Config:
   """
   base = qwen35_moe_debugmodel()
   _debugmodel_moe_8l16e(base)
+  # Paired Pallas grouped matmuls: EP's routing weights before W2 need them.
+  _use_tpu_moe_kernels(base)
   cfg = _use_graph_split(
       base,
       layers_per_executable=1,

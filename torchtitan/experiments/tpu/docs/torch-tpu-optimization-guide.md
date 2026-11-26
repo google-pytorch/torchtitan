@@ -560,7 +560,8 @@ Constraints:
   parameter names stops matching. Model checkpoints keep their per-layer keys and move freely
   between scan and non-scan runs. Optimizer checkpoints do not, so a run cannot resume across a
   flip of the flag.
-- The generic `*_and_offload` memory policies are rejected. Use `full_and_scan_offload`.
+- Of the `*_and_offload` memory policies, only `full_and_scan_offload` and
+  `tpu_selective_and_offload` work with scan; the others are rejected.
 - Use the recipe's libtpu flag bundle. In the 235B recipe each layer's expert-gradient
   reduce-scatters land at the end of the loop body with little compute left to hide them, and the
   scan step runs measurably slower without the recipe's flags.
@@ -632,12 +633,18 @@ Select it through the memory policy:
 |---|---|---|
 | `sac_and_offload` | unrolled graph or graph splitter | activations that selective recompute still saves |
 | `full_and_offload` | unrolled graph or graph splitter | saved layer boundaries under full recompute |
-| `tpu_selective_and_offload` | unrolled graph or graph splitter | saved layer boundaries; the `tpu_selective` save regions stay in HBM |
-| `full_and_scan_offload` | scan | the one stacked layer-input tensor |
+| `tpu_selective_and_offload` | unrolled graph, graph splitter, or scan | saved layer boundaries; the `tpu_selective` save regions stay in HBM. With scan, the saves named in `compile.scan_offload` |
+| `full_and_scan_offload` | scan | the saves named in `compile.scan_offload` |
 
 `compile.cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors
-are picked largest-first until the budget is spent. It does not apply to the scan policy, which
-always offloads its one tensor. Make sure the host has that much free RAM per rank.
+are picked largest-first until the budget is spent. It does not apply with scan, where both
+policies offload exactly the saves `compile.scan_offload` names. Make sure the host has that much
+free RAM per rank.
+
+`compile.scan_offload` names what goes to host, like a JAX offload policy: `layer_input` (the
+default) is the stacked layer input; a save region, e.g. `attention.inner_attention`, is that
+region's saved values and must also be in `compile.save_regions`. A name that matches no save
+raises.
 
 **With scan, offload is close to mandatory.** A scan has one loop, so the per-layer saves come out
 as one stacked `[n_layers, batch, seq, dim]` tensor. One tensor cannot be freed a row at a time, so

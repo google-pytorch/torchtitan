@@ -430,15 +430,69 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "full_and_scan_offload"):
       self._qwen3_graph_config(config)
 
-  def test_scanning_passes_save_regions_to_the_scan_body(self) -> None:
+  @parameterized.parameters("tpu_selective", "tpu_selective_and_offload")
+  def test_scanning_passes_save_regions_to_the_scan_body(
+      self, memory_policy: str
+  ) -> None:
     config = qwen3_8b()
     config.compile.use_scan_layers = True
-    config.compile.memory_policy = "tpu_selective"
+    config.compile.memory_policy = memory_policy
     config.compile.save_regions = ("attention.inner_attention",)
 
     with torch.device("meta"):
       model = self._qwen3_graph_config(config).model_spec.model.build()
     self.assertEqual(model.layers.save_regions, ("attention.inner_attention",))
+
+  def test_scan_offload_takes_a_saved_region(self) -> None:
+    config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3",
+        "--config=graph_trainer_qwen3_debugmodel",
+        "--compile.use-scan-layers",
+        "--compile.memory_policy=tpu_selective_and_offload",
+        "--compile.save_regions", "attention.inner_attention",
+        "--compile.scan_offload", "layer_input", "attention.inner_attention",
+    ])
+
+    self._qwen3_graph_config(config)
+    self.assertEqual(
+        config.compile.scan_offload,
+        ("layer_input", "attention.inner_attention"),
+    )
+
+  @parameterized.named_parameters(
+      ("unknown_name", True, "tpu_selective_and_offload", ("layer_inputs",),
+       "at most once"),
+      # Only tpu_selective_and_offload saves a region.
+      ("region_not_saved", True, "full_and_scan_offload",
+       ("attention.inner_attention",), "not saved"),
+      ("nothing", True, "tpu_selective_and_offload", (), "at least one"),
+      ("no_scan", False, "tpu_selective_and_offload",
+       ("attention.inner_attention",), "only applies"),
+  )
+  def test_scan_offload_rejects(
+      self, use_scan, policy, names, error
+  ) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = use_scan
+    config.compile.memory_policy = policy
+    if policy == "tpu_selective_and_offload":
+      config.compile.save_regions = ("attention.inner_attention",)
+    config.compile.scan_offload = names
+
+    with self.assertRaisesRegex(ValueError, error):
+      self._qwen3_graph_config(config)
+
+  def test_scan_offload_warns_that_the_budget_is_ignored(self) -> None:
+    config = qwen3_8b()
+    config.compile.use_scan_layers = True
+    config.compile.memory_policy = "full_and_scan_offload"
+    config.compile.cpu_offload_budget_gb = 4.5
+
+    with self.assertLogs(level="WARNING") as logs:
+      self._qwen3_graph_config(config)
+    self.assertTrue(
+        any("cpu_offload_budget_gb is ignored" in m for m in logs.output)
+    )
 
   @parameterized.parameters(
       "default", "full", "eager", "sac_and_offload", "full_and_offload"

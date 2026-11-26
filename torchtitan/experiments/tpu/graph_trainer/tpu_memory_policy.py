@@ -31,6 +31,9 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
+from torchtitan.experiments.tpu.graph_trainer.tpu_host_offload import (
+    offload_scan_activations,
+)
 from torchtitan.experiments.tpu.components.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     FEED_FORWARD_W2,
@@ -486,12 +489,18 @@ def _tpu_selective_and_offload_memory_policy_pass(
     *,
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
-    """``tpu_selective`` saves kept in HBM, plus CPU offload of layer boundaries.
+    """``tpu_selective`` saves kept in HBM, plus CPU offload of each layer's input.
 
-    The layer boundaries are offloaded as in ``full_and_offload``. The chosen
-    save-region values stay on device: backward reads them first, and
-    offloading them too would add their bytes to the host link every layer.
+    Without scan, the save-region values always stay on device. With scan,
+    ``compile.scan_offload`` can also send them to host.
     """
+    if config.compile.use_scan_layers:
+        # With scan, the saves live in the scan body (tagged by
+        # `LayerStack.run`): the outer graph gets the full policy, and the saves
+        # named in `compile.scan_offload` (default: the layer input) go to host
+        # inside the loops.
+        _full_memory_policy_pass(gm, config=config)
+        return offload_scan_activations(gm, tuple(config.compile.scan_offload))
     last_n_layers = config.compile.save_last_n_layers
     regions = resolve_save_regions(
         config.compile.save_regions,

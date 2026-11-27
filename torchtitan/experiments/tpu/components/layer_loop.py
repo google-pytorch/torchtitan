@@ -25,6 +25,7 @@ __all__ = [
     "TpuLayerLoop",
     "builds_layer_loop",
     "model_subclass",
+    "register_layer_loop_forward",
     "runs_layer_loop",
     "tpu_model_class",
 ]
@@ -84,9 +85,40 @@ def _forward(
     return output
 
 
+# Models with their own ``forward`` (not ``Decoder.forward``), keyed by model
+# class, to a copy of that forward that hands the layers to ``model.layers``.
+_LAYER_LOOP_FORWARDS: dict[type, object] = {}
+
+
+def register_layer_loop_forward(model_cls: type, forward) -> None:
+    """Lets ``tpu_model_class`` rewrite a model whose ``forward`` is its own.
+
+    ``forward`` must be ``model_cls.forward`` with the layer loop replaced by
+    one call to ``self.layers`` when that is a ``TpuLayerLoop``.
+    """
+    _LAYER_LOOP_FORWARDS[model_cls] = forward
+
+
+def _registered_forward(model_cls: type):
+    """The registered copy of ``model_cls.forward``, or None.
+
+    Matched on the ``forward`` function, not the class, so a subclass that
+    keeps the registered model's ``forward`` (a recipe's FLOP-accounting
+    config class, say) is rewritten too.
+    """
+    for cls, forward in _LAYER_LOOP_FORWARDS.items():
+        if model_cls.forward is cls.forward:
+            return forward
+    return None
+
+
+def _is_loop_forward(forward) -> bool:
+    return forward is _forward or forward in _LAYER_LOOP_FORWARDS.values()
+
+
 def runs_layer_loop(model: torch.nn.Module) -> bool:
     """Whether ``model`` hands its layers to ``model.layers`` to run."""
-    return type(model).forward is _forward
+    return _is_loop_forward(type(model).forward)
 
 
 def builds_layer_loop(model_config: Decoder.Config) -> bool:
@@ -94,7 +126,7 @@ def builds_layer_loop(model_config: Decoder.Config) -> bool:
 
     Lets a caller check the rewrite landed without building the model.
     """
-    return model_config._owner.forward is _forward
+    return _is_loop_forward(model_config._owner.forward)
 
 
 def model_subclass(
@@ -138,8 +170,12 @@ def tpu_model_class(config_cls: type) -> type:
     One class per config class, cached.
     """
     model_cls = config_cls._owner
-    if model_cls.forward is _forward:
+    if _is_loop_forward(model_cls.forward):
         return model_cls  # already rewritten
+    if (forward := _registered_forward(model_cls)) is not None:
+        return model_subclass(
+            model_cls, config_cls, f"Tpu{model_cls.__name__}", forward=forward
+        )
     if not issubclass(model_cls, Decoder) or model_cls.forward is not Decoder.forward:
         raise TypeError(
             f"{model_cls.__name__} is not a Decoder running the stock forward"

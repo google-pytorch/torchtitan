@@ -95,8 +95,23 @@ def _mangle(name: str) -> str:
     return name.replace(".", "__")
 
 
-def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
-    """Every layer must match layer 0, or they cannot share a stack.
+def _stack_key(position: int, name: str, period: int) -> str:
+    """Stack name for ``name`` at ``position`` in a cycle of ``period`` layers.
+
+    With ``period=1`` this is the plain mangled name, so existing checkpoints of
+    optimizer state keep their keys. ``period=4``: ``p3__attn__wq__weight``.
+    """
+    return _mangle(name) if period == 1 else f"p{position}__{_mangle(name)}"
+
+
+def check_layers_are_stackable(
+    layers: nn.ModuleDict | dict[str, nn.Module],
+) -> None:
+    """Every layer must match the first, or they cannot share a stack.
+
+    ``layers`` maps each layer's number (as a string) to the layer, so errors
+    name the real layer; with ``period > 1`` it holds one position's layers.
+    Below, "layer 0" means the first of them.
 
     Parameters become rows of one tensor, so they have to agree on name, shape,
     dtype and ``requires_grad``. Dtype matters because the stack is allocated
@@ -114,8 +129,9 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
         named = [*layer.named_parameters(), *layer.named_buffers()]
         return {n: (tuple(t.shape), t.dtype, t.requires_grad) for n, t in named}
 
-    template, zero_buffers = spec(layers["0"]), dict(layers["0"].named_buffers())
-    for i, layer in enumerate(layers.values()):
+    (first, layer0), *_ = layers.items()
+    template, zero_buffers = spec(layer0), dict(layer0.named_buffers())
+    for i, layer in layers.items():
         # Load balancing keeps its state in buffers, and buffers aren't stacked,
         # so every layer would route off layer 0's. The value check above misses
         # it: the buffers start equal and only diverge during training. With no
@@ -147,7 +163,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
             ]
         if differences:
             raise ValueError(
-                f"layer {i} does not match layer 0, so their weights cannot "
+                f"layer {i} does not match layer {first}, so their weights cannot "
                 f"share a stack: {differences}. Stacking needs identical "
                 "layers "
                 "(https://github.com/google-pytorch/torchtitan/issues/24)."
@@ -400,13 +416,24 @@ class LayerStack:
     order wrong fails loudly.
     """
 
-    def __init__(self, layers: nn.ModuleDict, holder: LayerStackHolder):
+    def __init__(
+        self, layers: nn.ModuleDict, holder: LayerStackHolder, period: int = 1
+    ):
         self.layers = layers
         # The `LayerStackHolder` the stacks are registered on.
         self.holder = holder
         self.n_layers = len(layers)
-        # Per-layer parameter FQNs relative to a layer, e.g. "attention.wq.weight".
-        self.names: list[str] = []
+        # One scan step runs `period` consecutive layers, each position reading
+        # its own stacks. 10 layers, period 4: layers 0-7 scan as 2 steps,
+        # layers 8-9 run unrolled with their own parameters.
+        if period < 1 or period > self.n_layers:
+            raise ValueError(f"period {period} needs 1 <= period <= {self.n_layers}")
+        self.period = period
+        self.n_cycles = self.n_layers // period
+        self.n_stacked = self.n_cycles * period
+        # Per position in the cycle: (per-layer FQN, stack key), e.g.
+        # ("attention.wq.weight", "attention__wq__weight").
+        self.keys: list[list[tuple[str, str]]] = [[] for _ in range(period)]
         # What has already run, so a caller can't reorder the steps.
         self._unregistered = False
         self._views_attached = False
@@ -419,15 +446,22 @@ class LayerStack:
         # here; see `scan_fsdp`.
         self.fsdp_plan: dict[str, ScanFSDPSpec] = {}
 
-    def _slots(self) -> Iterator[tuple[int, str, nn.Module, str]]:
-        """Every per-layer parameter, as (row, FQN, owning module, attribute).
+    @property
+    def all_keys(self) -> list[str]:
+        return [key for keys in self.keys for _, key in keys]
+
+    def _slots(self) -> Iterator[tuple[int, int, str, str, nn.Module, str]]:
+        """Every stacked per-layer parameter, as (layer, row, FQN, stack key,
+        owning module, attribute).
 
         `_parameters` is keyed by the last part of the name alone, so adding or
         deleting an entry needs the owning module as well as the name. Attaching
         and dropping views are inverses of each other, so both walk this.
+        Layers past the last whole cycle are not stacked and are skipped.
         """
-        for i, layer in enumerate(self.layers.values()):
-            for name in self.names:
+        for i in range(self.n_stacked):
+            layer = self.layers[str(i)]
+            for name, key in self.keys[i % self.period]:
                 # "attention.wq.weight" splits into path ["attention", "wq"] and
                 # attr "weight". Walking that path from a layer lands on the `wq`
                 # Linear, and its _parameters["weight"] is the slot to swap.
@@ -435,7 +469,7 @@ class LayerStack:
                 mod = layer
                 for part in path:
                     mod = getattr(mod, part)
-                yield i, name, mod, attr
+                yield i, i // self.period, name, key, mod, attr
 
     # -- construction ------------------------------------------------------
 
@@ -457,22 +491,28 @@ class LayerStack:
         are shape-and-dtype placeholders that ``to_empty`` will materialize.
         """
         assert not self._unregistered, "unregister_and_allocate() ran twice"
-        check_layers_are_stackable(self.layers)
-        for name, p in self.layers["0"].named_parameters():
-            self.names.append(name)
-            self.holder.register_parameter(
-                _mangle(name),
-                nn.Parameter(
-                    torch.empty(
-                        self.n_layers, *p.shape, dtype=p.dtype, device=p.device
+        for pos in range(self.period):
+            group = {
+                str(i): self.layers[str(i)]
+                for i in range(pos, self.n_stacked, self.period)
+            }
+            check_layers_are_stackable(group)
+            for name, p in group[str(pos)].named_parameters():
+                key = _stack_key(pos, name, self.period)
+                self.keys[pos].append((name, key))
+                self.holder.register_parameter(
+                    key,
+                    nn.Parameter(
+                        torch.empty(
+                            self.n_cycles, *p.shape, dtype=p.dtype, device=p.device
+                        ),
+                        requires_grad=p.requires_grad,
                     ),
-                    requires_grad=p.requires_grad,
-                ),
-            )
+                )
         # Row i of the stack is now the only copy. `layers.i.attention.wq.weight`
         # no longer resolves to a parameter, and nothing walking the tree finds
         # it.
-        for _, _, mod, attr in self._slots():
+        for *_, mod, attr in self._slots():
             del mod._parameters[attr]
         self._unregistered = True
 
@@ -501,11 +541,11 @@ class LayerStack:
         would point at nothing, and every write to it would be lost.
         """
         assert self._unregistered and not self._views_attached
-        for i, name, mod, attr in self._slots():
+        for i, row, name, key, mod, attr in self._slots():
             # Read out of `_parameters`, not with `getattr`: after SimpleFSDP
             # the attribute returns the *gathered* tensor, and a view of that
             # would alias a temporary, not this rank's shard.
-            stack = self.holder._parameters[_mangle(name)]
+            stack = self.holder._parameters[key]
             # `stack[i]` is basic indexing -- a plain integer, no mask, no index
             # tensor -- which in torch always returns a view, never a copy. So
             # this parameter shares storage with row i, and writing the "layer"
@@ -515,7 +555,7 @@ class LayerStack:
             #
             # Registered by hand, because `setattr` would go through SimpleFSDP's
             # parametrization instead of the raw slot.
-            layer = self.holder.as_layer_shape(_mangle(name), stack[i])
+            layer = self.holder.as_layer_shape(key, stack[row])
             view = nn.Parameter(layer, requires_grad=stack.requires_grad)
             mod._parameters[attr] = view
             self._views[(i, name)] = view
@@ -530,7 +570,7 @@ class LayerStack:
     def _drop_views(self) -> None:
         """Exact inverse of ``_attach_views``."""
         assert self._views_attached
-        for i, name, mod, attr in self._slots():
+        for i, _, name, _, mod, attr in self._slots():
             # `load_state_dict(assign=True)` puts the checkpoint's tensor in the
             # slot instead of copying into the view. The stack would keep its old
             # values and the loaded weights would be deleted on the next line --
@@ -623,8 +663,10 @@ class LayerStack:
 
     # -- running the layers ------------------------------------------------
 
-    def _plan_prequantized_gathers(self, template: nn.Module, layer_shapes):
-        """``(buffer prefix, layer param names, spec, quantize)`` per group.
+    def _plan_prequantized_gathers(
+        self, template: nn.Module, layer_shapes, position: int = 0
+    ):
+        """``(position, buffer prefix, stack keys, spec, quantize)`` per group.
 
         A submodule of the template opts in with ``scan_prequantize_groups()``
         (buffer prefix -> weight names) and ``scan_prequantize(shard,
@@ -633,6 +675,7 @@ class LayerStack:
         group and was not flattened; otherwise the module quantizes the
         gathered weight itself.
         """
+        key_of = dict(self.keys[position])
         plan = []
         for path, mod in template.named_modules():
             groups_fn = getattr(mod, "scan_prequantize_groups", None)
@@ -640,15 +683,16 @@ class LayerStack:
                 continue
             for key, weights in groups_fn().items():
                 names = [f"{path}.{w}" if path else w for w in weights]
-                specs = [self.fsdp_plan.get(_mangle(n)) for n in names]
+                keys = [key_of.get(n) for n in names]
+                specs = [self.fsdp_plan.get(k) for k in keys]
                 ok = all(
-                    n in self.names
-                    and n not in layer_shapes
+                    k is not None
+                    and k not in layer_shapes
                     and s is not None
                     and s.sharded
                     and s.gather_dim == 0
                     and s.group_name == specs[0].group_name
-                    for n, s in zip(names, specs)
+                    for k, s in zip(keys, specs)
                 )
                 if not ok:
                     logger.warning(
@@ -659,7 +703,9 @@ class LayerStack:
                     )
                     continue
                 prefix = f"{path}.{key}" if path else key
-                plan.append((prefix, names, specs[0], mod.scan_prequantize))
+                plan.append(
+                    (position, prefix, keys, specs[0], mod.scan_prequantize)
+                )
         if plan:
             logger.info(
                 "Scan body quantizes and gathers FP8: %s",
@@ -667,31 +713,25 @@ class LayerStack:
             )
         return plan
 
-    def _prequantized_scan_body(self, body, prequant):
+    def _prequantized_scan_body(self, body, keys, prequant):
         """``run``'s scan body, plus each layer's pre-quantized FP8 weights.
 
         Like the plain body in ``run`` -- make every row whole with
-        ``gather_slice``, run the layer, return a scalar y -- but each group in
+        ``gather_slice``, run the layers, return a scalar y -- but each group in
         ``prequant`` is also quantized from this rank's shard, gathered in FP8,
-        and passed in as ``<prefix>_q`` / ``<prefix>_scale``. The BF16 gathers
-        stay for their gradient routing.
+        and passed to its position's layer as ``<prefix>_q`` /
+        ``<prefix>_scale``. The BF16 gathers stay for their gradient routing.
         """
 
         def scan_body(carry, slices):
-            params = {
-                name: gather_slice(
-                    slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
-                )
-                for name in self.names
-            }
-            for prefix, names, spec, quantize in prequant:
-                shard = torch.cat(
-                    [slices[_mangle(n)].detach() for n in names], dim=-1
-                )
+            params = {k: gather_slice(slices[k], self.fsdp_plan.get(k)) for k in keys}
+            extra = {}
+            for pos, prefix, group_keys, spec, quantize in prequant:
+                shard = torch.cat([slices[k].detach() for k in group_keys], dim=-1)
                 q, scale = quantize(shard, functools.partial(gather_like, spec=spec))
-                params[f"{prefix}_q"] = q
-                params[f"{prefix}_scale"] = scale
-            out = body(carry, params)
+                extra.setdefault(pos, {})[f"{prefix}_q"] = q
+                extra.setdefault(pos, {})[f"{prefix}_scale"] = scale
+            out = body(carry, params, extra)
             # A scalar y, for the reason given in the plain body in ``run``.
             return out, out.new_zeros(())
 
@@ -700,10 +740,11 @@ class LayerStack:
     def run(self, h: torch.Tensor, *args, use_scan: bool):
         """Run the layers out of the stacks, one at a time or as one ``scan``.
 
-        Both paths run the same ``body``. Layer 0 acts as the template:
-        ``functional_call`` runs its ``forward`` with another layer's weights.
-        The layers' own buffers (the RoPE cache) are identical across layers, so
-        the template's are correct on every iteration.
+        Both paths run the same ``body``. Layers ``0..period-1`` act as the
+        templates, one per position in the cycle: ``functional_call`` runs a
+        template's ``forward`` with another layer's weights. The layers' own
+        buffers (the RoPE cache) are identical across the layers of a position,
+        so the template's are correct on every iteration.
 
         One difference is who slices the stacks. The loop indexes them itself;
         ``scan`` takes them as its ``xs``, slicing along their leading layer
@@ -720,38 +761,44 @@ class LayerStack:
         one layer is ever whole. See ``scan_fsdp``.
         """
         assert self._unregistered and not self._views_attached
-        template = self.layers["0"]
-        # Original per-layer shape of each flattened stack, by per-layer name.
-        # The body views a gathered layer back to it. Stacks that weren't
+        # Layers 0..period-1 stand in for every cycle, one per position.
+        templates = [self.layers[str(pos)] for pos in range(self.period)]
+        keys = self.all_keys
+        # Original per-layer shape of each flattened stack, by stack key. The
+        # body views a gathered layer back to it. Stacks that weren't
         # flattened aren't listed and pass through as they are.
         layer_shapes = {
-            name: self.holder.layer_shapes[_mangle(name)]
-            for name in self.names
-            if _mangle(name) in self.holder.layer_shapes
+            k: self.holder.layer_shapes[k]
+            for k in keys
+            if k in self.holder.layer_shapes
         }
         # Ensure every flattened stack in the holder maps to a layer parameter.
         # Otherwise, it would enter `body` still flattened without being reshaped.
-        unmatched = set(self.holder.layer_shapes) - {
-            _mangle(n) for n in layer_shapes
-        }
+        unmatched = set(self.holder.layer_shapes) - set(layer_shapes)
         if unmatched:
             raise RuntimeError(
                 f"flattened stacks with no layer name: {sorted(unmatched)}"
             )
 
-        def body(carry, params):
-            # Layer 0's module stands in for every layer, one row at a time.
-            # That is what makes the scan body a single traced graph instead of
-            # n_layers of them. It has no parameters of its own to collide with,
-            # because they were unregistered when the stacks were allocated.
-            params = {
-                n: t.view(layer_shapes[n]) if n in layer_shapes else t
-                for n, t in params.items()
-            }
-            return functional_call(template, params, (carry, *args))
+        def body(carry, params, extra=None):
+            # One cycle: each position's template runs with its row of its own
+            # stacks. That is what makes the scan body a single traced graph
+            # instead of n_layers of them. The templates have no parameters of
+            # their own to collide with: they were unregistered at allocation.
+            for pos, template in enumerate(templates):
+                layer_params = {
+                    name: params[k].view(layer_shapes[k])
+                    if k in layer_shapes
+                    else params[k]
+                    for name, k in self.keys[pos]
+                }
+                # The FP8 weights `_prequantized_scan_body` adds, if any.
+                layer_params.update((extra or {}).get(pos, {}))
+                carry = functional_call(template, layer_params, (carry, *args))
+            return carry
 
-        # One [n_layers, *shape] stack per parameter, keyed by its mangled
-        # name. For llama3-70B, unsharded, that is
+        # One [n_cycles, *shape] stack per parameter (per position in the
+        # cycle), keyed by its stack key. For llama3-70B, unsharded, that is
         #
         #     {"attention__wq__weight":     [80, 8192, 8192],
         #      "attention__wk__weight":     [80, 1024, 8192],
@@ -767,7 +814,7 @@ class LayerStack:
             # shard of it.
             if not self.fsdp_plan:
                 self.fsdp_plan = plan_stacked_gathers(self.holder)
-            if template.training and not h.requires_grad:
+            if templates[0].training and not h.requires_grad:
                 # When the init carry doesn't require grad, `scan`'s backward
                 # returns `zeros_like(carry)`. That cuts the gradient chain
                 # between layers while leaving the loss bit-exact, so nothing
@@ -777,28 +824,21 @@ class LayerStack:
                     "weight gradient would reflect only itself -- with a correct "
                     "loss and no error"
                 )
-            # `xs` is the body's input, one layer per step. `getattr` would
+            # `xs` is the body's input, one cycle per step. `getattr` would
             # fire SimpleFSDP's parametrization and gather the whole stack
             # here, outside the loop. `_parameters` passes this rank's shard
             # instead, and the body gathers one layer.
             xs = {}
-            for name in self.names:
-                param = self.holder._parameters[_mangle(name)]
-                xs[_mangle(name)] = (
-                    param.to_local() if isinstance(param, DTensor) else param
-                )
+            for k in keys:
+                param = self.holder._parameters[k]
+                xs[k] = param.to_local() if isinstance(param, DTensor) else param
 
             def scan_body(carry, slices):
                 # `scan` hands the body row i of every stack, under the same
                 # keys, and `gather_slice` makes each row whole.
                 out = body(
                     carry,
-                    {
-                        name: gather_slice(
-                            slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
-                        )
-                        for name in self.names
-                    },
+                    {k: gather_slice(slices[k], self.fsdp_plan.get(k)) for k in keys},
                 )
                 # A `scan` body returns (next_carry, y), and `scan` stacks the y
                 # of every iteration into one `[n_layers, ...]` output. We only
@@ -812,9 +852,15 @@ class LayerStack:
             # Opt-in FP8 path: modules that define `scan_prequantize_groups`
             # get their weights quantized per shard and gathered in FP8. With
             # no such module, `prequant` is empty and the body above runs as is.
-            prequant = self._plan_prequantized_gathers(template, layer_shapes)
+            prequant = [
+                group
+                for pos, template in enumerate(templates)
+                for group in self._plan_prequantized_gathers(
+                    template, layer_shapes, pos
+                )
+            ]
             if prequant:
-                scan_body = self._prequantized_scan_body(body, prequant)
+                scan_body = self._prequantized_scan_body(body, keys, prequant)
 
             # Budget 0.0 forces the gathered weight to be recomputed in the
             # backward. Left alone, the partitioner saves it -- a collective
@@ -835,16 +881,21 @@ class LayerStack:
             # The patch is process-global, so it has to be a window; it closes
             # when this call returns. `test_layer_stack.py` checks both halves.
             with scan_body_remat_window():
-                carry, _ = scan(scan_body, h, xs)
-            return carry
-
-        stacks = {_mangle(n): getattr(self.holder, _mangle(n)) for n in self.names}
-        for i in range(self.n_layers):
-            h = body(h, {n: stacks[_mangle(n)][i] for n in self.names})
+                h, _ = scan(scan_body, h, xs)
+        else:
+            stacks = {k: getattr(self.holder, k) for k in keys}
+            for c in range(self.n_cycles):
+                h = body(h, {k: stacks[k][c] for k in keys})
+        # Layers past the last whole cycle own their parameters and run as
+        # ordinary modules (MaxText does the same with `n_layers % period`).
+        for i in range(self.n_stacked, self.n_layers):
+            h = self.layers[str(i)](h, *args)
         return h
 
 
-def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
+def _apply_stacked_layers(
+    model: nn.Module, *, use_scan: bool, period: int = 1
+) -> None:
     """Stack the decoder layers' weights, and with ``use_scan`` run them as one.
 
     Called from the model's own ``__init__`` (see
@@ -858,8 +909,9 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
       them itself, which means its config went through ``tpu_model_class``.
       Stacking works by swapping that container for one that runs the layers out
       of the stacks.
-    * The layers are homogeneous, and no layer is an MoE with load balancing
-      on. Both checked, by :func:`check_layers_are_stackable`.
+    * The layers are homogeneous -- with ``period > 1``, the layers at the
+      same position in each cycle -- and no layer is an MoE with load
+      balancing on. Both checked, by :func:`check_layers_are_stackable`.
     * The layer signature is ``(h, *args)``, where ``h`` is the hidden state and
       layer ``i`` takes layer ``i-1``'s output. ``h`` is the only argument that
       changes between layers; ``*args`` (RoPE cache, attention masks) has to be
@@ -907,32 +959,36 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
 
     holder = LayerStackHolder()
     setattr(model, STACK_ATTR, holder)
-    stack = LayerStack(model.layers, holder)
+    stack = LayerStack(model.layers, holder, period)
     stack.unregister_and_allocate()
     stack.install(model, use_scan=use_scan)
     logger.info(
-        "Stacked %d weights across %d layers, run as a %s",
-        len(stack.names),
-        stack.n_layers,
+        "Stacked %d weights across %d layers (period %d, %d unrolled), run as a %s",
+        len(stack.all_keys),
+        stack.n_stacked,
+        period,
+        stack.n_layers - stack.n_stacked,
         "scan" if use_scan else "loop",
     )
 
 
 @functools.cache
-def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
+def _stacked_model_class(
+    config_cls: type, use_scan: bool, period: int = 1
+) -> type:
     """Build the ``Stacked<Model>`` subclass that stacks itself on construction.
 
     It subclasses whatever layer-loop class ``tpu_model_class`` builds, because
     the model has to run its layers through its layers container for stacking to
     do anything. Its ``__init__`` builds the model as usual and then stacks it.
 
-    One class per (config class, ``use_scan``), cached.
+    One class per (config class, ``use_scan``, ``period``), cached.
     """
     base = tpu_model_class(config_cls)
 
     def __init__(self, *args, **kwargs):
         base.__init__(self, *args, **kwargs)
-        _apply_stacked_layers(self, use_scan=use_scan)
+        _apply_stacked_layers(self, use_scan=use_scan, period=period)
 
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
@@ -964,7 +1020,7 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
 
 
 def with_tpu_stacked_layers(
-    model_config: Decoder.Config, *, use_scan: bool
+    model_config: Decoder.Config, *, use_scan: bool, period: int = 1
 ) -> Decoder.Config:
     """Put ``model_config`` on a model that arrives already stacked.
 
@@ -975,11 +1031,14 @@ def with_tpu_stacked_layers(
 
     ``use_scan`` additionally runs the layers as one ``scan`` rather than one
     at a time; it is fixed at construction because it decides which container
-    ``model.layers`` becomes.
+    ``model.layers`` becomes. ``period=k`` scans cycles of k layers whose
+    types repeat (Qwen3.5: 3 GatedDeltaNet, then 1 full attention), with one
+    stack set per position; leftover layers run unrolled.
 
     Builds on :func:`tpu_model_class`, and has to be applied in the same place
     and for the same reasons; see its docstring.
     """
     return derive(
-        model_config, _stacked_model_class(type(model_config), use_scan).Config
+        model_config,
+        _stacked_model_class(type(model_config), use_scan, period).Config,
     )

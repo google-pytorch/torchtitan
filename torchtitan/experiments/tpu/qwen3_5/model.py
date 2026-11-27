@@ -15,6 +15,7 @@ from torchtitan.config import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types, set_current_spmd_mesh, spmd_local_context
 from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
+from torchtitan.experiments.tpu.components.layer_loop import TpuLayerLoop, register_layer_loop_forward
 from torchtitan.models.common.attention import AttentionMasksType, FlexInnerAttention, VarlenInnerAttention
 from torchtitan.models.common.decoder_sharding import CP, decoder_input_sharding, DP, SpmdType, TP
 from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
@@ -143,6 +144,59 @@ class TpuQwen35TransformerBlock(Qwen35TransformerBlock):
     else:
       x_TD = x_TD + self.feed_forward(h_TD)
     return x_TD
+
+
+def _layer_loop_forward(
+    self,
+    tokens: torch.Tensor,
+    *,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.Tensor | None = None,
+    grid_thw: torch.Tensor | None = None,
+    grid_thw_videos: torch.Tensor | None = None,
+    attention_masks: Qwen35AttentionMaskDict | None = None,
+    positions: torch.Tensor | None = None,
+    special_tokens: dict[str, int] | None = None,
+):
+  """``Qwen35Model.forward``, but ``model.layers`` runs the layers.
+
+  A copy of upstream's forward; only the layer loop differs. Lets
+  ``tpu_model_class`` (and so layer stacking and scan) apply to Qwen3.5.
+  """
+  with spmd_local_context("dp"):
+    if self.tok_embeddings is not None:
+      x = self._prepare_multimodal_embeds(
+          tokens,
+          pixel_values=pixel_values,
+          pixel_values_videos=pixel_values_videos,
+          grid_thw=grid_thw,
+          grid_thw_videos=grid_thw_videos,
+          special_tokens=special_tokens,
+      )
+    else:
+      x = tokens
+
+  if spmd.is_type_checking():
+    spmd.assert_type(
+        x,
+        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},
+        spmd.PartitionSpec(("dp", "cp"), None),
+    )
+
+  # The only change from upstream: let the container run the layers.
+  if isinstance(self.layers, TpuLayerLoop):
+    x = self.layers(x, attention_masks, positions)
+  else:
+    for layer in self.layers.values():
+      x = layer(x, attention_masks, positions)
+
+  x = self.norm(x) if self.norm is not None else x
+  if self._skip_lm_head:
+    return x
+  return self.lm_head(x) if self.lm_head is not None else x
+
+
+register_layer_loop_forward(Qwen35Model, _layer_loop_forward)
 
 
 class TpuQwen35Model(Qwen35Model):
@@ -326,3 +380,35 @@ class TpuQwen35Model(Qwen35Model):
     inputs = batch.pop("input")
     labels = batch.pop("labels")
     return inputs, labels, batch
+
+
+def _tpu_layer_loop_forward(
+    self,
+    tokens: torch.Tensor,
+    *,
+    cp_full_positions: torch.Tensor | None = None,
+    cp_full_segment_ids: torch.Tensor | None = None,
+    **kwargs,
+):
+  """``TpuQwen35Model.forward``, but ``model.layers`` runs the layers.
+
+  Without the CP inputs that forward is upstream's, so this runs
+  ``_layer_loop_forward``. With them, the layers take two extra arguments a
+  ``TpuLayerLoop`` does not pass.
+  """
+  if cp_full_positions is None and cp_full_segment_ids is None:
+    return _layer_loop_forward(self, tokens, **kwargs)
+  if isinstance(self.layers, TpuLayerLoop):
+    raise NotImplementedError(
+        "Layer stacking and scan do not support Qwen3.5 context parallelism."
+    )
+  return TpuQwen35Model.forward(
+      self,
+      tokens,
+      cp_full_positions=cp_full_positions,
+      cp_full_segment_ids=cp_full_segment_ids,
+      **kwargs,
+  )
+
+
+register_layer_loop_forward(TpuQwen35Model, _tpu_layer_loop_forward)

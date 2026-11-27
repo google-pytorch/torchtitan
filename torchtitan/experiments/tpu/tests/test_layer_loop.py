@@ -225,6 +225,54 @@ class ForwardStructureTest(absltest.TestCase):
     )
 
 
+class Qwen35ForwardTest(absltest.TestCase):
+  """The registered Qwen3.5 copy gets the same drift guard as ``_forward``."""
+
+  def test_qwen35_forward_is_upstream_forward_modulo_the_loop(self) -> None:
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.experiments.tpu.qwen3_5.model import _layer_loop_forward
+    from torchtitan.models.qwen3_5.model import Qwen35Model  # pylint: disable=g-import-not-at-top
+
+    diff = "\n".join(
+        difflib.unified_diff(
+            textwrap.dedent(inspect.getsource(Qwen35Model.forward)).splitlines(),
+            textwrap.dedent(inspect.getsource(_layer_loop_forward)).splitlines(),
+            "Qwen35Model.forward",
+            "qwen3_5.model._layer_loop_forward",
+            lineterm="",
+        )
+    )
+    self.assertEqual(
+        _blank_the_loop(_layer_loop_forward, _is_tpu_dispatch),
+        _blank_the_loop(Qwen35Model.forward, _is_upstream_loop),
+        "Qwen35Model.forward changed upstream, or the copy drifted; re-sync "
+        f"experiments/tpu/qwen3_5/model.py:_layer_loop_forward.\n{diff}",
+    )
+
+  def test_a_subclass_keeping_the_forward_is_rewritten(self) -> None:
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.experiments.tpu.qwen3_5.model import _layer_loop_forward
+    from torchtitan.models.qwen3_5.model import Qwen35Model  # pylint: disable=g-import-not-at-top
+
+    class Sub(Qwen35Model):
+
+      @dataclasses.dataclass(kw_only=True, slots=True)
+      class Config(Qwen35Model.Config):
+        pass
+
+    for config_cls in (Qwen35Model.Config, Sub.Config):
+      with self.subTest(config_cls.__qualname__):
+        self.assertIs(tpu_model_class(config_cls).forward, _layer_loop_forward)
+
+  def test_the_tpu_model_is_rewritten(self) -> None:
+    # pylint: disable-next=g-import-not-at-top
+    from torchtitan.experiments.tpu.qwen3_5.model import _tpu_layer_loop_forward, TpuQwen35Model
+
+    self.assertIs(
+        tpu_model_class(TpuQwen35Model.Config).forward, _tpu_layer_loop_forward
+    )
+
+
 class ConfigRewriteTest(absltest.TestCase):
 
   def test_rewrite_swaps_the_model_class_and_keeps_every_field(self) -> None:

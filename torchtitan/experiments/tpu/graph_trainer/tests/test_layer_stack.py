@@ -131,6 +131,7 @@ def _build(
     device: str | torch.device = "cpu",
     world_size: int = 1,
     flatten: bool = False,
+    period: int = 1,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
@@ -159,7 +160,9 @@ def _build(
         mixed_precision_param=param_dtype, mixed_precision_reduce="float32"
     )
     if stacked or scan:
-        convert = functools.partial(with_tpu_stacked_layers, use_scan=scan)
+        convert = functools.partial(
+            with_tpu_stacked_layers, use_scan=scan, period=period
+        )
     else:
         convert = _layer_loop
     with torch.device("meta"):
@@ -458,6 +461,70 @@ class TestLayerStack(unittest.TestCase):
         stacked.load_state_dict(checkpoint)
         torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
 
+    # The llama3 debug model has 6 layers: period 4 is one cycle plus two
+    # unrolled layers, period 2 is three cycles.
+
+    def test_period_stacks_one_set_per_position(self):
+        model = _build(stacked=True, period=4)
+        holder = getattr(model, STACK_ATTR)
+        plain_layer = dict(_build(stacked=False).layers["0"].named_parameters())
+        stacks = dict(holder.named_parameters(recurse=False))
+        self.assertEqual(
+            set(stacks),
+            {f"p{pos}__{n.replace('.', '__')}" for pos in range(4) for n in plain_layer},
+        )
+        for name, stack in stacks.items():
+            self.assertEqual(stack.shape[0], 1, name)  # 6 // 4 cycles
+        # The two leftover layers keep their own parameters; the stacked ones
+        # keep none.
+        for i in range(6):
+            own = list(model.layers[str(i)].parameters())
+            self.assertEqual(bool(own), i >= 4, f"layer {i}")
+
+    def test_period_state_dict_is_identical(self):
+        """Init writes each layer's row of its own position's stack."""
+        plain = _build(stacked=False).state_dict()
+        stacked = _build(stacked=True, period=4).state_dict()
+
+        self.assertEqual(set(stacked), set(plain))
+        for key, want in plain.items():
+            torch.testing.assert_close(
+                stacked[key].to_local(), want.to_local(), rtol=0, atol=0, msg=key
+            )
+
+    def test_period_loads_an_unrolled_checkpoint_and_matches_it(self):
+        """A row/position mix-up would run the wrong weights with no error."""
+        plain = _build(stacked=False)
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
+        with torch.no_grad():
+            for p in plain.parameters():
+                p.add_(torch.randn_like(p))
+        checkpoint = copy.deepcopy(plain.state_dict())
+        for period in (2, 4):
+            with self.subTest(period=period):
+                stacked = _build(stacked=True, period=period)
+                stacked.load_state_dict(checkpoint)
+                torch.testing.assert_close(
+                    stacked(tokens), plain(tokens), rtol=0, atol=0
+                )
+
+    def test_period_scan_forward_matches_the_loop(self):
+        plain = _build(stacked=False)
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
+        for period in (2, 4):
+            with self.subTest(period=period):
+                torch._dynamo.reset()
+                scanned = _build(stacked=True, scan=True, period=period)
+                # Same tolerance as `test_scan_forward_matches_the_loop`.
+                torch.testing.assert_close(
+                    scanned(tokens), plain(tokens), rtol=1e-5, atol=1e-6
+                )
+
+    def test_period_must_fit_the_layers(self):
+        for period in (0, 7):
+            with self.subTest(period=period), self.assertRaises(ValueError):
+                _build(stacked=True, period=period)
+
     def test_refuses_load_state_dict_with_assign(self):
         """``assign=True`` would load into a tensor the stack never sees.
 
@@ -593,6 +660,14 @@ class TestStackable(unittest.TestCase):
             layer.moe.load_balance_coeff = load_balance_coeff
         with torch.device("meta"):
             return config.build()
+
+    def test_a_mismatch_names_the_real_layer_numbers(self):
+        # One position's layers, as `unregister_and_allocate` passes them with
+        # period 4: layer 7 differs from layer 3.
+        layers = {"3": _toy_layer(), "7": _toy_layer(out=6)}
+        with self.assertRaises(ValueError) as caught:
+            check_layers_are_stackable(layers)
+        self.assertIn("layer 7 does not match layer 3", str(caught.exception))
 
     def test_moe_layers_are_refused(self):
         """An MoE's load-balancing buffers are per-layer, and buffers aren't
@@ -771,8 +846,8 @@ class TestPrequantizedScanBody(unittest.TestCase):
     """The opt-in FP8 scan body, and that nothing else gets it."""
 
     def _stack(self) -> LayerStack:
-        stack = LayerStack(nn.ModuleDict(), holder=None)
-        stack.names = ["mlp.w1", "mlp.w3"]
+        stack = LayerStack(nn.ModuleDict({"0": nn.Identity()}), holder=None)
+        stack.keys = [[("mlp.w1", "mlp__w1"), ("mlp.w3", "mlp__w3")]]
         return stack
 
     def test_no_opt_in_means_no_prequantized_body(self):
@@ -789,24 +864,25 @@ class TestPrequantizedScanBody(unittest.TestCase):
             seen["shard"] = shard
             return shard.to(torch.float8_e4m3fn), shard.abs().amax(0, keepdim=True)
 
-        def body(carry, params):
-            seen["params"] = params
+        def body(carry, params, extra):
+            seen["params"], seen["extra"] = params, extra
             return carry + 1
 
-        prequant = [("mlp.fp8_w13", ["mlp.w1", "mlp.w3"], None, quantize)]
-        scan_body = stack._prequantized_scan_body(body, prequant)
+        keys = ["mlp__w1", "mlp__w3"]
+        prequant = [(0, "mlp.fp8_w13", keys, None, quantize)]
+        scan_body = stack._prequantized_scan_body(body, keys, prequant)
         w1, w3 = torch.randn(2, 3), torch.randn(2, 5)
         out, y = scan_body(torch.zeros(2), {"mlp__w1": w1, "mlp__w3": w3})
 
         torch.testing.assert_close(out, torch.ones(2))
         self.assertEqual(y.shape, ())
         params = seen["params"]
-        self.assertEqual(
-            set(params), {"mlp.w1", "mlp.w3", "mlp.fp8_w13_q", "mlp.fp8_w13_scale"}
-        )
+        # Position 0's layer gets the FP8 weights as well as its own.
+        self.assertEqual(set(seen["extra"]), {0})
+        self.assertEqual(set(seen["extra"][0]), {"mlp.fp8_w13_q", "mlp.fp8_w13_scale"})
         # No FSDP plan: the plain params are the rows as they came in.
-        self.assertIs(params["mlp.w1"], w1)
-        self.assertIs(params["mlp.w3"], w3)
+        self.assertIs(params["mlp__w1"], w1)
+        self.assertIs(params["mlp__w3"], w3)
         # The group's shards are quantized together, concatenated on the last axis.
         torch.testing.assert_close(seen["shard"], torch.cat([w1, w3], dim=-1))
 

@@ -599,6 +599,29 @@ def qwen35_moe_35b_split_tokamax_benchmark(
   return cfg
 
 
+def qwen35_moe_35b_scan_tokamax_benchmark() -> TpuGraphTrainer.Config:
+  """`qwen35_moe_35b_split_tokamax_benchmark` on scan instead of the graph split.
+
+  Each scan step runs one 4-layer cycle (3 GatedDeltaNet + 1 full attention).
+  Gradients reduce in float32, as in `qwen35_moe_35b`.
+  """
+  cfg = qwen35_moe_35b_split_tokamax_benchmark()
+  cfg.compile.graph_split = GraphSplitterConfig(enabled=False)
+  cfg.compile.use_scan_layers = True
+  cfg.compile.scan_period = 4
+  # The scan body recomputes everything in backward (`scan_body_remat_window`):
+  # `tpu_selective` rejects scan, and save regions do not reach the body.
+  cfg.compile.memory_policy = "full"
+  cfg.compile.save_regions = ()
+  # MoE.forward adds to a per-layer counter that nothing reads (the TPU
+  # registry turns load balancing off); a scan body cannot write it.
+  cfg.override.imports.append(
+      "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+      ".tpu_discarded_token_counter"
+  )
+  return cfg
+
+
 def qwen35_moe_35b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   """`qwen35_moe_35b_split_tokamax_benchmark` with expert parallelism (EP = 4).
 

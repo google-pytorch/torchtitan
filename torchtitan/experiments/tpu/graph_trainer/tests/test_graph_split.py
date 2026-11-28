@@ -1011,6 +1011,40 @@ class GraphSplitTest(absltest.TestCase):
         {layer: part + 1 for layer, part in rs_only.layer_to_partition.items()},
     )
 
+    # With a byte threshold, RS-only pipelining still moves each large gather
+    # one executable ahead (into the previously differentiated layer); the
+    # first backward layer has none before it and keeps its gather.
+    prefetched = split_backward_graph_by_layer(
+        backward,
+        n_layers=4,
+        pipeline_collectives=True,
+        pipeline_kinds=("rs",),
+        prefetch_ag_min_bytes=1,
+    )
+    first_layer = max(prefetched.layer_to_partition)
+    self.assertEqual(
+        prefetched.collective_layer_to_partition["ag"],
+        {
+            layer: part - (layer != first_layer)
+            for layer, part in prefetched.layer_to_partition.items()
+        },
+    )
+    self._assert_collective_chains_are_atomic(
+        backward, prefetched.partition_map
+    )
+    # A threshold above every gather changes nothing.
+    too_big = split_backward_graph_by_layer(
+        backward,
+        n_layers=4,
+        pipeline_collectives=True,
+        pipeline_kinds=("rs",),
+        prefetch_ag_min_bytes=1 << 40,
+    )
+    self.assertEqual(
+        too_big.collective_layer_to_partition["ag"],
+        too_big.layer_to_partition,
+    )
+
     # A reduce-scatter that is not a gradient reduction (like a TP activation
     # reduce-scatter): truncating a reduction's chain to its launch makes its
     # consumer ordinary compute. It stays with its inputs unless RS are

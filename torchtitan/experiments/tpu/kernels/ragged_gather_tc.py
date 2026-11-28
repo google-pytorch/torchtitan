@@ -197,6 +197,24 @@ def packed_stable_sort(
   return (sorted_packed >> shift).astype(jnp.int32), sorted_positions
 
 
+def _sort_slots_by_expert(
+    ids_flat_M: jax.Array, num_experts: int
+) -> tuple[jax.Array, jax.Array]:
+  """Stable sort of the routed slots by expert id, padding routes last.
+
+  A router that masks padding tokens (``token_mask``) marks their routes with
+  an id past the last expert (``num_experts + 1``). They are clamped to the
+  sentinel ``num_experts`` so they sort after every real expert, take no slot
+  in any rank's window and count toward no expert. The packed sort key must
+  also reserve the sentinel's bits: with ``max_key = num_experts - 1`` an id of
+  ``num_experts + 1`` can carry past the 32-bit packed key (e.g. 512 experts
+  and ``2**22 < M <= 2**23`` slots), wrapping a padding route onto expert 1.
+  Real ids (``< num_experts``) sort exactly as before.
+  """
+  key_M = jnp.minimum(ids_flat_M.astype(jnp.int32), jnp.int32(num_experts))
+  return packed_stable_sort(key_M, num_experts)
+
+
 def _sorted_expert_offsets(
     sorted_experts: jax.Array, num_experts: int
 ) -> jax.Array:
@@ -1164,8 +1182,8 @@ def _roe_routing_metadata_tpu(
     jax.Array,
 ]:
   m = ids_flat_M.shape[0]
-  sorted_experts_M, slot_order_M = packed_stable_sort(
-      ids_flat_M, num_experts - 1
+  sorted_experts_M, slot_order_M = _sort_slots_by_expert(
+      ids_flat_M, num_experts
   )
   group_offsets_Ep1 = _sorted_expert_offsets(sorted_experts_M, num_experts)
 

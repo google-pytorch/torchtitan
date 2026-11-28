@@ -105,6 +105,49 @@ class RaggedGatherTcTest(base_device_test.BaseAcceleratorDeviceTest):
     )
     self.assertEqual(empty_meta.num_indices, 0)
 
+  def test_sort_slots_by_expert_sorts_padding_last_without_key_overflow(self):
+    # 2**20 experts and 4096 slots: max_key = E - 1 fits the 32-bit packed key
+    # (20 + 12 bits), but the padding id E + 1 needs 21 bits and, packed with
+    # max_key = E - 1, wraps onto expert 1. This is the same carry as 512
+    # experts with 2**22 < M <= 2**23 slots (e.g. EP16 x 32K tokens x top-10).
+    num_experts = 1 << 20
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, num_experts, size=4096).astype(np.int32)
+    ids[rng.random(4096) < 0.25] = num_experts + 1
+    sorted_ids, order = ragged_gather_tc._sort_slots_by_expert(
+        jnp.asarray(ids), num_experts
+    )
+    key = np.minimum(ids, num_experts)
+    expected = np.argsort(key, kind="stable")
+    np.testing.assert_array_equal(np.asarray(order), expected)
+    np.testing.assert_array_equal(np.asarray(sorted_ids), key[expected])
+    # Every padding route sorts after every real route.
+    num_real = int((ids < num_experts).sum())
+    self.assertTrue(
+        bool((np.asarray(sorted_ids)[num_real:] == num_experts).all())
+    )
+
+    # The old key (max_key = E - 1) put padding routes among the real experts.
+    _, old_order = ragged_gather_tc.packed_stable_sort(
+        jnp.asarray(ids), num_experts - 1
+    )
+    self.assertFalse(np.array_equal(np.asarray(old_order), expected))
+
+  def test_sort_slots_by_expert_matches_old_sort_for_real_ids(self):
+    rng = np.random.default_rng(1)
+    for num_experts, m in ((8, 64), (512, 4096), (1 << 20, 4096)):
+      ids = rng.integers(0, num_experts, size=m).astype(np.int32)
+      new_ids, new_order = ragged_gather_tc._sort_slots_by_expert(
+          jnp.asarray(ids), num_experts
+      )
+      old_ids, old_order = ragged_gather_tc.packed_stable_sort(
+          jnp.asarray(ids), num_experts - 1
+      )
+      np.testing.assert_array_equal(
+          np.asarray(new_order), np.asarray(old_order)
+      )
+      np.testing.assert_array_equal(np.asarray(new_ids), np.asarray(old_ids))
+
   def test_multi_block_gather_and_four_buffer_reduce_ring(self):
     """Exercises >= 6 gather steps, >= 8 reduce blocks (4-buffer wrap), and rem > 0."""
     self._require_tpu()

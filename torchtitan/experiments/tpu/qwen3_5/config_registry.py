@@ -745,6 +745,47 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
   return cfg
 
 
+def qwen35_moe_397b_scan_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
+  """`qwen35_moe_397b_split_tokamax_ep_benchmark` on scan with EP = 16.
+
+  Each scan step runs one 4-layer cycle with full recompute, as in
+  `qwen35_moe_35b_scan_tokamax_benchmark`. EP = 16 Ring-of-Experts in 2 token
+  chunks, capacity factor 1.05; `"auto"` would pick the ragged all-to-all
+  (EP > top_k = 10), which a scan body cannot run. 4K context, 8192 tokens per
+  rank. Measured on tpu7x-4x4x8 (256 ranks, so efsdp = 16).
+  """
+  cfg = qwen35_moe_397b_split_tokamax_ep_benchmark()
+  cfg.compile.graph_split = GraphSplitterConfig(enabled=False)
+  cfg.compile.use_scan_layers = True
+  cfg.compile.scan_period = 4
+  cfg.compile.memory_policy = "full"
+  cfg.compile.save_regions = ()
+  cfg.override.imports.append(
+      "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+      ".tpu_discarded_token_counter"
+  )
+  cfg.training.max_context_length = 4096
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 8192
+  cfg.parallelism.expert_parallel_degree = 16
+  cfg.tpu_config.ep_transport = "ring_of_experts"
+  cfg.tpu_config.ep_token_chunks = 2
+  cfg.tpu_config.ep_capacity_factor = 1.05
+  cfg.tpu_config.ep_chunk_dw_fp32 = False
+  cfg.splash_attention_kernel = dataclasses.replace(
+      cfg.splash_attention_kernel,
+      use_tokamax_splash_attention_kernel=True,
+      use_batch_loop_fwd=True,
+      sa_num_stacked_q_heads=16,
+      sa_block_q=128,
+      sa_block_kv=1024,
+      sa_block_kv_compute=1024,
+      sa_block_q_dkv=1024,
+      sa_block_kv_dkv=1024,
+      sa_block_kv_dkv_compute=1024,
+  )
+  return cfg
+
+
 # A TPUTrainerConfig or a subclass (e.g. TpuGraphTrainer.Config).
 _TPUConfigT = TypeVar("_TPUConfigT", bound=TPUTrainerConfig)
 

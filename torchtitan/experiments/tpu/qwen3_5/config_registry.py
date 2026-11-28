@@ -1,5 +1,6 @@
 """TPU configuration registry for Qwen3.5 (Dense and MoE) models."""
 
+import dataclasses
 from typing import Literal, TypeVar
 
 from torchtitan.components.checkpointer.dcp import CheckpointManager
@@ -433,6 +434,72 @@ def graph_trainer_qwen35_moe_debugmodel_tpu_moe_kernels() -> (
   return cfg
 
 
+def _debugmodel_moe_8l16e(cfg: TPUTrainerConfig) -> None:
+  """Gives `cfg` the debug MoE model at 8 layers, 16 experts, top-4.
+
+  Two cycles of period 4 (3 GatedDeltaNet + 1 full attention), so a period-4
+  scan loops twice, and 16 experts split over EP = 2, 4 or 8 on 8 chips with
+  `efsdp = 8 / EP`. Everything else is `debugmodel_moe`'s.
+  """
+  # pylint: disable-next=g-import-not-at-top
+  import torchtitan.models.qwen3_5 as upstream_qwen3_5
+  from torchtitan.experiments.tpu.qwen3_5 import to_tpu_model_spec  # pylint: disable=g-import-not-at-top
+
+  spec = upstream_qwen3_5.model_registry(
+      "debugmodel_moe", seq_len=256, attn_backend="sdpa"
+  )
+  rope = next(l.attention.rope for l in spec.model.layers if l.attention)
+  # pylint: disable-next=protected-access
+  spec.model.layers = upstream_qwen3_5._build_qwen35_moe_layers(
+      rope=rope, attn_backend="sdpa", n_layers=8, dim=256, n_heads=4,
+      n_kv_heads=2, head_dim=64, rotary_dim=16, moe_hidden_dim=256,
+      num_experts=16, top_k=4, shared_expert_hidden_dim=256, n_key_heads=2,
+      n_value_heads=4, key_head_dim=128, value_head_dim=128,
+  )
+  model = spec.model
+  for converter in _TPU_MOE_CONVERTERS:
+    model = converter.build().convert(model)
+  cfg.model_spec = to_tpu_model_spec(dataclasses.replace(spec, model=model))
+
+
+def graph_trainer_qwen35_moe_debugmodel_ep() -> TpuGraphTrainer.Config:
+  """Split (one layer per executable) debug MoE, 8 layers, 16 experts, EP = 2.
+
+  The scan + EP proxy's reference lane. Ring-of-Experts at every EP (the
+  ragged all-to-all that `auto` picks past top_k = 4 does not trace in a scan
+  body yet). Two token chunks, the most a scan body allows
+  (`check_scan_expert_parallel`).
+  """
+  base = qwen35_moe_debugmodel()
+  _debugmodel_moe_8l16e(base)
+  # Paired Pallas grouped matmuls: EP's routing weights before W2 need them.
+  _use_tpu_moe_kernels(base)
+  cfg = _use_graph_split(
+      base,
+      layers_per_executable=1,
+      memory_policy="tpu_selective",
+      save_regions=("moe.routing",),
+  )
+  _use_expert_parallel(cfg, ep_degree=2, num_token_chunks=2)
+  cfg.tpu_config.ep_transport = "ring_of_experts"
+  return cfg
+
+
+def graph_trainer_qwen35_moe_debugmodel_scan_ep() -> TpuGraphTrainer.Config:
+  """`graph_trainer_qwen35_moe_debugmodel_ep` as a period-4 scan (2 cycles)."""
+  cfg = graph_trainer_qwen35_moe_debugmodel_ep()
+  cfg.compile.graph_split = GraphSplitterConfig(enabled=False)
+  cfg.compile.use_scan_layers = True
+  cfg.compile.scan_period = 4
+  cfg.compile.memory_policy = "full"
+  cfg.compile.save_regions = ()
+  cfg.override.imports.append(
+      "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+      ".tpu_discarded_token_counter"
+  )
+  return cfg
+
+
 def qwen35_moe_35b(flavor: str = "35B-A3B") -> TPUTrainerConfig:
   """Qwen3.5-35B-A3B (40 hybrid layers, 256 experts) on the regular trainer.
 
@@ -675,6 +742,47 @@ def qwen35_moe_397b_split_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
     experts.pallas_grouped_mm_w2_tgmm_tiling = (tile_m, 0, 0)
     experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (tile_m, 0, 2048)
   _use_expert_parallel(cfg, ep_degree=8, num_token_chunks=12)
+  return cfg
+
+
+def qwen35_moe_397b_scan_tokamax_ep_benchmark() -> TpuGraphTrainer.Config:
+  """`qwen35_moe_397b_split_tokamax_ep_benchmark` on scan with EP = 16.
+
+  Each scan step runs one 4-layer cycle with full recompute, as in
+  `qwen35_moe_35b_scan_tokamax_benchmark`. EP = 16 Ring-of-Experts in 2 token
+  chunks, capacity factor 1.05; `"auto"` would pick the ragged all-to-all
+  (EP > top_k = 10), which a scan body cannot run. 4K context, 8192 tokens per
+  rank. Measured on tpu7x-4x4x8 (256 ranks, so efsdp = 16).
+  """
+  cfg = qwen35_moe_397b_split_tokamax_ep_benchmark()
+  cfg.compile.graph_split = GraphSplitterConfig(enabled=False)
+  cfg.compile.use_scan_layers = True
+  cfg.compile.scan_period = 4
+  cfg.compile.memory_policy = "full"
+  cfg.compile.save_regions = ()
+  cfg.override.imports.append(
+      "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+      ".tpu_discarded_token_counter"
+  )
+  cfg.training.max_context_length = 4096
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 8192
+  cfg.parallelism.expert_parallel_degree = 16
+  cfg.tpu_config.ep_transport = "ring_of_experts"
+  cfg.tpu_config.ep_token_chunks = 2
+  cfg.tpu_config.ep_capacity_factor = 1.05
+  cfg.tpu_config.ep_chunk_dw_fp32 = False
+  cfg.splash_attention_kernel = dataclasses.replace(
+      cfg.splash_attention_kernel,
+      use_tokamax_splash_attention_kernel=True,
+      use_batch_loop_fwd=True,
+      sa_num_stacked_q_heads=16,
+      sa_block_q=128,
+      sa_block_kv=1024,
+      sa_block_kv_compute=1024,
+      sa_block_q_dkv=1024,
+      sa_block_kv_dkv=1024,
+      sa_block_kv_dkv_compute=1024,
+  )
   return cfg
 
 

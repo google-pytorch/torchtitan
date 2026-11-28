@@ -1,7 +1,9 @@
+import dataclasses
 from unittest import mock
 
 import pytest
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
@@ -536,3 +538,109 @@ def test_clone_repeated_tensors_compiles_fullgraph():
     torch.testing.assert_close(x.grad, torch.ones(4))
     assert not _is_tracing(x)
 
+
+
+class _StubExperts(torch.nn.Module):
+    """BF16 SwiGLU through the first local expert (static shapes)."""
+
+    def __init__(self, dim=8, hidden=12, local_experts=2):
+        super().__init__()
+        g = torch.Generator().manual_seed(0)
+        for name, shape in (
+            ("w1", (local_experts, dim, hidden)),
+            ("w2", (local_experts, hidden, dim)),
+            ("w3", (local_experts, dim, hidden)),
+        ):
+            w = (0.2 * torch.randn(*shape, generator=g)).bfloat16()
+            setattr(self, name, torch.nn.Parameter(w))
+        self.unshard_calls = 0
+
+    def unshard_weights(self):
+        self.unshard_calls += 1
+        return self.w1, self.w2, self.w3
+
+    def forward(self, x, counts, row_scale_R=None, *, pre_unsharded_weights=None):
+        w1, w2, w3 = pre_unsharded_weights or self.unshard_weights()
+        h = torch.nn.functional.silu(x @ w1[0]) * (x @ w3[0])
+        if row_scale_R is not None:
+            h = (h.float() * row_scale_R.reshape(-1, 1)).to(h.dtype)
+        return h @ w2[0]
+
+
+def _unchunked_ep_forward(routed, x, scores, ids, counts):
+    """The unchunked EP forward before chunking: dispatch, experts, combine."""
+    routed_input, counts_e, metadata = routed.token_dispatcher.dispatch(
+        x, scores, ids, counts
+    )
+    out = routed.inner_experts(
+        routed_input, counts_e, row_scale_R=metadata.row_scale_R
+    )
+    metadata = dataclasses.replace(metadata, row_scale_applied=True)
+    return routed.token_dispatcher.combine(out, metadata, x)
+
+
+def _joint_graph_signature(forward):
+    """Traces EP = 2, C = 1 forward + backward on one CPU process, with local
+    stand-ins for the EP collectives; returns each node's op, inputs and type."""
+    from torchtitan.experiments.tpu.components import token_dispatcher as td
+    from torchtitan.experiments.tpu.testing.roe_reference import (
+        ReferenceRoETokenDispatcher,
+    )
+
+    routed = TpuRoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(dim=8, hidden_dim=12, num_experts=2),
+        token_dispatcher=ReferenceRoETokenDispatcher.Config(
+            num_experts=4, top_k=2, ep_transport="ring_of_experts"
+        ),
+        scale_before_down_proj=True,
+    ).build()
+    routed.inner_experts = _StubExperts()
+    mesh = mock.Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    routed.token_dispatcher.ep_mesh = mesh
+    routed.register_buffer("_ep_local_rank", torch.tensor([0]), persistent=False)
+    routed.token_dispatcher.bind_ep_rank_holder(routed)
+    params = list(routed.inner_experts.parameters())
+
+    def step(x, scores, ids, counts):
+        out = forward(routed, x, scores, ids, counts)
+        return torch.autograd.grad(out.float().sum(), [x, scores, *params])
+
+    g = torch.Generator().manual_seed(7)
+    ids = torch.randint(0, 4, (5, 2), generator=g)
+    inputs = (
+        torch.randn(5, 8, generator=g).bfloat16().requires_grad_(),
+        (0.1 + torch.rand(5, 2, generator=g)).requires_grad_(),
+        ids,
+        torch.bincount(ids.reshape(-1), minlength=4),
+    )
+    gather = lambda x, mesh, pg: torch.cat([x.detach()] * 2)
+    scatter = lambda x, mesh, pg: x.detach().reshape(2, -1, *x.shape[1:]).sum(0)
+    with mock.patch.object(td, "_ep_all_gather_impl", gather), mock.patch.object(
+        td, "_ep_reduce_scatter_sum_impl", scatter
+    ), torch.fx.traceback.preserve_node_meta():
+        gm = make_fx(step)(*inputs)
+    assert routed.inner_experts.unshard_calls == 1  # Its own, not chunking's.
+    pos, sig = {}, []
+    for i, n in enumerate(gm.graph.nodes):
+        pos[n] = i
+        # No chunk tags, so no chunk barriers or FP32 cross-chunk dW sums.
+        assert not any(k.startswith("ep_chunk") for k in n.meta.get("custom", {}))
+        val = n.meta.get("val")
+        args = torch.fx.node.map_aggregate(
+            (n.args, n.kwargs), lambda a: pos[a] if isinstance(a, torch.fx.Node) else a
+        )
+        sig.append((
+            n.op,
+            str(n.target) if n.op == "call_function" else None,
+            None if n.op == "get_attr" else repr(args),
+            (tuple(val.shape), val.dtype) if isinstance(val, torch.Tensor) else None,
+        ))
+    return sig
+
+
+def test_single_chunk_ep_traces_the_unchunked_graph():
+    """Unchunked EP is chunked EP with C = 1: the same graph, node for node."""
+    got = _joint_graph_signature(lambda m, *a: m(*a))
+    assert got == _joint_graph_signature(_unchunked_ep_forward)

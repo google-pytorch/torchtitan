@@ -32,6 +32,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch import nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchtitan.tools.logging import logger
 
@@ -340,6 +341,12 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
     param_dtype = computation.param_dtype if computation else None
     reduce_dtype = computation.reduce_dtype if computation else None
 
+    pending = getattr(holder, "_ep_pending", None)
+    if pending:
+        raise RuntimeError(
+            f"expert stacks {sorted(pending)} were never placed on the expert "
+            "mesh; call LayerStackHolder.place_expert_stacks after SimpleFSDP"
+        )
     plan: dict[str, ScanFSDPSpec] = {}
     n_sharded = 0
     for name, param in holder._parameters.items():
@@ -358,24 +365,38 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
             continue
 
         mesh = param.device_mesh
+        # Expert stacks (`LayerStackHolder.place_expert_stacks`) live on
+        # ([dp_replicate,] efsdp, ep). Data axes are gathered, the model axis
+        # is not: the body gathers on efsdp and keeps this rank's EP block, so
+        # the shard axis is the one before `ep`.
+        names = mesh.mesh_dim_names or ()
+        ep_axis = bool(names) and names[-1] == "ep"
+        if ep_axis and not isinstance(param.placements[-1], Shard):
+            raise ValueError(
+                f"{name} on {names} must be Shard on 'ep', got {param.placements}"
+            )
+        shard_axis = mesh.ndim - 2 if ep_axis else mesh.ndim - 1
         # 1-D: `fully_shard`, one Shard placement. 2-D: `hybrid_shard`, which
         # SimpleFSDP builds as exactly (Replicate(), Shard(dim)) over
         # ("dp_replicate", "fsdp") -- so the shard axis is the last one, and the
         # first contributes only the backward all-reduce.
-        if mesh.ndim == 1:
+        if shard_axis == 0:
             replicate_group = None
             replicate_group_name = None
-        elif mesh.ndim == 2 and isinstance(param.placements[0], Replicate):
+        elif shard_axis == 1 and isinstance(param.placements[0], Replicate):
             replicate_group = mesh.get_group(0)
             replicate_group_name = replicate_group.group_name
         else:
             raise ValueError(
                 "the scan body's gather understands a 1-D dp mesh or a 2-D "
-                f"hybrid_shard mesh, got {mesh.ndim}-D with placements "
-                f"{param.placements} for {name}"
+                "hybrid_shard mesh (plus a trailing 'ep' axis for experts), got "
+                f"{names or mesh.ndim} with placements {param.placements} for {name}"
             )
-        placement = param.placements[-1]
-        if isinstance(placement, Shard):
+        placement = param.placements[shard_axis]
+        # An expert stack's efsdp axis is `_StridedShard` (piece i of this
+        # rank's EP block); gathering it over efsdp is a plain gather of that
+        # block. `_StridedShard` is not a `Shard` subclass in this torch.
+        if isinstance(placement, (Shard, _StridedShard)):
             if placement.dim == 0:
                 raise ValueError(
                     f"{name} is sharded on dim 0, but dim 0 is the scan axis "
@@ -385,7 +406,7 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
             # `mesh.size()` is every axis multiplied together, which under
             # hybrid_shard asks for `replicate * shard` and rejects sizes that
             # shard fine.
-            shard_degree = mesh.size(mesh.ndim - 1)
+            shard_degree = mesh.size(shard_axis)
             if param.shape[placement.dim] % shard_degree:
                 # Uneven shards. `redistribute` pads around its all-gather, so
                 # the unrolled path handles them; a bare collective cannot.
@@ -410,7 +431,7 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
                 f"{name} is {placement} on the shard axis, and the scan body's "
                 "gather handles only Shard and Replicate"
             )
-        shard_group = mesh.get_group(mesh.ndim - 1)
+        shard_group = mesh.get_group(shard_axis)
         plan[name] = ScanFSDPSpec(
             group_name=shard_group.group_name,
             group=shard_group,
@@ -449,6 +470,13 @@ def configure_simple_fsdp_shard_dims(
     """
     if parallel_dims is None:
         return []
+    if getattr(parallel_dims, "ep_enabled", False):
+        # Under EP, expert stacks skip dense FSDP: their holder places them on
+        # the expert mesh after `apply_simple_fsdp` (`place_expert_stacks`).
+        for module in model.modules():
+            stack = getattr(module, "stack", None)
+            if hasattr(stack, "expert_parallel_dims"):
+                stack.holder.stash_expert_stacks(stack.expert_parallel_dims())
     fsdp_degree = getattr(parallel_dims, "dp_shard", 1) * getattr(
         parallel_dims, "cp", 1
     )

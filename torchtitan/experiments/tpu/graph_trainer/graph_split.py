@@ -27,6 +27,7 @@ indivisible.
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import chain
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -702,6 +703,22 @@ def split_forward_graph_by_layer(
   return chunked
 
 
+BWD_PREFETCH_AG_MIN_BYTES_ENV = "TT_BWD_PREFETCH_AG_MIN_BYTES"
+
+
+def _value_bytes(node: torch.fx.Node) -> int:
+  val = node.meta.get("val")
+  if isinstance(val, (list, tuple)):
+    return sum(_value_bytes_of(v) for v in val)
+  return _value_bytes_of(val)
+
+
+def _value_bytes_of(val: Any) -> int:
+  if isinstance(val, torch.Tensor):
+    return val.numel() * val.element_size()
+  return 0
+
+
 def _collective_group_name(node: torch.fx.Node) -> str | None:
   """The ``group_name`` argument of a functional collective node, if any."""
   if "group_name" in node.kwargs:
@@ -812,6 +829,7 @@ def split_backward_graph_by_layer(
     pipeline_collectives: bool = False,
     pipeline_kinds: tuple[str, ...] = ("ag", "rs"),
     cpu_offload_prefetch_executables: int = 0,
+    prefetch_ag_min_bytes: int | None = None,
 ) -> PartitionedGraph:
   """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
 
@@ -820,6 +838,10 @@ def split_backward_graph_by_layer(
   stay with their inputs. Pipelining moves the collectives of
   ``pipeline_kinds`` and requires their ownership for every layer so it can
   safely form fill, overlap, and drain stages; the rest stay with their layer.
+  With pipelining on and ``"ag"`` not pipelined, a parameter gather whose
+  output has at least ``prefetch_ag_min_bytes`` bytes (default: env
+  ``TT_BWD_PREFETCH_AG_MIN_BYTES``, 0 = off) still moves one executable ahead,
+  e.g. only the expert weights, leaving small dense gathers with their layer.
   CPU-offload reload pairs may be placed a configured number of complete child
   executables before their first consumer; zero keeps the pair in the consumer
   child.
@@ -900,6 +922,11 @@ def split_backward_graph_by_layer(
       return 3 + (len(layer_ids) - 1) // layers_per_executable
     return 2 + (index + 1) // layers_per_executable
 
+  if prefetch_ag_min_bytes is None:
+    prefetch_ag_min_bytes = int(
+        os.environ.get(BWD_PREFETCH_AG_MIN_BYTES_ENV, "0") or 0
+    )
+  prefetched_ags = 0
   partition_map: dict[torch.fx.Node, int] = {}
   raw_collective_partitions: dict[str, dict[int, int]] = {
       "ag": {},
@@ -907,6 +934,18 @@ def split_backward_graph_by_layer(
   }
   for launch, (kind, layer_id) in owners.items():
     partition = collective_partition(kind, layer_id)
+    if (
+        kind == "ag"
+        and pipeline_collectives
+        and "ag" not in pipeline_kinds
+        and prefetch_ag_min_bytes > 0
+        and layer_indices[layer_id] > 0
+        and _value_bytes(launch) >= prefetch_ag_min_bytes
+    ):
+      # Large (expert) gather only: issue it in the executable of the layer
+      # differentiated just before, so that layer's compute hides it.
+      partition = 2 + (layer_indices[layer_id] - 1) // layers_per_executable
+      prefetched_ags += 1
     _assign_partition(
         partition_map,
         collective_chains[launch],
@@ -955,10 +994,12 @@ def split_backward_graph_by_layer(
   )
   logger.info(
       "Split TPU backward into %d executables with at most %d layers each "
-      "(pipeline_collectives=%s): compute=%s collectives=%s",
+      "(pipeline_collectives=%s, prefetched large gathers=%d): compute=%s "
+      "collectives=%s",
       len(set(chunked.partition_map.values())),
       layers_per_executable,
       pipeline_collectives,
+      prefetched_ags,
       chunked.layer_to_partition,
       chunked.collective_layer_to_partition,
   )

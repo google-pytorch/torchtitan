@@ -714,7 +714,12 @@ class SplashAttention(nn.Module):
     was_3d = q.dim() == 3
     seq_len = q.shape[0] if was_3d else q.shape[1]
     causal = is_causal if is_causal is not None else self.is_causal
-    block = splash_block_size_for(seq_len) if self.auto_block_size else None
+    max_block = int(os.environ.get("TT_SPLASH_MAX_BLOCK", "512"))
+    block = (
+        splash_block_size_for(seq_len, max_block_size=max_block)
+        if self.auto_block_size
+        else None
+    )
     # Fall back to the original module on CPU, for sequences too short for the
     # Pallas kernel, or when no block size divides the sequence length.
     if (
@@ -769,6 +774,103 @@ class SplashAttention(nn.Module):
     if segment_ids is not None and segment_ids.dim() == 1:
       segment_ids = segment_ids.unsqueeze(0)
 
+    unflattened_slots = False
+    orig_seq_len = seq_len
+    if cp_rank is None and q.shape[0] == 1:
+      try:
+        from torchtitan.experiments.tpu.components.unflatten_shim import (
+            get_unflatten_seq_len,
+        )
+
+        row_len = get_unflatten_seq_len()
+      except ImportError:
+        row_len = None
+      if row_len is not None and seq_len > row_len and seq_len % row_len == 0:
+        num_slots = seq_len // row_len
+        q = q.reshape(num_slots, row_len, q.shape[2], q.shape[3])
+        k = k.reshape(num_slots, row_len, k.shape[2], k.shape[3])
+        v = v.reshape(num_slots, row_len, v.shape[2], v.shape[3])
+        if segment_ids is not None:
+          segment_ids = segment_ids.reshape(num_slots, row_len)
+        seq_len = row_len
+        block = (
+            splash_block_size_for(seq_len, max_block_size=max_block)
+            if self.auto_block_size
+            else None
+        )
+        unflattened_slots = True
+
+    if os.environ.get("TT_SPLASH_USE_TOKAMAX", "0") == "1":
+      from torchtitan.experiments.tpu.kernels import tokamax_splash_attention  # pylint: disable=g-import-not-at-top
+
+      tk_block = block or int(os.environ.get("TT_SPLASH_MAX_BLOCK", "2048"))
+      tk_block = min(tk_block, seq_len)
+      tk_bq = min(
+          int(os.environ.get("TT_SPLASH_BLOCK_Q", str(tk_block))), seq_len
+      )
+      tk_bkv = min(
+          int(os.environ.get("TT_SPLASH_BLOCK_KV", str(tk_block))), seq_len
+      )
+      tk_comp = min(
+          tk_bkv, int(os.environ.get("TT_SPLASH_MAX_COMPUTE_BLOCK", "1024"))
+      )
+      tk_bq_dkv = min(
+          int(os.environ.get("TT_SPLASH_BLOCK_Q_DKV", str(tk_bkv))), seq_len
+      )
+      tk_bkv_dkv = int(os.environ.get("TT_SPLASH_BLOCK_KV_DKV", str(tk_bkv)))
+      if tk_bkv_dkv <= 0 or seq_len % tk_bkv_dkv != 0:
+        tk_bkv_dkv = tk_bkv
+      tk_dkv_comp = min(
+          tk_bkv_dkv,
+          int(os.environ.get("TT_SPLASH_DKV_COMPUTE_BLOCK", str(tk_comp))),
+      )
+      tk_layout = os.environ.get("TT_TOKAMAX_LAYOUT", "HEAD_DIM_MINOR")
+      tokamax_splash_attention.TokamaxConfig.update(
+          block_q=tk_bq,
+          block_kv=tk_bkv,
+          block_dkv=tk_bq_dkv,
+          block_kv_compute=tk_comp,
+          block_q_dkv=tk_bq_dkv,
+          block_kv_dkv=tk_bkv_dkv,
+          block_kv_dkv_compute=tk_dkv_comp,
+          q_layout=tk_layout,
+          k_layout=tk_layout,
+          v_layout=tk_layout,
+          use_fused_bwd_kernel=True,
+          use_vmap_bwd=os.environ.get("TT_SPLASH_VMAP_BWD", "0") == "1",
+          num_stacked_q_heads=int(os.environ.get("TT_TOKAMAX_STACKED_Q", "4")),
+          use_batch_loop_fwd=os.environ.get("TT_TOKAMAX_BATCH_LOOP_FWD", "0")
+          == "1",
+          use_transposed_bwd=os.environ.get("TT_TOKAMAX_TBWD", "0") == "1",
+      )
+      eff_window = self.local_window_size
+      max_doc_len = int(os.environ.get("TT_SPLASH_MAX_DOC_LEN", "0"))
+      if (
+          causal
+          and eff_window is None
+          and max_doc_len > 0
+          and seq_len > max_doc_len
+      ):
+        eff_window = max_doc_len
+      out = tokamax_splash_attention.splash_sdpa(
+          q,
+          k,
+          v,
+          segment_ids=segment_ids,
+          cp_rank=cp_rank,
+          scale=scale,
+          is_causal=causal,
+          local_window_size=eff_window,
+          enable_gqa=enable_gqa,
+      )
+      if unflattened_slots:
+        out = out.reshape(1, orig_seq_len, out.shape[2], out.shape[3])
+      if was_3d:
+        out = out.squeeze(0)
+      if q_is_dt:
+        out = DTensor.from_local(out, q_mesh, q_placements)
+      return out
+
     # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa
     # Pallas kernel expects (B, H, S, D). We transpose them here to match the
     # kernel's expected layout.
@@ -778,7 +880,53 @@ class SplashAttention(nn.Module):
 
     extra_sa_kwargs = dict(self.sa_kwargs)
     if block:
-      extra_sa_kwargs.update({name: block for name in _SPLASH_BLOCK_KWARGS})
+      max_compute_block = int(
+          os.environ.get("TT_SPLASH_MAX_COMPUTE_BLOCK", "1024")
+      )
+      for name in _SPLASH_BLOCK_KWARGS:
+        if name.endswith("_compute"):
+          extra_sa_kwargs[name] = min(block, max_compute_block)
+        else:
+          extra_sa_kwargs[name] = block
+    override_bq = int(os.environ.get("TT_SPLASH_BLOCK_Q", "0"))
+    if override_bq > 0 and seq_len % override_bq == 0:
+      extra_sa_kwargs["block_q"] = override_bq
+    override_bkv_dkv = int(os.environ.get("TT_SPLASH_BLOCK_KV_DKV", "0"))
+    if override_bkv_dkv > 0 and seq_len % override_bkv_dkv == 0:
+      extra_sa_kwargs["block_kv_dkv"] = override_bkv_dkv
+      max_compute_block = int(
+          os.environ.get("TT_SPLASH_MAX_COMPUTE_BLOCK", "1024")
+      )
+      extra_sa_kwargs["block_kv_dkv_compute"] = min(
+          override_bkv_dkv, max_compute_block
+      )
+    if os.environ.get("TT_SPLASH_VMAP_BWD", "0") == "1":
+      extra_sa_kwargs["use_vmap_bwd"] = True
+    if os.environ.get("TT_SPLASH_DOC_SKIP", "1") == "0":
+      extra_sa_kwargs["use_document_aware_block_skipping"] = False
+
+    eff_window = self.local_window_size
+    max_doc_len = int(os.environ.get("TT_SPLASH_MAX_DOC_LEN", "0"))
+    if causal and eff_window is None and max_doc_len > 0 and seq_len > max_doc_len:
+      eff_window = max_doc_len
+
+    b_kv_dkv = min(int(extra_sa_kwargs.get("block_kv_dkv", 512)), seq_len)
+    b_sz, n_h, _, h_dim = q_trans.shape
+    eff_b = b_sz if extra_sa_kwargs.get("use_vmap_bwd", False) else 1
+    partial_dq_gib = (
+        eff_b * (seq_len // max(b_kv_dkv, 1)) * n_h * seq_len * h_dim * 2
+    ) / float(1024**3)
+    max_dq_gib = float(os.environ.get("TT_SPLASH_FUSED_BWD_MAX_GIB", "18.0"))
+    if (
+        partial_dq_gib > max_dq_gib
+        and os.environ.get("TT_SPLASH_LONG_CTX_OPT", "1") != "0"
+    ):
+      dq_block = block or extra_sa_kwargs.get("block_q", 512)
+      extra_sa_kwargs.setdefault("use_fused_bwd_kernel", False)
+      if extra_sa_kwargs.get("block_q_dq") is None:
+        extra_sa_kwargs["block_q_dq"] = dq_block
+      if extra_sa_kwargs.get("block_kv_dq") is None:
+        extra_sa_kwargs["block_kv_dq"] = dq_block
     if cp_rank is not None:
       extra_sa_kwargs["cp_rank"] = cp_rank
 
@@ -789,13 +937,15 @@ class SplashAttention(nn.Module):
         segment_ids=segment_ids,
         scale=scale,
         is_causal=causal,
-        local_window_size=self.local_window_size,
+        local_window_size=eff_window,
         enable_gqa=enable_gqa,
         **extra_sa_kwargs,
     )
 
     # Transpose back to (B, S, H, D)
     out = out.transpose(1, 2)
+    if unflattened_slots:
+      out = out.reshape(1, orig_seq_len, out.shape[2], out.shape[3])
     if was_3d:
       out = out.squeeze(0)
     if q_is_dt:

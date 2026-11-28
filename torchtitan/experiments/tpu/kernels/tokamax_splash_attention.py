@@ -4,8 +4,10 @@ Wraps Tokamax's splash_attention_kernel for use with PyTorch tensors on TPU.
 Uses torch_tpu._internal.pallas.pallas.jax_op to bridge JAX -> PyTorch.
 """
 
+import dataclasses
 import functools
 import math
+import os
 from typing import Optional
 
 # JAX imports
@@ -129,6 +131,15 @@ def _make_splash_attention_fn(
     else:
       raise ValueError(f"Unknown layout: {layout_str}")
 
+  extra_cfg_kwargs = {}
+  dq_red_env = os.environ.get("TT_TOKAMAX_DQ_RED_STEPS", "").strip()
+  if dq_red_env:
+    extra_cfg_kwargs["dq_reduction_steps"] = int(dq_red_env)
+  if os.environ.get("TT_TOKAMAX_EXP_SCHED", "0") == "1":
+    extra_cfg_kwargs["use_experimental_scheduler"] = True
+  if os.environ.get("TT_TOKAMAX_REUSE_SCALED_Q", "0") == "1":
+    extra_cfg_kwargs["dkv_reuse_scaled_q"] = True
+
   config = splash_attention_kernel.SplashConfig(
       block_q=min(block_q, q_seq_len),
       block_kv=min(block_kv, kv_seq_len),
@@ -147,6 +158,7 @@ def _make_splash_attention_fn(
       k_layout=_get_layout(k_layout),
       v_layout=_get_layout(v_layout),
       num_stacked_q_heads=num_stacked_q_heads,
+      **extra_cfg_kwargs,
   )
   if cp_size > 1 and (
       getattr(config, "qk_diag_skip", False)
@@ -198,6 +210,10 @@ def _make_splash_attention_fn(
         cp_rank,
     )
 
+  fwd_config = config
+  if os.environ.get("TT_TOKAMAX_FWD_EXP_SCHED", "0") == "1":
+    fwd_config = dataclasses.replace(config, use_experimental_scheduler=True)
+
   @jax.jit
   def splash_fn(q, k, v, segment_ids=None, cp_rank=None):
     """Forward: returns (out, logsumexp) for the whole batch."""
@@ -219,7 +235,7 @@ def _make_splash_attention_fn(
           sinks=None,
           mask_value=_mask_value,
           is_mqa=is_mqa,
-          config=config,
+          config=fwd_config,
           save_residuals=True,
           mask_function=_mask_function,
           fwd_mask_sparsity=_fwd_mask_sparsity,

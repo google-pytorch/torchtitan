@@ -175,6 +175,31 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertLess(_relative_l2_error(dx.double().cpu(), dx_ref), 1e-2)
     self.assertLess(_relative_l2_error(dw.double().cpu(), dw_ref), 2e-3)
 
+  @parameterized.parameters(32768, 65536)
+  def test_tiled_long_strips_on_tpu7x(self, seq_len: int):
+    """Tests halo-tiled S=32768 and S=65536 bf16 strips on TPU7x."""
+    dev = self._require_tpu()
+    gen = pallas_vmem.tpu_generation()
+    if gen is None or gen < 7:
+      self.skipTest("Long-strip TPU7x causal_conv1d test requires TPU >= v7.")
+    torch.manual_seed(4)
+    x_dev = torch.randn(2, seq_len, 256, device=dev, dtype=torch.bfloat16)
+    w_dev = torch.randn(256, 1, 4, device=dev, dtype=torch.bfloat16) * 0.5
+    self.assertTrue(causal_conv1d.supports(x_dev, w_dev))
+    x_ref = x_dev.double().cpu().requires_grad_()
+    w_ref = w_dev.double().cpu().requires_grad_()
+    grad = torch.randn(2, seq_len, 256, dtype=torch.bfloat16)
+    out_ref = _reference(x_ref, w_ref)
+    dx_ref, dw_ref = torch.autograd.grad(out_ref, (x_ref, w_ref), grad.double())
+
+    x_in = x_dev.detach().requires_grad_()
+    w_in = w_dev.detach().requires_grad_()
+    out = causal_conv1d.causal_conv_silu(x_in, w_in)
+    dx, dw = torch.autograd.grad(out, (x_in, w_in), grad.to(dev))
+    self.assertLess(_relative_l2_error(out.double().cpu(), out_ref), 1e-2)
+    self.assertLess(_relative_l2_error(dx.double().cpu(), dx_ref), 1e-2)
+    self.assertLess(_relative_l2_error(dw.double().cpu(), dw_ref), 2e-3)
+
   def test_noncontiguous_partial_grads_and_fullgraph_compile(self):
     """Tests non-contiguous views, single-leaf grads, and torch.compile."""
     dev = self._require_tpu()
@@ -225,7 +250,7 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
         (torch.zeros(1, 6, 128, device=dev, dtype=torch.bfloat16), w_ok),
         (torch.zeros(0, 8, 128, device=dev, dtype=torch.bfloat16), w_ok),
         (torch.zeros(1, 0, 128, device=dev, dtype=torch.bfloat16), w_ok),
-        (torch.zeros(1, 16384, 128, device=dev, dtype=torch.bfloat16), w_ok),
+        (torch.zeros(1, 16392, 128, device=dev, dtype=torch.bfloat16), w_ok),
         (torch.zeros(1, 8, 128, device=dev, dtype=torch.float64), w_ok),
         (
             torch.zeros(1, 8, 128, device=dev, dtype=torch.bfloat16),
@@ -245,6 +270,13 @@ class CausalConv1dTest(base_device_test.BaseAcceleratorDeviceTest):
         )
     ):
       self.assertTrue(causal_conv1d.supports(x_ok, w_ok))
+      for tiled_s in (16384, 32768, 65536):
+        self.assertTrue(
+            causal_conv1d.supports(
+                torch.zeros(1, tiled_s, 128, device=dev, dtype=torch.bfloat16),
+                w_ok,
+            )
+        )
       for bad_x, bad_w in bad_cases:
         self.assertFalse(causal_conv1d.supports(bad_x, bad_w))
 

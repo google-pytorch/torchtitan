@@ -7,6 +7,7 @@
 """TPU-only GraphTrainer memory policies."""
 
 import operator
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -296,6 +297,41 @@ def select_ep_dispatch(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 EP_DISPATCH_REGION = SaveRegion(name=MOE_EP_DISPATCH, select=select_ep_dispatch)
 
+
+def select_gated_delta(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return Tokamax KDA or MaxText GDN forward+residual nodes so backward skips replay."""
+    nodes = []
+    for node in _forward_call_nodes(gm):
+        target = node.target
+        if isinstance(target, torch._ops.OpOverload) and target.name().startswith(
+            ("tt_qwen35::gated_delta", "tt_qwen35::maxtext_gdn_seg_fwd_res")
+        ):
+            nodes.append(node)
+    return nodes
+
+
+def select_moe_gate_up(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return MoE gate/up grouped-matmul + SwiGLU forward nodes."""
+    nodes = []
+    for node in _forward_call_nodes(gm):
+        target = node.target
+        if isinstance(target, torch._ops.OpOverload) and any(
+            k in target.name()
+            for k in (
+                "paired_segment_matmul",
+                "expert_swiglu",
+                "segment_matmul",
+            )
+        ):
+            fqn = _get_module_fqn(node)
+            if "w2" not in fqn:
+                nodes.append(node)
+    return nodes
+
+
+GATED_DELTA_REGION = SaveRegion(name="gated_delta", select=select_gated_delta)
+MOE_GATE_UP_REGION = SaveRegion(name="moe.gate_up", select=select_moe_gate_up)
+
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
@@ -303,6 +339,8 @@ SAVE_REGIONS: dict[str, SaveRegion] = {
         SPLASH_ATTENTION_REGION,
         FFN_W2_REGION,
         EP_DISPATCH_REGION,
+        GATED_DELTA_REGION,
+        MOE_GATE_UP_REGION,
     )
 }
 
@@ -477,6 +515,47 @@ def _tag_saved(node: torch.fx.Node, policy: CheckpointPolicy) -> None:
         saved.meta["recompute"] = policy
 
 
+def _select_offload_gdn_nodes(
+    gm: torch.fx.GraphModule,
+    hbm_save_nodes: set[torch.fx.Node],
+    num_offload_layers: int,
+) -> set[torch.fx.Node]:
+    """Select earlier GDN layers (+ their gated RMSNorm) for async CPU offload."""
+    if num_offload_layers <= 0:
+        return set()
+    gdn_candidates = select_gated_delta(gm)
+    hbm_layer_ids = {_get_layer_id(n) for n in hbm_save_nodes if n in gdn_candidates}
+    rem_gdn = [n for n in gdn_candidates if _get_layer_id(n) not in hbm_layer_ids]
+    if not rem_gdn:
+        return set()
+    k = min(num_offload_layers, len(rem_gdn))
+    if k == len(rem_gdn):
+        chosen_gdn = rem_gdn
+    elif k == 1:
+        chosen_gdn = [rem_gdn[-1]]
+    else:
+        chosen_idx = {int(round(i * (len(rem_gdn) - 1) / (k - 1))) for i in range(k)}
+        for idx in range(len(rem_gdn) - 1, -1, -1):
+            if len(chosen_idx) >= k:
+                break
+            chosen_idx.add(idx)
+        chosen_gdn = [rem_gdn[i] for i in sorted(chosen_idx)]
+    chosen_layer_ids = {_get_layer_id(n) for n in chosen_gdn}
+    norm_nodes = [
+        n
+        for n in _forward_call_nodes(gm)
+        if isinstance(n.target, torch._ops.OpOverload)
+        and "rms_norm_gated_fwd" in n.target.name()
+        and _get_layer_id(n) in chosen_layer_ids
+    ]
+    logger.warning(
+        "tpu_selective_and_offload: offloading"
+        f" {len(chosen_gdn)}/{len(gdn_candidates)} GDN layers"
+        f" {sorted(chosen_layer_ids)} (+ {len(norm_nodes)} rms_norm_gated) to CPU"
+    )
+    return {*chosen_gdn, *norm_nodes}
+
+
 @register_memory_policy("tpu_selective_and_offload")
 def _tpu_selective_and_offload_memory_policy_pass(
     gm: torch.fx.GraphModule,
@@ -488,6 +567,8 @@ def _tpu_selective_and_offload_memory_policy_pass(
     The layer boundaries are offloaded as in ``full_and_offload``. The chosen
     save-region values stay on device: backward reads them first, and
     offloading them too would add their bytes to the host link every layer.
+    When ``TT_OFFLOAD_GDN_LAYERS`` > 0, earlier GDN layers not kept in HBM are
+    additionally offloaded to CPU host RAM via ``ao.offload`` / ``ao.reload``.
     """
     last_n_layers = config.compile.save_last_n_layers
     regions = resolve_save_regions(
@@ -496,14 +577,16 @@ def _tpu_selective_and_offload_memory_policy_pass(
         "tpu_selective_and_offload",
     )
     save_nodes = select_saves(gm, regions, last_n_layers)
-    # Tag full remat first, so the layer boundaries are the only saved values
-    # and therefore the only ones the offload tagger can send to host.
-    full_remat_with_saves(gm, config, ())
+    offload_gdn_layers = int(os.environ.get("TT_OFFLOAD_GDN_LAYERS", "0"))
+    offload_region_nodes = _select_offload_gdn_nodes(gm, save_nodes, offload_gdn_layers)
+    # Tag full remat first, so the layer boundaries (plus optional offloaded GDN
+    # regions) are the only saved values the offload tagger sends to host.
+    full_remat_with_saves(gm, config, offload_region_nodes)
     tag_all_offloadable_activations(
         gm,
         cpu_budget_gb=config.compile.cpu_offload_budget_gb,
     )
-    # Then save the region values in HBM.
+    # Then save the HBM region values on device.
     for node in save_nodes:
         _tag_saved(node, CheckpointPolicy.MUST_SAVE)
     return gm

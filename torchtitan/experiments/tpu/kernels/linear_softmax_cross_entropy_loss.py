@@ -24,6 +24,7 @@ applies the transform to each logits tile in-kernel (see that module's doc).
 
 import hashlib
 import inspect
+import os
 
 import jax
 import tokamax
@@ -351,15 +352,21 @@ def _get_loss_op_names(
   )
 
   def fwd_wrapped(x, labels, weights):
+    fwd_b, fwd_h, fwd_v = b_block_size, h_block_size, v_block_size
+    fwd_env = os.environ.get("TT_LCE_FWD_BLOCKS", "").strip()
+    if fwd_env:
+      parts = [int(p.strip()) for p in fwd_env.split(",") if p.strip()]
+      if len(parts) == 3 and parts[0] == b_block_size:
+        fwd_b, fwd_h, fwd_v = parts
     return compiled_fwd(
         x,
         labels,
         weights,
         reduction,
         implementation,
-        b_block_size,
-        h_block_size,
-        v_block_size,
+        fwd_b,
+        fwd_h,
+        fwd_v,
         soft_cap,
         output_multiplier,
     )

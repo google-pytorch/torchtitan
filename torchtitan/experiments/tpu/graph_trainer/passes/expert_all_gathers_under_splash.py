@@ -32,6 +32,7 @@ configuration error.
 from __future__ import annotations
 
 import operator
+import os
 from collections import defaultdict
 
 import torch
@@ -77,14 +78,39 @@ def _is_gathered_expert_weight(node: torch.fx.Node) -> bool:
     )
 
 
+def _is_gdn_forward_op(target: object) -> bool:
+    return isinstance(target, torch._ops.OpOverload) and target.name().startswith(
+        (
+            "tt_qwen35::maxtext_gdn_seg_fwd",
+            "tt_qwen35::gated_delta",
+        )
+    )
+
+
 def _is_splash_output(node: torch.fx.Node) -> bool:
-    return (
+    if (
+        os.environ.get("TT_EXPERT_AG_UNDER_GDN", "0") == "1"
+        and node.op == "call_function"
+        and _is_gdn_forward_op(node.target)
+    ):
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            return True
+    if not (
         node.op == "call_function"
         and node.target is operator.getitem
         and node.args[1] == 0
         and isinstance(node.args[0], torch.fx.Node)
-        and _is_splash_forward_op(node.args[0].target)
-    )
+    ):
+        return False
+    src_target = node.args[0].target
+    if _is_splash_forward_op(src_target):
+        return True
+    if os.environ.get("TT_EXPERT_AG_UNDER_GDN", "0") == "1" and _is_gdn_forward_op(
+        src_target
+    ):
+        return True
+    return False
 
 
 def _layer_copy(node: torch.fx.Node) -> tuple[int, bool, bool]:

@@ -495,14 +495,11 @@ class CPTpuGatedDeltaNet(TpuGatedDeltaNet):
           gathered_positions, full_positions, cp, headtail
       )
       num_tokens = x_full_TD.shape[0]
-      # This rank's heads of the six input projections.
+      # This rank's heads of the six input projections (fused into 1 GEMM when fuse_input_projections=True).
       query_TC, key_TC, value_TC, gate_TC, a_TH, b_TH = (
-          F.linear(
-              x_full_TD,
-              _local_heads(proj.weight, rank, cp),
-              None if proj.bias is None else _local_heads(proj.bias, rank, cp),
+          self.input_projections(
+              x_full_TD, select=lambda w: _local_heads(w, rank, cp)
           )
-          for proj in (getattr(self, name) for name in _INPUT_PROJECTIONS)
       )
       output_THV = inner.local_forward(
           query_TC,

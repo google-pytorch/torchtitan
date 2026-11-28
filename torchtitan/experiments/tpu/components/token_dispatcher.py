@@ -28,6 +28,7 @@ bounds on each).
 
 from dataclasses import dataclass, replace
 import math
+import os
 from typing import Literal, get_args
 import weakref
 
@@ -367,6 +368,13 @@ class _RaggedAllToAll(torch.autograd.Function):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TpuLocalDispatchMetadata(LocalDispatchMetadata):
+  """EP=1 dispatch metadata carrying the cached inverse route permutation."""
+
+  inverse_permutation_N: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
 class TpuEpDispatchMetadata:
   """Dispatch metadata shared by the static-shape TPU EP transports.
 
@@ -437,8 +445,9 @@ class _ScaleRouteWeights(torch.autograd.Function):
   def forward(ctx, routed_output_ND, scores_N):
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(routed_output_ND, scores_N)
-    return (
-        routed_output_ND.float() * scores_N.reshape(-1, 1)
+    nz = scores_N.reshape(-1, 1) != 0
+    return torch.where(
+        nz, routed_output_ND.float() * scores_N.reshape(-1, 1), 0.0
     ).to(routed_output_ND.dtype)
 
   @staticmethod
@@ -448,15 +457,19 @@ class _ScaleRouteWeights(torch.autograd.Function):
       return None, None
 
     routed_output_ND, scores_N = ctx.saved_tensors
+    nz = scores_N.reshape(-1, 1) != 0
     grad_routed_output_ND = None
     if ctx.needs_input_grad[0]:
-      grad_routed_output_ND = (
-          grad_output_ND.float() * scores_N.reshape(-1, 1)
+      grad_routed_output_ND = torch.where(
+          nz, grad_output_ND.float() * scores_N.reshape(-1, 1), 0.0
       ).to(routed_output_ND.dtype)
 
     grad_scores_N = None
     if ctx.needs_input_grad[1]:
-      grad_scores_N = route_score_grad(grad_output_ND, routed_output_ND)
+      safe_routed_ND = torch.where(nz, routed_output_ND, 0.0)
+      grad_scores_N = torch.where(
+          scores_N != 0, route_score_grad(grad_output_ND, safe_routed_ND), 0.0
+      )
     return grad_routed_output_ND, grad_scores_N
 
 
@@ -518,13 +531,24 @@ class _StableGroupedReduce(torch.autograd.Function):
   """
 
   @staticmethod
-  def forward(ctx, src_ND, index_N, top_k):
+  def forward(ctx, src_ND, index_N, top_k, inverse_N=None):
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(index_N)
-    permutation_N = torch.argsort(index_N, stable=True)
+    if (
+        inverse_N is not None
+        and os.environ.get("TT_MOE_REUSE_INVERSE_PERM", "0") == "1"
+    ):
+      permutation_N = inverse_N
+    else:
+      permutation_N = torch.argsort(index_N, stable=True)
     grouped_TKD = torch.index_select(src_ND, 0, permutation_N).reshape(
         -1, top_k, src_ND.shape[1]
     )
+    if (
+        os.environ.get("TT_MOE_BF16_COMBINE", "0") == "1"
+        and src_ND.dtype == torch.bfloat16
+    ):
+      return grouped_TKD.sum(dim=1)
     return grouped_TKD.float().sum(dim=1).to(src_ND.dtype)
 
   @staticmethod
@@ -533,16 +557,17 @@ class _StableGroupedReduce(torch.autograd.Function):
     grad_src_ND = None
     if grad_output_TD is not None:
       grad_src_ND = torch.index_select(grad_output_TD, 0, index_N)
-    return grad_src_ND, None, None
+    return grad_src_ND, None, None, None
 
 
 def stable_grouped_reduce(
     src_ND: torch.Tensor,
     index_N: torch.Tensor,
     top_k: int,
+    inverse_N: torch.Tensor | None = None,
 ) -> torch.Tensor:
-  """Reduce fixed-K routes by token with FP32 accumulation."""
-  return _StableGroupedReduce.apply(src_ND, index_N, top_k)
+  """Reduce fixed-K routes by token with FP32 or BF16 accumulation."""
+  return _StableGroupedReduce.apply(src_ND, index_N, top_k, inverse_N)
 
 
 class _LocalReorder(torch.autograd.Function):
@@ -572,9 +597,10 @@ class _LocalReorder(torch.autograd.Function):
   """
 
   @staticmethod
-  def forward(ctx, x_TD, scores_TK, permutation_N, top_k):
+  def forward(ctx, x_TD, scores_TK, permutation_N, top_k, inverse_N=None):
     ctx.set_materialize_grads(False)
-    inverse_N = torch.argsort(permutation_N)
+    if inverse_N is None:
+      inverse_N = torch.argsort(permutation_N)
     token_indices_N = permutation_N // top_k
     ctx.save_for_backward(inverse_N)
     ctx.input_shape = x_TD.shape
@@ -593,18 +619,26 @@ class _LocalReorder(torch.autograd.Function):
     grad_x_TD = None
     if grad_routed_ND is not None:
       grad_x_TD = torch.index_select(grad_routed_ND, 0, inverse_N)
-      grad_x_TD = (
-          grad_x_TD.float()
-          .reshape(ctx.input_shape[0], ctx.top_k, ctx.input_shape[1])
-          .sum(dim=1)
-          .to(grad_routed_ND.dtype)
-      )
+      if (
+          os.environ.get("TT_MOE_BF16_COMBINE", "0") == "1"
+          and grad_routed_ND.dtype == torch.bfloat16
+      ):
+        grad_x_TD = grad_x_TD.reshape(
+            ctx.input_shape[0], ctx.top_k, ctx.input_shape[1]
+        ).sum(dim=1)
+      else:
+        grad_x_TD = (
+            grad_x_TD.float()
+            .reshape(ctx.input_shape[0], ctx.top_k, ctx.input_shape[1])
+            .sum(dim=1)
+            .to(grad_routed_ND.dtype)
+        )
     grad_scores_TK = None
     if grad_scores_N is not None:
       grad_scores_TK = torch.index_select(
           grad_scores_N, 0, inverse_N
       ).reshape(ctx.score_shape)
-    return grad_x_TD, grad_scores_TK, None, None
+    return grad_x_TD, grad_scores_TK, None, None, None
 
 
 def local_reorder(
@@ -612,12 +646,18 @@ def local_reorder(
     scores_TK: torch.Tensor,
     expert_ids_TK: torch.Tensor,
     top_k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_inverse: bool = False,
+):
   """Sort routes by expert while keeping all gathers row-indexed."""
-  # Marked so that a selective memory policy can save the sort order.
+  # Marked so that a selective memory policy can save the sort order & inverse.
   with annotate_region(MOE_ROUTING):
     permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
-  return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
+    inverse_N = torch.argsort(permutation_N)
+  out = _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k, inverse_N)
+  if return_inverse:
+    return (*out, inverse_N)
+  return out
 
 
 class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
@@ -1174,7 +1214,26 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           | TpuEpDispatchMetadata
       ),
   ]:
-    if self.ep_mesh is None or self.ep_transport == "all_to_all":
+    if self.ep_mesh is None:
+      (
+          routed_input_RD,
+          token_indices_experts_sorted_N,
+          topk_scores_experts_sorted_N,
+          inverse_N,
+      ) = local_reorder(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          self.top_k,
+          return_inverse=True,
+      )
+      metadata = TpuLocalDispatchMetadata(
+          token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+          topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
+          inverse_permutation_N=inverse_N,
+      )
+      return routed_input_RD, num_local_tokens_per_expert_E, metadata
+    if self.ep_transport == "all_to_all":
       return super().dispatch(
           x_TD,
           topk_scores_TK,
@@ -1413,6 +1472,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         routed_output_ND,
         metadata.token_indices_experts_sorted_N,
         self.top_k,
+        inverse_N=getattr(metadata, "inverse_permutation_N", None),
     )
 
 
@@ -1892,6 +1952,7 @@ class TpuRoutedExperts(RoutedExperts):
         routed_output_RD,
         metadata.token_indices_experts_sorted_N,
         self.token_dispatcher.top_k,
+        inverse_N=getattr(metadata, "inverse_permutation_N", None),
     )
 
 

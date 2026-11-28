@@ -157,6 +157,7 @@ def collect_collective_chains(
           or node.op != "call_function"
           or is_collective(node)
           or is_wait_tensor(node)
+          or getattr(node.target, "namespace", None) == "ao"
       ):
         continue
       candidates.add(node)

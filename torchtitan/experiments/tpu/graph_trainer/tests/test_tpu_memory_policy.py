@@ -883,6 +883,41 @@ class TestSplashAttentionRegion(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not return"):
             select_splash_attention(gm)
 
+    def test_gated_delta_and_moe_gate_up_save_regions(self) -> None:
+        from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+            SAVE_REGIONS,
+            _select_offload_gdn_nodes,
+            select_gated_delta,
+        )
+
+        self.assertIn("gated_delta", SAVE_REGIONS)
+        self.assertIn("moe.gate_up", SAVE_REGIONS)
+
+        if not hasattr(torch.ops, "tt_qwen35") or not hasattr(
+            torch.ops.tt_qwen35, "maxtext_gdn_seg_fwd_res"
+        ):
+            torch.library.define(
+                "tt_qwen35::maxtext_gdn_seg_fwd_res",
+                "(Tensor x) -> (Tensor, Tensor)",
+            )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        nodes = []
+        for layer_id in range(4):
+            n = graph.call_function(
+                torch.ops.tt_qwen35.maxtext_gdn_seg_fwd_res.default, args=(x,)
+            )
+            n.meta["custom"] = {"module_fqn": f"layers.{layer_id}.attn"}
+            nodes.append(n)
+        graph.output(tuple(nodes))
+        gm = torch.fx.GraphModule(nn.Module(), graph)
+
+        found = select_gated_delta(gm)
+        self.assertEqual([_get_layer_id(n) for n in found], [0, 1, 2, 3])
+        offloaded = _select_offload_gdn_nodes(gm, {found[3]}, num_offload_layers=2)
+        self.assertEqual(sorted(_get_layer_id(n) for n in offloaded), [0, 2])
+
 
 if __name__ == "__main__":
     absltest.main()

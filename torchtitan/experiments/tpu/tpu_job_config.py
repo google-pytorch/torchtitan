@@ -51,6 +51,11 @@ class TPUConfig:
   ] | None = None
   ep_scale_before_down_proj: bool | None = None
   ep_capacity_factor: float | None = None
+  # `ep_overflow_mode`: "drop" (the dispatcher default) drops routes past the
+  # capacity; "chunked" runs them in extra capacity-sized windows inside a
+  # while loop that runs zero iterations without overflow, so nothing is
+  # dropped (ring_of_experts only). None keeps the dispatcher's mode.
+  ep_overflow_mode: Literal["drop", "chunked"] | None = None
   ep_token_chunks: int | None = None
   ep_max_inflight_chunks: int | None = None
   # False sums each layer's cross-chunk expert dWeights in BF16 instead of FP32.

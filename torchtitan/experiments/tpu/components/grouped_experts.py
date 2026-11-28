@@ -363,6 +363,38 @@ class TpuGroupedExperts(GroupedExperts):
             w2_EKN = w2_EKN.transpose(-2, -1)
         return w1_EKN, w2_EKN, w3_EKN
 
+    def overflow_tail_weights(
+        self,
+        pre_unsharded_weights: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(w1 [E, D, F], w3 [E, D, F], w2 [E, F, D])`` for the overflow tail.
+
+        ``pre_unsharded_weights`` is an ``unshard_weights`` result (the chunked
+        EP path passes its per-chunk view so the gradients accumulate with the
+        chunk-0 experts'); otherwise ``unshard_weights`` runs here.
+        """
+        if not self.use_pallas_grouped_mm:
+            w1_EFD, w2_EDF, w3_EFD = (
+                pre_unsharded_weights
+                if pre_unsharded_weights is not None
+                else (self.w1_EFD, self.w2_EDF, self.w3_EFD)
+            )
+            return (
+                w1_EFD.transpose(-2, -1),
+                w3_EFD.transpose(-2, -1),
+                w2_EDF.transpose(-2, -1),
+            )
+        w1_EKN, w2_EKN, w3_EKN = (
+            pre_unsharded_weights
+            if pre_unsharded_weights is not None
+            else self.unshard_weights()
+        )
+        if self._use_transposed_w2_rhs:
+            w2_EKN = w2_EKN.transpose(-2, -1)
+        return w1_EKN, w3_EKN, w2_EKN
+
     # -- FP8 pre-quantized gathers (only with fp8_gather_quantized_weights) --
 
     def _register_prequantized_placeholders(self) -> None:

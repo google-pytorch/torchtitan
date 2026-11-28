@@ -30,6 +30,7 @@ def use_expert_parallel(
     ep_transport: str | None = None,
     scale_before_down_proj: bool | None = None,
     ep_capacity_factor: float | None = None,
+    ep_overflow_mode: str | None = None,
     num_token_chunks: int | None = None,
     max_inflight_chunks: int | None = None,
     accumulate_chunk_weight_grads_fp32: bool | None = None,
@@ -70,6 +71,10 @@ def use_expert_parallel(
       rounded up to a multiple of 1024 (the all-gather and reduce-scatter
       stay full size). ``None`` preserves any factor set on the dispatcher
       (default ``None``, dropless worst-case buffer).
+    ep_overflow_mode: Optional ``"drop"`` or ``"chunked"``: what happens
+      to routes past ``ep_capacity_factor``'s capacity. ``"chunked"`` runs
+      them in extra capacity-sized windows (Ring-of-Experts only), so no
+      route is dropped. ``None`` keeps the dispatcher's mode (``"drop"``).
     num_token_chunks: Optional override for the number of sequence chunks per
       MoE layer on ``TpuRoutedExperts``.
     max_inflight_chunks: Optional override for the maximum simultaneously live
@@ -151,6 +156,8 @@ def use_expert_parallel(
         derive_kwargs = {"ep_transport": chosen_transport}
         if ep_capacity_factor is not None:
           derive_kwargs["ep_capacity_factor"] = ep_capacity_factor
+        if ep_overflow_mode is not None:
+          derive_kwargs["ep_overflow_mode"] = ep_overflow_mode
         ep_dispatcher = torchtitan.config.derive(
             dispatcher,
             TpuAllToAllTokenDispatcher.Config,

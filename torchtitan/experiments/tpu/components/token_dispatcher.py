@@ -46,6 +46,13 @@ from torch.fx.traceback import annotate, annotate_fn
 
 from torchtitan.config import derive
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
+from torchtitan.experiments.tpu.components.ep_overflow import (
+    EpOverflowMode,
+    EpOverflowRouting,
+    local_routing,
+    overflow_tail,
+    overflow_tail_weights,
+)
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.components.remat_regions import (
     annotate_region,
@@ -382,6 +389,14 @@ class TpuEpDispatchMetadata:
   dropped_count: torch.Tensor
   row_scale_R: torch.Tensor | None = None
   row_scale_applied: bool = False
+  # ``ep_overflow_mode="chunked"`` only: routing of the routes past the
+  # capacity, and the expert weights (with their activation) that combine
+  # runs them through before the reduce-scatter (``ep_overflow.py``).
+  overflow: EpOverflowRouting | None = None
+  overflow_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+      None
+  )
+  overflow_activation: str = "silu"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -660,6 +675,13 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     #   1024 (the Pallas combine backward's block) and never exceeds the worst
     #   case.
     ep_capacity_factor: float | None = None
+    # What happens to the routes past `ep_capacity_factor`'s capacity:
+    # - "drop": dropped and counted in `dropped_count` (the default).
+    # - "chunked": no route is dropped. The capped buffer runs as chunk 0 and
+    #   an overflow tail runs the rest in further windows of `cap` sorted
+    #   slots, in a while loop that runs zero iterations without overflow
+    #   (`ep_overflow.py`). Ring-of-Experts only.
+    ep_overflow_mode: EpOverflowMode = "drop"
     roe_gather_block_size: int = 1024
     roe_reduce_block_size: int = 896
     roe_zero_pad_tail: bool = False
@@ -691,6 +713,12 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             "ep_capacity_factor must be a finite positive float or None"
             f" (dropless), got {self.ep_capacity_factor!r}"
         )
+    if config.ep_overflow_mode not in get_args(EpOverflowMode):
+      raise ValueError(
+          f"ep_overflow_mode must be one of {get_args(EpOverflowMode)}, got"
+          f" {config.ep_overflow_mode!r}"
+      )
+    self.ep_overflow_mode = config.ep_overflow_mode
     self.roe_gather_block_size = config.roe_gather_block_size
     self.roe_reduce_block_size = config.roe_reduce_block_size
     self.roe_zero_pad_tail = config.roe_zero_pad_tail
@@ -736,6 +764,46 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     )
     if getattr(holder, "collect_ep_drop_stats", False) or not _is_tracing(x):
       self.last_dropped_count = dropped_count
+
+  def _overflow_routing(
+      self,
+      tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+      x_all_G: torch.Tensor,
+      scores_all_GK: torch.Tensor,
+      cap: int,
+  ) -> EpOverflowRouting | None:
+    """Overflow tail routing under ``ep_overflow_mode="chunked"``, else None."""
+    if tables is None:
+      return None
+    slot_order_M, group_sizes_e, count_total = tables
+    return EpOverflowRouting(
+        x_all_G=x_all_G,
+        scores_flat_M=scores_all_GK.reshape(-1),
+        slot_order_M=slot_order_M,
+        group_sizes_e=group_sizes_e,
+        count_total=count_total,
+        cap=cap,
+        top_k=self.top_k,
+    )
+
+  def _apply_overflow_tail(
+      self, partial_G: torch.Tensor, metadata: TpuEpDispatchMetadata
+  ) -> torch.Tensor:
+    """Adds the routes past the capacity to a Ring-of-Experts partial sum."""
+    if metadata.overflow is None:
+      return partial_G
+    if metadata.overflow_weights is None:
+      raise RuntimeError(
+          "ep_overflow_mode='chunked' dispatch metadata reached combine"
+          " without expert weights; TpuRoutedExperts attaches them"
+          " (attach_overflow_weights)."
+      )
+    return overflow_tail(
+        partial_G,
+        metadata.overflow,
+        metadata.overflow_weights,
+        metadata.overflow_activation,
+    )
 
   def enable_row_scale_dispatch(self) -> None:
     """Requests per-row routing weights in EP dispatch metadata for ``scale_before_down_proj``."""
@@ -1050,7 +1118,14 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             reduce_block_size=reduce_block,
         )
         valid_count = start_count_2[1]
-        if is_capped:
+        overflow_tables = None
+        if is_capped and self.ep_overflow_mode == "chunked":
+          # Nothing is dropped: the overflow tail runs the routes past `cap`.
+          overflow_tables = local_routing(
+              ids_all_GK.reshape(-1), rank_idx_i32, e
+          )
+          dropped_count = valid_count.new_zeros(())
+        elif is_capped:
           rel_ids_GK = ids_all_GK - rank_idx_i32 * e
           unclamped_count = (
               (rel_ids_GK >= 0) & (rel_ids_GK < e)
@@ -1099,6 +1174,9 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
           gather_block_size=gather_block,
           reduce_block_size=reduce_block,
           zero_pad_tail=self.roe_zero_pad_tail,
+          overflow=self._overflow_routing(
+              overflow_tables, x_all_GD, scores_all_GK, cap
+          ),
       )
       return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
 
@@ -1156,6 +1234,7 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             reduce_block_size=metadata.reduce_block_size,
             zero_pad_tail=metadata.zero_pad_tail,
         )
+      partial_GD = self._apply_overflow_tail(partial_GD, metadata)
       return _EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
 
   @annotate_fn({"EP": "dispatch"})
@@ -1207,6 +1286,12 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     worst_case_rows = ep_size * max(num_routed, 1)
     r_static = self._ep_buffer_capacity(num_routed, ep_size)
     is_capped = r_static < worst_case_rows
+    if is_capped and self.ep_overflow_mode == "chunked":
+      raise NotImplementedError(
+          "ep_overflow_mode='chunked' supports ep_transport='ring_of_experts'"
+          " only; ragged_all_to_all would need a dynamic number of overflow"
+          " all-to-alls. Use ring_of_experts, or 'drop'."
+      )
 
     with maybe_set_sparse_mesh():
       pg = self.ep_mesh.get_group()
@@ -1618,6 +1703,29 @@ class TpuRoutedExperts(RoutedExperts):
       total = torch.full_like(dropped, num_tokens * self.token_dispatcher.top_k)
       self._last_ep_drop_stats_2 = torch.stack([dropped, total])
 
+  def _attach_overflow_weights(
+      self,
+      metadata,
+      pre_unsharded_weights: tuple[torch.Tensor, ...] | None = None,
+  ):
+    """Gives ``ep_overflow_mode="chunked"`` metadata the expert weights.
+
+    Combine runs the routes past the capacity through these weights (the
+    chunk's weights when chunking, so their gradients reach the same
+    accumulators); metadata without overflow routing is returned unchanged.
+    """
+    if (
+        not isinstance(metadata, TpuEpDispatchMetadata)
+        or metadata.overflow is None
+    ):
+      return metadata
+    weights, activation = overflow_tail_weights(
+        self.inner_experts, pre_unsharded_weights
+    )
+    return replace(
+        metadata, overflow_weights=weights, overflow_activation=activation
+    )
+
   def _ep_num_chunks(self, num_tokens: int, ep_size: int) -> int:
     """Returns the token chunks for a TPU EP forward of ``num_tokens`` tokens.
 
@@ -1696,6 +1804,9 @@ class TpuRoutedExperts(RoutedExperts):
         replace(metadata, row_scale_applied=True)
         if self.scale_before_down_proj
         else metadata
+    )
+    combine_metadata = self._attach_overflow_weights(
+        combine_metadata, pre_unsharded_weights
     )
     out_TD = self.token_dispatcher.combine(
         routed_output_RD, combine_metadata, x_TD

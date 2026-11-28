@@ -105,6 +105,7 @@ class ReferenceRoETokenDispatcher(td.TpuAllToAllTokenDispatcher):
         ).to(torch.int32)
         unclamped_local_counts_e = all_counts_ep1[:e]
         unclamped_count = unclamped_local_counts_e.sum(dtype=torch.int32)
+        overflow_tables = None
         if is_capped and e > 0:
           cum_e = unclamped_local_counts_e.cumsum(dim=0, dtype=torch.int32)
           clamped_cum_e = torch.clamp(cum_e, max=cap)
@@ -112,6 +113,14 @@ class ReferenceRoETokenDispatcher(td.TpuAllToAllTokenDispatcher):
           num_global_tokens_per_local_expert_e = clamped_cum_e - prev_clamped_e
           valid_count = clamped_cum_e[-1]
           dropped_count = unclamped_count - valid_count
+          if self.ep_overflow_mode == "chunked":
+            # The overflow tail runs the routes past `cap` in combine.
+            overflow_tables = (
+                perm_M.to(torch.int32),
+                unclamped_local_counts_e,
+                unclamped_count,
+            )
+            dropped_count = valid_count.new_zeros(())
         else:
           num_global_tokens_per_local_expert_e = unclamped_local_counts_e
           valid_count = unclamped_count
@@ -166,6 +175,9 @@ class ReferenceRoETokenDispatcher(td.TpuAllToAllTokenDispatcher):
           topk_scores_experts_sorted_N=scores_sorted_M,
           num_global_tokens=g_tokens,
           local_mask_sorted_M=local_mask_sorted_M,
+          overflow=self._overflow_routing(
+              overflow_tables, x_all_GD, scores_all_GK, cap
+          ),
       )
       return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
 
@@ -212,6 +224,7 @@ class ReferenceRoETokenDispatcher(td.TpuAllToAllTokenDispatcher):
           metadata.token_indices_experts_sorted_N,
           self.top_k,
       )
+      partial_GD = self._apply_overflow_tail(partial_GD, metadata)
       return td._EpReduceScatter.apply(partial_GD, self.ep_mesh, pg)
 
 

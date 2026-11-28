@@ -43,7 +43,7 @@ from torchtitan.tools.logging import logger
 
 _CHUNK_IDX_KEY = "ep_chunk_idx"
 _MAX_INFLIGHT_KEY = "ep_max_inflight_chunks"
-# Set on each chunk's `_ChunkWeight` (`TpuRoutedExperts._forward_ep_chunked`).
+# Set on each chunk's `_ChunkWeight` (`TpuRoutedExperts._forward_ep`).
 _CHUNK_WEIGHT_KEY = "ep_chunk_weight"
 _DEFAULT_MAX_INFLIGHT_CHUNKS = 2
 

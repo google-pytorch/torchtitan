@@ -1618,7 +1618,91 @@ class TpuRoutedExperts(RoutedExperts):
       total = torch.full_like(dropped, num_tokens * self.token_dispatcher.top_k)
       self._last_ep_drop_stats_2 = torch.stack([dropped, total])
 
-  def _forward_ep_chunked(
+  def _ep_num_chunks(self, num_tokens: int, ep_size: int) -> int:
+    """Returns the token chunks for a TPU EP forward of ``num_tokens`` tokens.
+
+    That is ``num_token_chunks``, or the largest divisor of ``num_tokens``
+    below it when it does not divide ``num_tokens``. A one-rank EP mesh or an
+    empty batch runs one chunk.
+    """
+    if ep_size <= 1 or num_tokens == 0 or self.num_token_chunks == 1:
+      return 1
+    num_chunks = self.num_token_chunks
+    if num_tokens % num_chunks != 0:
+      num_chunks = next(
+          d
+          for d in range(min(num_chunks, num_tokens), 0, -1)
+          if num_tokens % d == 0
+      )
+      # Dynamo cannot trace the set mutation or the logger call; make_fx
+      # and eager run them as Python.
+      if (
+          not torch.compiler.is_compiling()
+          and (num_tokens, num_chunks) not in self._warned_chunk_snap
+      ):
+        self._warned_chunk_snap.add((num_tokens, num_chunks))
+        logger.warning(
+            "%d tokens are not divisible by num_token_chunks=%d; using %d"
+            " chunks (fewer chunks keep more EP buffers live).",
+            num_tokens,
+            self.num_token_chunks,
+            num_chunks,
+        )
+    return num_chunks
+
+  def _ep_dispatch_experts_combine(
+      self,
+      x_TD: torch.Tensor,
+      topk_scores_TK: torch.Tensor,
+      topk_expert_ids_TK: torch.Tensor,
+      num_local_tokens_per_expert_E: torch.Tensor,
+      *,
+      pre_unsharded_weights: tuple[torch.Tensor, ...] | None = None,
+  ) -> tuple[torch.Tensor, TpuEpDispatchMetadata]:
+    """Runs one TPU EP dispatch, the experts and the combine.
+
+    With ``scale_before_down_proj``, the experts apply the dispatched per-row
+    routing weights before W2 and the combine skips the weight multiply.
+    Returns the combined output and the dispatch metadata.
+    """
+    routed_input_RD, num_tokens_per_expert_e, metadata = (
+        self.token_dispatcher.dispatch(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+        )
+    )
+    expert_kwargs = {}
+    if pre_unsharded_weights is not None:
+      expert_kwargs["pre_unsharded_weights"] = pre_unsharded_weights
+    if self.scale_before_down_proj:
+      if not isinstance(metadata, TpuEpDispatchMetadata):
+        raise ValueError(
+            "EP scale_before_down_proj requires TPU EP dispatch metadata, got"
+            f" {type(metadata).__name__}"
+        )
+      if metadata.row_scale_R is None:
+        raise ValueError(
+            "scale_before_down_proj expected EP dispatch metadata with"
+            " row_scale_R populated"
+        )
+      expert_kwargs["row_scale_R"] = metadata.row_scale_R
+    with maybe_set_sparse_mesh():
+      routed_output_RD = self.inner_experts(
+          routed_input_RD, num_tokens_per_expert_e, **expert_kwargs
+      )
+    combine_metadata = (
+        replace(metadata, row_scale_applied=True)
+        if self.scale_before_down_proj
+        else metadata
+    )
+    out_TD = self.token_dispatcher.combine(
+        routed_output_RD, combine_metadata, x_TD
+    )
+    return out_TD, metadata
+
+  def _forward_ep(
       self,
       x_TD: torch.Tensor,
       topk_scores_TK: torch.Tensor,
@@ -1628,6 +1712,24 @@ class TpuRoutedExperts(RoutedExperts):
       num_chunks: int,
       ep_size: int,
   ) -> torch.Tensor:
+    """The TPU EP forward over ``num_chunks`` token chunks.
+
+    One chunk is a single dispatch, expert call and combine: the experts
+    unshard their own weights, and the dispatcher records the dropped routes.
+    Only ``num_chunks > 1`` unshards the expert weights once for all chunks,
+    sums the chunks' weight gradients in FP32, tags each chunk for
+    ``insert_ep_chunk_barriers``, counts each chunk's tokens per expert and
+    records the dropped routes summed over the chunks.
+    """
+    if num_chunks == 1:
+      out_TD, _ = self._ep_dispatch_experts_combine(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+      )
+      return out_TD
+
     if isinstance(self.inner_experts, FSDPModule):
       raise NotImplementedError(
           "EP token chunking unshards the expert weights once per layer and"
@@ -1680,58 +1782,31 @@ class TpuRoutedExperts(RoutedExperts):
           "ep_chunk_idx": chunk_idx,
           "ep_max_inflight_chunks": self.max_inflight_chunks,
       }):
-        extra_expert_kwargs = {}
-        if unsharded_weights is not None:
-          chunk_weights = unsharded_weights
-          if weight_grad_accumulators is not None:
-            with annotate({_EP_CHUNK_WEIGHT_KEY: True}):
-              chunk_weights = tuple(
-                  w if acc is None else _ChunkWeight.apply(w, acc)
-                  for w, acc in zip(unsharded_weights, weight_grad_accumulators)
-              )
-          extra_expert_kwargs["pre_unsharded_weights"] = chunk_weights
+        chunk_weights = unsharded_weights
+        if weight_grad_accumulators is not None:
+          with annotate({_EP_CHUNK_WEIGHT_KEY: True}):
+            chunk_weights = tuple(
+                w if acc is None else _ChunkWeight.apply(w, acc)
+                for w, acc in zip(unsharded_weights, weight_grad_accumulators)
+            )
         counts_c = (
             _tokens_per_expert(ids_c, num_experts)
             if needs_chunk_counts
             else num_local_tokens_per_expert_E
         )
-        routed_input_c, num_tokens_per_expert_e, metadata_c = (
-            self.token_dispatcher.dispatch(x_c, scores_c, ids_c, counts_c)
+        out_c, metadata_c = self._ep_dispatch_experts_combine(
+            x_c,
+            scores_c,
+            ids_c,
+            counts_c,
+            pre_unsharded_weights=chunk_weights,
         )
         if (
             record_eager_drops
             and isinstance(metadata_c, TpuEpDispatchMetadata)
         ):
           dropped_chunks.append(metadata_c.dropped_count)
-        if self.scale_before_down_proj:
-          if not isinstance(metadata_c, TpuEpDispatchMetadata):
-            raise ValueError(
-                "Chunked EP scale_before_down_proj requires TPU EP dispatch"
-                f" metadata, got {type(metadata_c).__name__}"
-            )
-          if metadata_c.row_scale_R is None:
-            raise ValueError(
-                "scale_before_down_proj expected EP dispatch metadata with"
-                " row_scale_R populated"
-            )
-          with maybe_set_sparse_mesh():
-            routed_output_c = self.inner_experts(
-                routed_input_c,
-                num_tokens_per_expert_e,
-                row_scale_R=metadata_c.row_scale_R,
-                **extra_expert_kwargs,
-            )
-          metadata_c = replace(metadata_c, row_scale_applied=True)
-        else:
-          with maybe_set_sparse_mesh():
-            routed_output_c = self.inner_experts(
-                routed_input_c,
-                num_tokens_per_expert_e,
-                **extra_expert_kwargs,
-            )
-        out_chunks.append(
-            self.token_dispatcher.combine(routed_output_c, metadata_c, x_c)
-        )
+        out_chunks.append(out_c)
     if dropped_chunks and isinstance(
         self.token_dispatcher, TpuAllToAllTokenDispatcher
     ):
@@ -1772,46 +1847,20 @@ class TpuRoutedExperts(RoutedExperts):
       num_local_tokens_per_expert_E: torch.Tensor,
   ) -> torch.Tensor:
     ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
-    num_tokens = x_TD.shape[0]
-    if (
-        ep_mesh is not None
-        and ep_mesh.size() > 1
-        and self.num_token_chunks > 1
-        and num_tokens > 0
-        and getattr(self.token_dispatcher, "ep_transport", "all_to_all")
-        in ("ring_of_experts", "ragged_all_to_all", "auto")
-    ):
-      num_chunks = self.num_token_chunks
-      if num_tokens % num_chunks != 0:
-        num_chunks = next(
-            d
-            for d in range(min(num_chunks, num_tokens), 0, -1)
-            if num_tokens % d == 0
-        )
-        # Dynamo cannot trace the set mutation or the logger call; make_fx
-        # and eager run them as Python.
-        if (
-            not torch.compiler.is_compiling()
-            and (num_tokens, num_chunks) not in self._warned_chunk_snap
-        ):
-          self._warned_chunk_snap.add((num_tokens, num_chunks))
-          logger.warning(
-              "%d tokens are not divisible by num_token_chunks=%d; using %d"
-              " chunks (fewer chunks keep more EP buffers live).",
-              num_tokens,
-              self.num_token_chunks,
-              num_chunks,
-          )
-      if num_chunks > 1:
-        return self._forward_ep_chunked(
-            x_TD,
-            topk_scores_TK,
-            topk_expert_ids_TK,
-            num_local_tokens_per_expert_E,
-            num_chunks=num_chunks,
-            ep_size=ep_mesh.size(),
-        )
+    if ep_mesh is not None and getattr(
+        self.token_dispatcher, "ep_transport", "all_to_all"
+    ) in ("ring_of_experts", "ragged_all_to_all", "auto"):
+      ep_size = ep_mesh.size()
+      return self._forward_ep(
+          x_TD,
+          topk_scores_TK,
+          topk_expert_ids_TK,
+          num_local_tokens_per_expert_E,
+          num_chunks=self._ep_num_chunks(x_TD.shape[0], ep_size),
+          ep_size=ep_size,
+      )
 
+    # EP = 1, or upstream's `all_to_all` EP transport.
     if not self.scale_before_down_proj:
       return super().forward(
           x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
@@ -1824,23 +1873,6 @@ class TpuRoutedExperts(RoutedExperts):
             num_local_tokens_per_expert_E,
         )
     )
-    if isinstance(metadata, TpuEpDispatchMetadata):
-      if metadata.row_scale_R is None:
-        raise ValueError(
-            "scale_before_down_proj expected EP dispatch metadata with"
-            " row_scale_R populated"
-        )
-      with maybe_set_sparse_mesh():
-        routed_output_RD = self.inner_experts(
-            routed_input_RD,
-            num_tokens_per_expert_e,
-            row_scale_R=metadata.row_scale_R,
-        )
-      return self.token_dispatcher.combine(
-          routed_output_RD,
-          replace(metadata, row_scale_applied=True),
-          x_TD,
-      )
     # AllToAllDispatchMetadata subclasses LocalDispatchMetadata, so check for
     # it explicitly: the local reduce below has no return all-to-all.
     if not isinstance(metadata, LocalDispatchMetadata) or isinstance(
